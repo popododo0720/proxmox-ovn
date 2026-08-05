@@ -127,8 +127,8 @@ func (c *Controller) ReconcileAll(ctx context.Context) error {
 var dependencyOrder = []model.Kind{
 	model.KindProject,
 	model.KindProviderNetwork,
-	model.KindProviderSegment,
 	model.KindNetwork,
+	model.KindProviderSegment,
 	model.KindSubnet,
 	model.KindSecurityGroup,
 	model.KindSecurityGroupRule,

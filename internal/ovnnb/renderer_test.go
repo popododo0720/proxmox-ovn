@@ -1,0 +1,744 @@
+package ovnnb
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/pvnstack/proxmox-ovn/internal/controlstore"
+	"github.com/pvnstack/proxmox-ovn/internal/model"
+)
+
+var testOVSUUID = deterministicUUID("dhcp-options:subnet-1")
+
+type recordingRunner struct {
+	mu                   sync.Mutex
+	calls                [][]string
+	dhcpCreated          bool
+	routerSNATFindOutput string
+	gatewayChassisOutput string
+}
+
+type activeActiveRunner struct {
+	mu          sync.Mutex
+	initialFind int
+	created     bool
+	creates     int
+	barrier     chan struct{}
+	uuid        string
+}
+
+type movingGatewayRunner struct {
+	recordingRunner
+	failed bool
+}
+
+type unavailableGatewayRunner struct {
+	recordingRunner
+}
+
+func (runner *activeActiveRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
+	joined := strings.Join(arguments, " ")
+	if strings.Contains(joined, "find Logical_Switch _uuid="+runner.uuid) {
+		runner.mu.Lock()
+		if runner.created {
+			runner.mu.Unlock()
+			return []byte(runner.uuid + "\n"), nil
+		}
+		runner.initialFind++
+		if runner.initialFind == 2 {
+			close(runner.barrier)
+		}
+		barrier := runner.barrier
+		runner.mu.Unlock()
+		<-barrier
+		return nil, nil
+	}
+	if strings.Contains(joined, "create Logical_Switch") {
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		runner.creates++
+		if runner.created {
+			return []byte("transaction error: UUID already exists"), errors.New("exit status 1")
+		}
+		runner.created = true
+		return []byte(runner.uuid + "\n"), nil
+	}
+	return nil, nil
+}
+
+func (runner *recordingRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	runner.calls = append(runner.calls, append([]string(nil), arguments...))
+	joined := strings.Join(arguments, " ")
+	if strings.Contains(joined, "find DHCP_Options") {
+		if runner.dhcpCreated {
+			return []byte(testOVSUUID + "\n"), nil
+		}
+		return nil, nil
+	}
+	if strings.Contains(joined, "create DHCP_Options") {
+		runner.dhcpCreated = true
+		return []byte(testOVSUUID + "\n"), nil
+	}
+	if strings.Contains(joined, "find NAT") && strings.Contains(joined, `external_ids:pvn-kind="router-snat"`) {
+		return []byte(runner.routerSNATFindOutput), nil
+	}
+	if strings.Contains(joined, "lrp-get-gateway-chassis") {
+		return []byte(runner.gatewayChassisOutput), nil
+	}
+	return nil, nil
+}
+
+func (runner *movingGatewayRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, error) {
+	joined := strings.Join(arguments, " ")
+	output, err := runner.recordingRunner.Run(ctx, binary, arguments...)
+	if strings.Contains(joined, "lrp-add") && strings.Contains(joined, "lsp-add") && !strings.Contains(joined, "lsp-del") && !runner.failed {
+		runner.failed = true
+		return []byte("port already belongs to another logical switch"), errors.New("exit status 1")
+	}
+	if strings.Contains(joined, "get Logical_Router_Port") || strings.Contains(joined, "get Logical_Switch_Port") {
+		return []byte("owned-port\n"), nil
+	}
+	return output, err
+}
+
+func (runner *unavailableGatewayRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, error) {
+	joined := strings.Join(arguments, " ")
+	_, _ = runner.recordingRunner.Run(ctx, binary, arguments...)
+	if strings.Contains(joined, "lrp-add") || strings.Contains(joined, "get Logical_Router_Port") || strings.Contains(joined, "get Logical_Switch_Port") {
+		return []byte("database connection failed"), errors.New("exit status 1")
+	}
+	return nil, nil
+}
+
+func (runner *recordingRunner) contains(parts ...string) bool {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	for _, call := range runner.calls {
+		joined := strings.Join(call, " ")
+		matches := true
+		for _, part := range parts {
+			matches = matches && strings.Contains(joined, part)
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
+	ctx := context.Background()
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private", MTU: 1400}).(*model.Network)
+	subnet := mustCreate(t, store, &model.Subnet{
+		Metadata: model.Metadata{ID: "subnet-1"}, ProjectID: project.ID, NetworkID: network.ID,
+		Name: "private-v4", CIDR: "10.42.0.0/24", GatewayIP: "10.42.0.1", EnableDHCP: true,
+		DNSNameservers: []string{"1.1.1.1"},
+	}).(*model.Subnet)
+	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "web"}).(*model.SecurityGroup)
+	port := mustCreate(t, store, &model.Port{
+		Metadata: model.Metadata{ID: "port-1"}, ProjectID: project.ID, NetworkID: network.ID, Name: "vm100-net0",
+		MACAddress: "02:00:00:00:00:10", FixedIPs: []model.FixedIP{{SubnetID: subnet.ID, Address: "10.42.0.10"}},
+		SecurityGroupIDs: []string{group.ID}, AdminStateUp: true, BindingStatus: model.PortBinding,
+		NodeID: "pve-a", VMID: 100, NIC: "net0", RequestedChassis: "chassis-a",
+	}).(*model.Port)
+
+	runner := &recordingRunner{}
+	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}, WaitForSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range []model.Resource{network, subnet, group, port} {
+		if err := renderer.Render(ctx, resource); err != nil {
+			t.Fatalf("render %s: %v", resource.ResourceKind(), err)
+		}
+	}
+
+	for _, expected := range [][]string{
+		{"create Logical_Switch", stringAssignment("name", logicalSwitch(network.ID)), `external_ids:pvn-id="network-1"`},
+		{"create DHCP_Options", `cidr="10.42.0.0/24"`},
+		{"dhcp-options-set-options", "server_id=10.42.0.1", "mtu=1400"},
+		{"create Port_Group", portGroup(group.ID), `external_ids:pvn-id="sg-1"`},
+		{"lsp-add " + logicalSwitchUUID(network.ID) + " pvn-port-1", "lsp-set-enabled pvn-port-1 true"},
+		{"lsp-set-options pvn-port-1 requested-chassis=chassis-a"},
+		{"lsp-set-dhcpv4-options pvn-port-1 " + testOVSUUID},
+		{"get Logical_Switch_Port pvn-port-1", "add Port_Group " + portGroup(group.ID) + " ports @lsp"},
+	} {
+		if !runner.contains(expected...) {
+			t.Errorf("no OVN command contains %v; calls=%v", expected, runner.calls)
+		}
+	}
+}
+
+func TestExternalNetworkCreatesItsLocalnetPortImmediately(t *testing.T) {
+	ctx := context.Background()
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+	provider := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-1"}, Name: "uplink"}).(*model.ProviderNetwork)
+	segment := mustCreate(t, store, &model.ProviderSegment{
+		Metadata: model.Metadata{ID: "segment-1"}, ProviderNetworkID: provider.ID,
+		Name: "vlan-100", PhysicalNetwork: "provider", NetworkType: model.ProviderVLAN, VLANID: 100,
+	}).(*model.ProviderSegment)
+	network := mustCreate(t, store, &model.Network{
+		Metadata: model.Metadata{ID: "external-1"}, ProjectID: project.ID, Name: "external",
+		External: true, ProviderNetworkID: provider.ID,
+	}).(*model.Network)
+
+	runner := &recordingRunner{}
+	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := renderer.Render(ctx, network); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("lsp-add "+logicalSwitchUUID(network.ID)+" pvn-localnet-", "lsp-set-type", "localnet", "network_name=provider", "tag=100") {
+		t.Fatalf("external network localnet port was not rendered: %v", runner.calls)
+	}
+	_ = segment
+}
+
+func TestRendererUsesOVNNBCTL2503CommandBoundaries(t *testing.T) {
+	ctx := context.Background()
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private"}).(*model.Network)
+	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "default"}).(*model.SecurityGroup)
+	runner := &recordingRunner{}
+	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range []model.Resource{network, group} {
+		if err := renderer.Render(ctx, resource); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, call := range runner.calls {
+		for index, argument := range call {
+			if argument == "--may-exist" || argument == "--if-exists" || strings.HasPrefix(argument, "--id=") {
+				if index == 0 || call[index-1] != "--" {
+					t.Errorf("command option %q is not separated from global options: %v", argument, call)
+				}
+			}
+			if argument == "pg-add-ports" || argument == "pg-del-ports" {
+				t.Errorf("unsupported OVN 25.03 command used: %v", call)
+			}
+		}
+	}
+}
+
+func TestRendererRejectsTypedNilAndCrossProjectPort(t *testing.T) {
+	store := controlstore.NewMemory()
+	runner := &recordingRunner{}
+	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var network *model.Network
+	if err := renderer.Render(context.Background(), network); err == nil {
+		t.Fatal("typed nil resource unexpectedly rendered")
+	}
+
+	first := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-a"}, Name: "a", PoolID: "pool-a"}).(*model.Project)
+	second := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-b"}, Name: "b", PoolID: "pool-b"}).(*model.Project)
+	otherNetwork := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-b"}, ProjectID: second.ID, Name: "private"}).(*model.Network)
+	port := &model.Port{
+		Metadata: model.Metadata{ID: "port-a"}, ProjectID: first.ID, NetworkID: otherNetwork.ID, Name: "vm100-net0",
+		MACAddress: "02:00:00:00:00:01", LSPName: "pvn-port-a",
+	}
+	if err := renderer.Render(context.Background(), port); err == nil || !strings.Contains(err.Error(), "different projects") {
+		t.Fatalf("cross-project port error = %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("OVN called for rejected resources: %v", runner.calls)
+	}
+}
+
+func TestRouterRendersCentralizedGatewayDefaultRouteAndSNAT(t *testing.T) {
+	ctx := context.Background()
+	store, fixture := newNorthSouthFixture(t)
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(ctx, fixture.router); err != nil {
+		t.Fatal(err)
+	}
+
+	routerPort := gatewayRouterPort(fixture.router.ID)
+	switchPort := gatewaySwitchPort(fixture.router.ID)
+	routeUUID := routerDefaultRouteUUID(fixture.router.ID)
+	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
+	for _, expected := range [][]string{
+		{"lrp-add " + logicalRouterUUID(fixture.router.ID) + " " + routerPort, "192.0.2.10/24"},
+		{"lsp-add " + logicalSwitchUUID(fixture.externalNetwork.ID) + " " + switchPort, "lsp-set-type " + switchPort + " router", "router-port=" + routerPort},
+		{"create Logical_Router_Static_Route", routeUUID, `ip_prefix="0.0.0.0/0"`, `nexthop="192.0.2.1"`, `output_port="` + routerPort + `"`},
+		{"add Logical_Router " + logicalRouterUUID(fixture.router.ID) + " static_routes " + routeUUID},
+		{"lrp-set-gateway-chassis " + routerPort + " chassis-a 32767", "lrp-set-gateway-chassis " + routerPort + " chassis-b 32766"},
+		{"create NAT", snatUUID, `type="snat"`, `external_ip="192.0.2.10"`, `logical_ip="10.42.0.0/24"`},
+		{"add Logical_Router " + logicalRouterUUID(fixture.router.ID) + " nat " + snatUUID},
+	} {
+		if !runner.contains(expected...) {
+			t.Errorf("no OVN command contains %v; calls=%v", expected, runner.calls)
+		}
+	}
+	if runner.contains("chassis-disabled") {
+		t.Fatalf("disabled gateway chassis was selected: %v", runner.calls)
+	}
+}
+
+func TestRouterInterfaceReconcilesRouterSNAT(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), fixture.routerInterface); err != nil {
+		t.Fatal(err)
+	}
+	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
+	if !runner.contains("create NAT", snatUUID, `type="snat"`, `logical_ip="10.42.0.0/24"`) {
+		t.Fatalf("router interface did not reconcile SNAT: %v", runner.calls)
+	}
+}
+
+func TestRouterSNATDisableRemovesOnlyManagedRows(t *testing.T) {
+	ctx := context.Background()
+	store, fixture := newNorthSouthFixture(t)
+	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
+	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
+	renderer := newTestRenderer(t, runner, store)
+
+	update := *fixture.router
+	update.EnableSNAT = false
+	updated, _, err := store.Update(ctx, &update, fixture.router.Revision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := renderer.Render(ctx, updated); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("remove Logical_Router "+logicalRouterUUID(fixture.router.ID)+" nat "+snatUUID, "destroy NAT "+snatUUID) {
+		t.Fatalf("stale managed SNAT was not removed: %v", runner.calls)
+	}
+	if runner.contains("lr-nat-del") {
+		t.Fatalf("broad NAT deletion was used: %v", runner.calls)
+	}
+}
+
+func TestRouterWithoutExternalGatewayCleansGatewayRouteAndSNAT(t *testing.T) {
+	ctx := context.Background()
+	store, fixture := newNorthSouthFixture(t)
+	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
+	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
+	renderer := newTestRenderer(t, runner, store)
+
+	update := *fixture.router
+	update.ExternalNetworkID = ""
+	update.ExternalSubnetID = ""
+	update.ExternalIPAddress = ""
+	update.EnableSNAT = false
+	updated, _, err := store.Update(ctx, &update, fixture.router.Revision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := renderer.Render(ctx, updated); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("lsp-del "+gatewaySwitchPort(fixture.router.ID), "lrp-del "+gatewayRouterPort(fixture.router.ID), "destroy Logical_Router_Static_Route "+routerDefaultRouteUUID(fixture.router.ID), "destroy NAT "+snatUUID) {
+		t.Fatalf("external gateway artifacts were not cleaned: %v", runner.calls)
+	}
+}
+
+func TestRouterDeleteCleansNorthSouthArtifacts(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
+	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Delete(context.Background(), fixture.router); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("lsp-del "+gatewaySwitchPort(fixture.router.ID), "lrp-del "+gatewayRouterPort(fixture.router.ID), "lr-del "+logicalRouterUUID(fixture.router.ID), "destroy Logical_Router_Static_Route "+routerDefaultRouteUUID(fixture.router.ID), "destroy NAT "+snatUUID) {
+		t.Fatalf("router north-south artifacts were not deleted: %v", runner.calls)
+	}
+}
+
+func TestRouterInterfaceDeleteRemovesSNATAndReconciles(t *testing.T) {
+	ctx := context.Background()
+	store, fixture := newNorthSouthFixture(t)
+	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
+	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
+	renderer := newTestRenderer(t, runner, store)
+	tombstone, _, err := store.BeginDelete(ctx, model.KindRouterInterface, fixture.routerInterface.ID, fixture.routerInterface.Revision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := renderer.Delete(ctx, tombstone); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("lsp-del pvn-rsp-"+compact(fixture.routerInterface.ID), "lrp-del pvn-lrp-"+compact(fixture.routerInterface.ID), "destroy NAT "+snatUUID) {
+		t.Fatalf("router interface artifacts were not deleted: %v", runner.calls)
+	}
+}
+
+func TestRouterGatewayChassisIsDeterministicAndRemovesStaleMembers(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	routerPort := gatewayRouterPort(fixture.router.ID)
+	runner := &recordingRunner{gatewayChassisOutput: routerPort + "-chassis-old   100\n"}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), fixture.router); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("lrp-set-gateway-chassis "+routerPort+" chassis-a 32767", "lrp-set-gateway-chassis "+routerPort+" chassis-b 32766") {
+		t.Fatalf("gateway chassis priorities are not deterministic: %v", runner.calls)
+	}
+	if !runner.contains("lrp-del-gateway-chassis " + routerPort + " chassis-old") {
+		t.Fatalf("stale gateway chassis was not removed: %v", runner.calls)
+	}
+}
+
+func TestRouterGatewayMovesItsSwitchPortAtomicallyWhenExternalNetworkChanges(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	runner := &movingGatewayRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), fixture.router); err != nil {
+		t.Fatal(err)
+	}
+	port := gatewaySwitchPort(fixture.router.ID)
+	if !runner.contains("--if-exists lsp-del "+port, "--may-exist lsp-add "+logicalSwitchUUID(fixture.externalNetwork.ID)+" "+port) {
+		t.Fatalf("gateway switch port was not moved in one OVN transaction: %v", runner.calls)
+	}
+}
+
+func TestRouterGatewayDoesNotDeletePortsOnDatabaseFailure(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	runner := &unavailableGatewayRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), fixture.router); err == nil || !strings.Contains(err.Error(), "database connection failed") {
+		t.Fatalf("database failure = %v", err)
+	}
+	if runner.contains("lsp-del", "lrp-del") {
+		t.Fatalf("gateway ports were deleted after an inconclusive ownership probe: %v", runner.calls)
+	}
+}
+
+func TestNorthSouthRendererUsesOVN2503CompatibleCommands(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+	if err := renderer.Render(context.Background(), fixture.router); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("lrp-set-gateway-chassis") || !runner.contains("create Logical_Router_Static_Route") || !runner.contains("create NAT") {
+		t.Fatalf("expected OVN 25.03 north-south commands are absent: %v", runner.calls)
+	}
+	for _, call := range runner.calls {
+		for index, argument := range call {
+			if argument == "--may-exist" || argument == "--if-exists" || strings.HasPrefix(argument, "--id=") {
+				if index == 0 || call[index-1] != "--" {
+					t.Errorf("command option %q is not separated from global options: %v", argument, call)
+				}
+			}
+			if argument == "lsp-add-router-port" || argument == "lsp-add-localnet-port" {
+				t.Errorf("post-25.03.0 convenience command used: %v", call)
+			}
+		}
+	}
+}
+
+func TestRouterExternalGatewayRequiresEnabledGatewayNode(t *testing.T) {
+	ctx := context.Background()
+	store, fixture := newNorthSouthFixture(t)
+	for _, id := range []string{"node-a", "node-b"} {
+		resource, err := store.Get(ctx, model.KindNode, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		node := resource.(*model.Node)
+		node.Enabled = false
+		if _, _, err := store.Update(ctx, node, node.Revision, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(ctx, fixture.router); err == nil || !strings.Contains(err.Error(), "no enabled gateway chassis") {
+		t.Fatalf("missing gateway chassis error = %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("OVN was mutated before gateway placement validation: %v", runner.calls)
+	}
+}
+
+func TestRouterRejectsInvalidExternalNetworkRelationBeforeOVNMutation(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+	router := &model.Router{
+		Metadata:          model.Metadata{ID: "router-invalid"},
+		ProjectID:         fixture.project.ID,
+		Name:              "invalid",
+		ExternalNetworkID: fixture.internalNetwork.ID,
+		ExternalSubnetID:  fixture.internalSubnet.ID,
+		ExternalIPAddress: "10.42.0.10",
+		EnableSNAT:        true,
+	}
+
+	if err := renderer.Render(context.Background(), router); err == nil || !strings.Contains(err.Error(), "not provider-backed and external") {
+		t.Fatalf("invalid external relation error = %v", err)
+	}
+	otherExternal := mustCreate(t, store, &model.Network{
+		Metadata: model.Metadata{ID: "external-2"}, ProjectID: fixture.project.ID, Name: "external-other",
+		External: true, ProviderNetworkID: fixture.provider.ID,
+	}).(*model.Network)
+	otherSubnet := mustCreate(t, store, &model.Subnet{
+		Metadata: model.Metadata{ID: "external-subnet-2"}, ProjectID: fixture.project.ID, NetworkID: otherExternal.ID,
+		Name: "external-other-v4", CIDR: "198.51.100.0/24", GatewayIP: "198.51.100.1",
+	}).(*model.Subnet)
+	router.ExternalNetworkID = fixture.externalNetwork.ID
+	router.ExternalSubnetID = otherSubnet.ID
+	router.ExternalIPAddress = "198.51.100.10"
+	if err := renderer.Render(context.Background(), router); err == nil || !strings.Contains(err.Error(), "does not belong") {
+		t.Fatalf("external subnet relation error = %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("OVN was mutated for an invalid external relation: %v", runner.calls)
+	}
+}
+
+func TestFloatingIPMustMatchRouterExternalProviderAndSubnet(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	secondProvider := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-2"}, Name: "other"}).(*model.ProviderNetwork)
+	_ = mustCreate(t, store, &model.ProviderSegment{
+		Metadata: model.Metadata{ID: "segment-2"}, ProviderNetworkID: secondProvider.ID,
+		Name: "flat-other", PhysicalNetwork: "other", NetworkType: model.ProviderFlat,
+	})
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	mismatch := &model.FloatingIP{
+		Metadata: model.Metadata{ID: "fip-mismatch"}, ProjectID: fixture.project.ID,
+		ProviderNetworkID: secondProvider.ID, Address: "192.0.2.20", RouterID: fixture.router.ID,
+		FixedIPAddress: "10.42.0.10",
+	}
+	if err := renderer.Render(context.Background(), mismatch); err == nil || !strings.Contains(err.Error(), "provider network does not match") {
+		t.Fatalf("provider mismatch error = %v", err)
+	}
+	outOfSubnet := *mismatch
+	outOfSubnet.ID = "fip-outside"
+	outOfSubnet.ProviderNetworkID = fixture.provider.ID
+	outOfSubnet.Address = "198.51.100.20"
+	if err := renderer.Render(context.Background(), &outOfSubnet); err == nil || !strings.Contains(err.Error(), "outside router") {
+		t.Fatalf("external subnet mismatch error = %v", err)
+	}
+	if runner.contains("create NAT") {
+		t.Fatalf("inconsistent floating IP created NAT: %v", runner.calls)
+	}
+}
+
+func TestFloatingIPOnRouterExternalProviderRendersNAT(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	port := mustCreate(t, store, &model.Port{
+		Metadata: model.Metadata{ID: "port-1"}, ProjectID: fixture.project.ID, NetworkID: fixture.internalNetwork.ID,
+		Name: "vm100-net0", MACAddress: "02:00:00:00:00:10",
+		FixedIPs:     []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.10"}},
+		AdminStateUp: true, BindingStatus: model.PortUnbound,
+	}).(*model.Port)
+	floatingIP := &model.FloatingIP{
+		Metadata: model.Metadata{ID: "fip-1"}, ProjectID: fixture.project.ID,
+		ProviderNetworkID: fixture.provider.ID, Address: "192.0.2.20", RouterID: fixture.router.ID,
+		PortID: port.ID, FixedIPAddress: "10.42.0.10", FloatingStatus: model.FloatingIPActive,
+	}
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), floatingIP); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("create NAT", `type="dnat_and_snat"`, `external_ip="192.0.2.20"`, `logical_ip="10.42.0.10"`, "add Logical_Router "+logicalRouterUUID(fixture.router.ID)) {
+		t.Fatalf("valid floating IP NAT was not rendered: %v", runner.calls)
+	}
+}
+
+func TestDerivedNamesDoNotAliasPunctuation(t *testing.T) {
+	if logicalSwitch("a-b") == logicalSwitch("ab") || portGroup("a:b") == portGroup("a.b") {
+		t.Fatal("derived OVN names alias distinct PVN identifiers")
+	}
+}
+
+func TestActiveActiveNetworkCreateUsesOneDeterministicRow(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private"}).(*model.Network)
+	runner := &activeActiveRunner{barrier: make(chan struct{}), uuid: logicalSwitchUUID(network.ID)}
+	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorsByManager := make(chan error, 2)
+	for range 2 {
+		go func() { errorsByManager <- renderer.Render(context.Background(), network) }()
+	}
+	for range 2 {
+		if err := <-errorsByManager; err != nil {
+			t.Fatalf("active-active render failed: %v", err)
+		}
+	}
+	if !runner.created || runner.creates != 2 {
+		t.Fatalf("race was not exercised: created=%v attempts=%d", runner.created, runner.creates)
+	}
+}
+
+func TestDeletePortIsIdempotentAndScoped(t *testing.T) {
+	store := controlstore.NewMemory()
+	runner := &recordingRunner{}
+	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := &model.Port{Metadata: model.Metadata{ID: "port-1"}, LSPName: "pvn-port-1"}
+	if err := renderer.Delete(context.Background(), port); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("--if-exists lsp-del pvn-port-1") {
+		t.Fatalf("scoped idempotent delete missing: %v", runner.calls)
+	}
+}
+
+func TestRendererRejectsUnsafeResourceIDBeforeExecuting(t *testing.T) {
+	runner := &recordingRunner{}
+	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := controlstore.NewMemory()
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := &model.Network{Metadata: model.Metadata{ID: "../../bad"}, ProjectID: "project-1", Name: "bad", MTU: 1400}
+	if err := renderer.Render(context.Background(), resource); err == nil {
+		t.Fatal("unsafe ID unexpectedly rendered")
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("OVN was called for unsafe ID: %v", runner.calls)
+	}
+}
+
+func mustCreate(t *testing.T, store controlstore.Store, resource model.Resource) model.Resource {
+	t.Helper()
+	created, _, err := store.Create(context.Background(), resource, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+type northSouthFixture struct {
+	project         *model.Project
+	provider        *model.ProviderNetwork
+	externalNetwork *model.Network
+	externalSubnet  *model.Subnet
+	internalNetwork *model.Network
+	internalSubnet  *model.Subnet
+	router          *model.Router
+	routerInterface *model.RouterInterface
+}
+
+func newNorthSouthFixture(t *testing.T) (*controlstore.Memory, northSouthFixture) {
+	t.Helper()
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{
+		Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1",
+	}).(*model.Project)
+	provider := mustCreate(t, store, &model.ProviderNetwork{
+		Metadata: model.Metadata{ID: "provider-1"}, Name: "uplink", Shared: true,
+	}).(*model.ProviderNetwork)
+	_ = mustCreate(t, store, &model.ProviderSegment{
+		Metadata: model.Metadata{ID: "segment-1"}, ProviderNetworkID: provider.ID,
+		Name: "flat-provider", PhysicalNetwork: "provider", NetworkType: model.ProviderFlat,
+	})
+	externalNetwork := mustCreate(t, store, &model.Network{
+		Metadata: model.Metadata{ID: "external-1"}, ProjectID: project.ID, Name: "external",
+		External: true, ProviderNetworkID: provider.ID,
+	}).(*model.Network)
+	externalSubnet := mustCreate(t, store, &model.Subnet{
+		Metadata: model.Metadata{ID: "external-subnet-1"}, ProjectID: project.ID, NetworkID: externalNetwork.ID,
+		Name: "external-v4", CIDR: "192.0.2.0/24", GatewayIP: "192.0.2.1",
+	}).(*model.Subnet)
+	internalNetwork := mustCreate(t, store, &model.Network{
+		Metadata: model.Metadata{ID: "internal-1"}, ProjectID: project.ID, Name: "private",
+	}).(*model.Network)
+	internalSubnet := mustCreate(t, store, &model.Subnet{
+		Metadata: model.Metadata{ID: "internal-subnet-1"}, ProjectID: project.ID, NetworkID: internalNetwork.ID,
+		Name: "private-v4", CIDR: "10.42.0.0/24", GatewayIP: "10.42.0.1",
+	}).(*model.Subnet)
+	for _, node := range []*model.Node{
+		{Metadata: model.Metadata{ID: "node-b"}, Name: "pve-b", ChassisID: "chassis-b", Roles: []model.NodeRole{model.NodeRoleCompute, model.NodeRoleGateway}, Enabled: true},
+		{Metadata: model.Metadata{ID: "node-a"}, Name: "pve-a", ChassisID: "chassis-a", Roles: []model.NodeRole{model.NodeRoleGateway}, Enabled: true},
+		{Metadata: model.Metadata{ID: "node-disabled"}, Name: "pve-disabled", ChassisID: "chassis-disabled", Roles: []model.NodeRole{model.NodeRoleGateway}, Enabled: false},
+	} {
+		_ = mustCreate(t, store, node)
+	}
+	router := mustCreate(t, store, &model.Router{
+		Metadata: model.Metadata{ID: "router-1"}, ProjectID: project.ID, Name: "edge",
+		ExternalNetworkID: externalNetwork.ID, ExternalSubnetID: externalSubnet.ID,
+		ExternalIPAddress: "192.0.2.10", EnableSNAT: true,
+	}).(*model.Router)
+	routerInterface := mustCreate(t, store, &model.RouterInterface{
+		Metadata: model.Metadata{ID: "router-interface-1"}, ProjectID: project.ID,
+		RouterID: router.ID, SubnetID: internalSubnet.ID,
+	}).(*model.RouterInterface)
+	return store, northSouthFixture{
+		project: project, provider: provider, externalNetwork: externalNetwork, externalSubnet: externalSubnet,
+		internalNetwork: internalNetwork, internalSubnet: internalSubnet, router: router, routerInterface: routerInterface,
+	}
+}
+
+func newTestRenderer(t *testing.T, runner Runner, store controlstore.Store) *Renderer {
+	t.Helper()
+	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return renderer
+}

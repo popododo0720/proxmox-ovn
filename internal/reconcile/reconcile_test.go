@@ -200,7 +200,7 @@ func TestControllerReconcileAllUsesDependencyOrder(t *testing.T) {
 	if err := NewController(store, recorder).ReconcileAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []model.Kind{model.KindProject, model.KindProviderNetwork, model.KindProviderSegment, model.KindNetwork, model.KindSubnet, model.KindSecurityGroup, model.KindSecurityGroupRule, model.KindNode}
+	want := []model.Kind{model.KindProject, model.KindProviderNetwork, model.KindNetwork, model.KindProviderSegment, model.KindSubnet, model.KindSecurityGroup, model.KindSecurityGroupRule, model.KindNode}
 	if len(recorder.kinds) != len(want) {
 		t.Fatalf("render order=%v want=%v", recorder.kinds, want)
 	}
