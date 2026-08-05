@@ -18,12 +18,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/api"
-	"github.com/pvnstack/proxmox-ovn/internal/buildinfo"
-	pvnconfig "github.com/pvnstack/proxmox-ovn/internal/config"
-	"github.com/pvnstack/proxmox-ovn/internal/ovnnb"
-	"github.com/pvnstack/proxmox-ovn/internal/ovsdbstore"
-	"github.com/pvnstack/proxmox-ovn/internal/reconcile"
+	"github.com/popododo0720/proxmox-ovn/internal/api"
+	"github.com/popododo0720/proxmox-ovn/internal/buildinfo"
+	pvnconfig "github.com/popododo0720/proxmox-ovn/internal/config"
+	"github.com/popododo0720/proxmox-ovn/internal/ovnnb"
+	"github.com/popododo0720/proxmox-ovn/internal/ovsdbstore"
+	"github.com/popododo0720/proxmox-ovn/internal/reconcile"
 )
 
 type managerConfig struct {

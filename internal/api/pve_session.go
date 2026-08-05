@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/auth"
+	"github.com/popododo0720/proxmox-ovn/internal/auth"
 )
 
 const PVNCSRFHeader = "X-PVN-CSRF-Token"

@@ -3,7 +3,7 @@ package api
 import (
 	"fmt"
 
-	"github.com/pvnstack/proxmox-ovn/internal/model"
+	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
 func (s *Server) applyNetworkPolicy(resource model.Resource) error {

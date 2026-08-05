@@ -9,7 +9,7 @@ import (
 
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/ovsdb"
-	"github.com/pvnstack/proxmox-ovn/internal/controlschema"
+	"github.com/popododo0720/proxmox-ovn/internal/controlschema"
 )
 
 var errSerialization = errors.New("PVN control database serialization conflict")

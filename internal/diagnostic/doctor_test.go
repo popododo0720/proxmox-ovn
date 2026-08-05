@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pvnstack/proxmox-ovn/internal/config"
+	"github.com/popododo0720/proxmox-ovn/internal/config"
 )
 
 type fakeRunner struct {

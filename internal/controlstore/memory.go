@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/model"
+	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
 type idempotencyRecord struct {

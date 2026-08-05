@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/auth"
-	"github.com/pvnstack/proxmox-ovn/internal/controlstore"
+	"github.com/popododo0720/proxmox-ovn/internal/auth"
+	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 )
 
 func TestPVESessionExchangeAndCSRFProtection(t *testing.T) {

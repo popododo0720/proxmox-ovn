@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/controlstore"
-	"github.com/pvnstack/proxmox-ovn/internal/model"
+	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
+	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
 const maxHeartbeatWriteAttempts = 8

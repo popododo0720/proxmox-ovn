@@ -12,15 +12,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/buildinfo"
-	"github.com/pvnstack/proxmox-ovn/internal/central"
-	"github.com/pvnstack/proxmox-ovn/internal/centraldb"
-	"github.com/pvnstack/proxmox-ovn/internal/config"
-	"github.com/pvnstack/proxmox-ovn/internal/diagnostic"
-	"github.com/pvnstack/proxmox-ovn/internal/hostconfig"
-	"github.com/pvnstack/proxmox-ovn/internal/nodestate"
-	"github.com/pvnstack/proxmox-ovn/internal/pki"
-	"github.com/pvnstack/proxmox-ovn/internal/raftstatus"
+	"github.com/popododo0720/proxmox-ovn/internal/buildinfo"
+	"github.com/popododo0720/proxmox-ovn/internal/central"
+	"github.com/popododo0720/proxmox-ovn/internal/centraldb"
+	"github.com/popododo0720/proxmox-ovn/internal/config"
+	"github.com/popododo0720/proxmox-ovn/internal/diagnostic"
+	"github.com/popododo0720/proxmox-ovn/internal/hostconfig"
+	"github.com/popododo0720/proxmox-ovn/internal/nodestate"
+	"github.com/popododo0720/proxmox-ovn/internal/pki"
+	"github.com/popododo0720/proxmox-ovn/internal/raftstatus"
 )
 
 func main() {

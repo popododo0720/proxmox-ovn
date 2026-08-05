@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/pvnstack/proxmox-ovn/internal/model"
+	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
 // FakeRenderer is an in-memory, revision-aware renderer suitable for tests and

@@ -5,9 +5,9 @@ DEB_VERSION ?= 0.1.1
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w \
-	-X github.com/pvnstack/proxmox-ovn/internal/buildinfo.Version=$(VERSION) \
-	-X github.com/pvnstack/proxmox-ovn/internal/buildinfo.Commit=$(COMMIT) \
-	-X github.com/pvnstack/proxmox-ovn/internal/buildinfo.Date=$(BUILD_DATE)
+	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Version=$(VERSION) \
+	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Commit=$(COMMIT) \
+	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Date=$(BUILD_DATE)
 
 .PHONY: all build web-build test test-race web-test ui-test vet fmt-check package-check deb release clean
 

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pvnstack/proxmox-ovn/internal/nodestate"
-	"github.com/pvnstack/proxmox-ovn/internal/raftstatus"
+	"github.com/popododo0720/proxmox-ovn/internal/nodestate"
+	"github.com/popododo0720/proxmox-ovn/internal/raftstatus"
 )
 
 type statusRunner struct {

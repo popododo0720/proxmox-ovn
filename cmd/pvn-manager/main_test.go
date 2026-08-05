@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	pvnconfig "github.com/pvnstack/proxmox-ovn/internal/config"
-	"github.com/pvnstack/proxmox-ovn/internal/pki"
+	pvnconfig "github.com/popododo0720/proxmox-ovn/internal/config"
+	"github.com/popododo0720/proxmox-ovn/internal/pki"
 )
 
 func TestApplyClusterConfigHonorsExplicitFlags(t *testing.T) {

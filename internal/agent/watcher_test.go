@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/ovs"
+	"github.com/popododo0720/proxmox-ovn/internal/ovs"
 )
 
 type fakeSource struct{ interfaces []ovs.Interface }

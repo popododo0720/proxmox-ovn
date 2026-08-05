@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/ovs"
-	"github.com/pvnstack/proxmox-ovn/internal/pve"
+	"github.com/popododo0720/proxmox-ovn/internal/ovs"
+	"github.com/popododo0720/proxmox-ovn/internal/pve"
 )
 
 type TickSource interface {

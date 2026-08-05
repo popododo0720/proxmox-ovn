@@ -12,8 +12,8 @@ import (
 	"github.com/ovn-org/libovsdb/ovsdb"
 	"github.com/ovn-org/libovsdb/ovsdb/serverdb"
 	"github.com/ovn-org/libovsdb/server"
-	"github.com/pvnstack/proxmox-ovn/internal/controlschema"
-	"github.com/pvnstack/proxmox-ovn/internal/model"
+	"github.com/popododo0720/proxmox-ovn/internal/controlschema"
+	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
 // This self-contained integration test exercises the actual libovsdb JSON-RPC

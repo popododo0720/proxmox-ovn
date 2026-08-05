@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pvnstack/proxmox-ovn/internal/agent"
+	"github.com/popododo0720/proxmox-ovn/internal/agent"
 )
 
 func TestParseConfigUsesEnvironmentAndFlags(t *testing.T) {
