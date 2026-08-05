@@ -9,4 +9,5 @@
 *.dsc
 *.tar.*
 .env
-
+__pycache__/
+*.py[cod]
