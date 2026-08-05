@@ -265,7 +265,7 @@ for path in \
     usr/share/pvn/web/index.html \
     usr/share/pvn/schema/PVN_Control.ovsschema \
     usr/share/doc/pvn-node/examples/config.json \
-    usr/share/doc/pvn-node/inventory/pve-cluster-192.168.0.example
+    usr/share/doc/pvn-node/inventory/pve-cluster.example
 do
     [ -e "$package_root/$path" ] || { echo "package is missing $path" >&2; exit 1; }
 done

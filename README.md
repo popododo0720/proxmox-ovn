@@ -58,7 +58,7 @@ directly:
 
 ```sh
 make deb
-PVN_INVENTORY=deploy/inventory/pve-cluster-192.168.0.example
+PVN_INVENTORY=deploy/inventory/pve-cluster.example
 PVN_IDENTITY=/root/.ssh/id_ed25519
 PVN_DEB=dist/pvn-node_0.1.1_amd64.deb
 

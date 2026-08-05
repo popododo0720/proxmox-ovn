@@ -4,7 +4,7 @@
 #
 # These are root SSH management destinations only. Pass a verified private key
 # separately with --identity; password authentication is never used.
-PVN_TARGET_NODES="192.168.0.78 192.168.0.80 192.168.0.126"
+PVN_TARGET_NODES="pve-a.example.net pve-b.example.net pve-c.example.net"
 
 # Geneve/control addresses, MTU, routes, provider bridges, physical uplinks,
 # VLAN policy, and gateways intentionally do not belong in this inventory.

@@ -16,8 +16,8 @@ resolved.
 
 ## 1. Inventory and read-only discovery
 
-The requested three-node deployment inventory is installed as
-`inventory/pve-cluster-192.168.0.example`. It must list the full PVE cluster
+The example three-node deployment inventory is installed as
+`inventory/pve-cluster.example`. It must list the full PVE cluster
 membership exactly once in `PVN_TARGET_NODES`; the installer parses that field
 and never sources the file. Entries are management SSH destinations only.
 Pass the root SSH private key separately with `--identity`; do not store a
@@ -47,7 +47,7 @@ report from the example inventory nodes before activation:
 ```sh
 PVN_IDENTITY=/root/.ssh/id_ed25519
 mkdir -p ./pvn-discovery
-for host in 192.168.0.78 192.168.0.80 192.168.0.126; do
+for host in pve-a.example.net pve-b.example.net pve-c.example.net; do
   ssh -i "$PVN_IDENTITY" -o BatchMode=yes \
     -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
     -o PubkeyAuthentication=yes -o IdentitiesOnly=yes \
@@ -102,7 +102,7 @@ underlying installer directly:
 
 ```sh
 make deb
-PVN_INVENTORY=deploy/inventory/pve-cluster-192.168.0.example
+PVN_INVENTORY=deploy/inventory/pve-cluster.example
 PVN_IDENTITY=/root/.ssh/id_ed25519
 PVN_DEB=dist/pvn-node_0.1.1_amd64.deb
 
