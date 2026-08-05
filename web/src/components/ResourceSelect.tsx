@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApi } from '../api/context';
 import type { BaseResource } from '../api/types';
 
@@ -27,6 +27,11 @@ interface ResourceSelectProps {
   defaultValue?: string | string[];
   formValues?: Record<string, unknown>;
   onChange?: (value: string | string[]) => void;
+}
+
+function selectionValue(value: string | string[] | undefined, multiple: boolean): string | string[] {
+  if (multiple) return Array.isArray(value) ? value : value ? [value] : [];
+  return Array.isArray(value) ? (value[0] || '') : (value || '');
 }
 
 function readPath(value: unknown, path: string): unknown {
@@ -81,12 +86,35 @@ export function ResourceSelect({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
+  const [selection, setSelection] = useState<string | string[]>(() => selectionValue(defaultValue, multiple));
+  const wasActive = useRef(false);
 
   const missingDependency = (source.matches || []).find((match) => {
     if (match.required === false) return false;
     const value = formValues[match.formField];
     return value === null || value === undefined || value === '';
   });
+  const dependencyKey = (source.matches || [])
+    .map((match) => String(formValues[match.formField] ?? ''))
+    .join('\u0000');
+  const previousDependency = useRef(dependencyKey);
+
+  useEffect(() => {
+    if (active && !wasActive.current) setSelection(selectionValue(defaultValue, multiple));
+    wasActive.current = active;
+  }, [active, defaultValue, multiple]);
+
+  useEffect(() => {
+    if (!active) {
+      previousDependency.current = dependencyKey;
+      return;
+    }
+    if (previousDependency.current === dependencyKey) return;
+    previousDependency.current = dependencyKey;
+    const cleared = selectionValue(undefined, multiple);
+    setSelection(cleared);
+    onChange?.(cleared);
+  }, [active, dependencyKey, multiple, onChange]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -114,6 +142,8 @@ export function ResourceSelect({
     () => items.filter((item) => matchesSource(item, source, formValues)),
     [formValues, items, source],
   );
+  const selectedIDs = Array.isArray(selection) ? selection : selection ? [selection] : [];
+  const unavailableSelectedIDs = selectedIDs.filter((id) => !options.some((item) => item.id === id));
 
   const placeholder = missingDependency
     ? `Select ${missingDependency.formField.replace(/_id$/, '').replaceAll('_', ' ')} first…`
@@ -133,18 +163,22 @@ export function ResourceSelect({
         required={required}
         multiple={multiple}
         size={multiple ? Math.min(Math.max(options.length, 2), 5) : undefined}
-        defaultValue={defaultValue}
+        value={selection}
         disabled={Boolean(missingDependency) || (multiple && (loading || Boolean(error) || options.length === 0))}
         aria-busy={loading || undefined}
         onChange={(event) => {
           const value = multiple
             ? Array.from(event.currentTarget.selectedOptions, (option) => option.value)
             : event.currentTarget.value;
+          setSelection(value);
           onChange?.(value);
         }}
       >
         {!multiple && <option value="">{placeholder}</option>}
         {multiple && options.length === 0 && <option value="" disabled>{placeholder}</option>}
+        {unavailableSelectedIDs.map((value) => (
+          <option value={value} key={`current-${value}`}>{value} · current value unavailable</option>
+        ))}
         {options.map((item) => (
           <option value={item.id} key={item.id}>{resourceOptionLabel(item, source)}</option>
         ))}

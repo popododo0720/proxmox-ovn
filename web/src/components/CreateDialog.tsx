@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ResourceSelect, type ResourceReference } from './ResourceSelect';
 
 export interface FormField {
@@ -14,10 +14,16 @@ export interface FormField {
   help?: string;
 }
 
-function defaultFormValues(fields: FormField[]): Record<string, unknown> {
-  return Object.fromEntries(fields
-    .filter((field) => field.defaultValue !== undefined)
-    .map((field) => [field.name, field.defaultValue]));
+const emptyFormValues: Record<string, unknown> = {};
+
+function defaultFormValues(fields: FormField[], values: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...values };
+  for (const field of fields) {
+    if (result[field.name] === undefined && field.defaultValue !== undefined) {
+      result[field.name] = field.defaultValue;
+    }
+  }
+  return result;
 }
 
 export function CreateDialog({
@@ -26,17 +32,22 @@ export function CreateDialog({
   open,
   onClose,
   onSubmit,
+  mode = 'create',
+  values = emptyFormValues,
 }: {
   title: string;
   fields: FormField[];
   open: boolean;
   onClose: () => void;
   onSubmit: (value: Record<string, unknown>) => Promise<void>;
+  mode?: 'create' | 'edit';
+  values?: Record<string, unknown>;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const fieldPrefix = `resource-${useId().replaceAll(':', '')}`;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const initialValues = useMemo(() => defaultFormValues(fields), [fields]);
+  const initialValues = useMemo(() => defaultFormValues(fields, values), [fields, values]);
   const [formValues, setFormValues] = useState<Record<string, unknown>>(initialValues);
 
   useEffect(() => {
@@ -64,11 +75,11 @@ export function CreateDialog({
       }
       if (field.type === 'resource-select' && field.multiple) {
         const values = form.getAll(field.name).map((value) => String(value).trim()).filter(Boolean);
-        if (values.length > 0 || field.required) payload[field.name] = values;
+        if (values.length > 0 || field.required || mode === 'edit') payload[field.name] = values;
         continue;
       }
       const raw = String(form.get(field.name) ?? '').trim();
-      if (!raw && !field.required) continue;
+      if (!raw && !field.required && mode === 'create') continue;
       payload[field.name] = field.type === 'number' ? Number(raw) : raw;
     }
     try {
@@ -77,7 +88,7 @@ export function CreateDialog({
       setFormValues(initialValues);
       onClose();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'The resource could not be created');
+      setError(reason instanceof Error ? reason.message : `The resource could not be ${mode === 'edit' ? 'updated' : 'created'}`);
     } finally {
       setSubmitting(false);
     }
@@ -98,21 +109,22 @@ export function CreateDialog({
       <form onSubmit={submit}>
         <div className="dialog-heading">
           <div>
-            <span className="eyebrow">New resource</span>
+            <span className="eyebrow">{mode === 'edit' ? 'Edit resource' : 'New resource'}</span>
             <h2>{title}</h2>
           </div>
           <button type="button" className="icon-button" aria-label="Close" onClick={onClose} disabled={submitting}>×</button>
         </div>
         <div className="dialog-fields">
           {fields.map((field) => {
-            const fieldID = `resource-field-${field.name}`;
+            const fieldID = `${fieldPrefix}-${field.name}`;
+            const initialValue = initialValues[field.name];
             return field.type === 'checkbox' ? (
               <label className="checkbox-field" key={field.name}>
                 <>
                   <input
                     name={field.name}
                     type="checkbox"
-                    defaultChecked={Boolean(field.defaultValue)}
+                    defaultChecked={Boolean(initialValue)}
                     onChange={(event) => setFormValues((values) => ({ ...values, [field.name]: event.target.checked }))}
                   />
                   <span>{field.label}</span>
@@ -131,9 +143,9 @@ export function CreateDialog({
                       active={open}
                       required={field.required}
                       multiple={field.multiple}
-                      defaultValue={Array.isArray(field.defaultValue)
-                        ? field.defaultValue
-                        : field.defaultValue === undefined ? undefined : String(field.defaultValue)}
+                      defaultValue={Array.isArray(initialValue)
+                        ? initialValue.map(String)
+                        : initialValue === undefined ? undefined : String(initialValue)}
                       formValues={formValues}
                       onChange={(value) => setFormValues((values) => ({ ...values, [field.name]: value }))}
                     />
@@ -141,11 +153,11 @@ export function CreateDialog({
                     <select
                       id={fieldID}
                       name={field.name}
-                      defaultValue={String(field.defaultValue ?? '')}
+                      defaultValue={String(initialValue ?? '')}
                       required={field.required}
                       onChange={(event) => setFormValues((values) => ({ ...values, [field.name]: event.target.value }))}
                     >
-                      <option value="" disabled>Select…</option>
+                      <option value="" disabled={field.required}>{field.required ? 'Select…' : 'None'}</option>
                       {field.options?.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}
                     </select>
                   ) : (
@@ -155,7 +167,7 @@ export function CreateDialog({
                       type={field.type || 'text'}
                       required={field.required}
                       placeholder={field.placeholder}
-                      defaultValue={typeof field.defaultValue === 'boolean' || Array.isArray(field.defaultValue) ? undefined : field.defaultValue}
+                      defaultValue={typeof initialValue === 'boolean' || Array.isArray(initialValue) ? undefined : String(initialValue ?? '')}
                       onChange={(event) => setFormValues((values) => ({ ...values, [field.name]: event.target.value }))}
                     />
                   )}
@@ -169,7 +181,7 @@ export function CreateDialog({
         <div className="dialog-actions">
           <button type="button" className="button button-secondary" onClick={onClose} disabled={submitting}>Cancel</button>
           <button type="submit" className="button button-primary" disabled={submitting}>
-            {submitting ? 'Creating…' : 'Create'}
+            {submitting ? (mode === 'edit' ? 'Saving…' : 'Creating…') : (mode === 'edit' ? 'Save changes' : 'Create')}
           </button>
         </div>
       </form>

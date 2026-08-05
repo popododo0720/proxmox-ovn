@@ -22,8 +22,10 @@ export interface ResourcePageProps<T extends BaseResource> {
   columns: Column<T>[];
   createLabel?: string;
   createFields?: FormField[];
+  editFields?: FormField[];
   allowDelete?: boolean;
   createResource?: (payload: Record<string, unknown>) => Promise<T>;
+  updateResource?: (item: T, payload: Record<string, unknown>) => Promise<T>;
   deleteResource?: (item: T) => Promise<void>;
   compact?: boolean;
   emptyMessage?: string;
@@ -59,8 +61,10 @@ export function ResourcePage<T extends BaseResource>({
   columns,
   createLabel,
   createFields,
+  editFields,
   allowDelete = false,
   createResource,
+  updateResource,
   deleteResource,
   compact = false,
   emptyMessage = 'Create the first resource when the cluster is ready.',
@@ -72,6 +76,7 @@ export function ResourcePage<T extends BaseResource>({
   const [query, setQuery] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
+  const [editing, setEditing] = useState<T | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const tableColumns: Column<T>[] = columns.some((column) => String(column.key) === 'id')
     ? columns
@@ -153,7 +158,7 @@ export function ResourcePage<T extends BaseResource>({
               <thead>
                 <tr>
                   {tableColumns.map((column) => <th className={column.className} key={String(column.key)}>{column.label}</th>)}
-                  {allowDelete && <th className="actions-column"><span className="sr-only">Actions</span></th>}
+                  {(editFields || allowDelete) && <th className="actions-column"><span className="sr-only">Actions</span></th>}
                 </tr>
               </thead>
               <tbody>
@@ -173,11 +178,16 @@ export function ResourcePage<T extends BaseResource>({
                         </td>
                       );
                     })}
-                    {allowDelete && (
+                    {(editFields || allowDelete) && (
                       <td className="actions-column">
-                        <button className="table-action danger" disabled={deleting === item.id} onClick={() => void remove(item)}>
-                          {deleting === item.id ? 'Deleting…' : 'Delete'}
-                        </button>
+                        <span className="table-actions">
+                          {editFields && <button className="table-action" disabled={deleting === item.id} onClick={() => setEditing(item)}>Edit</button>}
+                          {allowDelete && (
+                            <button className="table-action danger" disabled={deleting === item.id} onClick={() => void remove(item)}>
+                              {deleting === item.id ? 'Deleting…' : 'Delete'}
+                            </button>
+                          )}
+                        </span>
                       </td>
                     )}
                   </tr>
@@ -198,6 +208,22 @@ export function ResourcePage<T extends BaseResource>({
           onSubmit={async (payload) => {
             if (createResource) await createResource(payload);
             else await api.create<T>(endpoint, payload);
+            await load();
+          }}
+        />
+      )}
+      {editFields && editing && (
+        <CreateDialog
+          key={`${editing.id}-${editing.revision || 0}`}
+          title={`Edit ${editing.name || editing.id}`}
+          fields={editFields}
+          values={editing}
+          mode="edit"
+          open
+          onClose={() => setEditing(null)}
+          onSubmit={async (payload) => {
+            if (updateResource) await updateResource(editing, payload);
+            else await api.update<T>(endpoint, editing.id, { ...editing, ...payload }, editing.revision);
             await load();
           }}
         />

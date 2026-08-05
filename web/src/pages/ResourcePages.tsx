@@ -82,6 +82,13 @@ const projectPortReference: ResourceReference = {
   emptyLabel: 'No ports in this project',
 };
 
+const currentProviderSegmentReference: ResourceReference = {
+  endpoint: '/provider-segments',
+  detailKeys: ['network_type', 'physical_network', 'vlan_id'],
+  matches: [{ formField: 'id', resourceField: 'provider_network_id' }],
+  emptyLabel: 'Create a segment for this provider network first',
+};
+
 const projectField: FormField = {
   name: 'project_id',
   label: 'Project',
@@ -118,6 +125,10 @@ export function ProjectsPage() {
       { name: 'pool_id', label: 'Existing PVE pool ID', required: true, placeholder: 'tenant-a' },
       { name: 'description', label: 'Description' },
     ]}
+    editFields={[
+      { name: 'name', label: 'Name', required: true },
+      { name: 'description', label: 'Description' },
+    ]}
     allowDelete
     emptyMessage="Create a PVE pool first, then map its ID here."
   />;
@@ -139,6 +150,13 @@ export function NetworksPage() {
       ]}
       createLabel="Network"
       createFields={networkFields}
+      editFields={[
+        { name: 'name', label: 'Name', required: true },
+        { name: 'description', label: 'Description' },
+        { name: 'mtu', label: 'Guest MTU', type: 'number', required: true },
+        { name: 'external', label: 'Provider-backed external network', type: 'checkbox' },
+        { name: 'provider_network_id', label: 'Provider network', type: 'resource-select', reference: providerNetworkReference },
+      ]}
       allowDelete
     />
     <ResourcePage<Subnet>
@@ -161,6 +179,11 @@ export function NetworksPage() {
         { name: 'cidr', label: 'IPv4 CIDR', required: true, placeholder: '10.42.0.0/24' },
         { name: 'gateway_ip', label: 'Gateway IP', placeholder: '10.42.0.1' },
         { name: 'enable_dhcp', label: 'Enable OVN DHCP', type: 'checkbox', defaultValue: true },
+      ]}
+      editFields={[
+        { name: 'name', label: 'Name', required: true },
+        { name: 'gateway_ip', label: 'Gateway IP' },
+        { name: 'enable_dhcp', label: 'Enable OVN DHCP', type: 'checkbox' },
       ]}
       allowDelete
       compact
@@ -187,10 +210,19 @@ export function RoutersPage() {
       createFields={[
         { name: 'name', label: 'Name', required: true, placeholder: 'edge' },
         projectField,
+        { name: 'description', label: 'Description' },
         { name: 'external_network_id', label: 'External network', type: 'resource-select', reference: externalNetworkReference },
         { name: 'external_subnet_id', label: 'External subnet', type: 'resource-select', reference: externalSubnetReference },
         { name: 'external_ip_address', label: 'Router external IPv4', placeholder: '203.0.113.10' },
         { name: 'enable_snat', label: 'Enable SNAT', type: 'checkbox', defaultValue: true },
+      ]}
+      editFields={[
+        { name: 'name', label: 'Name', required: true },
+        { name: 'description', label: 'Description' },
+        { name: 'external_network_id', label: 'External network', type: 'resource-select', reference: externalNetworkReference },
+        { name: 'external_subnet_id', label: 'External subnet', type: 'resource-select', reference: externalSubnetReference },
+        { name: 'external_ip_address', label: 'Router external IPv4' },
+        { name: 'enable_snat', label: 'Enable SNAT', type: 'checkbox' },
       ]}
       allowDelete
     />
@@ -284,6 +316,11 @@ export function FloatingIPsPage() {
       { name: 'port_id', label: 'Destination port', type: 'resource-select', reference: projectPortReference },
       { name: 'fixed_ip_address', label: 'Destination fixed IP' },
     ]}
+    editFields={[
+      { name: 'router_id', label: 'Router', type: 'resource-select', reference: projectRouterReference },
+      { name: 'port_id', label: 'Destination port', type: 'resource-select', reference: projectPortReference },
+      { name: 'fixed_ip_address', label: 'Destination fixed IP' },
+    ]}
     allowDelete
   />;
 }
@@ -307,6 +344,11 @@ export function SecurityGroupsPage() {
         projectField,
         { name: 'description', label: 'Description' },
         { name: 'stateful', label: 'Stateful', type: 'checkbox', defaultValue: true },
+      ]}
+      editFields={[
+        { name: 'name', label: 'Name', required: true },
+        { name: 'description', label: 'Description' },
+        { name: 'stateful', label: 'Stateful', type: 'checkbox' },
       ]}
       allowDelete
     />
@@ -338,6 +380,17 @@ export function SecurityGroupsPage() {
         { name: 'action', label: 'Action', type: 'select', required: true, defaultValue: 'allow', options: [{ label: 'Allow', value: 'allow' }, { label: 'Drop', value: 'drop' }] },
         { name: 'description', label: 'Description' },
       ]}
+      editFields={[
+        { name: 'direction', label: 'Direction', type: 'select', required: true, options: [{ label: 'Ingress', value: 'ingress' }, { label: 'Egress', value: 'egress' }] },
+        { name: 'ethertype', label: 'Ether type', type: 'select', required: true, options: [{ label: 'IPv4', value: 'IPv4' }] },
+        { name: 'protocol', label: 'Protocol', type: 'select', options: [{ label: 'TCP', value: 'tcp' }, { label: 'UDP', value: 'udp' }, { label: 'ICMP', value: 'icmp' }] },
+        { name: 'port_range_min', label: 'Port range start', type: 'number' },
+        { name: 'port_range_max', label: 'Port range end', type: 'number' },
+        { name: 'remote_cidr', label: 'Remote IPv4 CIDR' },
+        { name: 'remote_group_id', label: 'Remote security group', type: 'resource-select', reference: projectSecurityGroupReference },
+        { name: 'action', label: 'Action', type: 'select', required: true, options: [{ label: 'Allow', value: 'allow' }, { label: 'Drop', value: 'drop' }] },
+        { name: 'description', label: 'Description' },
+      ]}
       allowDelete
       compact
     />
@@ -363,6 +416,12 @@ export function ProviderNetworksPage() {
         { name: 'description', label: 'Description' },
         { name: 'shared', label: 'Shared between projects', type: 'checkbox', defaultValue: true },
       ]}
+      editFields={[
+        { name: 'name', label: 'Name', required: true },
+        { name: 'description', label: 'Description' },
+        { name: 'shared', label: 'Shared between projects', type: 'checkbox' },
+        { name: 'default_segment_id', label: 'Default segment', type: 'resource-select', reference: currentProviderSegmentReference, help: 'Required when this provider network has multiple segments.' },
+      ]}
       allowDelete
     />
     <ResourcePage<ProviderSegment>
@@ -383,6 +442,12 @@ export function ProviderNetworksPage() {
         { name: 'provider_network_id', label: 'Provider network', type: 'resource-select', reference: providerNetworkReference, required: true },
         { name: 'network_type', label: 'Type', type: 'select', required: true, defaultValue: 'vlan', options: [{ label: 'VLAN', value: 'vlan' }, { label: 'Flat', value: 'flat' }] },
         { name: 'physical_network', label: 'OVS bridge mapping', required: true, placeholder: 'provider' },
+        { name: 'vlan_id', label: 'VLAN ID', type: 'number' },
+      ]}
+      editFields={[
+        { name: 'name', label: 'Name', required: true },
+        { name: 'network_type', label: 'Type', type: 'select', required: true, options: [{ label: 'VLAN', value: 'vlan' }, { label: 'Flat', value: 'flat' }] },
+        { name: 'physical_network', label: 'OVS bridge mapping', required: true },
         { name: 'vlan_id', label: 'VLAN ID', type: 'number' },
       ]}
       allowDelete

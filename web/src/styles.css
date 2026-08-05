@@ -104,8 +104,10 @@ tbody tr:hover td { background: rgba(255,255,255,.012); }
 td strong { color: #edf4f8; font-weight: 650; }
 .mono-cell { max-width: 220px; color: #a5b5c0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10.5px; overflow-wrap: anywhere; }
 .error-cell { max-width: 260px; color: var(--danger); }
-.actions-column { width: 80px; text-align: right; }
+.actions-column { width: 112px; text-align: right; }
+.table-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .table-action { border: 0; background: transparent; color: var(--muted); font-size: 10px; font-weight: 700; cursor: pointer; }
+.table-action:hover { color: var(--accent); }
 .table-action.danger:hover { color: var(--danger); }
 .status-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border: 1px solid; border-radius: 999px; font-size: 9px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
 .status-pill::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }

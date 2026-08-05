@@ -59,4 +59,28 @@ describe('ResourceSelect', () => {
     await screen.findByRole('option', { name: 'tenant-a · project-1' });
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
   });
+
+  it('preserves an exact edit value while its human-readable option loads', async () => {
+    let resolveList: ((value: { items: Array<{ id: string; name: string }> }) => void) | undefined;
+    const list = vi.fn().mockReturnValue(new Promise((resolve) => { resolveList = resolve; }));
+
+    render(
+      <ApiProvider client={{ list } as unknown as ApiClient}>
+        <ResourceSelect
+          id="provider"
+          name="provider_network_id"
+          active
+          source={{ endpoint: '/provider-networks' }}
+          defaultValue="provider-exact-id"
+        />
+      </ApiProvider>,
+    );
+
+    expect(screen.getByRole('combobox')).toHaveValue('provider-exact-id');
+    expect(screen.getByRole('option', { name: 'provider-exact-id · current value unavailable' })).toBeInTheDocument();
+    resolveList?.({ items: [{ id: 'provider-exact-id', name: 'public' }] });
+
+    await screen.findByRole('option', { name: 'public · provider-exact-id' });
+    expect(screen.getByRole('combobox')).toHaveValue('provider-exact-id');
+  });
 });
