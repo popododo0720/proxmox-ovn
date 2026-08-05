@@ -48,6 +48,7 @@ jobs:
             exit 1
           fi
           grep -Fx "DEFAULT_VERSION=$release_version" deploy/scripts/pvn-install.sh
+          grep -Fx "DEFAULT_VERSION=$release_version" deploy/scripts/pvn-update.sh
           grep -Fx "DEB_VERSION ?= $release_version" Makefile
           printf 'PVN_RELEASE_VERSION=%s\n' "$release_version" >> "$GITHUB_ENV"
 

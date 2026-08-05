@@ -27,6 +27,8 @@ done
 
 deploy/tests/pvn-cluster-install-test.sh
 deploy/tests/pvn-install-test.sh
+python3 deploy/tests/pvn-cluster-update-test.py
+deploy/tests/pvn-update-test.sh
 deploy/tests/pvn-cluster-lease-test.sh
 deploy/tests/pvn-ovn-db-listeners-test.sh
 deploy/tests/pvn-topology-test.sh
@@ -275,6 +277,8 @@ for path in \
     usr/lib/pvn/pvn-guest-gate \
     usr/lib/pvn/pvn-ui-verify \
     usr/lib/pvn/pvn-cluster-lease \
+    usr/lib/pvn/pvn-cluster-update \
+    usr/lib/pvn/pvn-update.sh \
     usr/lib/pvn/pvn-topology \
     usr/lib/pvn/pvn-control-plane \
     usr/lib/systemd/system/pvn-node.target \

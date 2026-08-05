@@ -301,12 +301,49 @@ systemctl restart pvn-ovn-host-config ovn-controller \
 
 ## Upgrades
 
-Upgrade one PVE node at a time. The package restarts an already-active
-per-node stack and fails package configuration if any restart or readiness
-check fails; inspect the unit status printed by `postinst` before retrying. It
-deliberately does not restart active OVN central database units. After checking
-Raft health, restart central services one voter at a time during a maintenance
-window. Never upgrade enough voters concurrently to lose quorum.
+Run the hosted rolling updater on any online PVE node. With no arguments it
+downloads the release package, updater, and native PVE lease helper, verifies
+all three against `SHA256SUMS`, prints a read-only plan, and asks for the exact
+deployment ID before changing a node:
+
+```sh
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh)"
+```
+
+For non-interactive automation, plan first and then explicitly apply:
+
+```sh
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh)" \
+  pvn-update.sh plan
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh)" \
+  pvn-update.sh apply --confirm CLUSTER_NAME
+```
+
+The updater takes the shared PVE `mutation` lease, pins the exact online
+name/ID/management-IP membership and cluster configuration version, stages and
+hashes the DEB on every pending node, then upgrades nodes sequentially. Before
+and after every node it requires PVE quorum, consistent package state, the PVE
+UI hook, node readiness/`pvnctl doctor` for active transport nodes, and healthy
+local Raft status for active central voters. Existing `/etc/pvn`, shared PVN
+configuration, and database paths are preserved; an unexpected configuration
+change fails the rollout. A failed node stops the sequence. Nodes already
+completed remain upgraded, and a later run safely verifies/skips them while
+continuing the one remaining older version.
+
+Package installation restarts only an already-active per-node
+manager/agent/controller stack. The updater deliberately does not restart
+active PVN Control, OVN NB/SB, or northd processes and verifies that their PIDs
+did not change. This means package files can be at the new version while those
+central processes still run the previous executable until a maintenance
+restart. After the package rollout, check Raft health and restart central
+services one voter at a time. Never restart enough voters concurrently to lose
+quorum. Mixed-version compatibility is required for the duration of this
+rolling window; use a maintenance window for releases that declare a breaking
+database or wire-protocol change.
+
+A hard power loss can leave the cluster mutation lease for operator review.
+Inspect it with `pvn-cluster-lease show mutation`; never remove a lease until
+the recorded owner is proven dead and the partial rollout is audited.
 
 ## Node removal
 

@@ -1,0 +1,1048 @@
+#!/usr/bin/python3
+"""Fail-closed, rolling pvn-node package updater for a native PVE cluster."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import pathlib
+import re
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import time
+from typing import Iterable
+
+
+PROGRAM = "pvn-cluster-update"
+MEMBERS_PATH = pathlib.Path(os.environ.get("PVN_PVE_MEMBERS_FILE", "/etc/pve/.members"))
+COROSYNC_PATH = pathlib.Path(os.environ.get("PVN_PVE_COROSYNC_CONF", "/etc/pve/corosync.conf"))
+NODES_DIR = pathlib.Path(os.environ.get("PVN_PVE_NODES_DIR", "/etc/pve/nodes"))
+IDENTITY = pathlib.Path(os.environ.get("PVN_PVE_IDENTITY", "/root/.ssh/id_rsa"))
+PVECM = os.environ.get("PVN_PVECM_BIN", "pvecm")
+SSH = os.environ.get("PVN_SSH_BIN", "ssh")
+SCP = os.environ.get("PVN_SCP_BIN", "scp")
+CP = os.environ.get("PVN_CP_BIN", "cp")
+LOCAL_SH = os.environ.get("PVN_LOCAL_SH_BIN", "sh")
+DPKG = os.environ.get("PVN_DPKG_BIN", "dpkg")
+DPKG_DEB = os.environ.get("PVN_DPKG_DEB_BIN", "dpkg-deb")
+SHA256SUM = os.environ.get("PVN_SHA256SUM_BIN", "sha256sum")
+LEASE = os.environ.get("PVN_CLUSTER_LEASE_BIN", "/usr/lib/pvn/pvn-cluster-lease")
+LOCK_PATH = pathlib.Path(os.environ.get("PVN_UPDATE_LOCK_FILE", "/run/lock/pvn-cluster-update.lock"))
+
+SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
+SAFE_VERSION = re.compile(r"[A-Za-z0-9.+:~_-]+")
+SAFE_ARCH = re.compile(r"[A-Za-z0-9_-]+")
+SAFE_SHA = re.compile(r"[0-9a-f]{64}")
+
+
+class UpdateError(RuntimeError):
+    pass
+
+
+def fail(message: str) -> None:
+    raise UpdateError(message)
+
+
+def command(
+    arguments: list[str],
+    *,
+    input_text: str | None = None,
+    check: bool = True,
+    quiet: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            arguments,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=environment,
+        )
+    except OSError as error:
+        fail(f"cannot execute {arguments[0]}: {error}")
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        fail(f"command failed ({arguments[0]}): {detail[-4000:]}")
+    if not quiet and result.stderr:
+        sys.stderr.write(result.stderr)
+    return result
+
+
+def secure_regular(path: pathlib.Path, label: str, mode_mask: int = 0o022) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect {label}: {error}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fail(f"{label} must be a regular non-symlink file")
+    if metadata.st_uid != 0:
+        fail(f"{label} must be owned by root")
+    if stat.S_IMODE(metadata.st_mode) & mode_mask:
+        fail(f"{label} has unsafe write permissions")
+    return metadata
+
+
+def safe_name(value: object, label: str) -> str:
+    if not isinstance(value, str) or not SAFE_NAME.fullmatch(value) or value in {".", ".."}:
+        fail(f"{label} is unsafe or empty")
+    return value
+
+
+def safe_integer(value: object, label: str, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        fail(f"{label} is not a valid integer")
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
+class Node:
+    node_id: int
+    name: str
+    address: str
+    local: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class Snapshot:
+    mode: str
+    deployment: str
+    config_version: int
+    local_name: str
+    nodes: tuple[Node, ...]
+    fingerprint: str
+
+
+@dataclasses.dataclass(frozen=True)
+class Probe:
+    node: Node
+    version: str
+    architecture: str
+    node_state: str
+    central_state: str
+    central_pids: str
+
+
+def membership_fingerprint(mode: str, deployment: str, version: int, nodes: Iterable[Node]) -> str:
+    records = [
+        {"id": node.node_id, "ip": node.address, "name": node.name, "online": 1}
+        for node in sorted(nodes, key=lambda item: (item.node_id, item.name))
+    ]
+    payload = {
+        "cluster": deployment,
+        "config_version": version,
+        "mode": mode,
+        "node_count": len(records),
+        "nodes": records,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def parse_status(output: str, pattern: str, label: str) -> str:
+    matches = re.findall(pattern, output, re.MULTILINE)
+    if len(matches) != 1:
+        fail(f"pvecm status has an invalid {label} field")
+    return matches[0]
+
+
+def validate_host_pin(node: Node) -> None:
+    path = NODES_DIR / node.name / "ssh_known_hosts"
+    secure_regular(path, str(path))
+    try:
+        lines = [
+            line.strip()
+            for line in path.read_text(encoding="ascii").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    except (OSError, UnicodeError) as error:
+        fail(f"cannot read {path}: {error}")
+    if not lines:
+        fail(f"{path} contains no pinned host key")
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3 or fields[0] != node.name:
+            fail(f"{path} does not exclusively pin alias {node.name}")
+
+
+def discover() -> Snapshot:
+    secure_regular(MEMBERS_PATH, str(MEMBERS_PATH))
+    try:
+        data = json.loads(MEMBERS_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"cannot parse {MEMBERS_PATH}: {error}")
+    if not isinstance(data, dict):
+        fail(".members root must be an object")
+    local_name = safe_name(data.get("nodename"), ".members nodename")
+    cluster = data.get("cluster")
+    nodelist = data.get("nodelist")
+
+    if isinstance(cluster, dict) and cluster.get("name"):
+        secure_regular(COROSYNC_PATH, str(COROSYNC_PATH))
+        mode = "cluster"
+        deployment = safe_name(cluster.get("name"), "cluster name")
+        config_version = safe_integer(cluster.get("version"), "cluster config version")
+        node_count = safe_integer(cluster.get("nodes"), "cluster node count", 1)
+        if safe_integer(cluster.get("quorate"), "cluster quorum state") != 1:
+            fail("PVE cluster is not quorate")
+        if not isinstance(nodelist, dict) or len(nodelist) != node_count:
+            fail(".members nodelist count does not match cluster.nodes")
+        if local_name not in nodelist:
+            fail("local node is missing from .members nodelist")
+        nodes: list[Node] = []
+        seen_ids: set[int] = set()
+        for name, member in nodelist.items():
+            name = safe_name(name, "PVE node name")
+            if not isinstance(member, dict):
+                fail(f"node {name} record is not an object")
+            node_id = safe_integer(member.get("id"), f"node {name} id", 1)
+            if node_id in seen_ids:
+                fail(f"duplicate PVE node id {node_id}")
+            seen_ids.add(node_id)
+            if safe_integer(member.get("online"), f"node {name} online state") != 1:
+                fail(f"PVE node {name} is offline")
+            raw_address = member.get("ip")
+            if not isinstance(raw_address, str):
+                fail(f"node {name} has no management IP")
+            try:
+                address = str(ipaddress.ip_address(raw_address))
+            except ValueError:
+                fail(f"node {name} has an invalid management IP")
+            nodes.append(Node(node_id, name, address, name == local_name))
+
+        status_result = command([PVECM, "status"], quiet=True)
+        status = status_result.stdout
+        if parse_status(status, r"^Name:\s+(\S+)\s*$", "name") != deployment:
+            fail("pvecm cluster name differs from .members")
+        if int(parse_status(status, r"^Nodes:\s+(\d+)\s*$", "node count")) != node_count:
+            fail("pvecm node count differs from .members")
+        if parse_status(status, r"^Quorate:\s+(Yes|No)\s*$", "quorum") != "Yes":
+            fail("pvecm reports a non-quorate cluster")
+
+        live_result = command([PVECM, "nodes"], quiet=True)
+        live_members: dict[str, int] = {}
+        local_markers: list[str] = []
+        for line in live_result.stdout.splitlines():
+            match = re.fullmatch(
+                r"\s*(\d+)\s+\d+\s+([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?)(\s+\(local\))?\s*",
+                line,
+            )
+            if not match:
+                continue
+            name = match.group(2)
+            if name in live_members:
+                fail(f"pvecm nodes repeats node {name}")
+            live_members[name] = int(match.group(1))
+            if match.group(3):
+                local_markers.append(name)
+        expected = {node.name: node.node_id for node in nodes}
+        if live_members != expected:
+            fail("pvecm live membership differs from .members")
+        if local_markers != [local_name]:
+            fail("pvecm local node marker differs from .members nodename")
+        for node in nodes:
+            if not node.local:
+                validate_host_pin(node)
+    else:
+        if COROSYNC_PATH.exists():
+            fail("corosync.conf exists but .members has no cluster")
+        mode = "standalone"
+        deployment = f"standalone-{local_name}"
+        config_version = 0
+        if nodelist is None:
+            nodes = [Node(0, local_name, "local", True)]
+        else:
+            if not isinstance(nodelist, dict) or set(nodelist) != {local_name}:
+                fail("standalone .members must contain only the local node")
+            member = nodelist[local_name]
+            if not isinstance(member, dict):
+                fail("standalone local node record is not an object")
+            node_id = safe_integer(member.get("id", 0), "standalone node id")
+            if safe_integer(member.get("online", 1), "standalone online state") != 1:
+                fail("standalone local node is offline")
+            address = member.get("ip", "local")
+            if address != "local":
+                if not isinstance(address, str):
+                    fail("standalone node IP is invalid")
+                try:
+                    address = str(ipaddress.ip_address(address))
+                except ValueError:
+                    fail("standalone node IP is invalid")
+            nodes = [Node(node_id, local_name, address, True)]
+        if command([PVECM, "status"], check=False, quiet=True).returncode == 0:
+            fail("pvecm status succeeded although .members reports standalone mode")
+
+    nodes.sort(key=lambda item: (item.node_id, item.name))
+    fingerprint = membership_fingerprint(mode, deployment, config_version, nodes)
+    return Snapshot(mode, deployment, config_version, local_name, tuple(nodes), fingerprint)
+
+
+def revalidate(expected: Snapshot) -> None:
+    current = discover()
+    if current != expected:
+        fail("PVE membership or cluster configuration version changed during the update")
+
+
+def validate_identity() -> None:
+    metadata = secure_regular(IDENTITY, str(IDENTITY), mode_mask=0o077)
+    if stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
+        fail(f"PVE SSH identity mode must be 0400 or 0600: {IDENTITY}")
+
+
+REMOTE_SCRIPT = r'''set -eu
+export LC_ALL=C
+
+remote_fail() {
+    echo "PVN rolling update precondition failed: $*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || remote_fail "required command is unavailable: $1"
+}
+
+membership_record() {
+    python3 - <<'PVN_MEMBERS'
+import hashlib
+import ipaddress
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+
+def stop(message):
+    print(f"PVN remote membership check failed: {message}", file=__import__('sys').stderr)
+    raise SystemExit(1)
+
+path = pathlib.Path(os.environ.get("PVN_PVE_MEMBERS_FILE", "/etc/pve/.members"))
+try:
+    metadata = path.lstat()
+except OSError as error:
+    stop(f"cannot inspect {path}: {error}")
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    stop(f"{path} is not a regular non-symlink file")
+if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+    stop(f"{path} has unsafe ownership or permissions")
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception as error:
+    stop(f"cannot parse {path}: {error}")
+safe = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
+name = data.get("nodename")
+if not isinstance(name, str) or not safe.fullmatch(name) or name in {".", ".."}:
+    stop("unsafe nodename")
+cluster = data.get("cluster")
+nodelist = data.get("nodelist")
+nodes = []
+if isinstance(cluster, dict) and cluster.get("name"):
+    mode = "cluster"
+    deployment = cluster.get("name")
+    version = cluster.get("version")
+    count = cluster.get("nodes")
+    if not isinstance(deployment, str) or not safe.fullmatch(deployment):
+        stop("unsafe cluster name")
+    if type(version) is not int or version < 0 or type(count) is not int or count < 1:
+        stop("invalid cluster version or node count")
+    if cluster.get("quorate") != 1 or not isinstance(nodelist, dict) or len(nodelist) != count:
+        stop("cluster is not quorate or membership count is invalid")
+    if name not in nodelist:
+        stop("local node is absent from membership")
+    seen = set()
+    for node_name, member in nodelist.items():
+        if not isinstance(node_name, str) or not safe.fullmatch(node_name) or not isinstance(member, dict):
+            stop("unsafe node record")
+        node_id = member.get("id")
+        if type(node_id) is not int or node_id < 1 or node_id in seen or member.get("online") != 1:
+            stop("invalid, duplicate, or offline node")
+        seen.add(node_id)
+        try:
+            address = str(ipaddress.ip_address(member.get("ip")))
+        except (TypeError, ValueError):
+            stop("invalid node management IP")
+        nodes.append({"id": node_id, "ip": address, "name": node_name, "online": 1})
+    status = subprocess.run([os.environ.get("PVN_PVECM_BIN", "pvecm"), "status"], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if status.returncode != 0:
+        stop("pvecm status failed")
+    def field(pattern, label):
+        values = re.findall(pattern, status.stdout, re.MULTILINE)
+        if len(values) != 1:
+            stop(f"pvecm status has invalid {label}")
+        return values[0]
+    if field(r"^Name:\s+(\S+)\s*$", "name") != deployment:
+        stop("pvecm cluster name differs")
+    if int(field(r"^Nodes:\s+(\d+)\s*$", "node count")) != count:
+        stop("pvecm node count differs")
+    if field(r"^Quorate:\s+(Yes|No)\s*$", "quorum") != "Yes":
+        stop("pvecm reports non-quorate")
+    local_id = nodelist[name].get("id")
+else:
+    mode = "standalone"
+    deployment = f"standalone-{name}"
+    version = 0
+    if nodelist is None:
+        local_id = 0
+        address = "local"
+    else:
+        if not isinstance(nodelist, dict) or set(nodelist) != {name}:
+            stop("invalid standalone membership")
+        member = nodelist[name]
+        if not isinstance(member, dict) or member.get("online", 1) != 1:
+            stop("invalid standalone node")
+        local_id = member.get("id", 0)
+        address = member.get("ip", "local")
+        if address != "local":
+            try:
+                address = str(ipaddress.ip_address(address))
+            except (TypeError, ValueError):
+                stop("invalid standalone IP")
+    if type(local_id) is not int or local_id < 0:
+        stop("invalid standalone node ID")
+    count = 1
+    nodes.append({"id": local_id, "ip": address, "name": name, "online": 1})
+    status = subprocess.run([os.environ.get("PVN_PVECM_BIN", "pvecm"), "status"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if status.returncode == 0:
+        stop("pvecm status succeeded in standalone mode")
+nodes.sort(key=lambda item: (item["id"], item["name"]))
+payload = {"cluster": deployment, "config_version": version, "mode": mode,
+           "node_count": len(nodes), "nodes": nodes}
+fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True,
+                             separators=(",", ":")).encode()).hexdigest()
+print("|".join((mode, deployment, str(version), str(count), name,
+                str(local_id), fingerprint)))
+PVN_MEMBERS
+}
+
+unit_active() {
+    systemctl is-active "$1" 2>/dev/null || true
+}
+
+unit_enabled() {
+    systemctl is-enabled "$1" 2>/dev/null || true
+}
+
+require_active() {
+    [ "$(unit_active "$1")" = active ] || remote_fail "$1 is not active"
+}
+
+require_inactive() {
+    pvn_state=$(unit_active "$1")
+    case "$pvn_state" in inactive) ;; *) remote_fail "$1 must be inactive, found ${pvn_state:-unknown}" ;; esac
+}
+
+require_enabled() {
+    pvn_state=$(unit_enabled "$1")
+    case "$pvn_state" in enabled|enabled-runtime|linked|linked-runtime|alias) ;;
+        *) remote_fail "$1 is active but not enabled" ;;
+    esac
+}
+
+require_disabled() {
+    pvn_state=$(unit_enabled "$1")
+    case "$pvn_state" in disabled|masked|static|indirect) ;;
+        *) remote_fail "$1 must not be enabled, found ${pvn_state:-unknown}" ;;
+    esac
+}
+
+config_digest() {
+    python3 - <<'PVN_CONFIG_DIGEST'
+import hashlib
+import os
+import pathlib
+import stat
+
+digest = hashlib.sha256()
+roots = [pathlib.Path("/etc/pvn"), pathlib.Path("/etc/pve/pvn/config.json")]
+paths = []
+for root in roots:
+    if not root.exists() and not root.is_symlink():
+        continue
+    if root.is_dir() and not root.is_symlink():
+        paths.extend(sorted(root.rglob("*"), key=lambda item: str(item)))
+        paths.append(root)
+    else:
+        paths.append(root)
+for path in sorted(set(paths), key=lambda item: str(item)):
+    metadata = path.lstat()
+    relative = str(path).encode()
+    digest.update(len(relative).to_bytes(8, "big"))
+    digest.update(relative)
+    digest.update(str(stat.S_IMODE(metadata.st_mode)).encode())
+    digest.update(str(metadata.st_uid).encode())
+    digest.update(str(metadata.st_gid).encode())
+    if stat.S_ISREG(metadata.st_mode):
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    elif stat.S_ISLNK(metadata.st_mode):
+        digest.update(os.readlink(path).encode())
+    elif not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"unsupported persistent configuration object: {path}")
+print(digest.hexdigest())
+PVN_CONFIG_DIGEST
+}
+
+collect_state() {
+    for pvn_command in python3 pvecm dpkg dpkg-query systemctl sha256sum apt-get awk perl; do
+        require_command "$pvn_command"
+    done
+    [ "$(id -u)" -eq 0 ] || remote_fail "execution user is not root"
+    pvn_audit=$(dpkg --audit 2>/dev/null || true)
+    [ -z "$pvn_audit" ] || remote_fail "dpkg reports incomplete package state"
+    pvn_pkg_state=$(dpkg-query -W -f='${db:Status-Status}' pvn-node 2>/dev/null || true)
+    [ "$pvn_pkg_state" = installed ] || remote_fail "pvn-node is not completely installed"
+    pvn_version=$(dpkg-query -W -f='${Version}' pvn-node 2>/dev/null || true)
+    case "$pvn_version" in ''|*[!A-Za-z0-9.+:~_-]*) remote_fail "invalid installed pvn-node version" ;; esac
+    pvn_arch=$(dpkg --print-architecture)
+    case "$pvn_arch" in ''|*[!A-Za-z0-9_-]*) remote_fail "invalid Debian architecture" ;; esac
+    pvn_pve=$(dpkg-query -W -f='${Version}' pve-manager 2>/dev/null || true)
+    pvn_pve=${pvn_pve#*:}
+    case "$pvn_pve" in 9|9.*) ;; *) remote_fail "PVE 9 is required" ;; esac
+    pvn_members=$(membership_record) || remote_fail "cannot verify PVE membership"
+    pvn_old_ifs=$IFS
+    IFS='|'
+    read -r pvn_mode pvn_cluster pvn_config_version pvn_nodes pvn_hostname pvn_node_id pvn_fingerprint <<EOF
+$pvn_members
+EOF
+    IFS=$pvn_old_ifs
+
+    [ "$(unit_enabled ovn-host.service)" = masked ] || remote_fail "ovn-host.service must remain masked"
+    [ "$(unit_enabled ovn-central.service)" = masked ] || remote_fail "ovn-central.service must remain masked"
+    [ -x /usr/lib/pvn/pvn-ui-verify ] && /usr/lib/pvn/pvn-ui-verify >/dev/null ||
+        remote_fail "PVN UI verification failed"
+
+    if [ -e /etc/pvn/node-enabled ]; then
+        [ -f /etc/pvn/node-enabled ] && [ ! -L /etc/pvn/node-enabled ] ||
+            remote_fail "node activation marker is unsafe"
+        pvn_node_state=active
+        require_active pvn-node.target
+        require_enabled pvn-node.target
+        for pvn_unit in pvn-node-ready.service pvn-manager.service pvn-agent.service \
+            pvn-ovn-host-config.service ovn-controller.service
+        do
+            require_active "$pvn_unit"
+        done
+        /usr/sbin/pvnctl doctor >/dev/null || remote_fail "pvnctl doctor failed"
+    else
+        pvn_node_state=inactive
+        require_inactive pvn-node.target
+        require_disabled pvn-node.target
+        for pvn_unit in pvn-node-ready.service pvn-manager.service pvn-agent.service \
+            pvn-ovn-host-config.service ovn-controller.service
+        do
+            require_inactive "$pvn_unit"
+        done
+    fi
+
+    if [ -e /etc/pvn/central/enabled ]; then
+        [ -f /etc/pvn/central/enabled ] && [ ! -L /etc/pvn/central/enabled ] ||
+            remote_fail "central activation marker is unsafe"
+        pvn_central_state=active
+        require_active pvn-central.target
+        require_enabled pvn-central.target
+        pvn_central_pids=
+        for pvn_unit in pvn-control-db.service ovn-ovsdb-server-nb.service \
+            ovn-ovsdb-server-sb.service ovn-northd.service
+        do
+            require_active "$pvn_unit"
+            pvn_pid=$(systemctl show --property=MainPID --value "$pvn_unit" 2>/dev/null || true)
+            case "$pvn_pid" in ''|0|*[!0-9]*) remote_fail "$pvn_unit has no stable main PID" ;; esac
+            pvn_central_pids=${pvn_central_pids:+$pvn_central_pids,}$pvn_pid
+        done
+        /usr/sbin/pvnctl central status >/dev/null || remote_fail "local Raft health check failed"
+    else
+        pvn_central_state=inactive
+        pvn_central_pids=none
+        require_inactive pvn-central.target
+        require_disabled pvn-central.target
+        for pvn_unit in pvn-control-db.service ovn-ovsdb-server-nb.service \
+            ovn-ovsdb-server-sb.service ovn-northd.service
+        do
+            require_inactive "$pvn_unit"
+        done
+    fi
+}
+
+emit_probe() {
+    collect_state
+    printf 'PVN_UPDATE mode=%s cluster=%s config=%s fingerprint=%s nodes=%s pve=%s arch=%s version=%s hostname=%s nodeid=%s node=%s central=%s centralpids=%s\n' \
+        "$pvn_mode" "$pvn_cluster" "$pvn_config_version" "$pvn_fingerprint" \
+        "$pvn_nodes" "$pvn_pve" "$pvn_arch" "$pvn_version" "$pvn_hostname" \
+        "$pvn_node_id" "$pvn_node_state" "$pvn_central_state" "$pvn_central_pids"
+}
+
+pvn_action=${1:-}
+shift || true
+case "$pvn_action" in
+    probe)
+        [ "$#" -eq 0 ] || remote_fail "invalid probe arguments"
+        emit_probe
+        ;;
+    prepare)
+        [ "$#" -eq 0 ] || remote_fail "invalid prepare arguments"
+        umask 077
+        mktemp /var/tmp/pvn-node-update.XXXXXXXX.deb
+        ;;
+    verify)
+        [ "$#" -eq 2 ] || remote_fail "invalid verify arguments"
+        pvn_deb=$1
+        pvn_sha=$2
+        case "$pvn_deb" in /var/tmp/pvn-node-update.*.deb) ;; *) remote_fail "unsafe staged DEB path" ;; esac
+        case "$pvn_sha" in *[!0-9a-f]*|'') remote_fail "invalid expected SHA-256" ;; esac
+        [ "${#pvn_sha}" -eq 64 ] || remote_fail "invalid expected SHA-256 length"
+        [ -f "$pvn_deb" ] && [ ! -L "$pvn_deb" ] || remote_fail "staged DEB is unsafe"
+        pvn_actual=$(sha256sum -- "$pvn_deb" | awk '{print $1}')
+        [ "$pvn_actual" = "$pvn_sha" ] || remote_fail "staged DEB checksum mismatch"
+        ;;
+    apply)
+        [ "$#" -eq 11 ] || remote_fail "invalid apply arguments"
+        pvn_deb=$1
+        pvn_sha=$2
+        pvn_target=$3
+        pvn_target_arch=$4
+        pvn_expected_current=$5
+        pvn_expected_node=$6
+        pvn_expected_central=$7
+        pvn_expected_pids=$8
+        pvn_expected_config=$9
+        shift 9
+        pvn_expected_fingerprint=$1
+        pvn_expected_cluster=$2
+        case "$pvn_deb" in /var/tmp/pvn-node-update.*.deb) ;; *) remote_fail "unsafe staged DEB path" ;; esac
+        collect_state
+        [ "$pvn_version" = "$pvn_expected_current" ] || remote_fail "installed version changed before apply"
+        [ "$pvn_node_state" = "$pvn_expected_node" ] || remote_fail "node activation state changed before apply"
+        [ "$pvn_central_state" = "$pvn_expected_central" ] || remote_fail "central activation state changed before apply"
+        [ "$pvn_central_pids" = "$pvn_expected_pids" ] || remote_fail "central process identity changed before apply"
+        [ "$pvn_config_version" = "$pvn_expected_config" ] || remote_fail "cluster config version changed before apply"
+        [ "$pvn_fingerprint" = "$pvn_expected_fingerprint" ] || remote_fail "cluster membership changed before apply"
+        [ "$pvn_cluster" = "$pvn_expected_cluster" ] || remote_fail "cluster identity changed before apply"
+        [ "$pvn_target_arch" = all ] || [ "$pvn_target_arch" = "$pvn_arch" ] ||
+            remote_fail "DEB architecture differs from this node"
+        pvn_actual=$(sha256sum -- "$pvn_deb" | awk '{print $1}')
+        [ "$pvn_actual" = "$pvn_sha" ] || remote_fail "staged DEB changed before apply"
+        pvn_config_before=$(config_digest) || remote_fail "cannot fingerprint persistent configuration"
+        if [ "$pvn_central_state" = active ]; then
+            for pvn_db in /var/lib/pvn/control-db/pvn_control.db \
+                /var/lib/ovn/ovnnb_db.db /var/lib/ovn/ovnsb_db.db
+            do
+                [ -f "$pvn_db" ] && [ ! -L "$pvn_db" ] || remote_fail "central database is missing or unsafe: $pvn_db"
+            done
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade --no-remove -- "$pvn_deb"
+        collect_state
+        [ "$pvn_version" = "$pvn_target" ] || remote_fail "installed version differs from target"
+        [ "$pvn_node_state" = "$pvn_expected_node" ] || remote_fail "node activation state changed during update"
+        [ "$pvn_central_state" = "$pvn_expected_central" ] || remote_fail "central activation state changed during update"
+        [ "$pvn_central_pids" = "$pvn_expected_pids" ] ||
+            remote_fail "central service restarted unexpectedly; stop the rollout"
+        pvn_config_after=$(config_digest) || remote_fail "cannot re-fingerprint persistent configuration"
+        [ "$pvn_config_after" = "$pvn_config_before" ] ||
+            remote_fail "persistent /etc/pvn or shared PVN configuration changed during update"
+        if [ "$pvn_central_state" = active ]; then
+            for pvn_db in /var/lib/pvn/control-db/pvn_control.db \
+                /var/lib/ovn/ovnnb_db.db /var/lib/ovn/ovnsb_db.db
+            do
+                [ -f "$pvn_db" ] && [ ! -L "$pvn_db" ] || remote_fail "central database disappeared during update: $pvn_db"
+            done
+            printf 'PVN_UPDATED version=%s central-restart=pending\n' "$pvn_version"
+        else
+            printf 'PVN_UPDATED version=%s central-restart=none\n' "$pvn_version"
+        fi
+        ;;
+    cleanup)
+        [ "$#" -eq 1 ] || remote_fail "invalid cleanup arguments"
+        case "$1" in /var/tmp/pvn-node-update.*.deb) rm -f -- "$1" ;; *) remote_fail "unsafe staged DEB path" ;; esac
+        ;;
+    *) remote_fail "unknown remote action" ;;
+esac
+'''
+
+
+class Transport:
+    def __init__(self, snapshot: Snapshot, deb: pathlib.Path):
+        self.snapshot = snapshot
+        self.deb = deb
+
+    def _record(self, name: str) -> Node:
+        for node in self.snapshot.nodes:
+            if node.name == name:
+                return node
+        fail(f"no transport record for {name}")
+
+    def run(self, node: Node, action: str, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        remote_arguments = [action, *arguments]
+        if node.local:
+            return command(
+                [LOCAL_SH, "-s", "--", *remote_arguments],
+                input_text=REMOTE_SCRIPT,
+                check=check,
+                quiet=True,
+            )
+        known_hosts = NODES_DIR / node.name / "ssh_known_hosts"
+        ssh_arguments = [
+            SSH, "-F", "/dev/null", "-e", "none", "-i", str(IDENTITY),
+            "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no", "-o", "PubkeyAuthentication=yes",
+            "-o", "PreferredAuthentications=publickey", "-o", "IdentitiesOnly=yes",
+            "-o", "NumberOfPasswordPrompts=0", "-o", "StrictHostKeyChecking=yes",
+            "-o", "UpdateHostKeys=no", "-o", "CheckHostIP=no",
+            "-o", f"HostKeyAlias={node.name}", "-o", f"UserKnownHostsFile={known_hosts}",
+            "-o", "GlobalKnownHostsFile=none", "-o", "ConnectTimeout=10",
+            "--", f"root@{node.address}", "sh", "-s", "--", *remote_arguments,
+        ]
+        return command(ssh_arguments, input_text=REMOTE_SCRIPT, check=check, quiet=True)
+
+    def copy(self, node: Node, destination: str) -> None:
+        if node.local:
+            command([CP, "--", str(self.deb), destination], quiet=True)
+            return
+        address = f"[{node.address}]" if ":" in node.address else node.address
+        target = f"root@{address}:{destination}"
+        known_hosts = NODES_DIR / node.name / "ssh_known_hosts"
+        arguments = [
+            SCP, "-q", "-F", "/dev/null", "-i", str(IDENTITY),
+            "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no", "-o", "PubkeyAuthentication=yes",
+            "-o", "PreferredAuthentications=publickey", "-o", "IdentitiesOnly=yes",
+            "-o", "NumberOfPasswordPrompts=0", "-o", "StrictHostKeyChecking=yes",
+            "-o", "UpdateHostKeys=no", "-o", "CheckHostIP=no",
+            "-o", f"HostKeyAlias={node.name}", "-o", f"UserKnownHostsFile={known_hosts}",
+            "-o", "GlobalKnownHostsFile=none", "-o", "ConnectTimeout=10",
+            "--", str(self.deb), target,
+        ]
+        command(arguments, quiet=True)
+
+
+def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) != 1:
+        fail(f"unexpected health response from {node.name}")
+    fields = lines[0].split()
+    if len(fields) != 14 or fields[0] != "PVN_UPDATE":
+        fail(f"malformed health response from {node.name}")
+    values: dict[str, str] = {}
+    for field in fields[1:]:
+        if field.count("=") != 1:
+            fail(f"malformed health field from {node.name}")
+        key, value = field.split("=", 1)
+        if key in values or not value:
+            fail(f"duplicate or empty health field from {node.name}")
+        values[key] = value
+    required = {
+        "mode", "cluster", "config", "fingerprint", "nodes", "pve", "arch",
+        "version", "hostname", "nodeid", "node", "central", "centralpids",
+    }
+    if set(values) != required:
+        fail(f"unexpected health fields from {node.name}")
+    if values["mode"] != snapshot.mode or values["cluster"] != snapshot.deployment:
+        fail(f"{node.name} reports a different PVE deployment")
+    if values["config"] != str(snapshot.config_version) or values["fingerprint"] != snapshot.fingerprint:
+        fail(f"{node.name} reports different PVE membership or config version")
+    if values["nodes"] != str(len(snapshot.nodes)):
+        fail(f"{node.name} reports a different PVE node count")
+    if values["hostname"] != node.name or values["nodeid"] != str(node.node_id):
+        fail(f"{node.name} transport reached the wrong PVE node")
+    if not SAFE_ARCH.fullmatch(values["arch"]) or not SAFE_VERSION.fullmatch(values["version"]):
+        fail(f"{node.name} reports unsafe package metadata")
+    if values["node"] not in {"active", "inactive"} or values["central"] not in {"active", "inactive"}:
+        fail(f"{node.name} reports an invalid activation state")
+    if values["central"] == "inactive" and values["centralpids"] != "none":
+        fail(f"{node.name} reports central PIDs while inactive")
+    if values["central"] == "active" and not re.fullmatch(r"[1-9][0-9]*(?:,[1-9][0-9]*){3}", values["centralpids"]):
+        fail(f"{node.name} reports invalid central process identities")
+    return Probe(
+        node, values["version"], values["arch"], values["node"],
+        values["central"], values["centralpids"],
+    )
+
+
+def probe_all(transport: Transport, snapshot: Snapshot, announce: bool) -> dict[str, Probe]:
+    probes: dict[str, Probe] = {}
+    architecture: str | None = None
+    for node in snapshot.nodes:
+        if announce:
+            print(f"[{node.name}] read-only package, quorum, PVN, OVN, Raft, and UI checks")
+        result = transport.run(node, "probe")
+        probe = parse_probe(node, result.stdout, snapshot)
+        if architecture is None:
+            architecture = probe.architecture
+        elif probe.architecture != architecture:
+            fail(f"{node.name} architecture differs from the cluster")
+        probes[node.name] = probe
+        if announce:
+            print(
+                f"[{node.name}] healthy: pvn-node={probe.version} "
+                f"node={probe.node_state} central={probe.central_state}"
+            )
+    return probes
+
+
+def compare_versions(left: str, operator: str, right: str) -> bool:
+    return command([DPKG, "--compare-versions", left, operator, right], check=False, quiet=True).returncode == 0
+
+
+def validate_rollout_versions(probes: dict[str, Probe], target: str) -> None:
+    older: set[str] = set()
+    for probe in probes.values():
+        if probe.version == target:
+            continue
+        if not compare_versions(probe.version, "lt", target):
+            fail(f"downgrade refused: {probe.node.name} has {probe.version}, target is {target}")
+        older.add(probe.version)
+    if len(older) > 1:
+        fail("cluster has more than one pre-update package version; normalize it before rolling update")
+
+
+def inspect_deb(path: pathlib.Path) -> tuple[str, str, str]:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        fail(f"DEB is not readable: {error}")
+    if not resolved.is_file():
+        fail(f"DEB is not a regular file: {resolved}")
+    package = command([DPKG_DEB, "-f", str(resolved), "Package"], quiet=True).stdout.strip()
+    version = command([DPKG_DEB, "-f", str(resolved), "Version"], quiet=True).stdout.strip()
+    architecture = command([DPKG_DEB, "-f", str(resolved), "Architecture"], quiet=True).stdout.strip()
+    if package != "pvn-node":
+        fail("DEB package must be pvn-node")
+    if not SAFE_VERSION.fullmatch(version):
+        fail("DEB has an unsafe or empty version")
+    if not SAFE_ARCH.fullmatch(architecture):
+        fail("DEB has an unsafe or empty architecture")
+    digest_line = command([SHA256SUM, "--", str(resolved)], quiet=True).stdout.split()
+    if len(digest_line) < 1 or not SAFE_SHA.fullmatch(digest_line[0]):
+        fail("could not calculate a valid DEB SHA-256")
+    return version, architecture, digest_line[0]
+
+
+class UpdateLease:
+    def __init__(self, snapshot: Snapshot):
+        self.snapshot = snapshot
+        self.token = secrets.token_hex(24)
+        self.held = False
+        self.lock_handle = None
+
+    def acquire(self) -> None:
+        if not LOCK_PATH.is_absolute():
+            fail("PVN_UPDATE_LOCK_FILE must be absolute")
+        try:
+            self.lock_handle = LOCK_PATH.open("a+")
+            fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError) as error:
+            fail(f"another local PVN update is running or lock is unavailable: {error}")
+        owner = json.dumps(
+            {
+                "domain": "mutation",
+                "deployment": self.snapshot.deployment,
+                "node": self.snapshot.local_name,
+                "operation": "rolling-update",
+                "pid": os.getpid(),
+                "started": int(time.time()),
+                "token": self.token,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        command([LEASE, "acquire", "mutation", self.token], input_text=owner, quiet=True)
+        self.held = True
+
+    def release(self) -> None:
+        error: UpdateError | None = None
+        if self.held:
+            try:
+                command([LEASE, "release", "mutation", self.token], quiet=True)
+                self.held = False
+            except UpdateError as caught:
+                error = caught
+        if self.lock_handle is not None:
+            self.lock_handle.close()
+            self.lock_handle = None
+        if error is not None:
+            fail(f"cluster mutation lease could not be released; inspect `pvn-cluster-lease show mutation`: {error}")
+
+
+def cleanup_staged(transport: Transport, staged: dict[str, str]) -> None:
+    for name, path in list(staged.items()):
+        node = next(node for node in transport.snapshot.nodes if node.name == name)
+        result = transport.run(node, "cleanup", path, check=False)
+        if result.returncode != 0:
+            print(f"{PROGRAM}: warning: could not remove staged DEB {path} from {name}", file=sys.stderr)
+        staged.pop(name, None)
+
+
+def stage_pending(
+    transport: Transport,
+    snapshot: Snapshot,
+    probes: dict[str, Probe],
+    target: str,
+    digest: str,
+) -> dict[str, str]:
+    staged: dict[str, str] = {}
+    try:
+        for node in snapshot.nodes:
+            if probes[node.name].version == target:
+                continue
+            print(f"[{node.name}] staging checksum-verified pvn-node {target}")
+            result = transport.run(node, "prepare")
+            path = result.stdout.strip()
+            if not re.fullmatch(r"/var/tmp/pvn-node-update\.[A-Za-z0-9]+\.deb", path):
+                fail(f"unsafe staging path returned by {node.name}")
+            staged[node.name] = path
+            transport.copy(node, path)
+            transport.run(node, "verify", path, digest)
+        return staged
+    except Exception:
+        cleanup_staged(transport, staged)
+        raise
+
+
+def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, digest: str) -> None:
+    transport = Transport(snapshot, deb)
+    lease = UpdateLease(snapshot)
+    staged: dict[str, str] = {}
+    primary_error: BaseException | None = None
+    try:
+        lease.acquire()
+        revalidate(snapshot)
+        probes = probe_all(transport, snapshot, announce=True)
+        validate_rollout_versions(probes, target)
+        if architecture != "all" and any(probe.architecture != architecture for probe in probes.values()):
+            fail(f"DEB architecture {architecture} differs from one or more PVE nodes")
+        staged = stage_pending(transport, snapshot, probes, target, digest)
+        revalidate(snapshot)
+
+        for node in snapshot.nodes:
+            revalidate(snapshot)
+            probes = probe_all(transport, snapshot, announce=False)
+            validate_rollout_versions(probes, target)
+            current = probes[node.name]
+            if current.version == target:
+                print(f"[{node.name}] already at pvn-node {target}; health verified")
+                continue
+            path = staged.get(node.name)
+            if not path:
+                fail(f"no staged package for pending node {node.name}")
+            print(f"[{node.name}] rolling package update {current.version} -> {target}")
+            result = transport.run(
+                node,
+                "apply",
+                path,
+                digest,
+                target,
+                architecture,
+                current.version,
+                current.node_state,
+                current.central_state,
+                current.central_pids,
+                str(snapshot.config_version),
+                snapshot.fingerprint,
+                snapshot.deployment,
+            )
+            if "PVN_UPDATED" not in result.stdout:
+                fail(f"{node.name} returned no update completion record")
+            revalidate(snapshot)
+            final_gate = probe_all(transport, snapshot, announce=False)
+            if final_gate[node.name].version != target:
+                fail(f"post-update health gate found the wrong version on {node.name}")
+            transport.run(node, "cleanup", path)
+            staged.pop(node.name, None)
+            print(f"[{node.name}] updated; full-cluster health gate passed")
+
+        cleanup_staged(transport, staged)
+        revalidate(snapshot)
+        final = probe_all(transport, snapshot, announce=True)
+        if any(probe.version != target for probe in final.values()):
+            fail("final sweep found a mixed pvn-node version")
+        active_central = [probe.node.name for probe in final.values() if probe.central_state == "active"]
+        print(f"Updated pvn-node {target} on all {len(snapshot.nodes)} nodes in {snapshot.deployment}.")
+        print("Persistent /etc/pvn configuration, shared PVN configuration, and OVN/PVN databases were preserved.")
+        if active_central:
+            print(
+                "Central database/northd processes were intentionally not restarted on: "
+                + " ".join(active_central)
+            )
+            print("Complete their rolling restart separately, one healthy Raft voter at a time.")
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if staged:
+            cleanup_staged(transport, staged)
+        try:
+            lease.release()
+        except UpdateError:
+            if primary_error is None:
+                raise
+            print(
+                f"{PROGRAM}: warning: mutation lease release also failed; inspect it before retrying",
+                file=sys.stderr,
+            )
+
+
+def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, digest: str) -> None:
+    transport = Transport(snapshot, deb)
+    probes = probe_all(transport, snapshot, announce=True)
+    validate_rollout_versions(probes, target)
+    if architecture != "all" and any(probe.architecture != architecture for probe in probes.values()):
+        fail(f"DEB architecture {architecture} differs from one or more PVE nodes")
+    pending = [probe.node.name for probe in probes.values() if probe.version != target]
+    if pending:
+        print(f"Plan: pvn-node {target} ({digest}) would roll sequentially over: {' '.join(pending)}")
+    else:
+        print(f"Plan: every node already has pvn-node {target}; apply would run health verification only.")
+    print(f"Re-run with apply --confirm {snapshot.deployment}; no changes made.")
+
+
+def parse_arguments(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog=PROGRAM)
+    parser.add_argument("phase", choices=("plan", "apply"))
+    parser.add_argument("--deb", required=True, type=pathlib.Path)
+    parser.add_argument("--confirm", default="")
+    return parser.parse_args(arguments)
+
+
+def main(arguments: list[str]) -> int:
+    if os.geteuid() != 0:
+        fail("must run as root on a Proxmox VE node")
+    parsed = parse_arguments(arguments)
+    version, architecture, digest = inspect_deb(parsed.deb)
+    snapshot = discover()
+    if snapshot.mode == "cluster":
+        validate_identity()
+    if parsed.phase == "plan":
+        if parsed.confirm and parsed.confirm != snapshot.deployment:
+            fail(f"confirmation {parsed.confirm!r} does not match {snapshot.deployment!r}")
+        plan(snapshot, parsed.deb.resolve(), version, architecture, digest)
+        return 0
+    if not parsed.confirm:
+        fail("apply requires --confirm DEPLOYMENT_ID")
+    if parsed.confirm != snapshot.deployment:
+        fail(f"confirmation {parsed.confirm!r} does not match {snapshot.deployment!r}")
+    update_cluster(snapshot, parsed.deb.resolve(), version, architecture, digest)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print(f"{PROGRAM}: interrupted; completed nodes remain upgraded and are safe to verify/retry", file=sys.stderr)
+        raise SystemExit(130)
+    except UpdateError as error:
+        print(f"{PROGRAM}: {error}", file=sys.stderr)
+        raise SystemExit(1)
