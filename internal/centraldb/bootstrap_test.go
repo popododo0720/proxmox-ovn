@@ -31,7 +31,10 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 	if name == "ovsdb-tool" && len(args) > 0 {
 		switch args[0] {
 		case "create", "create-cluster", "join-cluster":
-			return nil, os.WriteFile(args[1], []byte("created"), 0o600)
+			if err := os.WriteFile(args[1], []byte("created"), 0o600); err != nil {
+				return nil, err
+			}
+			return nil, os.WriteFile(databaseLockPath(args[1]), nil, 0o600)
 		}
 	}
 	return nil, nil
@@ -48,6 +51,17 @@ func TestInitStandaloneAndRaftJoin(t *testing.T) {
 	if err := Init(context.Background(), runner, InitOptions{Database: standalone, Schema: schema}); err != nil {
 		t.Fatal(err)
 	}
+	assertLockRemoved(t, standalone)
+	bootstrap := filepath.Join(dir, "bootstrap.db")
+	if err := Init(context.Background(), runner, InitOptions{
+		Database: bootstrap,
+		Schema:   schema,
+		Mode:     "raft",
+		Local:    "ssl:192.0.2.1:6646",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertLockRemoved(t, bootstrap)
 	joined := filepath.Join(dir, "joined.db")
 	if err := Init(context.Background(), runner, InitOptions{
 		Database: joined,
@@ -58,9 +72,17 @@ func TestInitStandaloneAndRaftJoin(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	assertLockRemoved(t, joined)
 	want := []string{"join-cluster", joined, SchemaName, "ssl:192.0.2.2:6646", "ssl:192.0.2.1:6646"}
-	if got := runner.calls[1].args; !reflect.DeepEqual(got, want) {
+	if got := runner.calls[2].args; !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func assertLockRemoved(t *testing.T, database string) {
+	t.Helper()
+	if _, err := os.Lstat(databaseLockPath(database)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database lock was not removed: %v", err)
 	}
 }
 
@@ -99,6 +121,8 @@ func TestPromoteRequiresStoppedDatabaseAndKeepsBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	createClusterCall := runner.calls[len(runner.calls)-1]
+	assertLockRemoved(t, createClusterCall.args[1])
 	if backup != database+".standalone.20260805T010203Z" {
 		t.Fatalf("unexpected backup %q", backup)
 	}

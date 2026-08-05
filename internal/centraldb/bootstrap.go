@@ -76,8 +76,13 @@ func Init(ctx context.Context, runner Runner, options InitOptions) error {
 		return fmt.Errorf("unsupported database mode %q", options.Mode)
 	}
 
-	if output, err := runner.Run(ctx, "ovsdb-tool", args...); err != nil {
-		return commandError("initialize PVN control database", output, err)
+	output, runErr := runner.Run(ctx, "ovsdb-tool", args...)
+	lockErr := removeDatabaseLock(options.Database)
+	if runErr != nil {
+		return commandError("initialize PVN control database", output, runErr)
+	}
+	if lockErr != nil {
+		return fmt.Errorf("remove initialization lock: %w", lockErr)
 	}
 	if err := os.Chmod(options.Database, 0o600); err != nil {
 		return fmt.Errorf("secure database: %w", err)
@@ -143,9 +148,13 @@ func Promote(ctx context.Context, runner Runner, options PromoteOptions) (string
 		return backup, fmt.Errorf("prepare promotion path: %w", err)
 	}
 	defer os.Remove(temporaryPath)
+	defer os.Remove(databaseLockPath(temporaryPath))
 
 	if output, err := runner.Run(ctx, "ovsdb-tool", "create-cluster", temporaryPath, options.Database, options.Local); err != nil {
 		return backup, commandError("create clustered database", output, err)
+	}
+	if err := removeDatabaseLock(temporaryPath); err != nil {
+		return backup, fmt.Errorf("remove promotion lock: %w", err)
 	}
 	if err := os.Chmod(temporaryPath, 0o600); err != nil {
 		return backup, fmt.Errorf("secure clustered database: %w", err)
@@ -154,6 +163,18 @@ func Promote(ctx context.Context, runner Runner, options PromoteOptions) (string
 		return backup, fmt.Errorf("activate clustered database: %w", err)
 	}
 	return backup, nil
+}
+
+func databaseLockPath(database string) string {
+	return filepath.Join(filepath.Dir(database), "."+filepath.Base(database)+".~lock~")
+}
+
+func removeDatabaseLock(database string) error {
+	err := os.Remove(databaseLockPath(database))
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func validateClusterAddress(address string) error {
