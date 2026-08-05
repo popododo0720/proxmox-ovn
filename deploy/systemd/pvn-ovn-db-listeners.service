@@ -1,0 +1,28 @@
+[Unit]
+Description=Publish mutual-TLS OVN NB and SB client listeners
+Documentation=file:/usr/share/doc/pvn-node/operations.md
+Requires=pvn-central-preflight.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service
+After=pvn-central-preflight.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service
+Before=ovn-northd.service
+PartOf=pvn-central.target
+ConditionPathExists=/etc/pvn/central/enabled
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/pvn/central/ovn-listeners.env
+ExecStart=/usr/lib/pvn/pvn-ovn-db-listeners
+RemainAfterExit=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=pvn-central.target

@@ -1,0 +1,136 @@
+#!/bin/sh
+set -eu
+set -f
+
+fail() {
+    echo "PVN central preflight: $*" >&2
+    exit 1
+}
+
+require_file() {
+    [ -r "$1" ] || fail "required file is not readable: $1"
+}
+
+require_option() {
+    for option in ${OVN_CTL_OPTS:-}; do
+        [ "$option" = "$1" ] && return 0
+    done
+    fail "OVN_CTL_OPTS is missing required option: $1"
+}
+
+require_value_option() {
+    for option in ${OVN_CTL_OPTS:-}; do
+        case "$option" in
+            "$1"?*) return 0 ;;
+        esac
+    done
+    fail "OVN_CTL_OPTS is missing a value for option prefix: $1"
+}
+
+[ -e /etc/pvn/central/enabled ] || fail "activation marker is missing"
+require_file /etc/pvn/central/control-db.env
+require_file /etc/pvn/central/ovn-central.env
+require_file /etc/pvn/central/ovn-listeners.env
+for environment in /etc/pvn/central/control-db.env \
+    /etc/pvn/central/ovn-central.env /etc/pvn/central/ovn-listeners.env
+do
+    [ "$(/usr/bin/stat -c '%U:%G:%a' "$environment")" = root:pvn:640 ] ||
+        fail "$environment must be root:pvn mode 0640"
+done
+[ "${PVN_CONTROL_DB_FILE:-/var/lib/pvn/control-db/pvn_control.db}" = /var/lib/pvn/control-db/pvn_control.db ] ||
+    fail "PVN_CONTROL_DB_FILE must use the packaged database path"
+[ "${PVN_CONTROL_PORT:-}" = 6645 ] ||
+    fail "PVN_CONTROL_PORT must be explicitly set to 6645"
+[ "${PVN_CONTROL_TLS_CA:-/etc/pvn/pki/ca.pem}" = /etc/pvn/pki/ca.pem ] ||
+    fail "PVN_CONTROL_TLS_CA must use the packaged CA path"
+[ "${PVN_CONTROL_TLS_CERT:-/etc/pvn/pki/node.pem}" = /etc/pvn/pki/node.pem ] ||
+    fail "PVN_CONTROL_TLS_CERT must use the packaged certificate path"
+[ "${PVN_CONTROL_TLS_KEY:-/etc/pvn/pki/node-key.pem}" = /etc/pvn/pki/node-key.pem ] ||
+    fail "PVN_CONTROL_TLS_KEY must use the packaged private-key path"
+require_file /var/lib/pvn/control-db/pvn_control.db
+require_file /etc/pvn/pki/ca.pem
+require_file /etc/pvn/pki/node.pem
+require_file /etc/pvn/pki/node-key.pem
+[ "$(/usr/bin/stat -c '%U:%G:%a' /etc/pvn/pki/ca.pem)" = root:pvn:644 ] ||
+    fail "ca.pem must be root:pvn mode 0644"
+[ "$(/usr/bin/stat -c '%U:%G:%a' /etc/pvn/pki/node.pem)" = root:pvn:644 ] ||
+    fail "node.pem must be root:pvn mode 0644"
+[ "$(/usr/bin/stat -c '%U:%G:%a' /etc/pvn/pki/node-key.pem)" = root:pvn:640 ] ||
+    fail "node-key.pem must be root:pvn mode 0640"
+
+control_mode=${PVN_CONTROL_MODE:-}
+case "$control_mode" in
+    standalone)
+        /usr/bin/ovsdb-tool db-is-standalone "${PVN_CONTROL_DB_FILE:-/var/lib/pvn/control-db/pvn_control.db}" ||
+            fail "PVN Control mode says standalone but its database is clustered"
+        ;;
+    raft)
+        /usr/bin/ovsdb-tool db-is-clustered "${PVN_CONTROL_DB_FILE:-/var/lib/pvn/control-db/pvn_control.db}" ||
+            fail "PVN Control mode says raft but its database is not clustered"
+        case "$(/usr/bin/ovsdb-tool db-local-address "${PVN_CONTROL_DB_FILE:-/var/lib/pvn/control-db/pvn_control.db}")" in
+            ssl:*:6646) ;;
+            *) fail "PVN Control Raft must use mutual TLS on port 6646" ;;
+        esac
+        ;;
+    *) fail "PVN_CONTROL_MODE must be standalone or raft" ;;
+esac
+
+ovn_mode=${PVN_OVN_BOOTSTRAP:-}
+case "$ovn_mode" in
+    standalone)
+        [ "$control_mode" = standalone ] ||
+            fail "standalone OVN requires standalone PVN Control"
+        ;;
+    seed)
+        [ "$control_mode" = raft ] || fail "OVN seed mode requires Raft PVN Control"
+        require_value_option --db-nb-cluster-local-addr=
+        require_option --db-nb-cluster-local-port=6643
+        require_option --db-nb-cluster-local-proto=ssl
+        require_value_option --db-sb-cluster-local-addr=
+        require_option --db-sb-cluster-local-port=6644
+        require_option --db-sb-cluster-local-proto=ssl
+        ;;
+    join)
+        [ "$control_mode" = raft ] || fail "OVN join mode requires Raft PVN Control"
+        require_value_option --db-nb-cluster-local-addr=
+        require_option --db-nb-cluster-local-port=6643
+        require_option --db-nb-cluster-local-proto=ssl
+        require_value_option --db-sb-cluster-local-addr=
+        require_option --db-sb-cluster-local-port=6644
+        require_option --db-sb-cluster-local-proto=ssl
+        require_value_option --db-nb-cluster-remote-addr=
+        require_option --db-nb-cluster-remote-port=6643
+        require_value_option --db-sb-cluster-remote-addr=
+        require_option --db-sb-cluster-remote-port=6644
+        require_option --db-nb-cluster-remote-proto=ssl
+        require_option --db-sb-cluster-remote-proto=ssl
+        ;;
+    *) fail "PVN_OVN_BOOTSTRAP must be standalone, seed, or join" ;;
+esac
+
+for option in \
+    --db-nb-create-insecure-remote=no \
+    --db-sb-create-insecure-remote=no \
+    --ovn-nb-db-ssl-key=/etc/pvn/pki/node-key.pem \
+    --ovn-nb-db-ssl-cert=/etc/pvn/pki/node.pem \
+    --ovn-nb-db-ssl-ca-cert=/etc/pvn/pki/ca.pem \
+    --ovn-nb-db-ssl-protocols=TLSv1.2,TLSv1.3 \
+    --ovn-sb-db-ssl-key=/etc/pvn/pki/node-key.pem \
+    --ovn-sb-db-ssl-cert=/etc/pvn/pki/node.pem \
+    --ovn-sb-db-ssl-ca-cert=/etc/pvn/pki/ca.pem \
+    --ovn-sb-db-ssl-protocols=TLSv1.2,TLSv1.3
+do
+    require_option "$option"
+done
+
+for database in /var/lib/ovn/ovnnb_db.db /var/lib/ovn/ovnsb_db.db; do
+    [ -e "$database" ] || continue
+    if [ "$ovn_mode" = standalone ]; then
+        /usr/bin/ovsdb-tool db-is-standalone "$database" ||
+            fail "standalone OVN mode conflicts with clustered database: $database"
+    elif /usr/bin/ovsdb-tool db-is-standalone "$database"; then
+        fail "clustered OVN mode refuses standalone database: $database"
+    fi
+done
+
+exit 0

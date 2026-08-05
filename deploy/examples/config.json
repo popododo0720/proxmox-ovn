@@ -1,0 +1,54 @@
+{
+  "cluster": {
+    "id": "replace-with-stable-cluster-uuid",
+    "reconcile_every": 30000000000,
+    "orphan_grace": 300000000000,
+    "require_all_nodes": true,
+    "supported_pve_major": 9
+  },
+  "manager": {
+    "listen_address": ":8443",
+    "public_port": 8443,
+    "pve_url": "https://127.0.0.1:8006",
+    "unix_socket": "/run/pvn/manager.sock",
+    "web_root": "/usr/share/pvn/web",
+    "tls_cert": "/etc/pve/local/pve-ssl.pem",
+    "tls_key": "/etc/pve/local/pve-ssl.key"
+  },
+  "agent": {
+    "poll_every": 2000000000,
+    "bridge": "br-int",
+    "manager_url": "unix:///run/pvn/manager.sock",
+    "system_id_file": "/etc/openvswitch/system-id.conf"
+  },
+  "ovn": {
+    "control_db": [
+      "ssl:10.0.0.11:6645",
+      "ssl:10.0.0.12:6645",
+      "ssl:10.0.0.13:6645"
+    ],
+    "northbound": [
+      "ssl:10.0.0.11:6641",
+      "ssl:10.0.0.12:6641",
+      "ssl:10.0.0.13:6641"
+    ],
+    "southbound": [
+      "ssl:10.0.0.11:6642",
+      "ssl:10.0.0.12:6642",
+      "ssl:10.0.0.13:6642"
+    ],
+    "tls_ca": "/etc/pvn/pki/ca.pem",
+    "tls_cert": "/etc/pvn/pki/node.pem",
+    "tls_key": "/etc/pvn/pki/node-key.pem"
+  },
+  "networking": {
+    "encap_type": "geneve",
+    "encap_ip": "10.0.1.11",
+    "guest_mtu": 1400,
+    "physnet": "provider",
+    "provider_bridge": "br-provider"
+  },
+  "security": {
+    "session_ttl": 900000000000
+  }
+}

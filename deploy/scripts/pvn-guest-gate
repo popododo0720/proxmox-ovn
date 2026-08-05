@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+# Merely installing the package or creating shared pmxcfs configuration must
+# not change guest boot behavior. The root-owned local marker is the explicit
+# opt-in. Once opted in, guest startup fails closed unless the bounded PVN
+# readiness job completed successfully.
+if [ ! -e /etc/pvn/node-enabled ]; then
+    exit 0
+fi
+
+for unit in \
+    pvn-node.target pvn-node-ready.service pvn-manager.service \
+    pvn-ovn-host-config.service ovn-controller.service pvn-agent.service
+do
+    if ! /usr/bin/systemctl is-active --quiet "$unit"; then
+        echo "PVN guest startup gate: $unit is not active" >&2
+        exit 1
+    fi
+done
+
+exit 0

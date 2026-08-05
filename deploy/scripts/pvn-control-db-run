@@ -1,0 +1,65 @@
+#!/bin/sh
+set -eu
+umask 0077
+
+db=${PVN_CONTROL_DB_FILE:-/var/lib/pvn/control-db/pvn_control.db}
+listen=${PVN_CONTROL_LISTEN:-}
+port=${PVN_CONTROL_PORT:-6645}
+private_key=${PVN_CONTROL_TLS_KEY:-/etc/pvn/pki/node-key.pem}
+certificate=${PVN_CONTROL_TLS_CERT:-/etc/pvn/pki/node.pem}
+ca_cert=${PVN_CONTROL_TLS_CA:-/etc/pvn/pki/ca.pem}
+
+case "$db" in
+    /var/lib/pvn/control-db/pvn_control.db) ;;
+    *)
+        echo "PVN_CONTROL_DB_FILE must use /var/lib/pvn/control-db/pvn_control.db" >&2
+        exit 2
+        ;;
+esac
+case "$port" in
+    ''|*[!0-9]*)
+        echo "PVN_CONTROL_PORT must be numeric" >&2
+        exit 2
+        ;;
+esac
+if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    echo "PVN_CONTROL_PORT must be between 1 and 65535" >&2
+    exit 2
+fi
+[ "$port" = 6645 ] || {
+    echo "PVN_CONTROL_PORT must be 6645" >&2
+    exit 2
+}
+if ! printf '%s\n' "$listen" | awk -F. '
+    NF != 4 { exit 1 }
+    {
+        for (i = 1; i <= 4; i++) {
+            if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
+        }
+    }
+'; then
+    echo "PVN_CONTROL_LISTEN must be an IPv4 address" >&2
+    exit 2
+fi
+
+for path in "$db" "$private_key" "$certificate" "$ca_cert"; do
+    if [ ! -r "$path" ]; then
+        echo "required PVN control database or TLS file is not readable: $path" >&2
+        exit 1
+    fi
+done
+if [ "$(/usr/bin/ovsdb-tool db-name "$db")" != "PVN_Control" ]; then
+    echo "PVN_CONTROL_DB_FILE is not a PVN_Control database: $db" >&2
+    exit 1
+fi
+
+exec /usr/sbin/ovsdb-server \
+    "$db" \
+    --no-chdir \
+    --unixctl=/run/pvn-control/pvn-control-db.ctl \
+    --remote=punix:/run/pvn-control/pvn-control-db.sock \
+    "--remote=pssl:${port}:${listen}" \
+    "--private-key=${private_key}" \
+    "--certificate=${certificate}" \
+    "--ca-cert=${ca_cert}" \
+    --ssl-protocols=TLSv1.2,TLSv1.3

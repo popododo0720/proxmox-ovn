@@ -1,0 +1,38 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) build VERSION=$$(dpkg-parsechangelog -SVersion)
+	if [ -f web/package-lock.json ]; then npm --prefix web ci && npm --prefix web run build; fi
+
+override_dh_auto_test:
+	$(MAKE) test
+	if [ -f web/package-lock.json ]; then npm --prefix web test -- --run; fi
+
+override_dh_auto_install:
+	mkdir -p debian/pvn-node/usr/sbin
+	install -m 0755 bin/pvn-manager bin/pvn-agent bin/pvnctl debian/pvn-node/usr/sbin/
+	mkdir -p debian/pvn-node/usr/share/pvn
+	if [ -d web/dist ]; then cp -a web/dist debian/pvn-node/usr/share/pvn/web; fi
+	mkdir -p debian/pvn-node/usr/share/pvn/schema
+	install -m 0644 schema/*.ovsschema debian/pvn-node/usr/share/pvn/schema/
+	mkdir -p debian/pvn-node/usr/lib/systemd/system
+	install -m 0644 deploy/systemd/*.service deploy/systemd/*.target debian/pvn-node/usr/lib/systemd/system/
+	for source in deploy/systemd/*.service.d; do \
+		unit=$$(basename "$$source"); \
+		install -d "debian/pvn-node/usr/lib/systemd/system/$$unit"; \
+		install -m 0644 "$$source"/*.conf "debian/pvn-node/usr/lib/systemd/system/$$unit/"; \
+	done
+	mkdir -p debian/pvn-node/usr/share/pve-manager/js debian/pvn-node/usr/lib/pvn
+	install -m 0644 pve-ui/pvn-loader.js debian/pvn-node/usr/lib/pvn/
+	install -m 0755 pve-ui/inject.sh debian/pvn-node/usr/lib/pvn/pvn-ui-inject
+	install -m 0755 deploy/scripts/* debian/pvn-node/usr/lib/pvn/
+	mkdir -p debian/pvn-node/usr/share/doc/pvn-node/examples debian/pvn-node/usr/share/doc/pvn-node/inventory
+	install -m 0644 README.md docs/*.md debian/pvn-node/usr/share/doc/pvn-node/
+	install -m 0644 deploy/examples/* debian/pvn-node/usr/share/doc/pvn-node/examples/
+	install -m 0644 deploy/inventory/* debian/pvn-node/usr/share/doc/pvn-node/inventory/
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start

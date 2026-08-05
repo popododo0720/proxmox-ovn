@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+set -f
+
+fail() {
+    echo "PVN OVN host preflight: $*" >&2
+    exit 1
+}
+
+for path in /etc/pve/pvn/config.json /etc/pvn/node.env /etc/pvn/ovn-host.env \
+    /etc/pvn/pki/ca.pem /etc/pvn/pki/node.pem /etc/pvn/pki/node-key.pem
+do
+    [ -r "$path" ] || fail "required file is not readable: $path"
+done
+[ "$(/usr/bin/stat -c '%U:%G:%a' /etc/pvn/node.env)" = root:pvn:640 ] ||
+    fail "node.env must be root:pvn mode 0640"
+[ "$(/usr/bin/stat -c '%U:%G:%a' /etc/pvn/ovn-host.env)" = root:pvn:640 ] ||
+    fail "ovn-host.env must be root:pvn mode 0640"
+[ "$(/usr/bin/stat -c '%U:%G:%a' /etc/pvn/pki/ca.pem)" = root:pvn:644 ] ||
+    fail "ca.pem must be root:pvn mode 0644"
+[ "$(/usr/bin/stat -c '%U:%G:%a' /etc/pvn/pki/node.pem)" = root:pvn:644 ] ||
+    fail "node.pem must be root:pvn mode 0644"
+[ "$(/usr/bin/stat -c '%U:%G:%a' /etc/pvn/pki/node-key.pem)" = root:pvn:640 ] ||
+    fail "node-key.pem must be root:pvn mode 0640"
+
+for required in \
+    --ovn-controller-ssl-key=/etc/pvn/pki/node-key.pem \
+    --ovn-controller-ssl-cert=/etc/pvn/pki/node.pem \
+    --ovn-controller-ssl-ca-cert=/etc/pvn/pki/ca.pem \
+    --ovn-controller-ssl-protocols=TLSv1.2,TLSv1.3
+do
+    found=false
+    for option in ${OVN_CTL_OPTS:-}; do
+        [ "$option" = "$required" ] && found=true
+    done
+    [ "$found" = true ] || fail "OVN_CTL_OPTS is missing required option: $required"
+done
+
+exit 0

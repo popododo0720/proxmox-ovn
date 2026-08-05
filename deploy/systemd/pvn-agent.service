@@ -1,0 +1,33 @@
+[Unit]
+Description=PVN Proxmox/OVN interface binding agent
+Documentation=file:/usr/share/doc/pvn-node/architecture.md
+After=network-online.target pve-cluster.service openvswitch-switch.service pvn-ovn-host-config.service ovn-controller.service
+Requires=pvn-manager.service pvn-ovn-host-config.service ovn-controller.service
+Wants=network-online.target openvswitch-switch.service
+Before=pve-guests.service
+PartOf=pvn-node.target
+ConditionPathExists=/etc/pvn/node-enabled
+ConditionPathExists=/etc/pve/pvn/config.json
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/pvn/node.env
+ExecStart=/usr/sbin/pvn-agent --config /etc/pve/pvn/config.json
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/pvn /run/openvswitch /var/run/openvswitch
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=pvn-node.target

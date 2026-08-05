@@ -1,0 +1,9 @@
+# Deployment inventory for the requested PVE cluster. These are management
+# addresses only; discover hostnames, Geneve addresses, MTU, routes, uplinks,
+# and provider bridges on each node before rendering any node configuration.
+PVN_TARGET_NODES="192.168.0.78 192.168.0.80 192.168.0.126"
+
+# Intentionally unset until read-only host discovery succeeds.
+PVN_PROVIDER_BRIDGE=
+PVN_PROVIDER_UPLINK=
+PVN_ENCAP_NETWORK=

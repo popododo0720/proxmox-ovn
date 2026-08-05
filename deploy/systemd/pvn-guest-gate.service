@@ -1,0 +1,21 @@
+[Unit]
+Description=Gate PVE guest startup on explicitly activated PVN node readiness
+Documentation=file:/usr/share/doc/pvn-node/operations.md
+Wants=pvn-node.target
+After=pvn-node.target
+Before=pve-guests.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/lib/pvn/pvn-guest-gate
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true

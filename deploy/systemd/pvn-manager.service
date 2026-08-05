@@ -1,0 +1,41 @@
+[Unit]
+Description=PVN manager API and web interface
+Documentation=file:/usr/share/doc/pvn-node/architecture.md
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+PartOf=pvn-node.target
+ConditionPathExists=/etc/pvn/node-enabled
+ConditionPathExists=/etc/pve/pvn/config.json
+
+[Service]
+Type=simple
+User=pvn
+Group=pvn
+RuntimeDirectory=pvn
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+EnvironmentFile=/etc/pvn/node.env
+LoadCredential=pvn-config:/etc/pve/pvn/config.json
+LoadCredential=pvn-tls-cert:/etc/pve/local/pve-ssl.pem
+LoadCredential=pvn-tls-key:/etc/pve/local/pve-ssl.key
+Environment=PVN_TLS_CERT=%d/pvn-tls-cert
+Environment=PVN_TLS_KEY=%d/pvn-tls-key
+ExecStartPre=/usr/bin/test -r %d/pvn-config
+ExecStart=/usr/sbin/pvn-manager --config %d/pvn-config
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/pvn
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+[Install]
+WantedBy=pvn-node.target

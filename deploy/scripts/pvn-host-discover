@@ -1,0 +1,32 @@
+#!/bin/sh
+# Read-only PVE/OVS/OVN host inventory. It is safe to stream over SSH before
+# the pvn-node package is installed.
+set -u
+
+section() {
+    printf '\n[%s]\n' "$1"
+    shift
+    "$@" 2>&1 || true
+}
+
+section hostname hostname --fqdn
+section pve-version pveversion --verbose
+section pve-cluster pvecm status
+section packages dpkg-query -W -f='${Package}\t${Version}\t${db:Status-Abbrev}\n' \
+    pve-manager openvswitch-switch openvswitch-common ovn-host ovn-central
+section addresses ip -brief address show
+section routes ip route show table all
+section links ip -details link show
+section bridge-vlans bridge vlan show
+section ovs-summary ovs-vsctl --timeout=10 show
+section ovs-external-ids ovs-vsctl --timeout=10 get Open_vSwitch . external_ids
+section service-enable-state systemctl is-enabled \
+    openvswitch-switch.service ovn-host.service ovn-controller.service \
+    ovn-central.service ovn-ovsdb-server-nb.service \
+    ovn-ovsdb-server-sb.service ovn-northd.service
+section service-active-state systemctl is-active \
+    openvswitch-switch.service ovn-host.service ovn-controller.service \
+    ovn-central.service ovn-ovsdb-server-nb.service \
+    ovn-ovsdb-server-sb.service ovn-northd.service
+
+exit 0

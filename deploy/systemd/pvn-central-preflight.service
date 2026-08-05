@@ -1,0 +1,26 @@
+[Unit]
+Description=Validate the explicitly selected PVN central role
+Documentation=file:/usr/share/doc/pvn-node/operations.md
+After=network-online.target pve-cluster.service
+Before=pvn-control-db.service pvn-ovn-db-listeners.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service ovn-northd.service
+PartOf=pvn-central.target
+ConditionPathExists=/etc/pvn/central/enabled
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/pvn/central/control-db.env
+EnvironmentFile=/etc/pvn/central/ovn-central.env
+EnvironmentFile=/etc/pvn/central/ovn-listeners.env
+ExecStart=/usr/lib/pvn/pvn-central-preflight
+RemainAfterExit=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true

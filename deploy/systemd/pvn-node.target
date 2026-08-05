@@ -1,0 +1,12 @@
+[Unit]
+Description=PVN manager, local binding agent, and OVN transport node
+Documentation=file:/usr/share/doc/pvn-node/operations.md
+Requires=pvn-manager.service pvn-ovn-host-config.service ovn-controller.service pvn-agent.service pvn-node-ready.service
+After=network-online.target pve-cluster.service openvswitch-switch.service pvn-manager.service pvn-ovn-host-config.service ovn-controller.service pvn-agent.service pvn-node-ready.service
+Before=pve-guests.service
+ConditionPathExists=/etc/pvn/node-enabled
+ConditionPathExists=/etc/pve/pvn/config.json
+AllowIsolate=no
+
+[Install]
+WantedBy=multi-user.target

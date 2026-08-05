@@ -1,0 +1,37 @@
+[Unit]
+Description=PVN Control OVSDB server
+Documentation=file:/usr/share/doc/pvn-node/architecture.md
+After=network-online.target pve-cluster.service
+Requires=pvn-central-preflight.service
+Wants=network-online.target
+PartOf=pvn-central.target
+ConditionPathExists=/var/lib/pvn/control-db/pvn_control.db
+ConditionPathExists=/etc/pvn/central/enabled
+
+[Service]
+Type=simple
+User=pvn
+Group=pvn
+RuntimeDirectory=pvn-control
+RuntimeDirectoryMode=0750
+StateDirectory=pvn
+StateDirectoryMode=0750
+EnvironmentFile=/etc/pvn/central/control-db.env
+ExecStartPre=+/bin/chown pvn:pvn /var/lib/pvn/control-db/pvn_control.db
+ExecStart=/usr/lib/pvn/pvn-control-db-run
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/pvn-control /var/lib/pvn
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=pvn-central.target

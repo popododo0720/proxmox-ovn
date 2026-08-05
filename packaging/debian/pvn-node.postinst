@@ -1,0 +1,63 @@
+#!/bin/sh
+set -eu
+
+install_ui() {
+    [ -x /usr/lib/pvn/pvn-ui-inject ] || {
+        echo "PVN UI injector is missing" >&2
+        return 1
+    }
+    [ -x /usr/lib/pvn/pvn-ui-verify ] || {
+        echo "PVN UI verifier is missing" >&2
+        return 1
+    }
+    /usr/lib/pvn/pvn-ui-inject install
+    /usr/lib/pvn/pvn-ui-verify
+}
+
+if [ "${1:-}" = "triggered" ]; then
+    install_ui
+    exit 0
+fi
+
+if ! getent group pvn >/dev/null; then
+    addgroup --system pvn
+fi
+if ! getent passwd pvn >/dev/null; then
+    adduser --system --ingroup pvn --home /var/lib/pvn --no-create-home --disabled-login pvn
+fi
+
+install -d -m 0750 -o pvn -g pvn /var/lib/pvn
+install -d -m 0750 -o pvn -g pvn /var/lib/pvn/control-db
+install -d -m 0750 -o root -g pvn /etc/pvn /etc/pvn/central /etc/pvn/pki
+if [ ! -e /etc/pvn/ovn-host.env ]; then
+    install -m 0640 -o root -g pvn /usr/share/doc/pvn-node/examples/ovn-host.env /etc/pvn/ovn-host.env
+fi
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+# PVN starts the individual Debian OVN services. Mask the distro aggregate
+# units so their package defaults cannot create unmanaged standalone central
+# databases or start a controller outside pvn-node.target.
+systemctl disable ovn-central.service ovn-host.service >/dev/null 2>&1 || true
+if systemctl is-active --quiet pvn-central.target; then
+    systemctl mask ovn-central.service >/dev/null 2>&1 || true
+else
+    systemctl mask --now ovn-central.service >/dev/null 2>&1 || true
+fi
+systemctl mask ovn-host.service >/dev/null 2>&1 || true
+
+# Verify the supported PVE 9 template only after OVN aggregate services are
+# safely masked. A UI compatibility failure leaves package configuration
+# visibly failed without exposing an unmanaged OVN startup path.
+install_ui
+
+# A first install is deliberately inert. An operator activates pvn-node.target
+# after staging shared config, local config, PKI, and both OVS bridges. During
+# upgrades only already-active node services are restarted.
+if systemctl is-active --quiet pvn-node.target; then
+    systemctl restart pvn-ovn-host-config.service ovn-controller.service pvn-manager.service pvn-agent.service pvn-node-ready.service >/dev/null 2>&1 || true
+else
+    systemctl stop ovn-controller.service >/dev/null 2>&1 || true
+fi
+
+exit 0

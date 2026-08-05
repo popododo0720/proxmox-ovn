@@ -1,0 +1,87 @@
+#!/bin/sh
+set -eu
+
+marker_begin='<!-- PVN-LOADER:BEGIN -->'
+marker_end='<!-- PVN-LOADER:END -->'
+script_tag='    <script type="text/javascript" src="/pve2/js/pvn-loader.js"></script>'
+pve9_anchor='    <script type="text/javascript" src="/pve2/js/pvemanagerlib.js?ver=[% version %]"></script>'
+
+template=${1:-/usr/share/pve-manager/index.html.tpl}
+loader_target=${2:-/usr/share/pve-manager/js/pvn-loader.js}
+loader_source=${3:-/usr/lib/pvn/pvn-loader.js}
+
+[ "$#" -le 3 ] || {
+    echo "usage: pvn-ui-verify [template [loader-target [loader-source]]]" >&2
+    exit 2
+}
+
+pve_version=${PVN_PVE_VERSION:-}
+if [ -z "$pve_version" ] && command -v dpkg-query >/dev/null 2>&1; then
+    pve_version=$(dpkg-query -W -f='${Version}' pve-manager 2>/dev/null || true)
+fi
+pve_version=${pve_version#*:}
+case "$pve_version" in
+    9|9.*) ;;
+    *) exit 0 ;;
+esac
+
+fail() {
+    echo "PVN UI verification failed on pve-manager $pve_version: $*" >&2
+    exit 1
+}
+
+[ -f "$template" ] || fail "template is missing: $template"
+[ ! -L "$template" ] || fail "template is a symlink: $template"
+[ -f "$loader_target" ] || fail "loader target is missing: $loader_target"
+[ ! -L "$loader_target" ] || fail "loader target is a symlink: $loader_target"
+[ -f "$loader_source" ] || fail "packaged loader is missing: $loader_source"
+cmp -s "$loader_source" "$loader_target" ||
+    fail "installed loader differs from the packaged loader"
+
+awk -v anchor="$pve9_anchor" -v begin="$marker_begin" \
+    -v tag="$script_tag" -v end="$marker_end" '
+    $0 == anchor {
+        anchors++
+        if (state != 0 || expect_begin) bad=1
+        expect_begin=1
+        next
+    }
+    expect_begin {
+        expect_begin=0
+        if ($0 != begin) {
+            bad=1
+            next
+        }
+        begins++
+        state=1
+        next
+    }
+    state == 1 {
+        if ($0 != tag) {
+            bad=1
+            state=0
+            next
+        }
+        tags++
+        state=2
+        next
+    }
+    state == 2 {
+        if ($0 != end) {
+            bad=1
+            state=0
+            next
+        }
+        ends++
+        blocks++
+        state=0
+        next
+    }
+    $0 == begin || $0 == tag || $0 == end { bad=1 }
+    END {
+        if (bad || expect_begin || state != 0 || anchors != 1 ||
+            begins != 1 || tags != 1 || ends != 1 || blocks != 1) exit 1
+    }
+' "$template" || fail "exact supported PVE 9 loader block is absent or malformed"
+
+exit 0
