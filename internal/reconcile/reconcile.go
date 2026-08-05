@@ -202,8 +202,9 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 	return nil
 }
 
-// ReconcileAll is a forced drift audit. It is intentionally used at manager
-// startup even when the exact desired revision was recently confirmed.
+// ReconcileAll is an explicit forced drift audit. Manager startup uses the
+// freshness-aware periodic path so rolling restarts do not replay healthy OVN
+// state, while tests and operator-driven repair can still force a full pass.
 func (c *Controller) ReconcileAll(ctx context.Context) error {
 	return c.reconcileAll(ctx, 0)
 }

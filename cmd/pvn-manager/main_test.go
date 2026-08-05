@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -50,18 +52,157 @@ func TestReconcilerHealthTracksSuccessfulFailedAndStalePasses(t *testing.T) {
 	if err := health.Probe(context.Background()); err == nil {
 		t.Fatal("reconciler was ready before its first full pass")
 	}
+	health.start()
+	if err := health.Probe(context.Background()); err == nil {
+		t.Fatal("reconciler was ready while its first pass was in progress")
+	}
 	health.record(nil)
 	if err := health.Probe(context.Background()); err != nil {
 		t.Fatalf("successful pass was not ready: %v", err)
+	}
+	now = now.Add(3*time.Minute + time.Second)
+	health.start()
+	if err := health.Probe(context.Background()); err != nil {
+		t.Fatalf("healthy in-flight pass was not ready: %v", err)
+	}
+	now = now.Add(health.timeout)
+	if err := health.Probe(context.Background()); err != nil {
+		t.Fatalf("in-flight pass at its deadline was not ready: %v", err)
+	}
+	now = now.Add(time.Nanosecond)
+	if err := health.Probe(context.Background()); err == nil {
+		t.Fatal("over-time pass was reported ready")
 	}
 	health.record(errors.New("render failed"))
 	if err := health.Probe(context.Background()); err == nil {
 		t.Fatal("failed pass was reported ready")
 	}
+	health.start()
+	if err := health.Probe(context.Background()); err == nil {
+		t.Fatal("a recovering pass hid the last failed pass")
+	}
 	health.record(nil)
 	now = now.Add(3*time.Minute + time.Second)
 	if err := health.Probe(context.Background()); err == nil {
 		t.Fatal("stale pass was reported ready")
+	}
+}
+
+func TestReconcileSchedulingDurations(t *testing.T) {
+	tests := []struct {
+		name      string
+		interval  time.Duration
+		freshness time.Duration
+		timeout   time.Duration
+	}{
+		{name: "short worker retry", interval: time.Minute, freshness: 30 * time.Minute, timeout: 5 * time.Minute},
+		{name: "freshness scales", interval: 4 * time.Minute, freshness: 40 * time.Minute, timeout: 5 * time.Minute},
+		{name: "both scale", interval: 10 * time.Minute, freshness: 100 * time.Minute, timeout: 10 * time.Minute},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := reconcileFreshness(testCase.interval); got != testCase.freshness {
+				t.Fatalf("freshness=%v want=%v", got, testCase.freshness)
+			}
+			if got := reconcilePassTimeout(testCase.interval); got != testCase.timeout {
+				t.Fatalf("timeout=%v want=%v", got, testCase.timeout)
+			}
+		})
+	}
+}
+
+type periodicReconcileCall struct {
+	freshness time.Duration
+	deadline  time.Time
+	release   chan error
+}
+
+type controlledPeriodicReconciler struct {
+	calls chan periodicReconcileCall
+}
+
+func (reconciler *controlledPeriodicReconciler) ReconcilePeriodic(ctx context.Context, freshness time.Duration) error {
+	deadline, _ := ctx.Deadline()
+	call := periodicReconcileCall{freshness: freshness, deadline: deadline, release: make(chan error, 1)}
+	select {
+	case reconciler.calls <- call:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-call.release:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestReconcileLoopRunsImmediatelyThenWaitsAfterCompletion(t *testing.T) {
+	const interval = time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reconciler := &controlledPeriodicReconciler{calls: make(chan periodicReconcileCall, 1)}
+	health := newReconcilerHealth(interval, time.Now)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	waits := make(chan time.Duration, 1)
+	resume := make(chan bool, 1)
+	wait := func(ctx context.Context, duration time.Duration) bool {
+		waits <- duration
+		select {
+		case proceed := <-resume:
+			return proceed
+		case <-ctx.Done():
+			return false
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reconcilePeriodicallyWithWait(ctx, reconciler, interval, health, logger, wait)
+	}()
+
+	var first periodicReconcileCall
+	select {
+	case first = <-reconciler.calls:
+	case <-time.After(time.Second):
+		t.Fatal("first periodic pass did not start immediately")
+	}
+	if first.freshness != 30*time.Minute {
+		t.Fatalf("freshness=%v", first.freshness)
+	}
+	if remaining := time.Until(first.deadline); remaining < 4*time.Minute || remaining > 5*time.Minute {
+		t.Fatalf("pass deadline remaining=%v", remaining)
+	}
+	select {
+	case <-waits:
+		t.Fatal("retry interval started before the pass completed")
+	default:
+	}
+	first.release <- nil
+	select {
+	case duration := <-waits:
+		if duration != interval {
+			t.Fatalf("wait duration=%v", duration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry interval did not start after completion")
+	}
+	select {
+	case <-reconciler.calls:
+		t.Fatal("next pass started before the completion-based wait ended")
+	default:
+	}
+	resume <- true
+	select {
+	case <-reconciler.calls:
+	case <-time.After(time.Second):
+		t.Fatal("next pass did not start after the wait ended")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("periodic loop did not stop after cancellation")
 	}
 }
 

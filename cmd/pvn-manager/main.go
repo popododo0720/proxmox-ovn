@@ -208,6 +208,11 @@ func run(arguments []string) error {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
+	httpListener, err := net.Listen("tcp", defaults.listen)
+	if err != nil {
+		return fmt.Errorf("listen for PVN UI on %q: %w", defaults.listen, err)
+	}
+	defer httpListener.Close()
 	var runtimeListener net.Listener
 	if defaults.unixSocket != "" {
 		listener, listenErr := listenUnix(defaults.unixSocket)
@@ -222,21 +227,15 @@ func run(arguments []string) error {
 	}
 	reconcileContext, stopReconciler := context.WithCancel(context.Background())
 	defer stopReconciler()
-	initialReconcileErr := controller.ReconcileAll(startupContext)
-	reconcilerHealth.record(initialReconcileErr)
-	if initialReconcileErr != nil {
-		logger.Warn("initial PVN reconciliation incomplete", "error", initialReconcileErr)
-	}
-	go reconcilePeriodically(reconcileContext, controller, defaults.reconcileEvery, reconcilerHealth, logger)
 
 	serverErrors := make(chan error, 2)
 	go func() {
 		logger.Info("pvn-manager listening", "address", defaults.listen, "version", buildinfo.Version, "tls", defaults.tlsCert != "")
 		if defaults.tlsCert != "" {
-			serverErrors <- httpServer.ListenAndServeTLS(defaults.tlsCert, defaults.tlsKey)
+			serverErrors <- httpServer.ServeTLS(httpListener, defaults.tlsCert, defaults.tlsKey)
 			return
 		}
-		serverErrors <- httpServer.ListenAndServe()
+		serverErrors <- httpServer.Serve(httpListener)
 	}()
 	if runtimeListener != nil {
 		go func() {
@@ -244,6 +243,7 @@ func run(arguments []string) error {
 			serverErrors <- runtimeServer.Serve(runtimeListener)
 		}()
 	}
+	go reconcilePeriodically(reconcileContext, controller, defaults.reconcileEvery, reconcilerHealth, logger)
 
 	signalContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -343,18 +343,29 @@ func loadMutualTLS(caPath, certificatePath, keyPath string) (*tls.Config, error)
 type reconcilerHealth struct {
 	mu          sync.RWMutex
 	interval    time.Duration
+	timeout     time.Duration
 	clock       func() time.Time
+	startedAt   time.Time
 	completedAt time.Time
+	inFlight    bool
 	err         error
 }
 
 func newReconcilerHealth(interval time.Duration, clock func() time.Time) *reconcilerHealth {
-	return &reconcilerHealth{interval: interval, clock: clock}
+	return &reconcilerHealth{interval: interval, timeout: reconcilePassTimeout(interval), clock: clock}
+}
+
+func (health *reconcilerHealth) start() {
+	health.mu.Lock()
+	health.startedAt = health.clock().UTC()
+	health.inFlight = true
+	health.mu.Unlock()
 }
 
 func (health *reconcilerHealth) record(err error) {
 	health.mu.Lock()
 	health.completedAt = health.clock().UTC()
+	health.inFlight = false
 	health.err = err
 	health.mu.Unlock()
 }
@@ -363,38 +374,85 @@ func (health *reconcilerHealth) Probe(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	now := health.clock().UTC()
 	health.mu.RLock()
-	completedAt, reconcileErr := health.completedAt, health.err
+	startedAt, completedAt := health.startedAt, health.completedAt
+	inFlight, reconcileErr := health.inFlight, health.err
 	health.mu.RUnlock()
+	if inFlight && now.Sub(startedAt) > health.timeout {
+		return errors.New("periodic reconciliation exceeded its deadline")
+	}
 	if completedAt.IsZero() {
+		if inFlight {
+			return errors.New("first periodic reconciliation is still in progress")
+		}
 		return errors.New("full reconciliation has not completed")
 	}
 	if reconcileErr != nil {
 		return errors.New("last full reconciliation failed")
 	}
-	if health.clock().UTC().Sub(completedAt) > 3*health.interval {
+	if inFlight {
+		return nil
+	}
+	if now.Sub(completedAt) > 3*health.interval {
 		return errors.New("last full reconciliation is stale")
 	}
 	return nil
 }
 
-func reconcilePeriodically(ctx context.Context, controller *reconcile.Controller, interval time.Duration, health *reconcilerHealth, logger *slog.Logger) {
-	freshness := 10 * interval
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+type periodicReconciler interface {
+	ReconcilePeriodic(context.Context, time.Duration) error
+}
+
+func reconcileFreshness(interval time.Duration) time.Duration {
+	const minimumFreshness = 30 * time.Minute
+	if freshness := 10 * interval; freshness > minimumFreshness {
+		return freshness
+	}
+	return minimumFreshness
+}
+
+func reconcilePassTimeout(interval time.Duration) time.Duration {
+	const minimumTimeout = 5 * time.Minute
+	if interval > minimumTimeout {
+		return interval
+	}
+	return minimumTimeout
+}
+
+func reconcilePeriodically(ctx context.Context, controller periodicReconciler, interval time.Duration, health *reconcilerHealth, logger *slog.Logger) {
+	reconcilePeriodicallyWithWait(ctx, controller, interval, health, logger, waitForReconcileInterval)
+}
+
+func reconcilePeriodicallyWithWait(ctx context.Context, controller periodicReconciler, interval time.Duration, health *reconcilerHealth, logger *slog.Logger, wait func(context.Context, time.Duration) bool) {
+	freshness := reconcileFreshness(interval)
+	timeout := reconcilePassTimeout(interval)
 	for {
-		select {
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil {
 			return
-		case <-ticker.C:
-			reconcileContext, cancel := context.WithTimeout(ctx, interval)
-			err := controller.ReconcilePeriodic(reconcileContext, freshness)
-			cancel()
-			health.record(err)
-			if err != nil && !errors.Is(err, context.Canceled) {
-				logger.Warn("periodic PVN reconciliation incomplete", "error", err)
-			}
 		}
+		health.start()
+		reconcileContext, cancel := context.WithTimeout(ctx, timeout)
+		err := controller.ReconcilePeriodic(reconcileContext, freshness)
+		cancel()
+		health.record(err)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.Warn("periodic PVN reconciliation incomplete", "error", err)
+		}
+		if !wait(ctx, interval) {
+			return
+		}
+	}
+}
+
+func waitForReconcileInterval(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
