@@ -3,6 +3,7 @@ package controlstore
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/pvnstack/proxmox-ovn/internal/model"
@@ -21,6 +22,44 @@ type invariantTopology struct {
 	group, remoteGroup, otherGroup        *model.SecurityGroup
 	port, alternatePort, otherPort        *model.Port
 	router, otherRouter                   *model.Router
+}
+
+func TestMemorySerializesCrossKindExternalAddressClaims(t *testing.T) {
+	store := NewMemory()
+	topology := buildInvariantTopology(t, store)
+	candidates := []model.Resource{
+		&model.Router{ProjectID: topology.project.ID, Name: "racing-router", ExternalNetworkID: topology.externalNetwork.ID, ExternalSubnetID: topology.externalSubnet.ID, ExternalIPAddress: "192.0.2.70"},
+		&model.FloatingIP{ProjectID: topology.project.ID, ProviderNetworkID: topology.provider.ID, Address: "192.0.2.70"},
+	}
+	start := make(chan struct{})
+	errorsSeen := make(chan error, len(candidates))
+	var workers sync.WaitGroup
+	for index, candidate := range candidates {
+		workers.Add(1)
+		go func(index int, candidate model.Resource) {
+			defer workers.Done()
+			<-start
+			_, _, err := store.Create(context.Background(), candidate, "race-create-"+string(rune('a'+index)))
+			errorsSeen <- err
+		}(index, candidate)
+	}
+	close(start)
+	workers.Wait()
+	close(errorsSeen)
+	succeeded, conflicted := 0, 0
+	for err := range errorsSeen {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrAlreadyExists):
+			conflicted++
+		default:
+			t.Fatalf("unexpected create error: %v", err)
+		}
+	}
+	if succeeded != 1 || conflicted != 1 {
+		t.Fatalf("succeeded=%d conflicted=%d", succeeded, conflicted)
+	}
 }
 
 func buildInvariantTopology(t *testing.T, store Store) invariantTopology {
@@ -81,6 +120,16 @@ func TestMemoryEnforcesCrossResourceInvariants(t *testing.T) {
 	}, "inv-duplicate-fixed-ip"); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("duplicate fixed IP error=%v", err)
 	}
+	for name, resource := range map[string]model.Resource{
+		"duplicate router external IP": &model.Router{ProjectID: topology.project.ID, Name: "duplicate-router-ip", ExternalNetworkID: topology.externalNetwork.ID, ExternalSubnetID: topology.externalSubnet.ID, ExternalIPAddress: topology.router.ExternalIPAddress},
+		"floating IP equals router IP": &model.FloatingIP{ProjectID: topology.project.ID, ProviderNetworkID: topology.provider.ID, Address: topology.router.ExternalIPAddress},
+		"floating IP equals gateway":   &model.FloatingIP{ProjectID: topology.project.ID, ProviderNetworkID: topology.provider.ID, Address: topology.externalSubnet.GatewayIP},
+	} {
+		if _, _, err := store.Create(context.Background(), resource, "inv-address-"+name); !errors.Is(err, ErrAlreadyExists) {
+			t.Fatalf("%s error=%v", name, err)
+		}
+	}
+	mustCreate(t, store, &model.FloatingIP{ProjectID: topology.project.ID, ProviderNetworkID: topology.provider.ID, Address: "192.0.2.50"}, "inv-reserved-floating")
 
 	wrongDefault := *topology.provider
 	wrongDefault.DefaultSegmentID = topology.otherSegment.ID
@@ -93,6 +142,7 @@ func TestMemoryEnforcesCrossResourceInvariants(t *testing.T) {
 		resource model.Resource
 	}{
 		{"port fixed IP outside subnet", &model.Port{ProjectID: topology.project.ID, NetworkID: topology.privateNetwork.ID, Name: "bad-port-ip", MACAddress: "02:00:00:00:30:01", FixedIPs: []model.FixedIP{{SubnetID: topology.privateSubnet.ID, Address: "10.9.0.10"}}}},
+		{"port uses provider network", &model.Port{ProjectID: topology.project.ID, NetworkID: topology.externalNetwork.ID, Name: "bad-provider-port", MACAddress: "02:00:00:00:30:05", FixedIPs: []model.FixedIP{{SubnetID: topology.externalSubnet.ID, Address: "192.0.2.60"}}}},
 		{"port security group crosses project", &model.Port{ProjectID: topology.project.ID, NetworkID: topology.privateNetwork.ID, Name: "bad-port-sg", MACAddress: "02:00:00:00:30:02", SecurityGroupIDs: []string{topology.otherGroup.ID}}},
 		{"port chassis has no node", &model.Port{ProjectID: topology.project.ID, NetworkID: topology.privateNetwork.ID, Name: "bad-port-node", MACAddress: "02:00:00:00:30:03", RequestedChassis: topology.node.ChassisID}},
 		{"port chassis mismatches node", &model.Port{ProjectID: topology.project.ID, NetworkID: topology.privateNetwork.ID, Name: "bad-port-chassis", MACAddress: "02:00:00:00:30:04", NodeID: topology.node.ID, RequestedChassis: "another-chassis"}},
@@ -141,8 +191,19 @@ func TestMemoryReplacementPreservesCrossResourceInvariants(t *testing.T) {
 	mustCreate(t, store, &model.IPAllocation{ProjectID: topology.project.ID, SubnetID: topology.privateSubnet.ID, PortID: topology.port.ID, Address: "10.0.0.10", State: model.IPAllocated}, "inv-allocation")
 	routerInterface := mustCreate(t, store, &model.RouterInterface{ProjectID: topology.project.ID, RouterID: topology.router.ID, SubnetID: topology.privateSubnet.ID, PortID: topology.port.ID}, "inv-interface").(*model.RouterInterface)
 	mustCreate(t, store, &model.FloatingIP{ProjectID: topology.project.ID, ProviderNetworkID: topology.provider.ID, Address: "192.0.2.200", RouterID: topology.router.ID, PortID: topology.port.ID, FixedIPAddress: "10.0.0.10"}, "inv-floating")
+	reservedFloating := mustCreate(t, store, &model.FloatingIP{ProjectID: topology.project.ID, ProviderNetworkID: topology.provider.ID, Address: "192.0.2.50"}, "inv-reserved-floating").(*model.FloatingIP)
 	if _, err := store.Delete(context.Background(), model.KindRouterInterface, routerInterface.ID, routerInterface.Revision, "inv-delete-interface"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("delete router interface used by floating IP error=%v", err)
+	}
+	routerAddressCollision := *topology.router
+	routerAddressCollision.ExternalIPAddress = reservedFloating.Address
+	if _, _, err := store.Update(context.Background(), &routerAddressCollision, topology.router.Revision, "inv-router-address-collision"); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("router address collision error=%v", err)
+	}
+	gatewayAddressCollision := *topology.externalSubnet
+	gatewayAddressCollision.GatewayIP = reservedFloating.Address
+	if _, _, err := store.Update(context.Background(), &gatewayAddressCollision, topology.externalSubnet.Revision, "inv-gateway-address-collision"); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("gateway address collision error=%v", err)
 	}
 
 	updates := []struct {
@@ -191,7 +252,7 @@ func TestMemoryReplacementPreservesCrossResourceInvariants(t *testing.T) {
 		})
 	}
 
-	narrow := mustCreate(t, store, &model.Subnet{ProjectID: topology.project.ID, NetworkID: topology.externalNetwork.ID, Name: "external-narrow", CIDR: "192.0.2.0/28", GatewayIP: "192.0.2.1"}, "inv-external-narrow").(*model.Subnet)
+	narrow := mustCreate(t, store, &model.Subnet{ProjectID: topology.project.ID, NetworkID: topology.externalNetwork.ID, Name: "external-narrow", CIDR: "192.0.2.0/28", GatewayIP: "192.0.2.14"}, "inv-external-narrow").(*model.Subnet)
 	router := *topology.router
 	router.ExternalSubnetID = narrow.ID
 	if _, _, err := store.Update(context.Background(), &router, topology.router.Revision, "inv-narrow-router-subnet"); !errors.Is(err, ErrConflict) {

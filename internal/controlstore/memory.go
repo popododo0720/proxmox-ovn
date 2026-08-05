@@ -215,6 +215,9 @@ func (s *Memory) Update(ctx context.Context, resource model.Resource, expectedRe
 	// visible, matching the transactional PVN_Control store behavior.
 	s.resources[copyResource.ResourceKind()][id] = copyResource
 	graphErr := s.validateAllReferencesLocked()
+	if graphErr == nil {
+		graphErr = s.validateAllUniqueLocked()
+	}
 	s.resources[copyResource.ResourceKind()][id] = current
 	if graphErr != nil {
 		return nil, false, graphErr
@@ -490,8 +493,12 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 		if err != nil {
 			return err
 		}
-		if network.(*model.Network).ProjectID != value.ProjectID {
+		portNetwork := network.(*model.Network)
+		if portNetwork.ProjectID != value.ProjectID {
 			return storeError(ErrConflict, "network belongs to a different project")
+		}
+		if portNetwork.External || portNetwork.ProviderNetworkID != "" {
+			return storeError(ErrConflict, "tenant ports cannot use an external or provider-backed network")
 		}
 		for _, fixed := range value.FixedIPs {
 			subnetResource, subErr := s.requireLocked(model.KindSubnet, fixed.SubnetID, "fixed_ips.subnet_id")
@@ -809,7 +816,54 @@ func (s *Memory) validateUniqueLocked(candidate model.Resource, ignoredID string
 			return storeError(ErrAlreadyExists, "%s conflicts with existing %s %q on %s", candidate.ResourceKind(), existing.ResourceKind(), id, conflictField(candidate, existing))
 		}
 	}
+	for _, candidateClaim := range s.externalAddressClaimsLocked(candidate) {
+		for _, kind := range []model.Kind{model.KindSubnet, model.KindRouter, model.KindFloatingIP} {
+			for id, existing := range s.resources[kind] {
+				if kind == candidate.ResourceKind() && id == ignoredID {
+					continue
+				}
+				for _, existingClaim := range s.externalAddressClaimsLocked(existing) {
+					if candidateClaim == existingClaim {
+						return storeError(ErrAlreadyExists, "%s conflicts with existing %s %q on provider network address", candidate.ResourceKind(), kind, id)
+					}
+				}
+			}
+		}
+	}
 	return nil
+}
+
+func (s *Memory) validateAllUniqueLocked() error {
+	for _, kind := range model.Kinds() {
+		for id, resource := range s.resources[kind] {
+			if err := s.validateUniqueLocked(resource, id); err != nil {
+				return storeError(ErrConflict, "%s %q would violate uniqueness: %v", kind, id, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Memory) externalAddressClaimsLocked(resource model.Resource) []string {
+	providerID, address := "", ""
+	switch value := resource.(type) {
+	case *model.Subnet:
+		if networkResource, exists := s.resources[model.KindNetwork][value.NetworkID]; exists {
+			providerID = networkResource.(*model.Network).ProviderNetworkID
+			address = value.GatewayIP
+		}
+	case *model.Router:
+		if networkResource, exists := s.resources[model.KindNetwork][value.ExternalNetworkID]; exists {
+			providerID = networkResource.(*model.Network).ProviderNetworkID
+			address = value.ExternalIPAddress
+		}
+	case *model.FloatingIP:
+		providerID, address = value.ProviderNetworkID, value.Address
+	}
+	if providerID == "" || address == "" {
+		return nil
+	}
+	return []string{providerID + "\x00" + address}
 }
 
 func conflictField(candidate, existing model.Resource) string {

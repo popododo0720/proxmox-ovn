@@ -63,8 +63,12 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 		if err != nil {
 			return err
 		}
-		if network.(*model.Network).ProjectID != value.ProjectID {
+		portNetwork := network.(*model.Network)
+		if portNetwork.ProjectID != value.ProjectID {
 			return storeError(controlstore.ErrConflict, "network belongs to a different project")
+		}
+		if portNetwork.External || portNetwork.ProviderNetworkID != "" {
+			return storeError(controlstore.ErrConflict, "tenant ports cannot use an external or provider-backed network")
 		}
 		for _, fixed := range value.FixedIPs {
 			subnetResource, err := require(current, model.KindSubnet, fixed.SubnetID, "fixed_ips.subnet_id")
@@ -366,6 +370,20 @@ func validateUnique(current *snapshot, candidate model.Resource, ignoredID strin
 			return storeError(controlstore.ErrAlreadyExists, "%s conflicts with existing %s %q on %s", candidate.ResourceKind(), entry.resource.ResourceKind(), id, field)
 		}
 	}
+	for _, candidateClaim := range externalAddressClaims(current, candidate) {
+		for _, kind := range []model.Kind{model.KindSubnet, model.KindRouter, model.KindFloatingIP} {
+			for id, entry := range current.resources[kind] {
+				if kind == candidate.ResourceKind() && id == ignoredID {
+					continue
+				}
+				for _, existingClaim := range externalAddressClaims(current, entry.resource) {
+					if candidateClaim == existingClaim {
+						return storeError(controlstore.ErrAlreadyExists, "%s conflicts with existing %s %q on provider network address", candidate.ResourceKind(), kind, id)
+					}
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -385,6 +403,9 @@ func validateReplacement(current *snapshot, candidate model.Resource) error {
 			}
 		}
 	}
+	if err := validateSnapshotUnique(current); err != nil {
+		return storeError(controlstore.ErrConflict, "updating %s %q would violate uniqueness: %v", candidate.ResourceKind(), id, err)
+	}
 	return nil
 }
 
@@ -400,7 +421,41 @@ func validateSnapshotUnique(current *snapshot) error {
 			}
 		}
 	}
+	seenExternal := make(map[string]string)
+	for _, kind := range []model.Kind{model.KindSubnet, model.KindRouter, model.KindFloatingIP} {
+		for id, entry := range current.resources[kind] {
+			for _, key := range externalAddressClaims(current, entry.resource) {
+				owner := fmt.Sprintf("%s %q", kind, id)
+				if existing, duplicate := seenExternal[key]; duplicate {
+					return fmt.Errorf("stored %s conflicts with %s on provider network address", owner, existing)
+				}
+				seenExternal[key] = owner
+			}
+		}
+	}
 	return nil
+}
+
+func externalAddressClaims(current *snapshot, resource model.Resource) []string {
+	providerID, address := "", ""
+	switch value := resource.(type) {
+	case *model.Subnet:
+		if networkEntry, exists := current.resources[model.KindNetwork][value.NetworkID]; exists {
+			providerID = networkEntry.resource.(*model.Network).ProviderNetworkID
+			address = value.GatewayIP
+		}
+	case *model.Router:
+		if networkEntry, exists := current.resources[model.KindNetwork][value.ExternalNetworkID]; exists {
+			providerID = networkEntry.resource.(*model.Network).ProviderNetworkID
+			address = value.ExternalIPAddress
+		}
+	case *model.FloatingIP:
+		providerID, address = value.ProviderNetworkID, value.Address
+	}
+	if providerID == "" || address == "" {
+		return nil
+	}
+	return []string{providerID + "\x00" + address}
 }
 
 func uniqueKeys(resource model.Resource) []string {
