@@ -9,7 +9,7 @@ func TestSessionLifecycle(t *testing.T) {
 	store := NewSessionStore(time.Minute)
 	now := time.Unix(1000, 0)
 	store.now = func() time.Time { return now }
-	session, err := store.Create(Identity{User: "root@pam"}, "ticket")
+	session, err := store.Create(Identity{User: "root@pam"})
 	if err != nil {
 		t.Fatal(err)
 	}

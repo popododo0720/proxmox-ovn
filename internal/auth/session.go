@@ -18,7 +18,6 @@ type Session struct {
 	CSRFToken string
 	Identity  Identity
 	ExpiresAt time.Time
-	PVETicket string
 }
 
 type SessionStore struct {
@@ -39,7 +38,7 @@ func NewSessionStore(ttl time.Duration) *SessionStore {
 	}
 }
 
-func (s *SessionStore) Create(identity Identity, pveTicket string) (Session, error) {
+func (s *SessionStore) Create(identity Identity) (Session, error) {
 	id, err := randomToken(32)
 	if err != nil {
 		return Session{}, err
@@ -54,7 +53,7 @@ func (s *SessionStore) Create(identity Identity, pveTicket string) (Session, err
 	s.pruneLocked(now)
 	session := Session{
 		ID: id, CSRFToken: csrf, Identity: identity,
-		ExpiresAt: now.Add(s.ttl), PVETicket: pveTicket,
+		ExpiresAt: now.Add(s.ttl),
 	}
 	s.sessions[id] = session
 	return session, nil

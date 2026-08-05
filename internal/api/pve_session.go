@@ -94,7 +94,7 @@ func (p *PVESessionProvider) IssueSession(ctx context.Context, writer http.Respo
 		}
 		return Session{}, err
 	}
-	stored, err := p.sessions.Create(identity, ticket)
+	stored, err := p.sessions.Create(identity)
 	if err != nil {
 		return Session{}, err
 	}
