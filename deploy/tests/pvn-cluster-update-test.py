@@ -7,7 +7,9 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import os
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -42,16 +44,20 @@ def probe_line(
     *,
     node_state="active",
     central="inactive",
+    central_mode=None,
     central_pending="none",
 ) -> str:
     pids = "101,102,103,104" if central == "active" else "none"
+    if central_mode is None:
+        central_mode = "raft" if central == "active" else "inactive"
     return (
         "PVN_UPDATE "
         f"mode={snapshot.mode} cluster={snapshot.deployment} "
         f"config={snapshot.config_version} fingerprint={snapshot.fingerprint} "
         f"nodes={len(snapshot.nodes)} pve=9.2.2 arch=amd64 version={version} "
         f"hostname={node.name} nodeid={node.node_id} node={node_state} "
-        f"central={central} centralpids={pids} centralpending={central_pending}\n"
+        f"central={central} centralmode={central_mode} centralpids={pids} "
+        f"centralpending={central_pending}\n"
     )
 
 
@@ -65,6 +71,177 @@ snapshot = module.Snapshot("cluster", "lab-cluster", 7, "pve-a", nodes, fingerpr
 
 parsed = module.parse_probe(nodes[0], probe_line(snapshot, nodes[0], "0.1.0"), snapshot)
 check(parsed.version == "0.1.0" and parsed.node_state == "active", "valid probe was not parsed")
+standalone_node = module.Node(0, "pve-one", "local", True)
+standalone_fingerprint = module.membership_fingerprint(
+    "standalone", "standalone-pve-one", 0, (standalone_node,)
+)
+standalone_snapshot = module.Snapshot(
+    "standalone", "standalone-pve-one", 0, "pve-one", (standalone_node,), standalone_fingerprint
+)
+standalone = module.parse_probe(
+    standalone_node,
+    probe_line(
+        standalone_snapshot,
+        standalone_node,
+        "0.1.0",
+        central="active",
+        central_mode="standalone",
+    ),
+    standalone_snapshot,
+)
+check(standalone.central_mode == "standalone", "standalone active central was not parsed")
+try:
+    module.parse_probe(
+        nodes[0],
+        probe_line(snapshot, nodes[0], "0.1.0", central="active", central_mode="standalone"),
+        snapshot,
+    )
+except module.UpdateError:
+    pass
+else:
+    raise AssertionError("clustered PVE deployment accepted standalone central databases")
+inactive = module.parse_probe(
+    nodes[1], probe_line(snapshot, nodes[1], "0.1.0", node_state="inactive"), snapshot
+)
+check(inactive.central_mode == "inactive", "inactive central was not preserved")
+try:
+    module.parse_probe(
+        nodes[1],
+        probe_line(
+            snapshot,
+            nodes[1],
+            "0.1.0",
+            node_state="inactive",
+            central="inactive",
+            central_mode="standalone",
+        ),
+        snapshot,
+    )
+except module.UpdateError:
+    pass
+else:
+    raise AssertionError("inactive central accepted a live database mode")
+
+
+def exercise_remote_central_health(
+    configured_mode: str,
+    *,
+    database_modes: tuple[str, str, str] | None = None,
+    schema_drift: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    if database_modes is None:
+        database_modes = (configured_mode, configured_mode, configured_mode)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        control_environment = root / "control-db.env"
+        ovn_environment = root / "ovn-central.env"
+        control_environment.write_text(f"PVN_CONTROL_MODE={configured_mode}\n", encoding="ascii")
+        ovn_bootstrap = "standalone" if configured_mode == "standalone" else "seed"
+        ovn_environment.write_text(
+            f"PVN_OVN_BOOTSTRAP={ovn_bootstrap}\nOVN_CTL_OPTS=--one --two\n",
+            encoding="ascii",
+        )
+        control_environment.chmod(0o640)
+        ovn_environment.chmod(0o640)
+
+        records = (
+            (root / "control.db", "PVN_Control", database_modes[0]),
+            (root / "northbound.db", "OVN_Northbound", database_modes[1]),
+            (root / "southbound.db", "OVN_Southbound", database_modes[2]),
+        )
+        for path, name, mode in records:
+            path.write_text(f"{name}|{mode}\n", encoding="ascii")
+
+        calls = root / "calls"
+        tool = root / "ovsdb-tool"
+        tool.write_text(
+            """#!/bin/sh
+set -eu
+IFS='|' read -r name mode < "$2"
+case "$1" in
+  db-name) printf '%s\\n' "$name" ;;
+  db-is-standalone) [ "$mode" = standalone ] ;;
+  db-is-clustered) [ "$mode" = raft ] ;;
+  *) exit 2 ;;
+esac
+""",
+            encoding="ascii",
+        )
+        tool.chmod(0o755)
+
+        client = root / "ovsdb-client"
+        drift_name = "Wrong_Southbound" if schema_drift else "OVN_Southbound"
+        client.write_text(
+            f"""#!/bin/sh
+set -eu
+[ "$1" = --timeout=10 ] && [ "$2" = get-schema ]
+case "$3" in
+  unix:*control.sock) name=PVN_Control ;;
+  unix:*northbound.sock) name=OVN_Northbound ;;
+  unix:*southbound.sock) name={drift_name} ;;
+  *) exit 2 ;;
+esac
+printf 'client:%s\\n' "$4" >> "{calls}"
+printf '{{"name":"%s","tables":{{}}}}\\n' "$name"
+""",
+            encoding="ascii",
+        )
+        client.chmod(0o755)
+
+        pvnctl = root / "pvnctl"
+        pvnctl.write_text(
+            f"#!/bin/sh\nprintf 'raft\\n' >> '{calls}'\n[ \"$1 $2\" = 'central status' ]\n",
+            encoding="ascii",
+        )
+        pvnctl.chmod(0o755)
+
+        socket_paths = (root / "control.sock", root / "northbound.sock", root / "southbound.sock")
+        sockets = []
+        try:
+            for path in socket_paths:
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(path))
+                sockets.append(listener)
+
+            helpers = module.REMOTE_SCRIPT[
+                module.REMOTE_SCRIPT.index("remote_fail()") : module.REMOTE_SCRIPT.index("\ncollect_state()")
+            ]
+            replacements = {
+                "/etc/pvn/central/control-db.env": str(control_environment),
+                "/etc/pvn/central/ovn-central.env": str(ovn_environment),
+                "/var/lib/pvn/control-db/pvn_control.db": str(records[0][0]),
+                "/var/lib/ovn/ovnnb_db.db": str(records[1][0]),
+                "/var/lib/ovn/ovnsb_db.db": str(records[2][0]),
+                "/run/pvn-control/pvn-control-db.sock": str(socket_paths[0]),
+                "/run/ovn/ovnnb_db.sock": str(socket_paths[1]),
+                "/run/ovn/ovnsb_db.sock": str(socket_paths[2]),
+                "/usr/bin/ovsdb-tool": str(tool),
+                "/usr/bin/ovsdb-client": str(client),
+                "/usr/sbin/pvnctl": str(pvnctl),
+                'pvn_gid = grp.getgrnam("pvn").gr_gid': f"pvn_gid = {os.getgid()}",
+                "metadata.st_uid != 0": f"metadata.st_uid != {os.getuid()}",
+            }
+            for old, new in replacements.items():
+                helpers = helpers.replace(old, new)
+            script = "set -eu\n" + helpers + "\nactive_central_health\nprintf '%s\\n' \"$pvn_central_mode\"\n"
+            return subprocess.run(["sh", "-s"], input=script, text=True, capture_output=True, check=False)
+        finally:
+            for listener in sockets:
+                listener.close()
+
+
+standalone_health = exercise_remote_central_health("standalone")
+check(standalone_health.returncode == 0, f"standalone health failed: {standalone_health.stderr}")
+check(standalone_health.stdout.strip() == "standalone", "standalone mode was not selected")
+raft_health = exercise_remote_central_health("raft")
+check(raft_health.returncode == 0, f"Raft health failed: {raft_health.stderr}")
+check(raft_health.stdout.strip() == "raft", "Raft mode was not selected")
+mode_drift = exercise_remote_central_health(
+    "standalone", database_modes=("standalone", "standalone", "raft")
+)
+check(mode_drift.returncode != 0, "standalone configuration accepted a clustered database")
+identity_drift = exercise_remote_central_health("standalone", schema_drift=True)
+check(identity_drift.returncode != 0, "standalone socket accepted the wrong database schema")
 try:
     module.parse_probe(
         nodes[0],
@@ -81,6 +258,7 @@ events: list[str] = []
 versions = {"pve-a": "0.1.0", "pve-b": "0.1.0"}
 node_states = {"pve-a": "active", "pve-b": "inactive"}
 central_states = {"pve-a": "active", "pve-b": "inactive"}
+central_modes = {"pve-a": "raft", "pve-b": "inactive"}
 central_pending = {"pve-a": "none", "pve-b": "none"}
 fail_apply = ""
 
@@ -113,6 +291,7 @@ class FakeTransport:
                     versions[node.name],
                     node_state=node_states[node.name],
                     central=central_states[node.name],
+                    central_mode=central_modes[node.name],
                     central_pending=central_pending[node.name],
                 ),
                 "",
@@ -212,6 +391,11 @@ source = SCRIPT.read_text(encoding="utf-8")
 for required in (
     "apt-get install -y --only-upgrade --no-remove",
     "/usr/sbin/pvnctl central status",
+    "/usr/bin/ovsdb-tool db-is-standalone",
+    "/usr/bin/ovsdb-tool db-is-clustered",
+    "/usr/bin/ovsdb-client --timeout=10 get-schema",
+    "PVN_CONTROL_MODE",
+    "PVN_OVN_BOOTSTRAP",
     "central service restarted unexpectedly; stop the rollout",
     "persistent /etc/pvn or shared PVN configuration changed during update",
     "central-restart-pending",

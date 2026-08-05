@@ -329,11 +329,13 @@ name/ID/management-IP membership and cluster configuration version, stages and
 hashes the DEB on every pending node, then upgrades nodes sequentially. Before
 and after every node it requires PVE quorum, consistent package state, the PVE
 UI hook, node readiness/`pvnctl doctor` for active transport nodes, and healthy
-local Raft status for active central voters. Existing `/etc/pvn`, shared PVN
-configuration, and database paths are preserved; an unexpected configuration
-change fails the rollout. A failed node stops the sequence. Nodes already
-completed remain upgraded, and a later run safely verifies/skips them while
-continuing the one remaining older version.
+mode-specific database status for active central nodes: exact local schema
+identity over all three Unix sockets in standalone mode, or local Raft status
+in clustered mode. Existing `/etc/pvn`, shared PVN configuration, and database
+paths are preserved; an unexpected configuration change fails the rollout. A
+failed node stops the sequence. Nodes already completed remain upgraded, and a
+later run safely verifies/skips them while continuing the one remaining older
+version.
 
 Package installation restarts only an already-active per-node
 manager/agent/controller stack. The updater deliberately does not restart

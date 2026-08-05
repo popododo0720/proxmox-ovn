@@ -131,6 +131,7 @@ class Probe:
     architecture: str
     node_state: str
     central_state: str
+    central_mode: str
     central_pids: str
     central_pending: str
 
@@ -535,8 +536,114 @@ print(version)
 PVN_CENTRAL_RESTART_MARKER
 }
 
+central_configured_mode() {
+    python3 - <<'PVN_CENTRAL_CONFIGURED_MODE'
+import grp
+import pathlib
+import re
+import stat
+
+key_pattern = re.compile(r"^[A-Z][A-Z0-9_]*$")
+pvn_gid = grp.getgrnam("pvn").gr_gid
+
+def environment(path_text):
+    path = pathlib.Path(path_text)
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(f"{path} must be a regular non-symlink file")
+    if metadata.st_uid != 0 or metadata.st_gid != pvn_gid or stat.S_IMODE(metadata.st_mode) != 0o640:
+        raise SystemExit(f"{path} must be root:pvn mode 0640")
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise SystemExit(f"cannot read {path}: {error}")
+    values = {}
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise SystemExit(f"{path} contains an invalid environment line")
+        key, value = line.split("=", 1)
+        if not key_pattern.fullmatch(key) or key in values:
+            raise SystemExit(f"{path} contains an invalid or duplicate key")
+        values[key] = value
+    return values
+
+control = environment("/etc/pvn/central/control-db.env").get("PVN_CONTROL_MODE")
+ovn = environment("/etc/pvn/central/ovn-central.env").get("PVN_OVN_BOOTSTRAP")
+if control == "standalone" and ovn == "standalone":
+    print("standalone")
+elif control == "raft" and ovn in {"seed", "join"}:
+    print("raft")
+else:
+    raise SystemExit(f"central mode drift: PVN_CONTROL_MODE={control!r}, PVN_OVN_BOOTSTRAP={ovn!r}")
+PVN_CENTRAL_CONFIGURED_MODE
+}
+
+verify_central_database_file() {
+    pvn_database=$1
+    pvn_expected_name=$2
+    pvn_expected_mode=$3
+    [ -f "$pvn_database" ] && [ ! -L "$pvn_database" ] ||
+        remote_fail "central database is missing or unsafe: $pvn_database"
+    pvn_actual_name=$(/usr/bin/ovsdb-tool db-name "$pvn_database") ||
+        remote_fail "cannot read central database identity: $pvn_database"
+    [ "$pvn_actual_name" = "$pvn_expected_name" ] ||
+        remote_fail "central database identity drift at $pvn_database"
+    case "$pvn_expected_mode" in
+        standalone)
+            /usr/bin/ovsdb-tool db-is-standalone "$pvn_database" ||
+                remote_fail "central database mode drift (expected standalone): $pvn_database"
+            ;;
+        raft)
+            /usr/bin/ovsdb-tool db-is-clustered "$pvn_database" ||
+                remote_fail "central database mode drift (expected Raft): $pvn_database"
+            ;;
+        *) remote_fail "unsupported central database mode: $pvn_expected_mode" ;;
+    esac
+}
+
+standalone_database_health() {
+    pvn_socket=$1
+    pvn_expected_name=$2
+    [ -S "$pvn_socket" ] && [ ! -L "$pvn_socket" ] ||
+        remote_fail "standalone database socket is missing or unsafe: $pvn_socket"
+    pvn_schema=$(/usr/bin/ovsdb-client --timeout=10 get-schema "unix:$pvn_socket" "$pvn_expected_name") ||
+        remote_fail "standalone database is unavailable on $pvn_socket"
+    printf '%s\n' "$pvn_schema" | python3 -c '
+import json, sys
+expected = sys.argv[1]
+try:
+    schema = json.load(sys.stdin)
+except (OSError, ValueError) as error:
+    raise SystemExit(f"invalid schema response for {expected}: {error}")
+if schema.get("name") != expected or not isinstance(schema.get("tables"), dict):
+    raise SystemExit(f"database identity drift: expected {expected!r}")
+' "$pvn_expected_name" || remote_fail "standalone database identity check failed on $pvn_socket"
+}
+
+active_central_health() {
+    pvn_central_mode=$(central_configured_mode) ||
+        remote_fail "central mode configuration is missing, unsafe, or inconsistent"
+    verify_central_database_file /var/lib/pvn/control-db/pvn_control.db PVN_Control "$pvn_central_mode"
+    verify_central_database_file /var/lib/ovn/ovnnb_db.db OVN_Northbound "$pvn_central_mode"
+    verify_central_database_file /var/lib/ovn/ovnsb_db.db OVN_Southbound "$pvn_central_mode"
+    case "$pvn_central_mode" in
+        raft)
+            /usr/sbin/pvnctl central status >/dev/null ||
+                remote_fail "local Raft health check failed"
+            ;;
+        standalone)
+            standalone_database_health /run/pvn-control/pvn-control-db.sock PVN_Control
+            standalone_database_health /run/ovn/ovnnb_db.sock OVN_Northbound
+            standalone_database_health /run/ovn/ovnsb_db.sock OVN_Southbound
+            ;;
+        *) remote_fail "unsupported active central mode: $pvn_central_mode" ;;
+    esac
+}
+
 collect_state() {
-    for pvn_command in python3 pvecm dpkg dpkg-query systemctl sha256sum apt-get awk perl; do
+    for pvn_command in python3 pvecm dpkg dpkg-query systemctl sha256sum apt-get awk perl ovsdb-tool ovsdb-client; do
         require_command "$pvn_command"
     done
     [ "$(id -u)" -eq 0 ] || remote_fail "execution user is not root"
@@ -593,6 +700,8 @@ EOF
         pvn_central_state=active
         require_active pvn-central.target
         require_enabled pvn-central.target
+        require_active pvn-central-preflight.service
+        require_active pvn-ovn-db-listeners.service
         pvn_central_pids=
         for pvn_unit in pvn-control-db.service ovn-ovsdb-server-nb.service \
             ovn-ovsdb-server-sb.service ovn-northd.service
@@ -602,13 +711,15 @@ EOF
             case "$pvn_pid" in ''|0|*[!0-9]*) remote_fail "$pvn_unit has no stable main PID" ;; esac
             pvn_central_pids=${pvn_central_pids:+$pvn_central_pids,}$pvn_pid
         done
-        /usr/sbin/pvnctl central status >/dev/null || remote_fail "local Raft health check failed"
+        active_central_health
     else
         pvn_central_state=inactive
+        pvn_central_mode=inactive
         pvn_central_pids=none
         require_inactive pvn-central.target
         require_disabled pvn-central.target
-        for pvn_unit in pvn-control-db.service ovn-ovsdb-server-nb.service \
+        for pvn_unit in pvn-central-preflight.service pvn-control-db.service \
+            pvn-ovn-db-listeners.service ovn-ovsdb-server-nb.service \
             ovn-ovsdb-server-sb.service ovn-northd.service
         do
             require_inactive "$pvn_unit"
@@ -620,10 +731,10 @@ EOF
 
 emit_probe() {
     collect_state
-    printf 'PVN_UPDATE mode=%s cluster=%s config=%s fingerprint=%s nodes=%s pve=%s arch=%s version=%s hostname=%s nodeid=%s node=%s central=%s centralpids=%s centralpending=%s\n' \
+    printf 'PVN_UPDATE mode=%s cluster=%s config=%s fingerprint=%s nodes=%s pve=%s arch=%s version=%s hostname=%s nodeid=%s node=%s central=%s centralmode=%s centralpids=%s centralpending=%s\n' \
         "$pvn_mode" "$pvn_cluster" "$pvn_config_version" "$pvn_fingerprint" \
         "$pvn_nodes" "$pvn_pve" "$pvn_arch" "$pvn_version" "$pvn_hostname" \
-        "$pvn_node_id" "$pvn_node_state" "$pvn_central_state" "$pvn_central_pids" \
+        "$pvn_node_id" "$pvn_node_state" "$pvn_central_state" "$pvn_central_mode" "$pvn_central_pids" \
         "$pvn_central_pending"
 }
 
@@ -779,7 +890,7 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
     if len(lines) != 1:
         fail(f"unexpected health response from {node.name}")
     fields = lines[0].split()
-    if len(fields) != 15 or fields[0] != "PVN_UPDATE":
+    if len(fields) != 16 or fields[0] != "PVN_UPDATE":
         fail(f"malformed health response from {node.name}")
     values: dict[str, str] = {}
     for field in fields[1:]:
@@ -791,7 +902,7 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
         values[key] = value
     required = {
         "mode", "cluster", "config", "fingerprint", "nodes", "pve", "arch",
-        "version", "hostname", "nodeid", "node", "central", "centralpids",
+        "version", "hostname", "nodeid", "node", "central", "centralmode", "centralpids",
         "centralpending",
     }
     if set(values) != required:
@@ -808,6 +919,13 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
         fail(f"{node.name} reports unsafe package metadata")
     if values["node"] not in {"active", "inactive"} or values["central"] not in {"active", "inactive"}:
         fail(f"{node.name} reports an invalid activation state")
+    if values["central"] == "active" and values["centralmode"] not in {"raft", "standalone"}:
+        fail(f"{node.name} reports an invalid active central mode")
+    expected_central_mode = "standalone" if snapshot.mode == "standalone" else "raft"
+    if values["central"] == "active" and values["centralmode"] != expected_central_mode:
+        fail(f"{node.name} central database mode differs from the PVE deployment mode")
+    if values["central"] == "inactive" and values["centralmode"] != "inactive":
+        fail(f"{node.name} reports a central mode while inactive")
     if values["central"] == "inactive" and values["centralpids"] != "none":
         fail(f"{node.name} reports central PIDs while inactive")
     if values["central"] == "active" and not re.fullmatch(r"[1-9][0-9]*(?:,[1-9][0-9]*){3}", values["centralpids"]):
@@ -816,7 +934,7 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
         fail(f"{node.name} reports an invalid central restart marker")
     return Probe(
         node, values["version"], values["arch"], values["node"],
-        values["central"], values["centralpids"], values["centralpending"],
+        values["central"], values["centralmode"], values["centralpids"], values["centralpending"],
     )
 
 
@@ -1021,6 +1139,16 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
             probe.node.name for probe in final.values()
             if probe.central_state == "active" and probe.central_pending != "none"
         ]
+        standalone_pending = [
+            probe.node.name for probe in final.values()
+            if probe.central_state == "active" and probe.central_mode == "standalone"
+            and probe.central_pending != "none"
+        ]
+        raft_pending = [
+            probe.node.name for probe in final.values()
+            if probe.central_state == "active" and probe.central_mode == "raft"
+            and probe.central_pending != "none"
+        ]
         inactive_pending = [
             probe.node.name for probe in final.values()
             if probe.central_state == "inactive" and probe.central_pending != "none"
@@ -1032,7 +1160,17 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
                 "RESTART REQUIRED: active central processes were preserved and a durable "
                 "restart marker remains on: " + " ".join(active_pending)
             )
-            print("After full Raft convergence, restart those voters separately, one healthy voter at a time.")
+        if standalone_pending:
+            print(
+                "Restart the standalone central target during a maintenance window, then verify all "
+                "three exact local database schemas before clearing its marker: "
+                + " ".join(standalone_pending)
+            )
+        if raft_pending:
+            print(
+                "After full Raft convergence, restart these voters separately, one healthy voter at a time: "
+                + " ".join(raft_pending)
+            )
         if inactive_pending:
             print(
                 "Inactive central targets were not activated; an older restart marker remains on: "
@@ -1076,7 +1214,24 @@ def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, 
             "Plan: active central processes will not be restarted automatically; a durable "
             "restart-required marker will remain on: " + " ".join(central_will_require_restart)
         )
-        print("Plan: restart them separately only after full Raft convergence, one healthy voter at a time.")
+        standalone_restart = [
+            probe.node.name for probe in probes.values()
+            if probe.node.name in central_will_require_restart and probe.central_mode == "standalone"
+        ]
+        raft_restart = [
+            probe.node.name for probe in probes.values()
+            if probe.node.name in central_will_require_restart and probe.central_mode == "raft"
+        ]
+        if standalone_restart:
+            print(
+                "Plan: restart the standalone central target in a maintenance window and verify its "
+                "three local database schemas: " + " ".join(standalone_restart)
+            )
+        if raft_restart:
+            print(
+                "Plan: restart clustered voters only after full Raft convergence, one healthy voter at a time: "
+                + " ".join(raft_restart)
+            )
     print(f"Re-run with apply --confirm {snapshot.deployment}; no changes made.")
 
 
