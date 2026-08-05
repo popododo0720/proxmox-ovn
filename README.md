@@ -30,6 +30,6 @@ make test
 make build
 ```
 
-The detailed architecture and lab procedures live under `docs/` as the
-corresponding components are implemented.
-
+See [architecture](docs/architecture.md), [operations](docs/operations.md),
+and [development](docs/development.md) for the concrete topology, voter
+policy, bootstrap flow, security boundary, and current scope.
