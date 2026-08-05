@@ -35,15 +35,23 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def probe_line(snapshot, node, version, *, central="inactive") -> str:
+def probe_line(
+    snapshot,
+    node,
+    version,
+    *,
+    node_state="active",
+    central="inactive",
+    central_pending="none",
+) -> str:
     pids = "101,102,103,104" if central == "active" else "none"
     return (
         "PVN_UPDATE "
         f"mode={snapshot.mode} cluster={snapshot.deployment} "
         f"config={snapshot.config_version} fingerprint={snapshot.fingerprint} "
         f"nodes={len(snapshot.nodes)} pve=9.2.2 arch=amd64 version={version} "
-        f"hostname={node.name} nodeid={node.node_id} node=active "
-        f"central={central} centralpids={pids}\n"
+        f"hostname={node.name} nodeid={node.node_id} node={node_state} "
+        f"central={central} centralpids={pids} centralpending={central_pending}\n"
     )
 
 
@@ -71,6 +79,9 @@ else:
 
 events: list[str] = []
 versions = {"pve-a": "0.1.0", "pve-b": "0.1.0"}
+node_states = {"pve-a": "active", "pve-b": "inactive"}
+central_states = {"pve-a": "active", "pve-b": "inactive"}
+central_pending = {"pve-a": "none", "pve-b": "none"}
 fail_apply = ""
 
 
@@ -93,7 +104,19 @@ class FakeTransport:
     def run(self, node, action, *arguments, check=True):
         events.append(f"{action}:{node.name}")
         if action == "probe":
-            return subprocess.CompletedProcess([], 0, probe_line(self.snapshot, node, versions[node.name]), "")
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                probe_line(
+                    self.snapshot,
+                    node,
+                    versions[node.name],
+                    node_state=node_states[node.name],
+                    central=central_states[node.name],
+                    central_pending=central_pending[node.name],
+                ),
+                "",
+            )
         if action == "prepare":
             token = node.name.replace("-", "")
             return subprocess.CompletedProcess([], 0, f"/var/tmp/pvn-node-update.{token}.deb\n", "")
@@ -109,7 +132,12 @@ class FakeTransport:
             if arguments[9] != snapshot.fingerprint:
                 raise AssertionError("apply did not pin membership fingerprint")
             versions[node.name] = arguments[2]
-            return subprocess.CompletedProcess([], 0, f"PVN_UPDATED version={arguments[2]} central-restart=none\n", "")
+            if central_states[node.name] == "active":
+                central_pending[node.name] = arguments[2]
+            restart = "pending" if central_states[node.name] == "active" else "none"
+            return subprocess.CompletedProcess(
+                [], 0, f"PVN_UPDATED version={arguments[2]} central-restart={restart}\n", ""
+            )
         raise AssertionError(f"unexpected fake action {action}")
 
     def copy(self, node, destination):
@@ -129,9 +157,14 @@ try:
     with tempfile.TemporaryDirectory() as temporary:
         deb = pathlib.Path(temporary) / "pvn-node.deb"
         deb.write_bytes(b"test")
-        with contextlib.redirect_stdout(io.StringIO()):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
             module.update_cluster(snapshot, deb, "0.2.1", "amd64", "a" * 64)
     check(versions == {"pve-a": "0.2.1", "pve-b": "0.2.1"}, "not every node was updated")
+    check(central_pending == {"pve-a": "0.2.1", "pve-b": "none"}, "mixed central markers were not preserved")
+    check("RESTART REQUIRED" in output.getvalue() and "pve-a" in output.getvalue(), "active central restart was not reported")
+    check("Persistent /etc/pvn configuration" in output.getvalue(), "configuration preservation was not reported")
+    check("restart-central" not in " ".join(events), "updater unexpectedly restarted a central target")
     check(events[0] == "lease-acquire" and events[-1] == "lease-release", "mutation lease did not bracket rollout")
     first_apply = min(index for index, event in enumerate(events) if event.startswith("apply:"))
     for expected in ("verify:pve-a", "verify:pve-b"):
@@ -141,8 +174,19 @@ try:
         check(events.count(expected) == 1, "successful update left a staged DEB behind")
     check(events.count("membership-revalidate") >= 4, "membership was not repeatedly revalidated")
 
+    plan_output = io.StringIO()
+    with contextlib.redirect_stdout(plan_output):
+        module.plan(snapshot, deb, "0.2.1", "amd64", "a" * 64)
+    restart_lines = [
+        line for line in plan_output.getvalue().splitlines()
+        if "restart-required marker" in line
+    ]
+    check(len(restart_lines) == 1 and "pve-a" in restart_lines[0], "plan omitted active central restart work")
+    check("pve-b" not in restart_lines[0], "plan treated an inactive central target as restartable")
+
     events.clear()
     versions.update({"pve-a": "0.1.0", "pve-b": "0.1.0"})
+    central_pending.update({"pve-a": "none", "pve-b": "none"})
     fail_apply = "pve-a"
     try:
         with tempfile.TemporaryDirectory() as temporary:
@@ -170,6 +214,8 @@ for required in (
     "/usr/sbin/pvnctl central status",
     "central service restarted unexpectedly; stop the rollout",
     "persistent /etc/pvn or shared PVN configuration changed during update",
+    "central-restart-pending",
+    "RESTART REQUIRED: active central processes were preserved",
     '"domain": "mutation"',
 ):
     check(required in source, f"missing fail-closed updater behavior: {required}")

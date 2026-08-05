@@ -132,6 +132,7 @@ class Probe:
     node_state: str
     central_state: str
     central_pids: str
+    central_pending: str
 
 
 def membership_fingerprint(mode: str, deployment: str, version: int, nodes: Iterable[Node]) -> str:
@@ -496,6 +497,44 @@ print(digest.hexdigest())
 PVN_CONFIG_DIGEST
 }
 
+central_restart_marker() {
+    python3 - <<'PVN_CENTRAL_RESTART_MARKER'
+import pathlib
+import stat
+
+directory = pathlib.Path("/var/lib/pvn-node")
+marker = directory / "central-restart-pending"
+if not directory.exists() and not directory.is_symlink():
+    print("none")
+    raise SystemExit(0)
+metadata = directory.lstat()
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit(f"{directory} must be a real directory")
+if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700:
+    raise SystemExit(f"{directory} must be root:root mode 0700")
+if not marker.exists() and not marker.is_symlink():
+    print("none")
+    raise SystemExit(0)
+metadata = marker.lstat()
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit(f"{marker} must be a regular non-symlink file")
+if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+    raise SystemExit(f"{marker} must be root:root mode 0600")
+try:
+    raw = marker.read_text(encoding="ascii")
+except (OSError, UnicodeError) as error:
+    raise SystemExit(f"cannot read {marker}: {error}")
+lines = raw.splitlines()
+if len(lines) != 1 or raw != lines[0] + "\n":
+    raise SystemExit(f"{marker} must contain exactly one version line")
+version = lines[0]
+allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.+:~_-")
+if not version or any(character not in allowed for character in version):
+    raise SystemExit(f"{marker} contains an unsafe version")
+print(version)
+PVN_CENTRAL_RESTART_MARKER
+}
+
 collect_state() {
     for pvn_command in python3 pvecm dpkg dpkg-query systemctl sha256sum apt-get awk perl; do
         require_command "$pvn_command"
@@ -575,14 +614,17 @@ EOF
             require_inactive "$pvn_unit"
         done
     fi
+    pvn_central_pending=$(central_restart_marker) ||
+        remote_fail "central restart marker is unsafe"
 }
 
 emit_probe() {
     collect_state
-    printf 'PVN_UPDATE mode=%s cluster=%s config=%s fingerprint=%s nodes=%s pve=%s arch=%s version=%s hostname=%s nodeid=%s node=%s central=%s centralpids=%s\n' \
+    printf 'PVN_UPDATE mode=%s cluster=%s config=%s fingerprint=%s nodes=%s pve=%s arch=%s version=%s hostname=%s nodeid=%s node=%s central=%s centralpids=%s centralpending=%s\n' \
         "$pvn_mode" "$pvn_cluster" "$pvn_config_version" "$pvn_fingerprint" \
         "$pvn_nodes" "$pvn_pve" "$pvn_arch" "$pvn_version" "$pvn_hostname" \
-        "$pvn_node_id" "$pvn_node_state" "$pvn_central_state" "$pvn_central_pids"
+        "$pvn_node_id" "$pvn_node_state" "$pvn_central_state" "$pvn_central_pids" \
+        "$pvn_central_pending"
 }
 
 pvn_action=${1:-}
@@ -650,6 +692,10 @@ case "$pvn_action" in
         [ "$pvn_central_state" = "$pvn_expected_central" ] || remote_fail "central activation state changed during update"
         [ "$pvn_central_pids" = "$pvn_expected_pids" ] ||
             remote_fail "central service restarted unexpectedly; stop the rollout"
+        if [ "$pvn_central_state" = active ]; then
+            [ "$pvn_central_pending" = "$pvn_target" ] ||
+                remote_fail "active central restart marker does not match the installed target"
+        fi
         pvn_config_after=$(config_digest) || remote_fail "cannot re-fingerprint persistent configuration"
         [ "$pvn_config_after" = "$pvn_config_before" ] ||
             remote_fail "persistent /etc/pvn or shared PVN configuration changed during update"
@@ -733,7 +779,7 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
     if len(lines) != 1:
         fail(f"unexpected health response from {node.name}")
     fields = lines[0].split()
-    if len(fields) != 14 or fields[0] != "PVN_UPDATE":
+    if len(fields) != 15 or fields[0] != "PVN_UPDATE":
         fail(f"malformed health response from {node.name}")
     values: dict[str, str] = {}
     for field in fields[1:]:
@@ -746,6 +792,7 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
     required = {
         "mode", "cluster", "config", "fingerprint", "nodes", "pve", "arch",
         "version", "hostname", "nodeid", "node", "central", "centralpids",
+        "centralpending",
     }
     if set(values) != required:
         fail(f"unexpected health fields from {node.name}")
@@ -765,9 +812,11 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
         fail(f"{node.name} reports central PIDs while inactive")
     if values["central"] == "active" and not re.fullmatch(r"[1-9][0-9]*(?:,[1-9][0-9]*){3}", values["centralpids"]):
         fail(f"{node.name} reports invalid central process identities")
+    if values["centralpending"] != "none" and not SAFE_VERSION.fullmatch(values["centralpending"]):
+        fail(f"{node.name} reports an invalid central restart marker")
     return Probe(
         node, values["version"], values["arch"], values["node"],
-        values["central"], values["centralpids"],
+        values["central"], values["centralpids"], values["centralpending"],
     )
 
 
@@ -968,15 +1017,27 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
         final = probe_all(transport, snapshot, announce=True)
         if any(probe.version != target for probe in final.values()):
             fail("final sweep found a mixed pvn-node version")
-        active_central = [probe.node.name for probe in final.values() if probe.central_state == "active"]
+        active_pending = [
+            probe.node.name for probe in final.values()
+            if probe.central_state == "active" and probe.central_pending != "none"
+        ]
+        inactive_pending = [
+            probe.node.name for probe in final.values()
+            if probe.central_state == "inactive" and probe.central_pending != "none"
+        ]
         print(f"Updated pvn-node {target} on all {len(snapshot.nodes)} nodes in {snapshot.deployment}.")
         print("Persistent /etc/pvn configuration, shared PVN configuration, and OVN/PVN databases were preserved.")
-        if active_central:
+        if active_pending:
             print(
-                "Central database/northd processes were intentionally not restarted on: "
-                + " ".join(active_central)
+                "RESTART REQUIRED: active central processes were preserved and a durable "
+                "restart marker remains on: " + " ".join(active_pending)
             )
-            print("Complete their rolling restart separately, one healthy Raft voter at a time.")
+            print("After full Raft convergence, restart those voters separately, one healthy voter at a time.")
+        if inactive_pending:
+            print(
+                "Inactive central targets were not activated; an older restart marker remains on: "
+                + " ".join(inactive_pending)
+            )
     except BaseException as error:
         primary_error = error
         raise
@@ -1005,6 +1066,17 @@ def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, 
         print(f"Plan: pvn-node {target} ({digest}) would roll sequentially over: {' '.join(pending)}")
     else:
         print(f"Plan: every node already has pvn-node {target}; apply would run health verification only.")
+    central_will_require_restart = [
+        probe.node.name for probe in probes.values()
+        if probe.central_state == "active"
+        and (probe.version != target or probe.central_pending != "none")
+    ]
+    if central_will_require_restart:
+        print(
+            "Plan: active central processes will not be restarted automatically; a durable "
+            "restart-required marker will remain on: " + " ".join(central_will_require_restart)
+        )
+        print("Plan: restart them separately only after full Raft convergence, one healthy voter at a time.")
     print(f"Re-run with apply --confirm {snapshot.deployment}; no changes made.")
 
 

@@ -14,6 +14,39 @@ install_ui() {
     /usr/lib/pvn/pvn-ui-verify
 }
 
+mark_central_restart_pending() {
+    state_dir=/var/lib/pvn-node
+    marker=$state_dir/central-restart-pending
+    if [ -e "$state_dir" ]; then
+        [ -d "$state_dir" ] && [ ! -L "$state_dir" ] || {
+            echo "$state_dir must be a real directory" >&2
+            return 1
+        }
+    else
+        install -d -m 0700 -o root -g root "$state_dir"
+    fi
+    [ "$(stat -c '%U:%G:%a' "$state_dir")" = root:root:700 ] || {
+        echo "$state_dir must be root:root mode 0700" >&2
+        return 1
+    }
+
+    version=$(dpkg-query -W -f='${Version}' pvn-node 2>/dev/null || true)
+    case "$version" in
+        ''|*[!A-Za-z0-9.+:~_-]*)
+            echo "cannot record a safe pvn-node runtime version" >&2
+            return 1
+            ;;
+    esac
+    temporary=$(mktemp "$state_dir/.central-restart-pending.XXXXXXXX")
+    if ! printf '%s\n' "$version" >"$temporary" ||
+        ! chown root:root "$temporary" || ! chmod 0600 "$temporary" ||
+        ! mv -f -- "$temporary" "$marker"
+    then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
 if [ "${1:-}" = "triggered" ]; then
     install_ui
     exit 0
@@ -68,6 +101,14 @@ if systemctl is-active --quiet pvn-node.target; then
     fi
 else
     systemctl stop ovn-controller.service >/dev/null 2>&1 || true
+fi
+
+# Active central processes intentionally survive package configuration so a
+# single dpkg transaction cannot unexpectedly remove Raft quorum. The rolling
+# operator consumes this root-only marker only after every package health gate
+# and a separately verified, quorum-safe restart of that voter.
+if systemctl is-active --quiet pvn-central.target; then
+    mark_central_restart_pending
 fi
 
 exit 0

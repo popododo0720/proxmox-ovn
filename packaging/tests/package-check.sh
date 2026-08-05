@@ -66,6 +66,14 @@ grep -q 'PVN node stack failed to restart during package upgrade' packaging/debi
     echo "active-node upgrade must report a failed restart" >&2
     exit 1
 }
+grep -q 'central-restart-pending' packaging/debian/pvn-node.postinst || {
+    echo "active-central upgrades must leave a durable rolling-restart marker" >&2
+    exit 1
+}
+grep -q 'root:root:700' packaging/debian/pvn-node.postinst || {
+    echo "central rolling-restart state must be protected from service users" >&2
+    exit 1
+}
 grep -q 'PVN_CONTROL_PORT must be 6645' deploy/scripts/pvn-control-db-run || {
     echo "PVN Control client port must be pinned to 6645" >&2
     exit 1

@@ -338,13 +338,67 @@ continuing the one remaining older version.
 Package installation restarts only an already-active per-node
 manager/agent/controller stack. The updater deliberately does not restart
 active PVN Control, OVN NB/SB, or northd processes and verifies that their PIDs
-did not change. This means package files can be at the new version while those
-central processes still run the previous executable until a maintenance
-restart. After the package rollout, check Raft health and restart central
-services one voter at a time. Never restart enough voters concurrently to lose
-quorum. Mixed-version compatibility is required for the duration of this
-rolling window; use a maintenance window for releases that declare a breaking
-database or wire-protocol change.
+did not change. The package records a root-only durable restart-required marker
+at `/var/lib/pvn-node/central-restart-pending` for each active central target,
+and both plan/apply report the affected nodes.
+After the package rollout and full Raft convergence, restart those central
+services separately, one healthy voter at a time, then clear the marker only
+after verifying that voter. Never activate a previously inactive target or
+restart enough voters concurrently to lose quorum. Mixed-version compatibility
+is required for the duration of this rolling window; use a maintenance window
+for releases that declare a breaking database or wire-protocol change.
+
+Do not clear the marker while a voter still runs the old process. Once every
+database has converged beyond the one-member seed, use this sequence on exactly
+one voter at a time. The JSON guard proves that the remaining connected members
+can still form quorum without the local voter; run the same guard again after
+the restart before moving to the next voter:
+
+```sh
+raft_drain_check() {
+  pvnctl central status | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+databases = report.get("databases", [])
+if report.get("healthy") is not True or len(databases) != 3:
+    raise SystemExit("all three Raft databases must be healthy")
+for database in databases:
+    name = database.get("database", "unknown")
+    members = database.get("member_count", 0)
+    connected = database.get("connected_members", 0)
+    quorum = database.get("quorum_size", 0)
+    if members <= 1 or connected - 1 < quorum:
+        raise SystemExit(f"unsafe to drain {name}: "
+                         f"connected={connected}, quorum={quorum}")
+'
+}
+central_pids() {
+  for unit in pvn-control-db.service ovn-ovsdb-server-nb.service \
+    ovn-ovsdb-server-sb.service ovn-northd.service
+  do
+    systemctl show --property=MainPID --value "$unit"
+  done | paste -sd, -
+}
+
+raft_drain_check
+before=$(central_pids)
+systemctl restart pvn-central.target
+pvnctl central status
+raft_drain_check
+after=$(central_pids)
+[ "$before" != "$after" ] || { echo "central PIDs did not change" >&2; exit 1; }
+
+marker=/var/lib/pvn-node/central-restart-pending
+[ -f "$marker" ] && [ ! -L "$marker" ] || exit 1
+[ "$(stat -c '%u:%g:%a' "$marker")" = 0:0:600 ] || exit 1
+[ "$(cat "$marker")" = "$(dpkg-query -W -f='${Version}' pvn-node)" ] || exit 1
+rm -f -- "$marker"
+```
+
+Stop at the first failed command. Repeat only after the restarted voter and all
+three databases pass the guard. The marker lives outside `/var/lib/pvn`
+because that standard service state directory is writable by the unprivileged
+`pvn` account; restart authorization state must remain root-only.
 
 A hard power loss can leave the cluster mutation lease for operator review.
 Inspect it with `pvn-cluster-lease show mutation`; never remove a lease until
