@@ -90,7 +90,7 @@ func Default() Config {
 		Agent: AgentConfig{
 			PollEvery:    2 * time.Second,
 			Bridge:       "br-int",
-			ManagerURL:   "https://127.0.0.1:8443",
+			ManagerURL:   "unix:///run/pvn/manager.sock",
 			SystemIDFile: "/etc/openvswitch/system-id.conf",
 		},
 		Networking: NetworkingConfig{
@@ -141,6 +141,9 @@ func applyEnv(cfg *Config) {
 	if value := os.Getenv("PVN_NODE_NAME"); value != "" {
 		cfg.Cluster.NodeName = value
 	}
+	if value := os.Getenv("PVN_MANAGER_URL"); value != "" {
+		cfg.Agent.ManagerURL = value
+	}
 	if value := os.Getenv("PVN_ENCAP_IP"); value != "" {
 		cfg.Networking.EncapIP = value
 	}
@@ -174,14 +177,17 @@ func (c Config) Validate() error {
 	if c.Networking.GuestMTU < 576 || c.Networking.GuestMTU > 9000 {
 		problems = append(problems, "networking.guest_mtu must be between 576 and 9000")
 	}
-	for label, raw := range map[string]string{
-		"manager.pve_url":   c.Manager.PVEURL,
-		"agent.manager_url": c.Agent.ManagerURL,
-	} {
-		parsed, err := url.Parse(raw)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-			problems = append(problems, label+" must be an absolute HTTPS URL")
-		}
+	parsedPVE, err := url.Parse(c.Manager.PVEURL)
+	if err != nil || parsedPVE.Scheme != "https" || parsedPVE.Host == "" {
+		problems = append(problems, "manager.pve_url must be an absolute HTTPS URL")
+	}
+	parsedManager, err := url.Parse(c.Agent.ManagerURL)
+	if err != nil || (parsedManager.Scheme != "https" && parsedManager.Scheme != "unix") {
+		problems = append(problems, "agent.manager_url must use HTTPS or a Unix socket URL")
+	} else if parsedManager.Scheme == "https" && parsedManager.Host == "" {
+		problems = append(problems, "agent.manager_url HTTPS address must include a host")
+	} else if parsedManager.Scheme == "unix" && (parsedManager.Path == "" || parsedManager.Host != "") {
+		problems = append(problems, "agent.manager_url Unix address must be an absolute socket path")
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
