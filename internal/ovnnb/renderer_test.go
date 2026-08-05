@@ -39,6 +39,13 @@ type unavailableGatewayRunner struct {
 	recordingRunner
 }
 
+type providerPortRunner struct {
+	recordingRunner
+	uuid   string
+	exists bool
+	owned  bool
+}
+
 func (runner *activeActiveRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
 	joined := strings.Join(arguments, " ")
 	if strings.Contains(joined, "find Logical_Switch _uuid="+runner.uuid) {
@@ -113,6 +120,27 @@ func (runner *unavailableGatewayRunner) Run(ctx context.Context, binary string, 
 		return []byte("database connection failed"), errors.New("exit status 1")
 	}
 	return nil, nil
+}
+
+func (runner *providerPortRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, error) {
+	output, err := runner.recordingRunner.Run(ctx, binary, arguments...)
+	joined := strings.Join(arguments, " ")
+	if strings.Contains(joined, "find Logical_Switch_Port") {
+		if strings.Contains(joined, "name=") && runner.exists {
+			return []byte(runner.uuid + "\n"), nil
+		}
+		if strings.Contains(joined, "_uuid="+runner.uuid) && runner.exists && runner.owned {
+			return []byte(runner.uuid + "\n"), nil
+		}
+	}
+	if strings.Contains(joined, "lsp-add") && strings.Contains(joined, "pvn-localnet-") {
+		runner.exists = true
+		runner.owned = true
+	}
+	if strings.Contains(joined, "lsp-del "+runner.uuid) {
+		runner.exists = false
+	}
+	return output, err
 }
 
 func (runner *recordingRunner) contains(parts ...string) bool {
@@ -214,6 +242,147 @@ func TestExternalNetworkCreatesItsLocalnetPortImmediately(t *testing.T) {
 		t.Fatalf("external network localnet port was not rendered: %v", runner.calls)
 	}
 	_ = segment
+}
+
+func TestNetworkProviderChangeUpdatesOwnedLocalnetMapping(t *testing.T) {
+	ctx := context.Background()
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+	providerA := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-a"}, Name: "uplink-a"}).(*model.ProviderNetwork)
+	providerB := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-b"}, Name: "uplink-b"}).(*model.ProviderNetwork)
+	_ = mustCreate(t, store, &model.ProviderSegment{
+		Metadata: model.Metadata{ID: "segment-a"}, ProviderNetworkID: providerA.ID,
+		Name: "flat-a", PhysicalNetwork: "phys-a", NetworkType: model.ProviderFlat,
+	})
+	segmentB := mustCreate(t, store, &model.ProviderSegment{
+		Metadata: model.Metadata{ID: "segment-b"}, ProviderNetworkID: providerB.ID,
+		Name: "vlan-b", PhysicalNetwork: "phys-b", NetworkType: model.ProviderVLAN, VLANID: 222,
+	}).(*model.ProviderSegment)
+	network := &model.Network{
+		Metadata: model.Metadata{ID: "network-1", Revision: 1}, ProjectID: project.ID, Name: "provider",
+		ProviderNetworkID: providerA.ID,
+	}
+	runner := &providerPortRunner{uuid: deterministicUUID("localnet-row:" + network.ID)}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(ctx, network); err != nil {
+		t.Fatal(err)
+	}
+	updated := *network
+	updated.ProviderNetworkID = providerB.ID
+	updated.Revision++
+	if err := renderer.Render(ctx, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	port := "pvn-localnet-" + compact(network.ID)
+	if !runner.contains("find Logical_Switch_Port", "_uuid="+runner.uuid,
+		stringAssignment("type", "localnet"),
+		mapAssignment("external_ids", "pvn-managed", "true"),
+		mapAssignment("external_ids", "pvn-kind", model.KindProviderSegment.String()),
+		mapAssignment("external_ids", "pvn-network", network.ID)) {
+		t.Fatalf("existing localnet port ownership was not checked: %v", runner.calls)
+	}
+	if !runner.contains("lsp-set-options "+runner.uuid+" network_name=phys-b",
+		"set Logical_Switch_Port "+runner.uuid,
+		mapAssignment("external_ids", "pvn-id", segmentB.ID), "tag=222") {
+		t.Fatalf("provider change did not update the owned localnet row: %v", runner.calls)
+	}
+	lspAdds := 0
+	for _, call := range runner.calls {
+		if strings.Contains(strings.Join(call, " "), "lsp-add "+logicalSwitchUUID(network.ID)+" "+port) {
+			lspAdds++
+		}
+	}
+	if lspAdds != 1 {
+		t.Fatalf("provider change recreated the localnet port; lsp-add calls=%d calls=%v", lspAdds, runner.calls)
+	}
+}
+
+func TestNetworkProviderRemovalDeletesOnlyOwnedLocalnetPort(t *testing.T) {
+	ctx := context.Background()
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+	provider := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-1"}, Name: "uplink"}).(*model.ProviderNetwork)
+	_ = mustCreate(t, store, &model.ProviderSegment{
+		Metadata: model.Metadata{ID: "segment-1"}, ProviderNetworkID: provider.ID,
+		Name: "flat", PhysicalNetwork: "provider", NetworkType: model.ProviderFlat,
+	})
+	network := &model.Network{
+		Metadata: model.Metadata{ID: "network-1", Revision: 1}, ProjectID: project.ID, Name: "provider",
+		ProviderNetworkID: provider.ID,
+	}
+	runner := &providerPortRunner{uuid: deterministicUUID("localnet-row:" + network.ID)}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(ctx, network); err != nil {
+		t.Fatal(err)
+	}
+	overlay := *network
+	overlay.ProviderNetworkID = ""
+	overlay.Revision++
+	if err := renderer.Render(ctx, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("--if-exists lsp-del " + runner.uuid) {
+		t.Fatalf("owned localnet port was not removed by UUID: %v", runner.calls)
+	}
+	if runner.exists {
+		t.Fatal("localnet runner still contains the removed provider port")
+	}
+}
+
+func TestNetworkProviderRemovalRefusesUnownedNameCollision(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+	network := &model.Network{Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "overlay"}
+	runner := &providerPortRunner{
+		uuid: deterministicUUID("foreign-localnet-row:" + network.ID), exists: true, owned: false,
+	}
+	renderer := newTestRenderer(t, runner, store)
+
+	err := renderer.Render(context.Background(), network)
+	if err == nil || !strings.Contains(err.Error(), "is not owned by PVN network") {
+		t.Fatalf("unowned localnet collision error = %v", err)
+	}
+	if runner.contains("lsp-del") {
+		t.Fatalf("unowned localnet row was deleted: %v", runner.calls)
+	}
+}
+
+func TestSecurityGroupDefaultDropHasOwnedDHCPv4Exceptions(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "default"}).(*model.SecurityGroup)
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), group); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []struct {
+		owner     string
+		direction string
+		match     string
+	}{
+		{owner: group.ID + ":dhcpv4-client", direction: "from-lport", match: "ip4 && udp && udp.src == 68 && udp.dst == 67"},
+		{owner: group.ID + ":dhcpv4-server", direction: "to-lport", match: "ip4 && udp && udp.src == 67 && udp.dst == 68"},
+	} {
+		if !runner.contains("create ACL", stringAssignment("direction", expected.direction), "priority=3000",
+			stringAssignment("match", expected.match), stringAssignment("action", "allow"),
+			mapAssignment("external_ids", "pvn-managed", "true"),
+			mapAssignment("external_ids", "pvn-owner", expected.owner)) {
+			t.Errorf("DHCPv4 exception %q was not rendered: %v", expected.owner, runner.calls)
+		}
+	}
+	for _, direction := range []string{"to-lport", "from-lport"} {
+		owner := group.ID + ":default-drop:" + direction
+		if !runner.contains("create ACL", stringAssignment("direction", direction), "priority=1000",
+			stringAssignment("match", "ip4"), stringAssignment("action", "drop"),
+			mapAssignment("external_ids", "pvn-owner", owner)) {
+			t.Errorf("arbitrary IPv4 traffic is not default-dropped for %s: %v", direction, runner.calls)
+		}
+	}
 }
 
 func TestRendererUsesOVNNBCTL2503CommandBoundaries(t *testing.T) {

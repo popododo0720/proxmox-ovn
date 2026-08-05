@@ -212,7 +212,7 @@ func (renderer *Renderer) network(ctx context.Context, network *model.Network) e
 		return wrapRender("network", network.ID, err)
 	}
 	if network.ProviderNetworkID == "" {
-		return nil
+		return renderer.removeProviderPort(ctx, network)
 	}
 	segment, err := renderer.defaultProviderSegment(ctx, network.ProviderNetworkID)
 	if err != nil {
@@ -1132,21 +1132,71 @@ func (renderer *Renderer) defaultProviderSegment(ctx context.Context, providerID
 
 func (renderer *Renderer) renderProviderPort(ctx context.Context, segment *model.ProviderSegment, network *model.Network) error {
 	port := "pvn-localnet-" + compact(network.ID)
-	args := []string{
-		"--", "--may-exist", "lsp-add", logicalSwitchUUID(network.ID), port,
-		"--", "lsp-set-addresses", port, "unknown",
-		"--", "lsp-set-type", port, "localnet",
-		"--", "lsp-set-options", port, "network_name=" + segment.PhysicalNetwork,
-		"--", "set", "Logical_Switch_Port", port,
+	existing, err := renderer.ownedProviderPort(ctx, network.ID, port)
+	if err != nil {
+		return wrapRender("provider port ownership", network.ID, err)
 	}
+	target := port
+	args := make([]string, 0, 32)
+	if existing == "" {
+		args = append(args, "--", "--may-exist", "lsp-add", logicalSwitchUUID(network.ID), port)
+	} else {
+		// Address the row by UUID after the ownership probe so a same-name row
+		// cannot be substituted between the read and the update.
+		target = existing
+	}
+	args = append(args,
+		"--", "lsp-set-addresses", target, "unknown",
+		"--", "lsp-set-type", target, "localnet",
+		"--", "lsp-set-options", target, "network_name="+segment.PhysicalNetwork,
+		"--", "set", "Logical_Switch_Port", target,
+	)
 	args = append(args, metadataAssignments(segment, map[string]string{"pvn-network": network.ID})...)
 	if segment.NetworkType == model.ProviderVLAN {
-		args = append(args, "--", "set", "Logical_Switch_Port", port, "tag="+strconv.Itoa(segment.VLANID))
+		args = append(args, "--", "set", "Logical_Switch_Port", target, "tag="+strconv.Itoa(segment.VLANID))
 	} else {
-		args = append(args, "--", "clear", "Logical_Switch_Port", port, "tag")
+		args = append(args, "--", "clear", "Logical_Switch_Port", target, "tag")
 	}
-	_, err := renderer.client.run(ctx, args...)
+	_, err = renderer.client.run(ctx, args...)
 	return wrapRender("provider segment", segment.ID, err)
+}
+
+func (renderer *Renderer) removeProviderPort(ctx context.Context, network *model.Network) error {
+	port := "pvn-localnet-" + compact(network.ID)
+	existing, err := renderer.ownedProviderPort(ctx, network.ID, port)
+	if err != nil {
+		return wrapRender("provider port ownership", network.ID, err)
+	}
+	if existing == "" {
+		return nil
+	}
+	_, err = renderer.client.run(ctx, "--", "--if-exists", "lsp-del", existing)
+	return wrapRender("remove provider port", network.ID, err)
+}
+
+// ownedProviderPort returns the UUID of the deterministic localnet port only
+// when the row has all ownership markers written by PVN. Provider changes are
+// allowed to replace pvn-id (the segment ID), so network ownership is the
+// stable identity across those updates.
+func (renderer *Renderer) ownedProviderPort(ctx context.Context, networkID, port string) (string, error) {
+	existing, err := renderer.findOne(ctx, "Logical_Switch_Port", stringAssignment("name", port))
+	if err != nil || existing == "" {
+		return existing, err
+	}
+	owned, err := renderer.findMany(ctx, "Logical_Switch_Port",
+		"_uuid="+existing,
+		stringAssignment("type", "localnet"),
+		mapAssignment("external_ids", "pvn-managed", "true"),
+		mapAssignment("external_ids", "pvn-kind", model.KindProviderSegment.String()),
+		mapAssignment("external_ids", "pvn-network", networkID),
+	)
+	if err != nil {
+		return "", err
+	}
+	if len(owned) != 1 || owned[0] != existing {
+		return "", fmt.Errorf("logical switch port %q exists but is not owned by PVN network %q", port, networkID)
+	}
+	return existing, nil
 }
 
 func (renderer *Renderer) securityGroup(ctx context.Context, group *model.SecurityGroup) error {
@@ -1173,6 +1223,18 @@ func (renderer *Renderer) securityGroup(ctx context.Context, group *model.Securi
 	args := append([]string{"set", "Port_Group", uuid, stringAssignment("name", name)}, metadata...)
 	if _, err := renderer.client.run(ctx, args...); err != nil {
 		return wrapRender("security group", group.ID, err)
+	}
+	for _, exception := range []struct {
+		owner     string
+		direction string
+		match     string
+	}{
+		{owner: group.ID + ":dhcpv4-client", direction: "from-lport", match: "ip4 && udp && udp.src == 68 && udp.dst == 67"},
+		{owner: group.ID + ":dhcpv4-server", direction: "to-lport", match: "ip4 && udp && udp.src == 67 && udp.dst == 68"},
+	} {
+		if err := renderer.ensureACL(ctx, name, exception.owner, exception.direction, 3000, exception.match, "allow", group.Revision); err != nil {
+			return err
+		}
 	}
 	for _, direction := range []string{"to-lport", "from-lport"} {
 		owner := group.ID + ":default-drop:" + direction
