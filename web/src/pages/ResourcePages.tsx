@@ -1,10 +1,12 @@
 import { useState } from 'react';
+import { useApi } from '../api/context';
 import type {
   FloatingIP,
   Network,
   NodeStatus,
   Operation,
   Port,
+  PortProvisionInput,
   Project,
   ProviderNetwork,
   ProviderSegment,
@@ -146,6 +148,7 @@ export function RoutersPage() {
 }
 
 export function PortsPage() {
+  const api = useApi();
   const [tableKey, setTableKey] = useState(0);
 
   return <div className="stacked-pages">
@@ -162,7 +165,29 @@ export function PortsPage() {
         { key: 'vmid', label: 'Attachment', render: (item) => formatValue(item.vmid ? `${item.node_id}/${item.vmid}/${item.nic || '?'}` : undefined) },
         { key: 'binding_status', label: 'Binding', render: (item) => <StatusPill value={item.binding_status || item.state} /> },
       ]}
-      emptyMessage="Ports are created when a VM NIC is attached to a PVN network."
+      createLabel="Tenant port"
+      createFields={[
+        { name: 'name', label: 'Name', placeholder: 'web-01' },
+        { name: 'project_id', label: 'Project ID', required: true },
+        { name: 'network_id', label: 'Tenant network ID', required: true },
+        { name: 'subnet_id', label: 'Subnet ID', help: 'Optional. PVN allocates the next free address when set.' },
+        { name: 'fixed_ip_address', label: 'Requested fixed IPv4', help: 'Requires a subnet ID.' },
+        { name: 'mac_address', label: 'Requested MAC', help: 'Leave blank for a stable PVN-generated MAC.' },
+        { name: 'security_group_ids', label: 'Security group IDs', help: 'Optional comma-separated IDs.' },
+      ]}
+      createResource={(payload) => {
+        const securityGroupIDs = String(payload.security_group_ids ?? '')
+          .split(',')
+          .map((value) => value.trim())
+          .filter(Boolean);
+        const input = { ...payload } as unknown as PortProvisionInput;
+        delete (input as unknown as Record<string, unknown>).security_group_ids;
+        if (securityGroupIDs.length > 0) input.security_group_ids = securityGroupIDs;
+        return api.provisionPort(input);
+      }}
+      allowDelete
+      deleteResource={(port) => api.deprovisionPort(port.id, port.revision || 0)}
+      emptyMessage="Provision a tenant port, then attach it to a VM NIC below."
     />
     <PortAttachmentPanel onChanged={() => setTableKey((value) => value + 1)} />
   </div>;

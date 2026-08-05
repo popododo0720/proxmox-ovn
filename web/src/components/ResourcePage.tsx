@@ -22,6 +22,8 @@ export interface ResourcePageProps<T extends BaseResource> {
   createLabel?: string;
   createFields?: FormField[];
   allowDelete?: boolean;
+  createResource?: (payload: Record<string, unknown>) => Promise<T>;
+  deleteResource?: (item: T) => Promise<void>;
   compact?: boolean;
   emptyMessage?: string;
 }
@@ -57,6 +59,8 @@ export function ResourcePage<T extends BaseResource>({
   createLabel,
   createFields,
   allowDelete = false,
+  createResource,
+  deleteResource,
   compact = false,
   emptyMessage = 'Create the first resource when the cluster is ready.',
 }: ResourcePageProps<T>) {
@@ -97,7 +101,8 @@ export function ResourcePage<T extends BaseResource>({
     if (!window.confirm(`Delete ${label}? This request is reconciled through OVN.`)) return;
     setDeleting(item.id);
     try {
-      await api.remove(endpoint, item.id, item.revision);
+      if (deleteResource) await deleteResource(item);
+      else await api.remove(endpoint, item.id, item.revision);
       await load();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Delete failed');
@@ -181,7 +186,8 @@ export function ResourcePage<T extends BaseResource>({
           open={createOpen}
           onClose={() => setCreateOpen(false)}
           onSubmit={async (payload) => {
-            await api.create<T>(endpoint, payload);
+            if (createResource) await createResource(payload);
+            else await api.create<T>(endpoint, payload);
             await load();
           }}
         />

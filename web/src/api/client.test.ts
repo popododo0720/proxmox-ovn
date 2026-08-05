@@ -68,6 +68,31 @@ describe('ApiClient', () => {
     expect(JSON.parse(String(detach.body))).toEqual({ generation: 2 });
   });
 
+  it('uses dedicated idempotent port provision and deprovision actions', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ data: { id: 'port-1', revision: 1 } }, 201))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const client = new ApiClient('/api/v1', fetcher as unknown as typeof fetch);
+    client.setCSRFToken('csrf-value');
+
+    await client.provisionPort({ project_id: 'project-1', network_id: 'network-1', subnet_id: 'subnet-1' }, 'provision-key');
+    await client.deprovisionPort('port-1', 1, 'deprovision-key');
+
+    const provisionURL = fetcher.mock.calls[0][0] as URL;
+    const provision = fetcher.mock.calls[0][1] as RequestInit;
+    expect(provisionURL.pathname).toBe('/api/v1/ports/provision');
+    expect(provision.method).toBe('POST');
+    expect(new Headers(provision.headers).get('Idempotency-Key')).toBe('provision-key');
+    expect(JSON.parse(String(provision.body))).toEqual({ project_id: 'project-1', network_id: 'network-1', subnet_id: 'subnet-1' });
+
+    const deprovisionURL = fetcher.mock.calls[1][0] as URL;
+    const deprovision = fetcher.mock.calls[1][1] as RequestInit;
+    expect(deprovisionURL.pathname).toBe('/api/v1/ports/port-1/deprovision');
+    expect(deprovision.method).toBe('DELETE');
+    expect(new Headers(deprovision.headers).get('If-Match')).toBe('"1"');
+    expect(new Headers(deprovision.headers).get('Idempotency-Key')).toBe('deprovision-key');
+  });
+
   it('surfaces structured API errors', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({
       error: { code: 'revision_conflict', message: 'resource changed', details: { current: 3 } },

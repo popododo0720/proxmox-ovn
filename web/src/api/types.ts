@@ -106,6 +106,16 @@ export interface PortDetachInput {
   generation: number;
 }
 
+export interface PortProvisionInput {
+  project_id: string;
+  network_id: string;
+  subnet_id?: string;
+  name?: string;
+  mac_address?: string;
+  fixed_ip_address?: string;
+  security_group_ids?: string[];
+}
+
 export interface FloatingIP extends BaseResource {
   project_id?: string;
   provider_network_id?: string;

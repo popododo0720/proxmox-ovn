@@ -10,6 +10,7 @@ import type {
   Port,
   PortAttachInput,
   PortDetachInput,
+  PortProvisionInput,
   Project,
   ProviderNetwork,
   ProviderSegment,
@@ -214,6 +215,18 @@ export class ApiClient {
     return this.request<Port>(`/ports/${encodeURIComponent(id)}/detach`, {
       method: 'POST',
       body: input,
+      revision,
+      idempotencyKey,
+    });
+  }
+
+  provisionPort(input: PortProvisionInput, idempotencyKey: string = crypto.randomUUID()): Promise<Port> {
+    return this.request<Port>('/ports/provision', { method: 'POST', body: input, idempotencyKey });
+  }
+
+  deprovisionPort(id: ResourceID, revision: number, idempotencyKey: string = crypto.randomUUID()): Promise<void> {
+    return this.request<void>(`/ports/${encodeURIComponent(id)}/deprovision`, {
+      method: 'DELETE',
       revision,
       idempotencyKey,
     });
