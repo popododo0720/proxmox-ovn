@@ -264,6 +264,10 @@ after every database-process restart. PVN removes only the packaged replicated
 any other unexpected remote; node-local listener addresses are never written
 to replicated `NB_Global` or `SB_Global` rows.
 
+The Debian 13 SB vendor unit spells its PID path as `%t/run/ovn/ovnsb_db.pid`,
+which expands to `/run/run/ovn/ovnsb_db.pid`. The PVN drop-in pins the actual
+process path, `/run/ovn/ovnsb_db.pid`, so systemd can track SB startup exactly.
+
 PVN Control's client endpoint is fixed at 6645, its Raft endpoint is fixed at
 6646, and startup rejects other values. Its node-local control socket lives in
 `/run/pvn-control`, separate from the manager's `/run/pvn` runtime directory;

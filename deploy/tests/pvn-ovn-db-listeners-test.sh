@@ -257,6 +257,7 @@ grep -Fxq 'EnvironmentFile=/etc/pvn/central/ovn-listeners.env' "$NB_DROPIN"
 grep -Fxq 'EnvironmentFile=/etc/pvn/central/ovn-listeners.env' "$SB_DROPIN"
 grep -Fxq 'ExecStartPost=/usr/lib/pvn/pvn-ovn-db-listeners nb' "$NB_DROPIN"
 grep -Fxq 'ExecStartPost=/usr/lib/pvn/pvn-ovn-db-listeners sb' "$SB_DROPIN"
+[ "$(grep -Fxc 'PIDFile=/run/ovn/ovnsb_db.pid' "$SB_DROPIN")" -eq 1 ]
 grep -Fxq 'TimeoutStartSec=120' "$NB_DROPIN"
 grep -Fxq 'TimeoutStartSec=120' "$SB_DROPIN"
 grep -Fxq 'ExecStart=/usr/lib/pvn/pvn-ovn-db-listeners' \

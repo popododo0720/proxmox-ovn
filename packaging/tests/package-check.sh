@@ -127,6 +127,11 @@ grep -q '^Environment=PVN_PVE_CA_FILE=%d/pvn-pve-ca$' deploy/systemd/pvn-manager
     echo "the manager must validate PVE with its credential CA copy" >&2
     exit 1
 }
+if [ "$(grep -Fxc 'PIDFile=/run/ovn/ovnsb_db.pid' \
+        deploy/systemd/ovn-ovsdb-server-sb.service.d/90-pvn.conf)" -ne 1 ]; then
+    echo "the OVN SB drop-in must override the vendor PIDFile with /run/ovn/ovnsb_db.pid" >&2
+    exit 1
+fi
 grep -q '^ExecStart=/usr/sbin/pvn-manager --config %d/pvn-config$' deploy/systemd/pvn-manager.service || {
     echo "the unprivileged manager must read its credential copy" >&2
     exit 1
@@ -305,6 +310,12 @@ for path in \
 do
     [ -e "$package_root/$path" ] || { echo "package is missing $path" >&2; exit 1; }
 done
+
+if [ "$(grep -Fxc 'PIDFile=/run/ovn/ovnsb_db.pid' \
+        "$package_root/usr/lib/systemd/system/ovn-ovsdb-server-sb.service.d/90-pvn.conf")" -ne 1 ]; then
+    echo "built package lacks the exact OVN SB PIDFile override" >&2
+    exit 1
+fi
 
 command -v file >/dev/null 2>&1 || {
     echo "file(1) is required to verify production binaries" >&2
