@@ -8,6 +8,7 @@ LDFLAGS := -s -w \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Version=$(VERSION) \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Commit=$(COMMIT) \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Date=$(BUILD_DATE)
+GO_BUILD_FLAGS := -trimpath -buildvcs=false
 
 .PHONY: all build web-build test test-race web-test ui-test vet fmt-check package-check deb release clean
 
@@ -15,9 +16,9 @@ all: test build
 
 build:
 	mkdir -p bin
-	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o bin/pvn-manager ./cmd/pvn-manager
-	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o bin/pvn-agent ./cmd/pvn-agent
-	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o bin/pvnctl ./cmd/pvnctl
+	CGO_ENABLED=0 go build $(GO_BUILD_FLAGS) -ldflags '$(LDFLAGS)' -o bin/pvn-manager ./cmd/pvn-manager
+	CGO_ENABLED=0 go build $(GO_BUILD_FLAGS) -ldflags '$(LDFLAGS)' -o bin/pvn-agent ./cmd/pvn-agent
+	CGO_ENABLED=0 go build $(GO_BUILD_FLAGS) -ldflags '$(LDFLAGS)' -o bin/pvnctl ./cmd/pvnctl
 
 web-build:
 	npm --prefix web ci
