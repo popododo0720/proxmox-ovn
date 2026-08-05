@@ -1,14 +1,23 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { ResourceSelect, type ResourceReference } from './ResourceSelect';
 
 export interface FormField {
   name: string;
   label: string;
-  type?: 'text' | 'number' | 'checkbox' | 'select';
+  type?: 'text' | 'number' | 'checkbox' | 'select' | 'resource-select';
   required?: boolean;
   placeholder?: string;
-  defaultValue?: string | number | boolean;
+  defaultValue?: string | string[] | number | boolean;
   options?: Array<{ label: string; value: string }>;
+  reference?: ResourceReference;
+  multiple?: boolean;
   help?: string;
+}
+
+function defaultFormValues(fields: FormField[]): Record<string, unknown> {
+  return Object.fromEntries(fields
+    .filter((field) => field.defaultValue !== undefined)
+    .map((field) => [field.name, field.defaultValue]));
 }
 
 export function CreateDialog({
@@ -27,13 +36,19 @@ export function CreateDialog({
   const dialog = useRef<HTMLDialogElement>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const initialValues = useMemo(() => defaultFormValues(fields), [fields]);
+  const [formValues, setFormValues] = useState<Record<string, unknown>>(initialValues);
 
   useEffect(() => {
     const element = dialog.current;
     if (!element) return;
-    if (open && !element.open) element.showModal();
+    if (open && !element.open) {
+      setError('');
+      setFormValues(initialValues);
+      element.showModal();
+    }
     if (!open && element.open) element.close();
-  }, [open]);
+  }, [initialValues, open]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -47,6 +62,11 @@ export function CreateDialog({
         payload[field.name] = form.has(field.name);
         continue;
       }
+      if (field.type === 'resource-select' && field.multiple) {
+        const values = form.getAll(field.name).map((value) => String(value).trim()).filter(Boolean);
+        if (values.length > 0 || field.required) payload[field.name] = values;
+        continue;
+      }
       const raw = String(form.get(field.name) ?? '').trim();
       if (!raw && !field.required) continue;
       payload[field.name] = field.type === 'number' ? Number(raw) : raw;
@@ -54,6 +74,7 @@ export function CreateDialog({
     try {
       await onSubmit(payload);
       formElement.reset();
+      setFormValues(initialValues);
       onClose();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The resource could not be created');
@@ -83,39 +104,66 @@ export function CreateDialog({
           <button type="button" className="icon-button" aria-label="Close" onClick={onClose} disabled={submitting}>×</button>
         </div>
         <div className="dialog-fields">
-          {fields.map((field) => (
-            <label className={field.type === 'checkbox' ? 'checkbox-field' : 'form-field'} key={field.name}>
-              {field.type === 'checkbox' ? (
+          {fields.map((field) => {
+            const fieldID = `resource-field-${field.name}`;
+            return field.type === 'checkbox' ? (
+              <label className="checkbox-field" key={field.name}>
                 <>
                   <input
                     name={field.name}
                     type="checkbox"
                     defaultChecked={Boolean(field.defaultValue)}
+                    onChange={(event) => setFormValues((values) => ({ ...values, [field.name]: event.target.checked }))}
                   />
                   <span>{field.label}</span>
                 </>
-              ) : (
+                {field.help && <small>{field.help}</small>}
+              </label>
+            ) : (
+              <div className="form-field" key={field.name}>
                 <>
-                  <span>{field.label}{field.required && <em> required</em>}</span>
-                  {field.type === 'select' ? (
-                    <select name={field.name} defaultValue={String(field.defaultValue ?? '')} required={field.required}>
+                  <label htmlFor={fieldID}>{field.label}{field.required && <em aria-hidden="true"> required</em>}</label>
+                  {field.type === 'resource-select' && field.reference ? (
+                    <ResourceSelect
+                      id={fieldID}
+                      name={field.name}
+                      source={field.reference}
+                      active={open}
+                      required={field.required}
+                      multiple={field.multiple}
+                      defaultValue={Array.isArray(field.defaultValue)
+                        ? field.defaultValue
+                        : field.defaultValue === undefined ? undefined : String(field.defaultValue)}
+                      formValues={formValues}
+                      onChange={(value) => setFormValues((values) => ({ ...values, [field.name]: value }))}
+                    />
+                  ) : field.type === 'select' ? (
+                    <select
+                      id={fieldID}
+                      name={field.name}
+                      defaultValue={String(field.defaultValue ?? '')}
+                      required={field.required}
+                      onChange={(event) => setFormValues((values) => ({ ...values, [field.name]: event.target.value }))}
+                    >
                       <option value="" disabled>Select…</option>
                       {field.options?.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}
                     </select>
                   ) : (
                     <input
+                      id={fieldID}
                       name={field.name}
                       type={field.type || 'text'}
                       required={field.required}
                       placeholder={field.placeholder}
-                      defaultValue={typeof field.defaultValue === 'boolean' ? undefined : field.defaultValue}
+                      defaultValue={typeof field.defaultValue === 'boolean' || Array.isArray(field.defaultValue) ? undefined : field.defaultValue}
+                      onChange={(event) => setFormValues((values) => ({ ...values, [field.name]: event.target.value }))}
                     />
                   )}
                 </>
-              )}
-              {field.help && <small>{field.help}</small>}
-            </label>
-          ))}
+                {field.help && <small>{field.help}</small>}
+              </div>
+            );
+          })}
         </div>
         {error && <p className="inline-error" role="alert">{error}</p>}
         <div className="dialog-actions">

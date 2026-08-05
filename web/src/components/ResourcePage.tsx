@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useApi } from '../api/context';
 import type { BaseResource } from '../api/types';
+import { CopyableID } from './CopyableID';
 import { CreateDialog, type FormField } from './CreateDialog';
 import { EmptyState } from './EmptyState';
 import { ErrorState } from './ErrorState';
@@ -72,6 +73,9 @@ export function ResourcePage<T extends BaseResource>({
   const [reloadKey, setReloadKey] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
+  const tableColumns: Column<T>[] = columns.some((column) => String(column.key) === 'id')
+    ? columns
+    : [...columns, { key: 'id', label: 'ID', className: 'mono-cell' }];
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -148,18 +152,24 @@ export function ResourcePage<T extends BaseResource>({
             <table>
               <thead>
                 <tr>
-                  {columns.map((column) => <th className={column.className} key={String(column.key)}>{column.label}</th>)}
+                  {tableColumns.map((column) => <th className={column.className} key={String(column.key)}>{column.label}</th>)}
                   {allowDelete && <th className="actions-column"><span className="sr-only">Actions</span></th>}
                 </tr>
               </thead>
               <tbody>
                 {visibleItems.map((item) => (
                   <tr key={item.id}>
-                    {columns.map((column) => {
+                    {tableColumns.map((column) => {
                       const value = readPath(item, String(column.key));
                       return (
                         <td className={column.className} key={String(column.key)}>
-                          {column.render ? column.render(item) : /^(status|state)$/.test(String(column.key)) ? <StatusPill value={value} /> : formatValue(value)}
+                          {String(column.key) === 'id'
+                            ? <CopyableID value={item.id} />
+                            : column.render
+                              ? column.render(item)
+                              : /^(status|state)$/.test(String(column.key))
+                                ? <StatusPill value={value} />
+                                : formatValue(value)}
                         </td>
                       );
                     })}

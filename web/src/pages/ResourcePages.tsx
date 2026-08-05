@@ -17,8 +17,78 @@ import type {
   Subnet,
 } from '../api/types';
 import { PortAttachmentPanel } from '../components/PortAttachmentPanel';
+import type { FormField } from '../components/CreateDialog';
 import { ResourcePage, formatValue, type Column } from '../components/ResourcePage';
+import type { ResourceReference } from '../components/ResourceSelect';
 import { StatusPill } from '../components/StatusPill';
+
+const projectReference: ResourceReference = {
+  endpoint: '/projects',
+  detailKeys: ['pool_id'],
+  emptyLabel: 'No project mappings available',
+};
+
+const providerNetworkReference: ResourceReference = {
+  endpoint: '/provider-networks',
+  emptyLabel: 'No provider networks available',
+};
+
+const projectNetworkReference: ResourceReference = {
+  endpoint: '/networks',
+  matches: [{ formField: 'project_id' }],
+  emptyLabel: 'No networks in this project',
+};
+
+const projectSubnetReference: ResourceReference = {
+  endpoint: '/subnets',
+  detailKeys: ['cidr'],
+  matches: [
+    { formField: 'project_id' },
+    { formField: 'network_id' },
+  ],
+  emptyLabel: 'No subnets on this network',
+};
+
+const externalNetworkReference: ResourceReference = {
+  endpoint: '/networks',
+  where: { external: true },
+  emptyLabel: 'No external networks available',
+};
+
+const externalSubnetReference: ResourceReference = {
+  endpoint: '/subnets',
+  detailKeys: ['cidr'],
+  matches: [{ formField: 'external_network_id', resourceField: 'network_id' }],
+  emptyLabel: 'No subnets on this external network',
+};
+
+const projectRouterReference: ResourceReference = {
+  endpoint: '/routers',
+  detailKeys: ['external_ip_address'],
+  matches: [{ formField: 'project_id' }],
+  emptyLabel: 'No routers in this project',
+};
+
+const projectSecurityGroupReference: ResourceReference = {
+  endpoint: '/security-groups',
+  matches: [{ formField: 'project_id' }],
+  emptyLabel: 'No security groups in this project',
+};
+
+const projectPortReference: ResourceReference = {
+  endpoint: '/ports',
+  detailKeys: ['mac_address'],
+  matches: [{ formField: 'project_id' }],
+  emptyLabel: 'No ports in this project',
+};
+
+const projectField: FormField = {
+  name: 'project_id',
+  label: 'Project',
+  type: 'resource-select',
+  reference: projectReference,
+  required: true,
+};
 
 const projectColumns: Column<Project>[] = [
   { key: 'name', label: 'Project', render: (item) => <strong>{item.name || item.id}</strong> },
@@ -29,10 +99,10 @@ const projectColumns: Column<Project>[] = [
 
 const networkFields = [
   { name: 'name', label: 'Name', required: true, placeholder: 'application' },
-  { name: 'project_id', label: 'Project ID', required: true },
+  projectField,
   { name: 'mtu', label: 'Guest MTU', type: 'number' as const, defaultValue: 1400 },
   { name: 'external', label: 'Provider-backed external network', type: 'checkbox' as const },
-  { name: 'provider_network_id', label: 'Provider network ID', help: 'Required only for an external network.' },
+  { name: 'provider_network_id', label: 'Provider network', type: 'resource-select' as const, reference: providerNetworkReference, help: 'Required only for an external network.' },
   { name: 'description', label: 'Description' },
 ];
 
@@ -86,8 +156,8 @@ export function NetworksPage() {
       createLabel="Subnet"
       createFields={[
         { name: 'name', label: 'Name', required: true, placeholder: 'application-v4' },
-        { name: 'project_id', label: 'Project ID', required: true },
-        { name: 'network_id', label: 'Network ID', required: true },
+        projectField,
+        { name: 'network_id', label: 'Network', type: 'resource-select', reference: projectNetworkReference, required: true },
         { name: 'cidr', label: 'IPv4 CIDR', required: true, placeholder: '10.42.0.0/24' },
         { name: 'gateway_ip', label: 'Gateway IP', placeholder: '10.42.0.1' },
         { name: 'enable_dhcp', label: 'Enable OVN DHCP', type: 'checkbox', defaultValue: true },
@@ -116,9 +186,9 @@ export function RoutersPage() {
       createLabel="Router"
       createFields={[
         { name: 'name', label: 'Name', required: true, placeholder: 'edge' },
-        { name: 'project_id', label: 'Project ID', required: true },
-        { name: 'external_network_id', label: 'External network ID' },
-        { name: 'external_subnet_id', label: 'External subnet ID' },
+        projectField,
+        { name: 'external_network_id', label: 'External network', type: 'resource-select', reference: externalNetworkReference },
+        { name: 'external_subnet_id', label: 'External subnet', type: 'resource-select', reference: externalSubnetReference },
         { name: 'external_ip_address', label: 'Router external IPv4', placeholder: '203.0.113.10' },
         { name: 'enable_snat', label: 'Enable SNAT', type: 'checkbox', defaultValue: true },
       ]}
@@ -137,9 +207,9 @@ export function RoutersPage() {
       ]}
       createLabel="Router interface"
       createFields={[
-        { name: 'project_id', label: 'Project ID', required: true },
-        { name: 'router_id', label: 'Router ID', required: true },
-        { name: 'subnet_id', label: 'Subnet ID', required: true },
+        projectField,
+        { name: 'router_id', label: 'Router', type: 'resource-select', reference: projectRouterReference, required: true },
+        { name: 'subnet_id', label: 'Subnet', type: 'resource-select', reference: { ...projectSubnetReference, matches: [{ formField: 'project_id' }] }, required: true },
       ]}
       allowDelete
       compact
@@ -168,18 +238,17 @@ export function PortsPage() {
       createLabel="Tenant port"
       createFields={[
         { name: 'name', label: 'Name', placeholder: 'web-01' },
-        { name: 'project_id', label: 'Project ID', required: true },
-        { name: 'network_id', label: 'Tenant network ID', required: true },
-        { name: 'subnet_id', label: 'Subnet ID', help: 'Optional. PVN allocates the next free address when set.' },
+        projectField,
+        { name: 'network_id', label: 'Tenant network', type: 'resource-select', reference: projectNetworkReference, required: true },
+        { name: 'subnet_id', label: 'Subnet', type: 'resource-select', reference: projectSubnetReference, help: 'Optional. PVN allocates the next free address when set.' },
         { name: 'fixed_ip_address', label: 'Requested fixed IPv4', help: 'Requires a subnet ID.' },
         { name: 'mac_address', label: 'Requested MAC', help: 'Leave blank for a stable PVN-generated MAC.' },
-        { name: 'security_group_ids', label: 'Security group IDs', help: 'Optional comma-separated IDs.' },
+        { name: 'security_group_ids', label: 'Security groups', type: 'resource-select', reference: projectSecurityGroupReference, multiple: true, help: 'Optional. Select every policy that should apply to this port.' },
       ]}
       createResource={(payload) => {
-        const securityGroupIDs = String(payload.security_group_ids ?? '')
-          .split(',')
-          .map((value) => value.trim())
-          .filter(Boolean);
+        const securityGroupIDs = Array.isArray(payload.security_group_ids)
+          ? payload.security_group_ids.map(String).map((value) => value.trim()).filter(Boolean)
+          : String(payload.security_group_ids ?? '').split(',').map((value) => value.trim()).filter(Boolean);
         const input = { ...payload } as unknown as PortProvisionInput;
         delete (input as unknown as Record<string, unknown>).security_group_ids;
         if (securityGroupIDs.length > 0) input.security_group_ids = securityGroupIDs;
@@ -208,11 +277,11 @@ export function FloatingIPsPage() {
     ]}
     createLabel="Floating IP"
     createFields={[
-      { name: 'project_id', label: 'Project ID', required: true },
-      { name: 'provider_network_id', label: 'Provider network ID', required: true },
+      projectField,
+      { name: 'provider_network_id', label: 'Provider network', type: 'resource-select', reference: providerNetworkReference, required: true },
       { name: 'address', label: 'Floating IPv4 address', required: true, placeholder: '203.0.113.42' },
-      { name: 'router_id', label: 'Router ID', help: 'Required when associating this address with a port.' },
-      { name: 'port_id', label: 'Destination port ID' },
+      { name: 'router_id', label: 'Router', type: 'resource-select', reference: projectRouterReference, help: 'Required when associating this address with a port.' },
+      { name: 'port_id', label: 'Destination port', type: 'resource-select', reference: projectPortReference },
       { name: 'fixed_ip_address', label: 'Destination fixed IP' },
     ]}
     allowDelete
@@ -235,7 +304,7 @@ export function SecurityGroupsPage() {
       createLabel="Security group"
       createFields={[
         { name: 'name', label: 'Name', required: true, placeholder: 'web-servers' },
-        { name: 'project_id', label: 'Project ID', required: true },
+        projectField,
         { name: 'description', label: 'Description' },
         { name: 'stateful', label: 'Stateful', type: 'checkbox', defaultValue: true },
       ]}
@@ -257,15 +326,15 @@ export function SecurityGroupsPage() {
       ]}
       createLabel="Security group rule"
       createFields={[
-        { name: 'project_id', label: 'Project ID', required: true },
-        { name: 'security_group_id', label: 'Security group ID', required: true },
+        projectField,
+        { name: 'security_group_id', label: 'Security group', type: 'resource-select', reference: projectSecurityGroupReference, required: true },
         { name: 'direction', label: 'Direction', type: 'select', required: true, defaultValue: 'ingress', options: [{ label: 'Ingress', value: 'ingress' }, { label: 'Egress', value: 'egress' }] },
         { name: 'ethertype', label: 'Ether type', type: 'select', required: true, defaultValue: 'IPv4', options: [{ label: 'IPv4', value: 'IPv4' }] },
         { name: 'protocol', label: 'Protocol', type: 'select', options: [{ label: 'TCP', value: 'tcp' }, { label: 'UDP', value: 'udp' }, { label: 'ICMP', value: 'icmp' }] },
         { name: 'port_range_min', label: 'Port range start', type: 'number' },
         { name: 'port_range_max', label: 'Port range end', type: 'number' },
         { name: 'remote_cidr', label: 'Remote IPv4 CIDR', placeholder: '0.0.0.0/0' },
-        { name: 'remote_group_id', label: 'Remote security group ID' },
+        { name: 'remote_group_id', label: 'Remote security group', type: 'resource-select', reference: projectSecurityGroupReference },
         { name: 'action', label: 'Action', type: 'select', required: true, defaultValue: 'allow', options: [{ label: 'Allow', value: 'allow' }, { label: 'Drop', value: 'drop' }] },
         { name: 'description', label: 'Description' },
       ]}
@@ -311,7 +380,7 @@ export function ProviderNetworksPage() {
       createLabel="Provider segment"
       createFields={[
         { name: 'name', label: 'Name', required: true, placeholder: 'public-vlan' },
-        { name: 'provider_network_id', label: 'Provider network ID', required: true },
+        { name: 'provider_network_id', label: 'Provider network', type: 'resource-select', reference: providerNetworkReference, required: true },
         { name: 'network_type', label: 'Type', type: 'select', required: true, defaultValue: 'vlan', options: [{ label: 'VLAN', value: 'vlan' }, { label: 'Flat', value: 'flat' }] },
         { name: 'physical_network', label: 'OVS bridge mapping', required: true, placeholder: 'provider' },
         { name: 'vlan_id', label: 'VLAN ID', type: 'number' },

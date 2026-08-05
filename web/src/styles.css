@@ -156,11 +156,17 @@ td strong { color: #edf4f8; font-weight: 650; }
 .workflow-progress > span:last-child { color: var(--muted); font-size: 10px; }
 .inline-success { margin-top: 12px; padding: 10px 12px; color: #9ce7cf; background: #142b25; border: 1px solid #31594d; border-radius: 7px; font-size: 11px; }
 .form-field { display: flex; flex-direction: column; gap: 6px; color: #aab8c2; font-size: 11px; }
-.form-field > span { font-weight: 650; }
+.form-field > label, .form-field > span { font-weight: 650; }
 .form-field em { color: #687b89; font-size: 8px; font-style: normal; font-weight: 500; text-transform: uppercase; }
 .form-field input, .form-field select { width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid #34434f; border-radius: 7px; outline: 0; color: var(--text); background: #101820; }
 .form-field input:focus, .form-field select:focus { border-color: #599e8c; box-shadow: 0 0 0 3px rgba(102,211,176,.08); }
 .form-field small, .checkbox-field small { color: #758692; font-size: 9px; line-height: 1.45; }
+.reference-error { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #ffabb0; font-size: 9px; line-height: 1.4; }
+.reference-error button { padding: 0; border: 0; color: var(--accent); background: transparent; font-size: 9px; font-weight: 700; cursor: pointer; }
+.copyable-id { display: inline-flex; max-width: 260px; align-items: center; gap: 7px; }
+.copyable-id code { min-width: 0; overflow-wrap: anywhere; color: #a5b5c0; font: inherit; }
+.copyable-id button { flex: none; padding: 2px 5px; border: 1px solid #354551; border-radius: 5px; color: #8194a2; background: #121b22; font-size: 8px; font-weight: 750; cursor: pointer; }
+.copyable-id button:hover { color: var(--accent); border-color: #477a6d; }
 .nic-list { margin-top: 12px; padding: 16px; }
 .nic-list-heading { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
 .nic-list-heading strong { color: var(--text); font-size: 12px; }
