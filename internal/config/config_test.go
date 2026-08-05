@@ -1,11 +1,102 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestLoadNodeUsesExplicitLocalEncapIP(t *testing.T) {
+	configPath := writeValidConfig(t)
+	t.Setenv("PVN_ENCAP_IP", "198.51.100.99")
+
+	for _, test := range []struct {
+		name string
+		ip   string
+	}{
+		{name: "first-node", ip: "192.0.2.10"},
+		{name: "second-node", ip: "192.0.2.11"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			nodeEnvPath := filepath.Join(t.TempDir(), "node.env")
+			contents := "# node-local settings\nPVN_NODE_NAME=" + test.name + "\nPVN_ENCAP_IP=" + test.ip + "\n"
+			if err := os.WriteFile(nodeEnvPath, []byte(contents), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadNode(configPath, nodeEnvPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Networking.EncapIP != test.ip || cfg.Cluster.NodeName != test.name {
+				t.Fatalf("node-local overlay not applied: %+v", cfg)
+			}
+		})
+	}
+}
+
+func TestLoadNodeFailsClosed(t *testing.T) {
+	configPath := writeValidConfig(t)
+	tests := []struct {
+		name     string
+		contents string
+		mode     os.FileMode
+		want     string
+	}{
+		{name: "missing-encap", contents: "PVN_NODE_NAME=pve-a\n", mode: 0o640, want: "requires PVN_ENCAP_IP"},
+		{name: "duplicate", contents: "PVN_ENCAP_IP=192.0.2.10\nPVN_ENCAP_IP=192.0.2.11\n", mode: 0o640, want: "duplicate key"},
+		{name: "unsupported", contents: "PVN_ENCAP_IP=192.0.2.10\nUNSAFE=value\n", mode: 0o640, want: "unsupported key"},
+		{name: "shell-syntax", contents: "PVN_ENCAP_IP='192.0.2.10'\n", mode: 0o640, want: "unquoted single value"},
+		{name: "invalid-ip", contents: "PVN_ENCAP_IP=not-an-ip\n", mode: 0o640, want: "must be an IPv4 address"},
+		{name: "unsafe-permissions", contents: "PVN_ENCAP_IP=192.0.2.10\n", mode: 0o660, want: "unsafe permissions"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "node.env")
+			if err := os.WriteFile(path, []byte(test.contents), test.mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadNode(configPath, path); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("expected %q failure, got %v", test.want, err)
+			}
+		})
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing.env")
+	if _, err := LoadNode(configPath, missing); err == nil || !strings.Contains(err.Error(), "inspect node environment") {
+		t.Fatalf("missing node environment must fail closed: %v", err)
+	}
+	realPath := filepath.Join(t.TempDir(), "real.env")
+	if err := os.WriteFile(realPath, []byte("PVN_ENCAP_IP=192.0.2.10\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	symlinkPath := filepath.Join(t.TempDir(), "node.env")
+	if err := os.Symlink(realPath, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadNode(configPath, symlinkPath); err == nil || !strings.Contains(err.Error(), "non-symlink") {
+		t.Fatalf("symlinked node environment must fail closed: %v", err)
+	}
+}
+
+func writeValidConfig(t *testing.T) string {
+	t.Helper()
+	cfg := validConfig()
+	cfg.Networking.EncapIP = ""
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
 
 func TestLoadAndEnvironmentOverrides(t *testing.T) {
 	dir := t.TempDir()

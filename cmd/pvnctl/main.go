@@ -123,10 +123,11 @@ func pkiIssueNode(args []string) error {
 func doctor(args []string) error {
 	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	path := flags.String("config", config.DefaultPath, "PVN config path")
+	nodeEnvPath := flags.String("node-env", config.DefaultNodeEnvPath, "node-local PVN environment path")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := config.Load(*path)
+	cfg, err := config.LoadNode(*path, *nodeEnvPath)
 	if err != nil {
 		return err
 	}

@@ -306,6 +306,13 @@ also proves its startup PVN Control and OVN NB probes passed. Keep the packaged
 `PVN_HEALTH_LISTEN` and `PVN_AGENT_HEALTH_URL` values unchanged. This is a
 bounded local startup check, not continuous health monitoring.
 
+`pvnctl doctor` always reads node-local identity from `/etc/pvn/node.env`, even
+when invoked directly by an operator, the control-plane, or the updater. The
+shared `/etc/pve/pvn/config.json` intentionally leaves `networking.encap_ip`
+empty. Use `--node-env /absolute/test/path` only for an isolated test fixture;
+the file is parsed as a strict, non-shell `KEY=VALUE` allowlist and fails closed
+when it is missing, malformed, duplicated, symlinked, or unsafely writable.
+
 At boot, `pvn-guest-gate.service` leaves normal PVE behavior unchanged when
 the local marker is absent. When the marker exists, a failed readiness check
 fails that `pve-guests.service` start, so all guests on that host—not only PVN
