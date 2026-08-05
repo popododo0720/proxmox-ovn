@@ -5,6 +5,8 @@ proxmox-ovn (0.2.11) unstable; urgency=medium
   * Stabilize multi-role node heartbeats across OVSDB set ordering.
   * Coordinate drift audits and recover abandoned or superseded operations.
   * Batch periodic snapshots to avoid repeated full control DB decoding.
+  * Resolve node-agent ports with narrow OVSDB reads instead of full snapshots.
+  * Pace healthy drift audits and serve APIs before background reconciliation.
   * Keep diagnostics while suppressing OVSDB and routine OVN payload logs.
 
  -- PVN Project <root@localhost>  Wed, 05 Aug 2026 12:46:00 +0000
