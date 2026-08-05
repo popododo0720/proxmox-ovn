@@ -35,13 +35,28 @@ func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) 
 	}
 	lock := c.resourceLock(kind, id)
 	lock.Lock()
-	defer lock.Unlock()
 
 	resource, err := c.store.Get(ctx, kind, id)
 	if err != nil {
+		lock.Unlock()
 		return err
 	}
 	meta := resource.GetMetadata()
+	if meta.State == model.ResourceDeleting {
+		// A manager may have died after persisting the tombstone but before
+		// removing the OVN rows. Release the local lock because Delete takes
+		// the same lock, then finish the durable delete workflow. This also
+		// keeps periodic reconciliation from rendering tombstones.
+		lock.Unlock()
+		if err := c.Delete(ctx, resource); err != nil {
+			return err
+		}
+		if err := c.store.Purge(ctx, kind, id, meta.Revision); err != nil && !errors.Is(err, controlstore.ErrNotFound) {
+			return fmt.Errorf("purge deleted %s %q revision %d: %w", kind, id, meta.Revision, err)
+		}
+		return nil
+	}
+	defer lock.Unlock()
 	if meta.AppliedRevision >= meta.Revision && meta.State == model.ResourceReady {
 		return nil
 	}
@@ -81,7 +96,21 @@ func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) 
 	op = updated.(*model.Operation)
 
 	renderErr := c.renderer.Render(ctx, resource)
-	_, markErr := c.store.MarkReconciled(ctx, kind, id, meta.Revision, renderErr)
+	staleDelete := false
+	latest, latestErr := c.store.Get(ctx, kind, id)
+	if errors.Is(latestErr, controlstore.ErrNotFound) || (latestErr == nil && latest.GetMetadata().State == model.ResourceDeleting) {
+		// Render and delete are separate systems, so the desired row can be
+		// deleted while an older manager is still writing OVN. An idempotent
+		// cleanup after the render closes that race and prevents orphan rows.
+		staleDelete = true
+		renderErr = c.renderer.Delete(ctx, resource)
+	} else if latestErr != nil && renderErr == nil {
+		renderErr = fmt.Errorf("reload desired state after render: %w", latestErr)
+	}
+	var markErr error
+	if !staleDelete {
+		_, markErr = c.store.MarkReconciled(ctx, kind, id, meta.Revision, renderErr)
+	}
 	completed := time.Now().UTC()
 	op.CompletedAt = &completed
 	if renderErr != nil {

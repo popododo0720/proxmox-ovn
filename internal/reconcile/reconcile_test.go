@@ -24,6 +24,27 @@ func (r *recordingRenderer) Render(_ context.Context, resource model.Resource) e
 
 func (*recordingRenderer) Delete(context.Context, model.Resource) error { return nil }
 
+type blockingRenderer struct {
+	delegate *FakeRenderer
+	started  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (r *blockingRenderer) Render(ctx context.Context, resource model.Resource) error {
+	r.once.Do(func() { close(r.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.release:
+		return r.delegate.Render(ctx, resource)
+	}
+}
+
+func (r *blockingRenderer) Delete(ctx context.Context, resource model.Resource) error {
+	return r.delegate.Delete(ctx, resource)
+}
+
 func createProject(t *testing.T, store controlstore.Store) *model.Project {
 	t.Helper()
 	resource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool"}, "create-project")
@@ -245,5 +266,63 @@ func TestControllerDeleteCleansRendererBeforePurge(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("delete operation not recorded: %#v", operations)
+	}
+}
+
+func TestControllerReconcileRecoversPersistedTombstone(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := NewFakeRenderer()
+	controller := NewController(store, renderer)
+	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete"); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("Get() error=%v, want not found", err)
+	}
+	if _, ok := renderer.Rendered(model.KindProject, project.ID); ok {
+		t.Fatal("renderer still contains recovered tombstone")
+	}
+}
+
+func TestControllerCleansRenderThatRacesWithDistributedDelete(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	delegate := NewFakeRenderer()
+	renderer := &blockingRenderer{delegate: delegate, started: make(chan struct{}), release: make(chan struct{})}
+	reconcileController := NewController(store, renderer)
+	deleteController := NewController(store, renderer)
+
+	reconcileDone := make(chan error, 1)
+	go func() {
+		reconcileDone <- reconcileController.Reconcile(context.Background(), model.KindProject, project.ID)
+	}()
+	<-renderer.started
+
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteController.Delete(context.Background(), tombstone); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
+		t.Fatal(err)
+	}
+	close(renderer.release)
+	if err := <-reconcileDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := delegate.Rendered(model.KindProject, project.ID); ok {
+		t.Fatal("stale render survived the distributed delete")
+	}
+	if calls := delegate.DeleteCalls(model.KindProject, project.ID); calls != 2 {
+		t.Fatalf("delete calls=%d, want distributed delete plus stale cleanup", calls)
 	}
 }
