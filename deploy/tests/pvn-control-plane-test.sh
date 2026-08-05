@@ -195,7 +195,7 @@ class FakeBackend:
         for node in found.nodes:
             status = self.node_status(node)
             if not all(status.get(key) is True for key in
-                       ("ready", "service_ready", "doctor", "marker")):
+                       ("ready", "target_active", "service_ready", "doctor", "marker")):
                 raise ControlPlaneError(
                     f"complete ledger package repin refused: doctor failed on {node.name}"
                 )
@@ -324,10 +324,12 @@ class FakeBackend:
             self.log.append("node:" + node.name)
 
     def node_status(self, node):
+        target_active = node.name in self.node_targets
         service_ready = node.name in self.nodes
         doctor = node.name not in self.doctor_fail
         return {
-            "ready": service_ready and doctor,
+            "ready": target_active and service_ready and doctor,
+            "target_active": target_active,
             "service_ready": service_ready,
             "doctor": doctor,
             "marker": node.name in self.node_markers,
@@ -895,6 +897,176 @@ with tempfile.TemporaryDirectory() as temporary:
 with tempfile.TemporaryDirectory() as temporary:
     backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary), count=2)
     expect_error(backend.discover, "positive odd node count")
+
+
+def complete_system_backend_state(root):
+    backend, _, _ = canonical_topology_fixture(root)
+    found = backend.discover()
+    cids = {name: f"production-cid-{index}" for index, name in enumerate(DATABASES, 1)}
+    ledger = complete_ledger(found, cids)
+    pki = ledger["cert_fingerprints"]
+    reports = {}
+    statuses = {}
+    probes = {}
+    for index, node in enumerate(found.nodes):
+        databases = {
+            name: {
+                "exists": True,
+                "name": name,
+                "clustered": True,
+                "local_address": f"ssl:{node.control_ip}:{port}",
+                "cluster_id": cids[name],
+                "cluster_id_pending": False,
+                "server_id": f"production-sid-{name}-{node.name}",
+            }
+            for name, port in DATABASES.items()
+        }
+        probes[node.name] = {
+            "cert_hashes": {
+                "ca": pki["ca_certificate_sha256"],
+                "cert": pki["nodes"][node.name]["certificate_sha256"],
+                "public_key": pki["nodes"][node.name]["public_key_sha256"],
+            },
+            "pki_owner_present": True,
+            "seed_ca_present": index == 0,
+            "central_marker": True,
+            "central_active": True,
+            "node_marker": True,
+            "node_active": True,
+            "node_ready": True,
+            "central_restart_pending": node.package_version,
+            "databases": databases,
+        }
+        reports[node.name] = {
+            "healthy": True,
+            "target_active": True,
+            "offline": copy.deepcopy(databases),
+            "databases": [
+                {
+                    "database": name,
+                    "healthy": True,
+                    "member_count": len(found.nodes),
+                    "connected_members": len(found.nodes),
+                    "membership_change": False,
+                    "cluster_id": cids[name],
+                    "server_id": databases[name]["server_id"],
+                    "address": databases[name]["local_address"],
+                }
+                for name in DATABASES
+            ],
+        }
+        statuses[node.name] = {
+            "ready": True,
+            "target_active": True,
+            "service_ready": True,
+            "doctor": True,
+            "marker": True,
+        }
+    backend.probes = probes
+    backend.central_status = lambda node, _mode: copy.deepcopy(reports[node.name])
+    backend.node_status = lambda node: copy.deepcopy(statuses[node.name])
+    return backend, found, ledger, reports, statuses
+
+
+# Exercise the production complete-repin proof, rather than only the fake
+# orchestration model. Online rows must identify the same local DB files, and
+# a fresh target/service/doctor check is required at proof time.
+with tempfile.TemporaryDirectory() as temporary:
+    backend, found, ledger, _, _ = complete_system_backend_state(
+        pathlib.Path(temporary)
+    )
+    ControlPlane(backend, None)._assert_package_repin_safe(found, ledger)
+
+
+def production_complete_repin_rejected(case):
+    with tempfile.TemporaryDirectory() as temporary:
+        backend, found, ledger, reports, statuses = complete_system_backend_state(
+            pathlib.Path(temporary)
+        )
+        first, second, third = found.nodes
+        if case == "pki":
+            backend.probes[first.name]["cert_hashes"]["cert"] = "0" * 64
+        elif case == "seed-ca":
+            backend.probes[second.name]["seed_ca_present"] = True
+        elif case == "central-target":
+            backend.probes[first.name]["central_active"] = False
+        elif case == "node-marker":
+            backend.probes[second.name]["node_marker"] = False
+        elif case == "restart-marker":
+            backend.probes[third.name]["central_restart_pending"] = None
+        elif case == "offline-cid":
+            backend.probes[first.name]["databases"]["OVN_Northbound"][
+                "cluster_id"
+            ] = "foreign-cid"
+        elif case == "offline-sid":
+            backend.probes[first.name]["databases"]["OVN_Southbound"][
+                "server_id"
+            ] = ""
+        elif case == "member-count":
+            reports[second.name]["databases"][0]["member_count"] = 2
+        elif case == "online-cid":
+            reports[second.name]["databases"][1]["cluster_id"] = "foreign-cid"
+        elif case == "online-sid":
+            reports[third.name]["databases"][2]["server_id"] = "foreign-sid"
+        elif case == "doctor":
+            statuses[first.name]["doctor"] = False
+            statuses[first.name]["ready"] = False
+        elif case == "live-node-target":
+            statuses[second.name]["target_active"] = False
+            statuses[second.name]["ready"] = False
+        else:
+            raise AssertionError(case)
+        control = ControlPlane(backend, None)
+        expect_error(
+            lambda: control._assert_package_repin_safe(found, ledger),
+            "repin refused",
+        )
+
+
+for production_case in (
+    "pki", "seed-ca", "central-target", "node-marker", "restart-marker",
+    "offline-cid", "offline-sid", "member-count", "online-cid", "online-sid",
+    "doctor", "live-node-target",
+):
+    production_complete_repin_rejected(production_case)
+
+
+# A wedged doctor command fails closed inside the remote helper instead of
+# holding a read-only plan or the cluster mutation lease indefinitely.
+assert re.search(
+    r'\["/usr/sbin/pvnctl", "doctor"\], check=False, timeout=30',
+    module["REMOTE_HELPER"],
+)
+remote_tree = ast.parse(module["REMOTE_HELPER"])
+remote_run_nodes = [
+    node for node in remote_tree.body
+    if isinstance(node, ast.FunctionDef) and node.name in {"fail", "run"}
+]
+
+class TimeoutSubprocess:
+    PIPE = subprocess.PIPE
+    TimeoutExpired = subprocess.TimeoutExpired
+
+    @staticmethod
+    def run(arguments, **_kwargs):
+        raise subprocess.TimeoutExpired(arguments, 30)
+
+timeout_namespace = {
+    "os": os,
+    "subprocess": TimeoutSubprocess,
+    "sys": sys,
+}
+exec(compile(ast.Module(body=remote_run_nodes, type_ignores=[]),
+             "remote-timeout", "exec"), timeout_namespace)
+timeout_error = io.StringIO()
+with contextlib.redirect_stderr(timeout_error):
+    try:
+        timeout_namespace["run"](["/usr/sbin/pvnctl", "doctor"], timeout=30)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("remote helper accepted a timed-out doctor command")
+assert "timed out after 30 seconds" in timeout_error.getvalue()
 
 
 # The real backend's staged-recovery probe accepts only the sole active seed,

@@ -275,10 +275,13 @@ def fail(message):
     print(message, file=sys.stderr)
     raise SystemExit(1)
 
-def run(arguments, check=True):
-    result = subprocess.run(arguments, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, check=False,
-                            env={**os.environ, "LC_ALL": "C"})
+def run(arguments, check=True, timeout=None):
+    try:
+        result = subprocess.run(arguments, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, check=False, timeout=timeout,
+                                env={**os.environ, "LC_ALL": "C"})
+    except subprocess.TimeoutExpired:
+        fail(f"{' '.join(arguments)} timed out after {timeout} seconds")
     if check and result.returncode != 0:
         fail(f"{' '.join(arguments)}: {result.stderr.strip() or result.stdout.strip()}")
     return result
@@ -1016,12 +1019,18 @@ elif action == "activate-node":
     print(json.dumps({"ready": True}))
 
 elif action == "node-status":
+    target_active = run(
+        ["systemctl", "is-active", "pvn-node.target"], check=False
+    ).stdout.strip() == "active"
     service_ready = run(
         ["systemctl", "is-active", "pvn-node-ready.service"], check=False
     ).stdout.strip() == "active"
-    doctor = run(["/usr/sbin/pvnctl", "doctor"], check=False).returncode == 0
+    doctor = run(
+        ["/usr/sbin/pvnctl", "doctor"], check=False, timeout=30
+    ).returncode == 0
     print(json.dumps({
-        "ready": service_ready and doctor,
+        "ready": target_active and service_ready and doctor,
+        "target_active": target_active,
         "service_ready": service_ready,
         "doctor": doctor,
         "marker": os.path.exists("/etc/pvn/node-enabled"),
@@ -1520,8 +1529,30 @@ class SystemBackend:
                     raise ControlPlaneError(
                         f"{prefix}: online/offline probe drift on {node.name} {name}"
                     )
+            rows = report.get("databases")
+            if not isinstance(rows, list) or len(rows) != len(DATABASES):
+                raise ControlPlaneError(
+                    f"{prefix}: live voter {node.name} database status is incomplete"
+                )
+            by_name = {row.get("database"): row for row in rows
+                       if isinstance(row, dict)}
+            if set(by_name) != set(DATABASES):
+                raise ControlPlaneError(
+                    f"{prefix}: live voter {node.name} database names drift"
+                )
+            if discovery.mode == "raft":
+                for name in DATABASES:
+                    row = by_name[name]
+                    info = databases[name]
+                    if row.get("cluster_id") != info.get("cluster_id") or \
+                            row.get("server_id") != info.get("server_id") or \
+                            row.get("address") != info.get("local_address"):
+                        raise ControlPlaneError(
+                            f"{prefix}: online/offline identity drift on {node.name} {name}"
+                        )
             status = self.node_status(node)
             if status.get("ready") is not True or \
+                    status.get("target_active") is not True or \
                     status.get("service_ready") is not True or \
                     status.get("doctor") is not True or status.get("marker") is not True:
                 raise ControlPlaneError(
@@ -1632,8 +1663,16 @@ class SystemBackend:
                 "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1", "--",
                 f"root@{self.node_addresses[name]}", remote_command,
             ]
-        result = subprocess.run(command, input=canonical_json(payload).decode(), text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        try:
+            result = subprocess.run(
+                command, input=canonical_json(payload).decode(), text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                timeout=180,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ControlPlaneError(
+                f"{name} {action} helper could not complete: {error}"
+            ) from error
         if result.returncode != 0:
             raise ControlPlaneError(f"{name} {action} failed: {result.stderr.strip() or result.stdout.strip()}")
         try:
