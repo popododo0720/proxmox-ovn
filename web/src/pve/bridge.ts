@@ -38,6 +38,12 @@ export interface PveNicUpdate {
   linkDown: boolean;
 }
 
+export interface PveQemuStatus {
+  status?: string;
+  qmpstatus?: string;
+  [key: string]: unknown;
+}
+
 export function readPveBridgeBootstrap(
   locationValue: Pick<Location, 'search'> = window.location,
   referrer = document.referrer,
@@ -83,6 +89,10 @@ export class PveBridge {
     return this.request('GET', this.qemuPath(node, vmid)) as Promise<Record<string, unknown>>;
   }
 
+  getQemuStatus(node: string, vmid: number): Promise<PveQemuStatus> {
+    return this.request('GET', this.qemuStatusPath(node, vmid)) as Promise<PveQemuStatus>;
+  }
+
   setQemuNic(node: string, vmid: number, update: PveNicUpdate): Promise<unknown> {
     this.assertDigestAndNic(update.digest, update.nic);
     if (!/^[A-Fa-f0-9]{2}(?::[A-Fa-f0-9]{2}){5}$/.test(update.macAddress)) {
@@ -109,10 +119,19 @@ export class PveBridge {
   }
 
   private qemuPath(node: string, vmid: number): string {
+    this.assertNodeAndVM(node, vmid);
+    return `/nodes/${encodeURIComponent(node)}/qemu/${vmid}/config`;
+  }
+
+  private qemuStatusPath(node: string, vmid: number): string {
+    this.assertNodeAndVM(node, vmid);
+    return `/nodes/${encodeURIComponent(node)}/qemu/${vmid}/status/current`;
+  }
+
+  private assertNodeAndVM(node: string, vmid: number): void {
     if (!/^[A-Za-z0-9._-]+$/.test(node) || !Number.isSafeInteger(vmid) || vmid <= 0) {
       throw new Error('Invalid PVE node or VM ID');
     }
-    return `/nodes/${encodeURIComponent(node)}/qemu/${vmid}/config`;
   }
 
   private assertDigestAndNic(digest: string, nic: string): void {

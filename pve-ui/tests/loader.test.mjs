@@ -100,6 +100,37 @@ test('bridge rejects the wrong origin and permits only an exact QEMU config path
   assert.equal(apiRequests[0].method, 'GET');
 });
 
+test('bridge permits read-only QEMU status but never status mutations', () => {
+  const { DatacenterConfig, frames, listeners, apiRequests } = harness();
+  const config = new DatacenterConfig();
+  config.initComponent();
+  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
+  panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
+  const frame = frames[0];
+  const url = new URL(frame.src);
+  const base = {
+    source: 'pvn-ui', type: 'pvn:pve:request', version: 1,
+    nonce: url.searchParams.get('pveBridgeNonce'),
+    path: '/nodes/pve-01/qemu/100/status/current',
+  };
+
+  listeners.get('message')({
+    origin: url.origin,
+    source: frame.contentWindow,
+    data: { ...base, id: 'status-read', method: 'GET' },
+  });
+  assert.equal(apiRequests.length, 1);
+  assert.equal(apiRequests[0].url, base.path);
+  assert.equal(apiRequests[0].method, 'GET');
+
+  listeners.get('message')({
+    origin: url.origin,
+    source: frame.contentWindow,
+    data: { ...base, id: 'status-write', method: 'PUT', params: { digest: 'a'.repeat(40), delete: 'net0' } },
+  });
+  assert.equal(apiRequests.length, 1);
+});
+
 test('bridge sends a nonce-bound response only to the manager origin', () => {
   const { DatacenterConfig, frames, listeners, apiRequests } = harness();
   const config = new DatacenterConfig();

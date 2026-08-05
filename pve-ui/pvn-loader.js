@@ -172,6 +172,10 @@
                 return;
             }
             var message = event.data;
+            var configPath = message && typeof message.path === 'string' &&
+                /^\/nodes\/[A-Za-z0-9._-]+\/qemu\/[1-9][0-9]*\/config$/.test(message.path);
+            var statusPath = message && typeof message.path === 'string' &&
+                /^\/nodes\/[A-Za-z0-9._-]+\/qemu\/[1-9][0-9]*\/status\/current$/.test(message.path);
             if (!validMessageShape(message) ||
                 message.source !== SOURCE_UI ||
                 message.type !== REQUEST_TYPE ||
@@ -180,7 +184,8 @@
                 typeof message.id !== 'string' ||
                 !/^[A-Za-z0-9_-]{1,128}$/.test(message.id) ||
                 (message.method !== 'GET' && message.method !== 'PUT') ||
-                !/^\/nodes\/[A-Za-z0-9._-]+\/qemu\/[1-9][0-9]*\/config$/.test(message.path)) {
+                (!configPath && !statusPath) ||
+                (statusPath && message.method !== 'GET')) {
                 return;
             }
             if (!window.Proxmox || !window.Proxmox.Utils || typeof window.Proxmox.Utils.API2Request !== 'function') {
