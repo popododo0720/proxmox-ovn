@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/pvnstack/proxmox-ovn/internal/config"
 	"github.com/pvnstack/proxmox-ovn/internal/diagnostic"
 	"github.com/pvnstack/proxmox-ovn/internal/nodestate"
+	"github.com/pvnstack/proxmox-ovn/internal/pki"
 )
 
 func main() {
@@ -36,9 +38,82 @@ func run(args []string) error {
 		return centralCommand(args[1:])
 	case "node":
 		return nodeCommand(args[1:])
+	case "pki":
+		return pkiCommand(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func pkiCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: pvnctl pki <init-ca|issue-node>")
+	}
+	switch args[0] {
+	case "init-ca":
+		return pkiInitCA(args[1:])
+	case "issue-node":
+		return pkiIssueNode(args[1:])
+	default:
+		return fmt.Errorf("unknown pki command %q", args[0])
+	}
+}
+
+func pkiInitCA(args []string) error {
+	flags := flag.NewFlagSet("pki init-ca", flag.ContinueOnError)
+	configPath := flags.String("config", config.DefaultPath, "PVN config path")
+	directory := flags.String("directory", "/etc/pvn/pki/ca", "CA output directory")
+	confirmation := flags.String("confirm", "", "exact PVN cluster ID")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := confirmedConfig(*configPath, *confirmation)
+	if err != nil {
+		return err
+	}
+	files, err := pki.CreateCA(pki.CAOptions{Directory: *directory, ClusterID: cfg.Cluster.ID})
+	if err != nil {
+		return err
+	}
+	return writeJSON(os.Stdout, files)
+}
+
+func pkiIssueNode(args []string) error {
+	flags := flag.NewFlagSet("pki issue-node", flag.ContinueOnError)
+	configPath := flags.String("config", config.DefaultPath, "PVN config path")
+	caCertificate := flags.String("ca-cert", "/etc/pvn/pki/ca/ca.pem", "CA certificate path")
+	caKey := flags.String("ca-key", "/etc/pvn/pki/ca/ca-key.pem", "CA private key path")
+	directory := flags.String("directory", "/etc/pvn/pki/nodes", "node certificate output directory")
+	name := flags.String("name", "", "PVE node/chassis name")
+	dnsNames := flags.String("dns", "", "comma-separated DNS subject names")
+	ipAddresses := flags.String("ips", "", "comma-separated IP subject addresses")
+	confirmation := flags.String("confirm", "", "exact PVN cluster ID")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if _, err := confirmedConfig(*configPath, *confirmation); err != nil {
+		return err
+	}
+	var addresses []net.IP
+	for _, raw := range splitList(*ipAddresses) {
+		address := net.ParseIP(raw)
+		if address == nil {
+			return fmt.Errorf("invalid certificate IP address %q", raw)
+		}
+		addresses = append(addresses, address)
+	}
+	files, err := pki.IssueNode(pki.IssueOptions{
+		CACertificate: *caCertificate,
+		CAKey:         *caKey,
+		Directory:     *directory,
+		Name:          *name,
+		DNSNames:      splitList(*dnsNames),
+		IPAddresses:   addresses,
+	})
+	if err != nil {
+		return err
+	}
+	return writeJSON(os.Stdout, files)
 }
 
 func doctor(args []string) error {
