@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,51 @@ type blockingRenderer struct {
 	started  chan struct{}
 	release  chan struct{}
 	once     sync.Once
+}
+
+type blockingDeleteRenderer struct {
+	delegate *FakeRenderer
+	started  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (renderer *blockingDeleteRenderer) Render(ctx context.Context, resource model.Resource) error {
+	return renderer.delegate.Render(ctx, resource)
+}
+
+func (renderer *blockingDeleteRenderer) Delete(ctx context.Context, resource model.Resource) error {
+	renderer.once.Do(func() { close(renderer.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-renderer.release:
+		return renderer.delegate.Delete(ctx, resource)
+	}
+}
+
+type renewalObservingStore struct {
+	controlstore.Store
+	renewed chan time.Time
+	fail    error
+}
+
+func (store *renewalObservingStore) RenewOperationLease(ctx context.Context, operationID string, expectedRevision int64, leaseOwner string, renewedAt time.Time) (*model.Operation, error) {
+	if store.fail != nil {
+		select {
+		case store.renewed <- renewedAt:
+		default:
+		}
+		return nil, store.fail
+	}
+	operation, err := store.Store.RenewOperationLease(ctx, operationID, expectedRevision, leaseOwner, renewedAt)
+	if err == nil {
+		select {
+		case store.renewed <- renewedAt:
+		default:
+		}
+	}
+	return operation, err
 }
 
 func (r *blockingRenderer) Render(ctx context.Context, resource model.Resource) error {
@@ -101,6 +147,26 @@ func createProject(t *testing.T, store controlstore.Store) *model.Project {
 		t.Fatal(err)
 	}
 	return resource.(*model.Project)
+}
+
+func waitForRenewalSpan(t *testing.T, renewed <-chan time.Time, span time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	var first time.Time
+	for {
+		select {
+		case timestamp := <-renewed:
+			if first.IsZero() {
+				first = timestamp
+			}
+			if timestamp.Sub(first) >= span {
+				return
+			}
+		case <-deadline.C:
+			t.Fatalf("writer lease was not renewed across %s", span)
+		}
+	}
 }
 
 func TestControllerRendersRevisionOnce(t *testing.T) {
@@ -431,7 +497,7 @@ func TestReconcileAllRecoversCrashAfterExternalWriteBeforeDeleteCheck(t *testing
 	}
 	operation := operationResource.(*model.Operation)
 	started := time.Now().UTC().Add(-operationLease - time.Minute)
-	if _, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, started, started.Add(-operationLease)); err != nil {
+	if _, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-crashed", started, started.Add(-operationLease)); err != nil {
 		t.Fatal(err)
 	}
 	if err := renderer.Render(context.Background(), project); err != nil {
@@ -542,5 +608,114 @@ func TestControllersShareRunningOperationLease(t *testing.T) {
 	}
 	if _, calls := renderer.state(); calls != 1 {
 		t.Fatalf("renderer calls=%d, want one durable operation owner", calls)
+	}
+}
+
+func TestHeartbeatKeepsBlockedRenderFencedPastLease(t *testing.T) {
+	const lease = 45 * time.Millisecond
+	baseStore := controlstore.NewMemory()
+	store := &renewalObservingStore{Store: baseStore, renewed: make(chan time.Time, 64)}
+	project := createProject(t, store)
+	delegate := NewFakeRenderer()
+	renderer := &blockingRenderer{delegate: delegate, started: make(chan struct{}), release: make(chan struct{})}
+	reconcileController := NewController(store, renderer, WithLeaseDuration(lease))
+	deleteController := NewController(store, renderer, WithLeaseDuration(lease))
+	done := make(chan error, 1)
+	go func() { done <- reconcileController.Reconcile(context.Background(), model.KindProject, project.ID) }()
+	<-renderer.started
+	waitForRenewalSpan(t, store.renewed, lease)
+
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-after-long-render")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteController.Delete(context.Background(), tombstone); !errors.Is(err, ErrReconcileLeaseActive) {
+		t.Fatalf("Delete() error=%v, want renewed writer lease", err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("Purge() error=%v, want renewed writer fence", err)
+	}
+	close(renderer.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteController.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("Get() error=%v, want purged tombstone", err)
+	}
+}
+
+func TestHeartbeatKeepsBlockedDeleteFencedPastLease(t *testing.T) {
+	const lease = 45 * time.Millisecond
+	baseStore := controlstore.NewMemory()
+	store := &renewalObservingStore{Store: baseStore, renewed: make(chan time.Time, 64)}
+	project := createProject(t, store)
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "begin-long-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegate := NewFakeRenderer()
+	renderer := &blockingDeleteRenderer{delegate: delegate, started: make(chan struct{}), release: make(chan struct{})}
+	first := NewController(store, renderer, WithLeaseDuration(lease))
+	second := NewController(store, renderer, WithLeaseDuration(lease))
+	done := make(chan error, 1)
+	go func() { done <- first.Delete(context.Background(), tombstone) }()
+	<-renderer.started
+	waitForRenewalSpan(t, store.renewed, lease)
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("Purge() error=%v, want running delete fence", err)
+	}
+	if err := second.Delete(context.Background(), tombstone); !errors.Is(err, ErrReconcileLeaseActive) {
+		t.Fatalf("concurrent Delete() error=%v, want active delete lease", err)
+	}
+	close(renderer.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHeartbeatLossCancelsBlockedRendererWithoutCompletingOperation(t *testing.T) {
+	baseStore := controlstore.NewMemory()
+	store := &renewalObservingStore{Store: baseStore, renewed: make(chan time.Time, 1), fail: controlstore.ErrPrecondition}
+	project := createProject(t, store)
+	renderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
+	controller := NewController(store, renderer, WithLeaseDuration(30*time.Millisecond))
+	done := make(chan error, 1)
+	go func() { done <- controller.Reconcile(context.Background(), model.KindProject, project.ID) }()
+	<-renderer.started
+	select {
+	case <-store.renewed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("heartbeat did not attempt renewal")
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "lost its writer lease") {
+		t.Fatalf("Reconcile() error=%v, want writer lease loss", err)
+	}
+	operations, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 || operations[0].(*model.Operation).OperationStatus != model.OperationRunning {
+		t.Fatalf("operation was completed after lease loss: %#v", operations)
+	}
+}
+
+func TestParentCancellationStopsHeartbeatAndReturnsContextError(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
+	controller := NewController(store, renderer, WithLeaseDuration(30*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- controller.Reconcile(ctx, model.KindProject, project.ID) }()
+	<-renderer.started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Reconcile() error=%v, want context canceled", err)
 	}
 }

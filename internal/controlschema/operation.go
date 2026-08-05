@@ -33,6 +33,7 @@ type Operation struct {
 	ID              string                   `ovsdb:"id"`
 	IdempotencyKey  string                   `ovsdb:"idempotency_key"`
 	LastError       string                   `ovsdb:"last_error"`
+	LeaseOwner      string                   `ovsdb:"lease_owner"`
 	OperationStatus OperationOperationStatus `ovsdb:"operation_status"`
 	Revision        int                      `ovsdb:"revision"`
 	StartedAt       string                   `ovsdb:"started_at"`

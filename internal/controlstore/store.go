@@ -42,7 +42,9 @@ type Store interface {
 	Get(context.Context, model.Kind, string) (model.Resource, error)
 	List(context.Context, model.Kind, ListOptions) ([]model.Resource, error)
 	Update(context.Context, model.Resource, int64, string) (model.Resource, bool, error)
-	ClaimReconcile(context.Context, string, int64, time.Time, time.Time) (*model.Operation, error)
+	ClaimReconcile(context.Context, string, int64, string, time.Time, time.Time) (*model.Operation, error)
+	ClaimDelete(context.Context, string, int64, string, time.Time, time.Time) (*model.Operation, error)
+	RenewOperationLease(context.Context, string, int64, string, time.Time) (*model.Operation, error)
 	FenceReconciles(context.Context, model.Kind, string, time.Time, time.Time) (bool, bool, error)
 	BeginDelete(context.Context, model.Kind, string, int64, string) (model.Resource, bool, error)
 	Purge(context.Context, model.Kind, string, int64) error

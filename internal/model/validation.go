@@ -333,6 +333,11 @@ func validateOperation(o *Operation) error {
 	if o.OperationStatus != OperationQueued && o.OperationStatus != OperationRunning && o.OperationStatus != OperationSucceeded && o.OperationStatus != OperationFailed {
 		return invalid("status", "is not recognized")
 	}
+	if o.OperationStatus == OperationRunning && (o.Action == "reconcile" || o.Action == "delete") {
+		if err := validateName("lease_owner", o.LeaseOwner); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

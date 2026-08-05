@@ -280,6 +280,7 @@
         "operation_status": {"type": {"key": {"type": "string", "enum": ["set", ["queued", "running", "succeeded", "failed"]]}}},
         "idempotency_key": {"type": "string"},
         "error": {"type": "string"},
+        "lease_owner": {"type": "string"},
         "started_at": {"type": "string"},
         "completed_at": {"type": "string"},
         "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},

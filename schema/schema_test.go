@@ -47,4 +47,7 @@ func TestPVNControlSchemaHasRequiredTablesAndIndexes(t *testing.T) {
 			t.Errorf("table %s has no unique id index", name)
 		}
 	}
+	if _, ok := document.Tables["Operation"].Columns["lease_owner"]; !ok {
+		t.Error("Operation table missing lease_owner")
+	}
 }

@@ -333,9 +333,17 @@ func TestStoreReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 		OperationStatus: model.OperationQueued,
 	}, "reconcile-fenced-project").(*model.Operation)
 	started := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
-	claimed, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, started, started.Add(-2*time.Minute))
+	claimed, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-ovsdb", started, started.Add(-2*time.Minute))
 	if err != nil || claimed.OperationStatus != model.OperationRunning || claimed.StartedAt == nil || !claimed.StartedAt.Equal(started) {
 		t.Fatalf("ClaimReconcile() operation=%#v err=%v", claimed, err)
+	}
+	if _, err := store.RenewOperationLease(context.Background(), claimed.ID, claimed.Revision, "lease-other", started.Add(time.Second)); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("wrong-owner RenewOperationLease() error=%v", err)
+	}
+	renewedAt := started.Add(time.Minute)
+	claimed, err = store.RenewOperationLease(context.Background(), claimed.ID, claimed.Revision, "lease-ovsdb", renewedAt)
+	if err != nil || claimed.Revision != operation.Revision+2 || claimed.StartedAt == nil || !claimed.StartedAt.Equal(started) || !claimed.UpdatedAt.Equal(renewedAt) {
+		t.Fatalf("RenewOperationLease() operation=%#v err=%v", claimed, err)
 	}
 	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-fenced-project")
 	if err != nil {
@@ -344,11 +352,11 @@ func TestStoreReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
 		t.Fatalf("Purge() error=%v, want reconcile fence", err)
 	}
-	active, recovered, err := store.FenceReconciles(context.Background(), model.KindProject, project.ID, started.Add(-time.Minute), started.Add(time.Minute))
+	active, recovered, err := store.FenceReconciles(context.Background(), model.KindProject, project.ID, renewedAt.Add(-time.Minute), renewedAt.Add(time.Minute))
 	if err != nil || !active || recovered {
 		t.Fatalf("live FenceReconciles() active=%v recovered=%v err=%v", active, recovered, err)
 	}
-	active, recovered, err = store.FenceReconciles(context.Background(), model.KindProject, project.ID, started.Add(time.Second), started.Add(3*time.Minute))
+	active, recovered, err = store.FenceReconciles(context.Background(), model.KindProject, project.ID, renewedAt.Add(time.Second), renewedAt.Add(3*time.Minute))
 	if err != nil || active || !recovered {
 		t.Fatalf("expired FenceReconciles() active=%v recovered=%v err=%v", active, recovered, err)
 	}
@@ -379,7 +387,7 @@ func TestStoreReconcileCannotStartAfterTombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
-	if _, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, now, now.Add(-2*time.Minute)); !errors.Is(err, controlstore.ErrPrecondition) {
+	if _, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-ovsdb", now, now.Add(-2*time.Minute)); !errors.Is(err, controlstore.ErrPrecondition) {
 		t.Fatalf("ClaimReconcile() error=%v, want inactive target precondition", err)
 	}
 	stored, err := store.Get(context.Background(), model.KindOperation, operation.ID)
@@ -393,6 +401,37 @@ func TestStoreReconcileCannotStartAfterTombstone(t *testing.T) {
 	queued.OperationStatus = model.OperationRunning
 	if _, _, err := store.Update(context.Background(), queued, queued.Revision, ""); !errors.Is(err, controlstore.ErrConflict) {
 		t.Fatalf("generic running transition error=%v", err)
+	}
+}
+
+func TestStoreDeleteLeaseBlocksPurgeUntilOwnerCompletes(t *testing.T) {
+	store := deterministicStore(newFakeDatabase())
+	project := mustCreate(t, store, &model.Project{Name: "delete-tenant", PoolID: "delete-pool"}, "delete-project").(*model.Project)
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "begin-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := mustCreate(t, store, &model.Operation{Action: "delete", TargetKind: model.KindProject, TargetID: project.ID, TargetRevision: tombstone.GetMetadata().Revision, OperationStatus: model.OperationQueued}, "delete-operation").(*model.Operation)
+	now := time.Date(2026, 8, 5, 3, 0, 0, 0, time.UTC)
+	claimed, err := store.ClaimDelete(context.Background(), operation.ID, operation.Revision, "lease-delete", now, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("Purge() error=%v, want delete lease fence", err)
+	}
+	claimed, err = store.RenewOperationLease(context.Background(), claimed.ID, claimed.Revision, "lease-delete", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed.OperationStatus = model.OperationSucceeded
+	completed := now.Add(2 * time.Second)
+	claimed.CompletedAt = &completed
+	if _, _, err := store.Update(context.Background(), claimed, claimed.Revision, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -415,7 +454,7 @@ func TestStoreClaimAndDeleteAreSerializedAcrossManagers(t *testing.T) {
 		now := time.Now().UTC()
 		go func() {
 			<-start
-			_, err := second.ClaimReconcile(context.Background(), operation.ID, operation.Revision, now, now.Add(-2*time.Minute))
+			_, err := second.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-ovsdb", now, now.Add(-2*time.Minute))
 			claimResult <- err
 		}()
 		go func() {

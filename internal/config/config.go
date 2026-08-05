@@ -172,6 +172,9 @@ func (c Config) Validate() error {
 	if c.Cluster.ReconcileEvery <= 0 {
 		problems = append(problems, "cluster.reconcile_every must be positive")
 	}
+	if c.Cluster.OrphanGrace < time.Minute {
+		problems = append(problems, "cluster.orphan_grace must be at least one minute")
+	}
 	if c.Agent.PollEvery <= 0 {
 		problems = append(problems, "agent.poll_every must be positive")
 	}

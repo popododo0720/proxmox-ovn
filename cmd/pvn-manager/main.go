@@ -42,6 +42,7 @@ type managerConfig struct {
 	ovnTLSCert      string
 	ovnTLSKey       string
 	reconcileEvery  time.Duration
+	orphanGrace     time.Duration
 	requireAllNodes bool
 	guestMTU        int
 	physnet         string
@@ -120,6 +121,9 @@ func run(arguments []string) error {
 	if defaults.reconcileEvery <= 0 {
 		return errors.New("reconcile interval must be positive")
 	}
+	if defaults.orphanGrace <= 0 {
+		return errors.New("orphan grace must be positive")
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	startupContext, startupCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -154,7 +158,7 @@ func run(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	controller := reconcile.NewController(store, renderer)
+	controller := reconcile.NewController(store, renderer, reconcile.WithLeaseDuration(defaults.orphanGrace))
 	var sessionProvider api.SessionProvider
 	if defaults.insecureNoAuth {
 		logger.Warn("PVE authentication is disabled; do not use this mode in production")
@@ -287,6 +291,7 @@ func applyClusterConfig(target *managerConfig, clusterConfig pvnconfig.Config, e
 	target.ovnTLSCert = clusterConfig.OVN.TLSCert
 	target.ovnTLSKey = clusterConfig.OVN.TLSKey
 	target.reconcileEvery = clusterConfig.Cluster.ReconcileEvery
+	target.orphanGrace = clusterConfig.Cluster.OrphanGrace
 	target.requireAllNodes = clusterConfig.Cluster.RequireAllNodes
 	target.guestMTU = clusterConfig.Networking.GuestMTU
 	target.physnet = clusterConfig.Networking.Physnet

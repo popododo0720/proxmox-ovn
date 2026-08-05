@@ -2,6 +2,8 @@ package reconcile
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -12,31 +14,57 @@ import (
 )
 
 // Renderer materializes one immutable desired resource revision. Implementations
-// must treat repeated calls for the same kind, id, and revision as idempotent.
+// must treat repeated calls for the same kind, id, and revision as idempotent
+// and stop issuing external writes after the context is cancelled.
 type Renderer interface {
 	Render(context.Context, model.Resource) error
 	Delete(context.Context, model.Resource) error
 }
 
 type Controller struct {
-	store    controlstore.Store
-	renderer Renderer
-	locksMu  sync.Mutex
-	locks    map[string]*sync.Mutex
+	store     controlstore.Store
+	renderer  Renderer
+	locksMu   sync.Mutex
+	locks     map[string]*sync.Mutex
+	lease     time.Duration
+	heartbeat time.Duration
+	now       func() time.Time
+	newOwner  func() string
 }
 
 // ErrReconcileLeaseActive means deletion was durably recorded but cleanup must
-// wait for a manager that is still allowed to write the target's realized
+// wait for a manager that is still allowed to change the target's realized
 // state. Callers must leave the tombstone in place and retry later.
 var ErrReconcileLeaseActive = errors.New("target has an active reconcile lease")
 
 const (
-	operationLease       = 2 * time.Minute
+	operationLease       = 5 * time.Minute
 	maxConvergencePasses = 8
+	maxHeartbeatInterval = 30 * time.Second
 )
 
-func NewController(store controlstore.Store, renderer Renderer) *Controller {
-	return &Controller{store: store, renderer: renderer, locks: make(map[string]*sync.Mutex)}
+type Option func(*Controller)
+
+// WithLeaseDuration uses the cluster orphan grace as the maximum interval
+// between durable writer heartbeats.
+func WithLeaseDuration(duration time.Duration) Option {
+	return func(controller *Controller) {
+		if duration > 0 {
+			controller.lease = duration
+			controller.heartbeat = heartbeatInterval(duration)
+		}
+	}
+}
+
+func NewController(store controlstore.Store, renderer Renderer, options ...Option) *Controller {
+	controller := &Controller{
+		store: store, renderer: renderer, locks: make(map[string]*sync.Mutex),
+		lease: operationLease, heartbeat: heartbeatInterval(operationLease), now: time.Now, newOwner: randomLeaseOwner,
+	}
+	for _, option := range options {
+		option(controller)
+	}
+	return controller
 }
 
 func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) error {
@@ -102,8 +130,8 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 		_, markErr := c.store.MarkReconciled(ctx, kind, id, meta.Revision, nil)
 		return markErr
 	}
-	now := time.Now().UTC()
-	claimed, claimErr := c.store.ClaimReconcile(ctx, op.ID, op.Revision, now, now.Add(-operationLease))
+	now := c.now().UTC()
+	claimed, claimErr := c.store.ClaimReconcile(ctx, op.ID, op.Revision, c.newOwner(), now, now.Add(-c.lease))
 	if claimErr != nil {
 		if errors.Is(claimErr, controlstore.ErrPrecondition) || errors.Is(claimErr, controlstore.ErrConflict) || errors.Is(claimErr, controlstore.ErrNotFound) {
 			// Another manager won the claim, or the exact desired revision
@@ -114,8 +142,16 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 	}
 	op = claimed
 
-	renderErr, markErr := c.renderUntilStable(ctx, resource)
-	completed := time.Now().UTC()
+	renderContext, heartbeat := c.startHeartbeat(ctx, op)
+	renderErr, markErr := c.renderUntilStable(renderContext, resource)
+	op, leaseErr := heartbeat.stop()
+	if leaseErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("reconcile %s %q lost its writer lease: %w", kind, id, leaseErr)
+	}
+	completed := c.now().UTC()
 	op.CompletedAt = &completed
 	if renderErr != nil {
 		op.OperationStatus = model.OperationFailed
@@ -232,8 +268,8 @@ func (c *Controller) Delete(ctx context.Context, resource model.Resource) error 
 	lock := c.resourceLock(kind, id)
 	lock.Lock()
 	defer lock.Unlock()
-	now := time.Now().UTC()
-	active, recovered, err := c.store.FenceReconciles(ctx, kind, id, now.Add(-operationLease), now)
+	now := c.now().UTC()
+	active, recovered, err := c.store.FenceReconciles(ctx, kind, id, now.Add(-c.lease), now)
 	if err != nil {
 		return fmt.Errorf("fence reconcile operations for deleting %s %q: %w", kind, id, err)
 	}
@@ -257,15 +293,25 @@ func (c *Controller) Delete(ctx context.Context, resource model.Resource) error 
 			return nil
 		}
 	}
-	now = time.Now().UTC()
-	op.OperationStatus, op.StartedAt, op.CompletedAt, op.Error = model.OperationRunning, &now, nil, ""
-	updated, _, err := c.store.Update(ctx, op, op.Revision, "")
-	if err != nil {
-		return fmt.Errorf("start delete operation: %w", err)
+	now = c.now().UTC()
+	claimed, claimErr := c.store.ClaimDelete(ctx, op.ID, op.Revision, c.newOwner(), now, now.Add(-c.lease))
+	if claimErr != nil {
+		if errors.Is(claimErr, controlstore.ErrPrecondition) || errors.Is(claimErr, controlstore.ErrConflict) {
+			return fmt.Errorf("%w for deleting %s %q", ErrReconcileLeaseActive, kind, id)
+		}
+		return fmt.Errorf("claim delete operation: %w", claimErr)
 	}
-	op = updated.(*model.Operation)
-	renderErr := c.renderer.Delete(ctx, resource)
-	completed := time.Now().UTC()
+	op = claimed
+	deleteContext, heartbeat := c.startHeartbeat(ctx, op)
+	renderErr := c.renderer.Delete(deleteContext, resource)
+	op, leaseErr := heartbeat.stop()
+	if leaseErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("delete %s %q lost its writer lease: %w", kind, id, leaseErr)
+	}
+	completed := c.now().UTC()
 	op.CompletedAt = &completed
 	if renderErr != nil {
 		op.OperationStatus, op.Error = model.OperationFailed, renderErr.Error()
@@ -298,4 +344,93 @@ func operationKey(kind model.Kind, id string, revision int64) string {
 
 func deleteOperationKey(kind model.Kind, id string, revision int64) string {
 	return fmt.Sprintf("delete:%s:%s:%d", kind, id, revision)
+}
+
+type operationHeartbeat struct {
+	cancel    context.CancelFunc
+	stopOnce  sync.Once
+	stopCh    chan struct{}
+	done      chan struct{}
+	mu        sync.Mutex
+	operation *model.Operation
+	err       error
+}
+
+func (c *Controller) startHeartbeat(parent context.Context, operation *model.Operation) (context.Context, *operationHeartbeat) {
+	workContext, cancel := context.WithCancel(parent)
+	heartbeat := &operationHeartbeat{
+		cancel: cancel, stopCh: make(chan struct{}), done: make(chan struct{}), operation: operation,
+	}
+	go func() {
+		defer close(heartbeat.done)
+		ticker := time.NewTicker(c.heartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeat.stopCh:
+				return
+			case <-workContext.Done():
+				heartbeat.fail(workContext.Err())
+				return
+			case <-ticker.C:
+				current := heartbeat.current()
+				renewed, err := c.store.RenewOperationLease(workContext, current.ID, current.Revision, current.LeaseOwner, c.now().UTC())
+				if err != nil {
+					heartbeat.fail(err)
+					cancel()
+					return
+				}
+				heartbeat.setOperation(renewed)
+			}
+		}
+	}()
+	return workContext, heartbeat
+}
+
+func (heartbeat *operationHeartbeat) current() *model.Operation {
+	heartbeat.mu.Lock()
+	defer heartbeat.mu.Unlock()
+	return heartbeat.operation
+}
+
+func (heartbeat *operationHeartbeat) setOperation(operation *model.Operation) {
+	heartbeat.mu.Lock()
+	heartbeat.operation = operation
+	heartbeat.mu.Unlock()
+}
+
+func (heartbeat *operationHeartbeat) fail(err error) {
+	heartbeat.mu.Lock()
+	if heartbeat.err == nil {
+		heartbeat.err = err
+	}
+	heartbeat.mu.Unlock()
+}
+
+func (heartbeat *operationHeartbeat) stop() (*model.Operation, error) {
+	heartbeat.stopOnce.Do(func() { close(heartbeat.stopCh) })
+	<-heartbeat.done
+	heartbeat.cancel()
+	heartbeat.mu.Lock()
+	defer heartbeat.mu.Unlock()
+	return heartbeat.operation, heartbeat.err
+}
+
+func heartbeatInterval(lease time.Duration) time.Duration {
+	interval := lease / 3
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+	if interval > maxHeartbeatInterval {
+		interval = maxHeartbeatInterval
+	}
+	return interval
+}
+
+func randomLeaseOwner() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return "lease-" + hex.EncodeToString(value[:])
+	}
+	return fmt.Sprintf("lease-%d", time.Now().UnixNano())
 }

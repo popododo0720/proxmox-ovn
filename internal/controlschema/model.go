@@ -536,6 +536,9 @@ var schema = `{
         "last_error": {
           "type": "string"
         },
+        "lease_owner": {
+          "type": "string"
+        },
         "operation_status": {
           "type": {
             "key": {

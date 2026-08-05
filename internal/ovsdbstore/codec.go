@@ -414,9 +414,10 @@ func decodeResource(kind model.Kind, row ovsdb.Row, refs *snapshot) (model.Resou
 		status, e5 := stringValue("operation_status")
 		key, e6 := stringValue("idempotency_key")
 		errorText, e7 := stringValue("error")
-		started, e8 := rowOptionalTime(row, "started_at")
-		completed, e9 := rowOptionalTime(row, "completed_at")
-		return &model.Operation{Metadata: meta, Action: action, TargetKind: model.Kind(targetKind), TargetID: targetID, TargetRevision: targetRevision, OperationStatus: model.OperationStatus(status), IdempotencyKey: key, Error: errorText, StartedAt: started, CompletedAt: completed}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9)
+		leaseOwner, e8 := stringValue("lease_owner")
+		started, e9 := rowOptionalTime(row, "started_at")
+		completed, e10 := rowOptionalTime(row, "completed_at")
+		return &model.Operation{Metadata: meta, Action: action, TargetKind: model.Kind(targetKind), TargetID: targetID, TargetRevision: targetRevision, OperationStatus: model.OperationStatus(status), IdempotencyKey: key, Error: errorText, LeaseOwner: leaseOwner, StartedAt: started, CompletedAt: completed}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10)
 	default:
 		return nil, fmt.Errorf("unsupported resource kind %q", kind)
 	}
@@ -531,7 +532,7 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 		row["roles"], row["enabled"], row["last_seen_at"] = encodeStringSet(roles), value.Enabled, encodeOptionalTime(value.LastSeenAt)
 	case *model.Operation:
 		row["action"], row["target_kind"], row["target_id"], row["target_revision"] = value.Action, string(value.TargetKind), value.TargetID, value.TargetRevision
-		row["operation_status"], row["idempotency_key"], row["error"] = string(value.OperationStatus), value.IdempotencyKey, value.Error
+		row["operation_status"], row["idempotency_key"], row["error"], row["lease_owner"] = string(value.OperationStatus), value.IdempotencyKey, value.Error, value.LeaseOwner
 		row["started_at"], row["completed_at"] = encodeOptionalTime(value.StartedAt), encodeOptionalTime(value.CompletedAt)
 	default:
 		return nil, fmt.Errorf("unsupported resource type %T", resource)

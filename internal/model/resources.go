@@ -266,6 +266,7 @@ type Operation struct {
 	OperationStatus OperationStatus `json:"status"`
 	IdempotencyKey  string          `json:"idempotency_key,omitempty"`
 	Error           string          `json:"error,omitempty"`
+	LeaseOwner      string          `json:"lease_owner,omitempty"`
 	StartedAt       *time.Time      `json:"started_at,omitempty"`
 	CompletedAt     *time.Time      `json:"completed_at,omitempty"`
 }
