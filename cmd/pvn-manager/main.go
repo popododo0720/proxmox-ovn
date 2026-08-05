@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ type managerConfig struct {
 	frameAncestors  []string
 	controlDB       []string
 	northbound      []string
+	southbound      []string
 	ovnTLSCA        string
 	ovnTLSCert      string
 	ovnTLSKey       string
@@ -154,6 +156,13 @@ func run(arguments []string) error {
 	if err := ovnClient.Probe(startupContext); err != nil {
 		return err
 	}
+	southboundProbe, err := ovnnb.NewSouthboundProbe(ovnnb.SouthboundProbeConfig{
+		Database: defaults.southbound, TLSCA: defaults.ovnTLSCA,
+		TLSCert: defaults.ovnTLSCert, TLSKey: defaults.ovnTLSKey, Timeout: 15,
+	})
+	if err != nil {
+		return fmt.Errorf("configure OVN Southbound probe: %w", err)
+	}
 	renderer, err := ovnnb.NewRenderer(ovnClient, store)
 	if err != nil {
 		return err
@@ -169,11 +178,13 @@ func run(arguments []string) error {
 		}
 		sessionProvider = provider
 	}
+	reconcilerHealth := newReconcilerHealth(defaults.reconcileEvery, time.Now)
 	handler, err := api.New(api.Options{
 		Store: store, Reconciler: controller, SessionProvider: sessionProvider, Logger: logger,
 		RequireAllNodes: defaults.requireAllNodes, NodeHeartbeatTTL: 2 * time.Minute,
 		GuestMTU: defaults.guestMTU, Physnet: defaults.physnet,
-		ClusterName: defaults.clusterName,
+		ClusterName: defaults.clusterName, NorthboundProbe: ovnClient,
+		SouthboundProbe: southboundProbe, ReconcilerProbe: reconcilerHealth,
 	})
 	if err != nil {
 		return err
@@ -211,10 +222,12 @@ func run(arguments []string) error {
 	}
 	reconcileContext, stopReconciler := context.WithCancel(context.Background())
 	defer stopReconciler()
-	if err := controller.ReconcileAll(startupContext); err != nil {
-		logger.Warn("initial PVN reconciliation incomplete", "error", err)
+	initialReconcileErr := controller.ReconcileAll(startupContext)
+	reconcilerHealth.record(initialReconcileErr)
+	if initialReconcileErr != nil {
+		logger.Warn("initial PVN reconciliation incomplete", "error", initialReconcileErr)
 	}
-	go reconcilePeriodically(reconcileContext, controller, defaults.reconcileEvery, logger)
+	go reconcilePeriodically(reconcileContext, controller, defaults.reconcileEvery, reconcilerHealth, logger)
 
 	serverErrors := make(chan error, 2)
 	go func() {
@@ -287,6 +300,7 @@ func applyClusterConfig(target *managerConfig, clusterConfig pvnconfig.Config, e
 	target.frameAncestors = append([]string(nil), clusterConfig.Security.AllowedOrigins...)
 	target.controlDB = append([]string(nil), clusterConfig.OVN.ControlDB...)
 	target.northbound = append([]string(nil), clusterConfig.OVN.Northbound...)
+	target.southbound = append([]string(nil), clusterConfig.OVN.Southbound...)
 	target.ovnTLSCA = clusterConfig.OVN.TLSCA
 	target.ovnTLSCert = clusterConfig.OVN.TLSCert
 	target.ovnTLSKey = clusterConfig.OVN.TLSKey
@@ -326,7 +340,45 @@ func loadMutualTLS(caPath, certificatePath, keyPath string) (*tls.Config, error)
 	}, nil
 }
 
-func reconcilePeriodically(ctx context.Context, controller *reconcile.Controller, interval time.Duration, logger *slog.Logger) {
+type reconcilerHealth struct {
+	mu          sync.RWMutex
+	interval    time.Duration
+	clock       func() time.Time
+	completedAt time.Time
+	err         error
+}
+
+func newReconcilerHealth(interval time.Duration, clock func() time.Time) *reconcilerHealth {
+	return &reconcilerHealth{interval: interval, clock: clock}
+}
+
+func (health *reconcilerHealth) record(err error) {
+	health.mu.Lock()
+	health.completedAt = health.clock().UTC()
+	health.err = err
+	health.mu.Unlock()
+}
+
+func (health *reconcilerHealth) Probe(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	health.mu.RLock()
+	completedAt, reconcileErr := health.completedAt, health.err
+	health.mu.RUnlock()
+	if completedAt.IsZero() {
+		return errors.New("full reconciliation has not completed")
+	}
+	if reconcileErr != nil {
+		return errors.New("last full reconciliation failed")
+	}
+	if health.clock().UTC().Sub(completedAt) > 3*health.interval {
+		return errors.New("last full reconciliation is stale")
+	}
+	return nil
+}
+
+func reconcilePeriodically(ctx context.Context, controller *reconcile.Controller, interval time.Duration, health *reconcilerHealth, logger *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -337,6 +389,7 @@ func reconcilePeriodically(ctx context.Context, controller *reconcile.Controller
 			reconcileContext, cancel := context.WithTimeout(ctx, interval)
 			err := controller.ReconcileAll(reconcileContext)
 			cancel()
+			health.record(err)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				logger.Warn("periodic PVN reconciliation incomplete", "error", err)
 			}

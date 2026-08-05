@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/buildinfo"
@@ -21,6 +22,7 @@ const (
 	maxRequestBody         = 1 << 20
 	defaultOperationsLimit = 100
 	maximumOperationsLimit = 500
+	defaultHealthTimeout   = 5 * time.Second
 )
 
 var ErrUnauthenticated = errors.New("PVE session is not authenticated")
@@ -54,6 +56,17 @@ type Reconciler interface {
 	Reconcile(context.Context, model.Kind, string) error
 }
 
+// HealthProber performs a read-only liveness check of one manager dependency.
+// Implementations must honor context cancellation and must not repair or
+// otherwise mutate the dependency while serving the health endpoint.
+type HealthProber interface {
+	Probe(context.Context) error
+}
+
+type HealthProbeFunc func(context.Context) error
+
+func (probe HealthProbeFunc) Probe(ctx context.Context) error { return probe(ctx) }
+
 type DeletionReconciler interface {
 	Delete(context.Context, model.Resource) error
 }
@@ -69,6 +82,10 @@ type Options struct {
 	GuestMTU         int
 	Physnet          string
 	ClusterName      string
+	NorthboundProbe  HealthProber
+	SouthboundProbe  HealthProber
+	ReconcilerProbe  HealthProber
+	HealthTimeout    time.Duration
 }
 
 type Server struct {
@@ -80,6 +97,10 @@ type Server struct {
 	guestMTU        int
 	physnet         string
 	clusterName     string
+	northboundProbe HealthProber
+	southboundProbe HealthProber
+	reconcilerProbe HealthProber
+	healthTimeout   time.Duration
 }
 
 type sessionContextKey struct{}
@@ -103,10 +124,15 @@ func New(options Options) (*Server, error) {
 	if options.GuestMTU < 576 || options.GuestMTU > 9000 {
 		return nil, errors.New("API guest MTU must be between 576 and 9000")
 	}
+	if options.HealthTimeout <= 0 {
+		options.HealthTimeout = defaultHealthTimeout
+	}
 	return &Server{
 		store: options.Store, reconciler: options.Reconciler, sessionProvider: options.SessionProvider,
 		logger: options.Logger, clusterGate: newClusterCapacityGate(options.RequireAllNodes, options.NodeHeartbeatTTL, options.Clock),
 		guestMTU: options.GuestMTU, physnet: strings.TrimSpace(options.Physnet), clusterName: strings.TrimSpace(options.ClusterName),
+		northboundProbe: options.NorthboundProbe, southboundProbe: options.SouthboundProbe,
+		reconcilerProbe: options.ReconcilerProbe, healthTimeout: options.HealthTimeout,
 	}, nil
 }
 
@@ -187,11 +213,63 @@ func (s *Server) health(writer http.ResponseWriter, request *http.Request) {
 		methodNotAllowed(writer, http.MethodGet)
 		return
 	}
-	status := s.clusterGate.status(request.Context(), s.store)
+	capacity := s.clusterGate.status(request.Context(), s.store)
+	components := s.componentHealth(request.Context())
+	status := capacity.Label()
+	for _, component := range components {
+		if component != "ready" {
+			status = "degraded"
+			break
+		}
+	}
 	writeJSON(writer, http.StatusOK, map[string]any{"data": map[string]any{
-		"status": status.Label(), "time": s.clusterGate.now().UTC(), "cluster": s.clusterName,
-		"version": buildinfo.Version, "capacity": status,
+		"status": status, "time": s.clusterGate.now().UTC(), "cluster": s.clusterName,
+		"version": buildinfo.Version, "capacity": capacity,
+		"database": components["database"], "ovn_northbound": components["ovn_northbound"],
+		"ovn_southbound": components["ovn_southbound"], "reconciler": components["reconciler"],
 	}})
+}
+
+func (s *Server) componentHealth(parent context.Context) map[string]string {
+	ctx, cancel := context.WithTimeout(parent, s.healthTimeout)
+	defer cancel()
+
+	type componentProbe struct {
+		name  string
+		probe HealthProber
+	}
+	probes := []componentProbe{
+		{name: "database", probe: HealthProbeFunc(func(ctx context.Context) error {
+			_, err := s.store.List(ctx, model.KindOperation, controlstore.ListOptions{Limit: 1})
+			return err
+		})},
+		{name: "ovn_northbound", probe: s.northboundProbe},
+		{name: "ovn_southbound", probe: s.southboundProbe},
+		{name: "reconciler", probe: s.reconcilerProbe},
+	}
+	statuses := make([]string, len(probes))
+	var wait sync.WaitGroup
+	wait.Add(len(probes))
+	for index, item := range probes {
+		go func() {
+			defer wait.Done()
+			if item.probe == nil {
+				statuses[index] = "unavailable"
+				return
+			}
+			if err := item.probe.Probe(ctx); err != nil {
+				statuses[index] = "degraded"
+				return
+			}
+			statuses[index] = "ready"
+		}()
+	}
+	wait.Wait()
+	result := make(map[string]string, len(probes))
+	for index, item := range probes {
+		result[item.name] = statuses[index]
+	}
+	return result
 }
 
 func (s *Server) session(writer http.ResponseWriter, request *http.Request) {

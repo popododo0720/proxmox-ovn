@@ -32,14 +32,16 @@ export interface SessionInfo {
   expires_at?: string;
 }
 
+export type OperationalHealth = 'ready' | 'degraded' | 'unavailable';
+
 export interface HealthStatus {
   status: string;
   version?: string;
   cluster?: string;
-  database?: string;
-  ovn_northbound?: string;
-  ovn_southbound?: string;
-  reconciler?: string;
+  database: OperationalHealth;
+  ovn_northbound: OperationalHealth;
+  ovn_southbound: OperationalHealth;
+  reconciler: OperationalHealth;
   capacity?: {
     ready: boolean;
     reason?: string;

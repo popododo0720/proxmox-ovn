@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,6 +25,7 @@ func TestApplyClusterConfigHonorsExplicitFlags(t *testing.T) {
 	cluster.Security.AllowedOrigins = []string{"https://pve.example:8006"}
 	cluster.OVN.ControlDB = []string{"ssl:192.0.2.10:6645"}
 	cluster.OVN.Northbound = []string{"ssl:192.0.2.10:6641"}
+	cluster.OVN.Southbound = []string{"ssl:192.0.2.10:6642"}
 	cluster.OVN.TLSCA = "/etc/pvn/pki/ca.pem"
 	cluster.OVN.TLSCert = "/etc/pvn/pki/node.pem"
 	cluster.OVN.TLSKey = "/etc/pvn/pki/node-key.pem"
@@ -36,8 +39,29 @@ func TestApplyClusterConfigHonorsExplicitFlags(t *testing.T) {
 	if len(target.frameAncestors) != 1 || target.frameAncestors[0] != "https://pve.example:8006" {
 		t.Fatalf("frame ancestors=%v", target.frameAncestors)
 	}
-	if len(target.controlDB) != 1 || len(target.northbound) != 1 || target.ovnTLSCA != cluster.OVN.TLSCA || target.reconcileEvery != cluster.Cluster.ReconcileEvery {
+	if len(target.controlDB) != 1 || len(target.northbound) != 1 || len(target.southbound) != 1 || target.southbound[0] != cluster.OVN.Southbound[0] || target.ovnTLSCA != cluster.OVN.TLSCA || target.reconcileEvery != cluster.Cluster.ReconcileEvery {
 		t.Fatalf("OVN settings not applied: %#v", target)
+	}
+}
+
+func TestReconcilerHealthTracksSuccessfulFailedAndStalePasses(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	health := newReconcilerHealth(time.Minute, func() time.Time { return now })
+	if err := health.Probe(context.Background()); err == nil {
+		t.Fatal("reconciler was ready before its first full pass")
+	}
+	health.record(nil)
+	if err := health.Probe(context.Background()); err != nil {
+		t.Fatalf("successful pass was not ready: %v", err)
+	}
+	health.record(errors.New("render failed"))
+	if err := health.Probe(context.Background()); err == nil {
+		t.Fatal("failed pass was reported ready")
+	}
+	health.record(nil)
+	now = now.Add(3*time.Minute + time.Second)
+	if err := health.Probe(context.Background()); err == nil {
+		t.Fatal("stale pass was reported ready")
 	}
 }
 

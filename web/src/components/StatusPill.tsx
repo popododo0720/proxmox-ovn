@@ -1,8 +1,8 @@
 export function StatusPill({ value }: { value: unknown }) {
   const label = String(value ?? 'unknown');
-  const tone = /^(active|online|ready|succeeded|complete|completed|bound|leader|voter)$/i.test(label)
+  const tone = /^(ok|active|online|ready|succeeded|complete|completed|bound|leader|voter)$/i.test(label)
     ? 'good'
-    : /^(error|failed|offline|degraded|blocked)$/i.test(label)
+    : /^(error|failed|offline|degraded|blocked|unavailable)$/i.test(label)
       ? 'bad'
       : /^(creating|updating|deleting|running|pending|queued)$/i.test(label)
         ? 'busy'

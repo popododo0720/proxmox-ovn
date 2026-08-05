@@ -99,5 +99,5 @@ function Metric({ label, value, detail }: { label: string; value: number; detail
 }
 
 function HealthRow({ label, value }: { label: string; value: unknown }) {
-  return <div className="health-row"><span>{label}</span><StatusPill value={value || 'unknown'} /></div>;
+  return <div className="health-row"><span>{label}</span><StatusPill value={value} /></div>;
 }
