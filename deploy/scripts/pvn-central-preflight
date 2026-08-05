@@ -41,6 +41,10 @@ done
     fail "PVN_CONTROL_DB_FILE must use the packaged database path"
 [ "${PVN_CONTROL_PORT:-}" = 6645 ] ||
     fail "PVN_CONTROL_PORT must be explicitly set to 6645"
+[ -n "${PVN_OVN_LISTEN:-}" ] ||
+    fail "PVN_OVN_LISTEN must be explicitly set"
+[ "${PVN_OVN_LISTEN:-}" = "${PVN_CONTROL_LISTEN:-}" ] ||
+    fail "PVN_OVN_LISTEN must match the node-local PVN_CONTROL_LISTEN address"
 [ "${PVN_CONTROL_TLS_CA:-/etc/pvn/pki/ca.pem}" = /etc/pvn/pki/ca.pem ] ||
     fail "PVN_CONTROL_TLS_CA must use the packaged CA path"
 [ "${PVN_CONTROL_TLS_CERT:-/etc/pvn/pki/node.pem}" = /etc/pvn/pki/node.pem ] ||
