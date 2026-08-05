@@ -8,6 +8,9 @@ for script in deploy/scripts/* packaging/debian/pvn-node.postinst packaging/debi
     sh -n "$script"
 done
 
+deploy/tests/pvn-cluster-install-test.sh
+deploy/tests/pvn-install-test.sh
+
 if grep -R -n -E '(^|[[:space:]])(ovs-vsctl|ip)[[:space:]].*(add-br|add-port).*br-provider' deploy packaging; then
     echo "package must never create or attach a physical provider bridge" >&2
     exit 1

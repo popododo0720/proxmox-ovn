@@ -9,7 +9,7 @@ LDFLAGS := -s -w \
 	-X github.com/pvnstack/proxmox-ovn/internal/buildinfo.Commit=$(COMMIT) \
 	-X github.com/pvnstack/proxmox-ovn/internal/buildinfo.Date=$(BUILD_DATE)
 
-.PHONY: all build web-build test test-race web-test ui-test vet fmt-check package-check deb clean
+.PHONY: all build web-build test test-race web-test ui-test vet fmt-check package-check deb release clean
 
 all: test build
 
@@ -81,6 +81,15 @@ deb: package-check web-build ui-test
 	pvn_deb="dist/pvn-node_$(DEB_VERSION)_$${pvn_arch}.deb"; \
 	dpkg-deb --root-owner-group --build "$$pvn_root" "$$pvn_deb"; \
 	packaging/tests/package-check.sh "$$pvn_deb"
+
+release: deb
+	@set -eu; \
+	pvn_arch=$$(dpkg --print-architecture); \
+	pvn_deb="pvn-node_$(DEB_VERSION)_$${pvn_arch}.deb"; \
+	install -m 0755 deploy/scripts/pvn-install.sh dist/pvn-install.sh; \
+	install -m 0755 deploy/scripts/pvn-cluster-install dist/pvn-cluster-install; \
+	cd dist; \
+	sha256sum "$$pvn_deb" pvn-cluster-install pvn-install.sh > SHA256SUMS
 
 clean:
 	rm -rf bin coverage dist
