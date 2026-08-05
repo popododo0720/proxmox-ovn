@@ -321,6 +321,9 @@ func validateOperation(o *Operation) error {
 	if err := required("action", o.Action); err != nil {
 		return err
 	}
+	if err := required("idempotency_key", o.IdempotencyKey); err != nil {
+		return err
+	}
 	if !o.TargetKind.Valid() || o.TargetKind == KindOperation {
 		return invalid("target_kind", "must identify a non-operation resource")
 	}

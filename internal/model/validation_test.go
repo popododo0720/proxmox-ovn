@@ -59,6 +59,8 @@ func TestResourceValidation(t *testing.T) {
 		{"security rule remote conflict", &SecurityGroupRule{ProjectID: "p", SecurityGroupID: "sg", Direction: DirectionIngress, EtherType: EtherTypeIPv4, RemoteCIDR: "10.0.0.0/8", RemoteGroupID: "other", Action: ActionAllow}, false},
 		{"node", &Node{Name: "pve01", ChassisID: "chassis-1", Roles: []NodeRole{NodeRoleCompute, NodeRoleGateway}}, true},
 		{"node duplicate role", &Node{Name: "pve01", ChassisID: "chassis-1", Roles: []NodeRole{NodeRoleCompute, NodeRoleCompute}}, false},
+		{"operation", &Operation{Action: "reconcile", TargetKind: KindNetwork, TargetID: "network-id", TargetRevision: 1, IdempotencyKey: "reconcile:network:network-id:1", OperationStatus: OperationQueued}, true},
+		{"operation without idempotency", &Operation{Action: "reconcile", TargetKind: KindNetwork, TargetID: "network-id", TargetRevision: 1, OperationStatus: OperationQueued}, false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

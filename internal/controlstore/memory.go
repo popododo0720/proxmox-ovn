@@ -91,6 +91,9 @@ func (s *Memory) Create(ctx context.Context, resource model.Resource, key string
 	if err != nil {
 		return nil, false, err
 	}
+	if operation, ok := copyResource.(*model.Operation); ok && operation.IdempotencyKey == "" {
+		operation.IdempotencyKey = key
+	}
 	meta := copyResource.GetMetadata()
 	if meta.ID == "" {
 		meta.ID = s.newID()
@@ -663,6 +666,14 @@ func conflictField(candidate, existing model.Resource) string {
 		right := existing.(*model.SecurityGroup)
 		if left.ProjectID == right.ProjectID && left.Name == right.Name {
 			return "project_id,name"
+		}
+	case *model.Operation:
+		right := existing.(*model.Operation)
+		if left.IdempotencyKey == right.IdempotencyKey {
+			return "idempotency_key"
+		}
+		if left.TargetKind == right.TargetKind && left.TargetID == right.TargetID && left.TargetRevision == right.TargetRevision {
+			return "target_kind,target_id,target_revision"
 		}
 	case *model.Node:
 		right := existing.(*model.Node)

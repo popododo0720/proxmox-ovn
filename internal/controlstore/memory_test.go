@@ -254,6 +254,18 @@ func TestMemoryContextCancellation(t *testing.T) {
 	}
 }
 
+func TestMemoryOperationUsesRequestIdempotencyKey(t *testing.T) {
+	store := deterministicStore()
+	operation := &model.Operation{Action: "reconcile", TargetKind: model.KindNetwork, TargetID: "network-id", TargetRevision: 1}
+	created := mustCreate(t, store, operation, "reconcile:network:network-id:1").(*model.Operation)
+	if created.IdempotencyKey != "reconcile:network:network-id:1" {
+		t.Fatalf("idempotency key = %q", created.IdempotencyKey)
+	}
+	if _, _, err := store.Create(context.Background(), &model.Operation{Action: "retry", TargetKind: model.KindNetwork, TargetID: "network-id", TargetRevision: 1}, "retry-key"); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("duplicate target revision error = %v", err)
+	}
+}
+
 func TestMemoryDeleteTombstoneMustBePurged(t *testing.T) {
 	store := deterministicStore()
 	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool"}, "create").(*model.Project)
