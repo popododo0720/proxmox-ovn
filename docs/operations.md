@@ -14,11 +14,23 @@ their individual controller, database, and northd units instead. If OVN was
 already used by another system, do not install PVN until that ownership is
 resolved.
 
-## 1. Read-only discovery
+## 1. Inventory and read-only discovery
 
 The requested three-node deployment inventory is installed as
-`inventory/pve-cluster-192.168.0.example`; its entries are management
-addresses only. Before writing configuration, discover on every node:
+`inventory/pve-cluster-192.168.0.example`. It must list the full PVE cluster
+membership exactly once in `PVN_TARGET_NODES`; the installer parses that field
+and never sources the file. Entries are management SSH destinations only.
+Pass the root SSH private key separately with `--identity`; do not store a
+password or private key in the inventory.
+
+Before running the installer, verify and populate the deployment host's SSH
+`known_hosts` entries through a trusted channel. The installer requires
+strict host-key checking and root public-key authentication. It disables
+password and keyboard-interactive authentication, uses only the supplied key,
+and never prompts for credentials.
+
+The package-safety preflight is not a topology-readiness check. Before writing
+configuration, separately discover on every node:
 
 - PVE hostname, cluster membership, quorum, and PVE major version;
 - management and intended Geneve addresses, routes, and underlay MTU;
@@ -29,22 +41,119 @@ Do not infer a Geneve address, provider bridge, or physical uplink from the
 management addresses. PVN never creates a provider bridge, attaches a physical
 NIC, changes a host address, or rewrites `/etc/network/interfaces`.
 
-After key-based SSH access is available, collect the same read-only report from
-the inventory nodes before installation:
+After key-based SSH access is available, collect the same read-only topology
+report from the example inventory nodes before activation:
 
 ```sh
-. deploy/inventory/pve-cluster-192.168.0.example
+PVN_IDENTITY=/root/.ssh/id_ed25519
 mkdir -p ./pvn-discovery
-for host in $PVN_TARGET_NODES; do
-  ssh -o BatchMode=yes root@"$host" 'sh -s' \
+for host in 192.168.0.78 192.168.0.80 192.168.0.126; do
+  ssh -i "$PVN_IDENTITY" -o BatchMode=yes \
+    -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+    -o PubkeyAuthentication=yes -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=yes root@"$host" 'sh -s' \
     < deploy/scripts/pvn-host-discover > "./pvn-discovery/$host.txt"
 done
 ```
 
-## 2. Install the same package everywhere
+PVN never infers a Geneve address, provider bridge, physical uplink, VLAN
+policy, or gateway path from a management address. No package or installer
+phase auto-wires a provider network.
 
-To prevent Debian dependency installation from briefly starting its aggregate
-OVN units, pre-mask them before installing the package and dependencies:
+## 2. Safe cluster package stage
+
+The intended release entry point is:
+
+```sh
+bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)"
+```
+
+`RELEASE_HOST` is a placeholder, not a live public endpoint. When hosting a
+release locally, publish `pvn-install.sh` and a release directory containing
+the versioned `pvn-node` DEB, `pvn-cluster-install`, and `SHA256SUMS`. The
+bootstrap accepts only an HTTPS release directory, downloads the three release
+files into a private temporary directory, verifies the DEB and cluster
+installer against `SHA256SUMS`, and removes the directory on exit. With no
+arguments it prompts on the terminal for the inventory and private-key paths,
+then runs the read-only preflight first. After a successful preflight it asks
+for the exact PVE cluster name. Press Enter to stop without installing; only
+the matching cluster name enters the package-apply phase.
+
+Use the hosted bootstrap's `install` phase first as a dry run:
+
+```sh
+bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)" pvn-install.sh \
+  install --inventory /path/to/inventory --identity /root/.ssh/id_ed25519 \
+  --release-base-url https://RELEASE_HOST/releases/v0.1.1
+```
+
+After reviewing every target and the printed cluster name, repeat with both
+write gates:
+
+```sh
+bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)" pvn-install.sh \
+  install --inventory /path/to/inventory --identity /root/.ssh/id_ed25519 \
+  --release-base-url https://RELEASE_HOST/releases/v0.1.1 \
+  --apply --confirm CLUSTER_ID
+```
+
+From a source checkout, build the DEB, set the three local paths, and run the
+underlying installer directly:
+
+```sh
+make deb
+PVN_INVENTORY=deploy/inventory/pve-cluster-192.168.0.example
+PVN_IDENTITY=/root/.ssh/id_ed25519
+PVN_DEB=dist/pvn-node_0.1.1_amd64.deb
+
+./deploy/scripts/pvn-cluster-install preflight \
+  --inventory "$PVN_INVENTORY" --identity "$PVN_IDENTITY"
+```
+
+Preflight is always read-only. It connects to every inventory node and rejects
+missing quorum, a non-PVE-9 node, inconsistent cluster names or architectures,
+an incomplete inventory, active PVN/OVN services, enabled PVN targets,
+activation markers, incomplete `pvn-node` package state, or an unsupported PVE
+UI template. All nodes must pass before the command succeeds.
+
+Preview package installation without changing a node:
+
+```sh
+./deploy/scripts/pvn-cluster-install install \
+  --inventory "$PVN_INVENTORY" --identity "$PVN_IDENTITY" --deb "$PVN_DEB"
+```
+
+`install` also defaults to a dry run. It prints the package version and digest,
+the exact target list, and the discovered value required by `--confirm`. After
+reviewing that output, perform only the package stage:
+
+```sh
+./deploy/scripts/pvn-cluster-install install \
+  --inventory "$PVN_INVENTORY" --identity "$PVN_IDENTITY" --deb "$PVN_DEB" \
+  --apply --confirm CLUSTER_ID
+```
+
+Immediately before each node's first change, the installer repeats its safety
+preflight. It stages the DEB in a private temporary path, verifies its SHA-256,
+masks `ovn-host.service` and `ovn-central.service` before apt can start them,
+installs the package, verifies the installed version and PVE UI hook, confirms
+that PVN remains disabled and inactive, and removes the staged file. A failure
+stops before the next node; nodes already completed remain installed but
+inactive, so investigate the failure and then rerun the same command.
+
+This completes package distribution only. It does **not** create `br-int` or a
+provider bridge, attach an uplink, edit `/etc/network/interfaces`, select
+Geneve/control addresses, install PKI or configuration, initialize PVN/OVN
+databases, create either activation marker, or enable a PVN target. Continue
+with the topology, bootstrap, and activation sections below as separate
+operator decisions.
+
+### Manual single-node package command
+
+If the phased installer cannot be used, preserve the same ordering on each
+online node. To prevent Debian dependency installation from briefly starting
+its aggregate OVN units, pre-mask them before installing the package and
+dependencies:
 
 ```sh
 systemctl mask ovn-host.service ovn-central.service

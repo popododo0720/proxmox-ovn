@@ -1,9 +1,12 @@
-# Deployment inventory for the requested PVE cluster. These are management
-# addresses only; discover hostnames, Geneve addresses, MTU, routes, uplinks,
-# and provider bridges on each node before rendering any node configuration.
+# Package-stage inventory for the requested PVE cluster. pvn-cluster-install
+# parses this file; it never sources it. Exactly one PVN_TARGET_NODES assignment
+# is supported, and it must contain every PVE cluster member once.
+#
+# These are root SSH management destinations only. Pass a verified private key
+# separately with --identity; password authentication is never used.
 PVN_TARGET_NODES="192.168.0.78 192.168.0.80 192.168.0.126"
 
-# Intentionally unset until read-only host discovery succeeds.
-PVN_PROVIDER_BRIDGE=
-PVN_PROVIDER_UPLINK=
-PVN_ENCAP_NETWORK=
+# Geneve/control addresses, MTU, routes, provider bridges, physical uplinks,
+# VLAN policy, and gateways intentionally do not belong in this inventory.
+# Discover and configure them in the later topology phase. The cluster
+# installer never creates a bridge or auto-wires a provider uplink.
