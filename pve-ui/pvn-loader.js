@@ -219,7 +219,7 @@
             xtype: 'panel',
             itemId: 'pvn',
             title: 'PVN',
-            iconCls: 'fa fa-project-diagram',
+            iconCls: 'fa fa-sitemap',
             layout: 'fit',
             border: false,
             listeners: {
