@@ -1,7 +1,7 @@
 proxmox-ovn (0.2.11) unstable; urgency=medium
 
   * Reconnect long-running managers after PVN Control DB rolling restarts.
-  * Use OVN-assigned row identities for OVN 25.03 compatibility.
+  * Use OVN 25.03-compatible UUID lookups and atomic attached rows.
 
  -- PVN Project <root@localhost>  Wed, 05 Aug 2026 12:46:00 +0000
 
