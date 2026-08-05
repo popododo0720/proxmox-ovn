@@ -97,9 +97,35 @@ make_manifest
 
 INVENTORY=$WORK/inventory
 IDENTITY=$WORK/id_ed25519
+MEMBERS=$WORK/members.json
 printf '%s\n' 'PVN_TARGET_NODES="node-a node-b"' > "$INVENTORY"
 : > "$IDENTITY"
 chmod 0600 "$IDENTITY"
+
+write_members() {
+    pvn_member_count=$1
+    case "$pvn_member_count" in
+        1)
+            cat > "$MEMBERS" <<'EOF'
+{"nodename":"node-a","version":7,"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"}}}
+EOF
+            ;;
+        2)
+            cat > "$MEMBERS" <<'EOF'
+{"nodename":"node-a","version":7,"cluster":{"name":"lab-cluster","version":9,"nodes":2,"quorate":1},"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"},"node-b":{"id":2,"online":1,"ip":"192.0.2.12"}}}
+EOF
+            ;;
+        3)
+            cat > "$MEMBERS" <<'EOF'
+{"nodename":"node-a","version":7,"cluster":{"name":"lab-cluster","version":9,"nodes":3,"quorate":1},"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"},"node-b":{"id":2,"online":1,"ip":"192.0.2.12"},"node-c":{"id":3,"online":1,"ip":"192.0.2.13"}}}
+EOF
+            ;;
+        *) fail "unsupported test membership count: $pvn_member_count" ;;
+    esac
+    chmod 0600 "$MEMBERS"
+}
+
+write_members 3
 
 export PATH="$BIN:$PATH"
 export PVN_TEST_ASSETS=$ASSETS
@@ -127,6 +153,7 @@ run_bootstrap() {
 
 run_local_bootstrap() {
     PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 \
+    PVN_CP_MEMBERS=$MEMBERS \
     "$BOOTSTRAP" "$@"
 }
 
@@ -181,6 +208,48 @@ EOF
 cmp "$WORK/expected-setup.log" "$SETUP_LOG" ||
     fail "full install did not run the topology/control-plane sequence"
 assert_temp_cleaned
+
+# A standalone node remains a supported full-setup placement.
+write_members 1
+reset_logs
+PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=standalone-node-a PVN_FULL=1 \
+    PVN_GENEVE_CIDR=192.168.100.0/24 \
+    PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+    PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+    PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+    PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+    run_local_bootstrap > "$WORK/standalone-full-apply.out"
+cat > "$WORK/expected-standalone-setup.log" <<'EOF'
+topology plan --geneve-cidr 192.168.100.0/24 --provider-cidr 192.168.200.0/24 --guest-mtu 1300
+topology apply --geneve-cidr 192.168.100.0/24 --provider-cidr 192.168.200.0/24 --guest-mtu 1300 --provider-port-ready OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP --confirm standalone-node-a
+control plan
+control apply --confirm standalone-node-a
+EOF
+cmp "$WORK/expected-standalone-setup.log" "$SETUP_LOG" ||
+    fail "standalone full install did not preserve the setup sequence"
+assert_temp_cleaned
+
+# The package stage may support other cluster sizes, but automated control-plane
+# activation currently supports only one or three nodes. Reject an unsupported
+# cluster before even the read-only topology plan, and especially before apply.
+write_members 2
+reset_logs
+if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
+    PVN_GENEVE_CIDR=192.168.100.0/24 \
+    PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+    PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+    PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+    PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+    run_local_bootstrap > "$WORK/unsupported-full.out" 2>&1
+then
+    fail "unsupported cluster reached full setup"
+fi
+grep -q 'supports exactly one or three nodes, found 2' \
+    "$WORK/unsupported-full.out" || fail "unsupported cluster error was unclear"
+[ ! -s "$SETUP_LOG" ] ||
+    fail "unsupported cluster invoked topology/control-plane tooling"
+assert_temp_cleaned
+write_members 3
 
 reset_logs
 if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
@@ -321,5 +390,23 @@ sed -n '1p' "$INSTALLER_LOG" | grep -q '^preflight ' ||
 sed -n '2p' "$INSTALLER_LOG" | grep -q -- '^install .*--apply --confirm lab-cluster$' ||
     fail "interactive exact cluster confirmation was not applied"
 assert_temp_cleaned
+
+# The optional interactive full-setup prompt uses the same pre-mutation
+# compatibility gate as --full.
+write_members 2
+reset_logs
+if printf 'lab-cluster\ny\n' | script -qefc \
+    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 PVN_CP_MEMBERS='$MEMBERS' PVN_TOPOLOGY_BIN='$BIN/pvn-topology' PVN_CONTROL_PLANE_BIN='$BIN/pvn-control-plane' bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    /dev/null > "$WORK/interactive-unsupported-full.out" 2>&1
+then
+    fail "interactive unsupported cluster reached full setup"
+fi
+grep -q 'supports exactly one or three nodes, found 2' \
+    "$WORK/interactive-unsupported-full.out" ||
+    fail "interactive unsupported cluster error was unclear"
+[ ! -s "$SETUP_LOG" ] ||
+    fail "interactive unsupported cluster invoked topology/control-plane tooling"
+assert_temp_cleaned
+write_members 3
 
 echo "pvn-install tests passed"

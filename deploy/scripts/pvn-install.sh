@@ -31,6 +31,8 @@ PROVIDER_PORT_READY=${PVN_PROVIDER_PORT_READY:-}
 CURL_BIN=${PVN_CURL_BIN:-curl}
 TOPOLOGY_BIN=${PVN_TOPOLOGY_BIN:-/usr/lib/pvn/pvn-topology}
 CONTROL_PLANE_BIN=${PVN_CONTROL_PLANE_BIN:-/usr/lib/pvn/pvn-control-plane}
+CONTROL_PLANE_MEMBERS=${PVN_CP_MEMBERS:-/etc/pve/.members}
+PYTHON_BIN=${PVN_INSTALL_PYTHON:-python3}
 WORK=
 
 usage() {
@@ -235,7 +237,7 @@ fi
 [ "$FULL" -eq 0 ] || [ "$ADVANCED" -eq 0 ] ||
     fail "--full must run directly on a PVE node"
 
-for command_name in "$CURL_BIN" sha256sum awk mktemp chmod rm; do
+for command_name in "$CURL_BIN" "$PYTHON_BIN" sha256sum awk mktemp chmod rm; do
     command -v "$command_name" >/dev/null 2>&1 ||
         fail "required command is unavailable: $command_name"
 done
@@ -343,11 +345,106 @@ run_topology() {
     "$TOPOLOGY_BIN" "$@"
 }
 
+preflight_control_plane() {
+    pvn_setup_cluster=$1
+    "$PYTHON_BIN" - "$CONTROL_PLANE_MEMBERS" "$pvn_setup_cluster" "$PROGRAM" <<'PY'
+import ipaddress
+import json
+import pathlib
+import re
+import stat
+import sys
+
+members_path = pathlib.Path(sys.argv[1])
+confirmation = sys.argv[2]
+program = sys.argv[3]
+safe_name = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
+
+
+def fail(message):
+    raise SystemExit(f"{program}: control-plane compatibility preflight: {message}")
+
+
+try:
+    metadata = members_path.lstat()
+    raw = members_path.read_bytes()
+except OSError as error:
+    fail(f"cannot read PVE membership: {error}")
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    fail("PVE membership is not a regular non-symlink file")
+if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+    fail("PVE membership must be root-owned and not group/world writable")
+try:
+    members = json.loads(raw)
+except (UnicodeError, json.JSONDecodeError) as error:
+    fail(f"cannot parse PVE membership: {error}")
+if not isinstance(members, dict):
+    fail("PVE membership root must be an object")
+
+local_name = members.get("nodename")
+nodelist = members.get("nodelist")
+if not isinstance(local_name, str) or not safe_name.fullmatch(local_name):
+    fail("PVE local node name is unsafe or empty")
+if not isinstance(nodelist, dict) or local_name not in nodelist:
+    fail("PVE membership is missing the local node")
+
+node_ids = set()
+node_ips = set()
+for name, node in nodelist.items():
+    if not isinstance(name, str) or not safe_name.fullmatch(name) or not isinstance(node, dict):
+        fail("PVE membership contains a malformed node")
+    node_id = node.get("id")
+    if type(node_id) is not int or node_id <= 0 or node_id in node_ids:
+        fail(f"PVE node {name} has an invalid or duplicate node id")
+    node_ids.add(node_id)
+    if node.get("online") != 1:
+        fail(f"PVE node {name} is offline")
+    try:
+        address = ipaddress.ip_address(node.get("ip"))
+    except ValueError:
+        fail(f"PVE node {name} has an invalid management IP")
+    if address.version != 4 or address.is_unspecified or address.is_multicast:
+        fail(f"PVE node {name} has an unusable management IPv4 address")
+    address_text = str(address)
+    if address_text in node_ips:
+        fail(f"PVE node {name} repeats a management IP")
+    node_ips.add(address_text)
+
+node_count = len(nodelist)
+cluster = members.get("cluster")
+if isinstance(cluster, dict) and cluster.get("name"):
+    cluster_name = cluster.get("name")
+    if not isinstance(cluster_name, str) or not safe_name.fullmatch(cluster_name):
+        fail("PVE cluster name is unsafe or empty")
+    if cluster.get("quorate") != 1 or cluster.get("nodes") != node_count:
+        fail("PVE membership is not fully online and quorate")
+    deployment = cluster_name
+else:
+    if node_count != 1:
+        fail("standalone PVE membership contains multiple nodes")
+    deployment = f"standalone-{local_name}"
+
+if node_count not in {1, 3}:
+    fail(
+        f"automated activation supports exactly one or three nodes, found {node_count}; "
+        "topology was not changed"
+    )
+if confirmation != deployment:
+    fail(f"confirmation must exactly match {deployment!r}")
+
+print(
+    f"Control-plane compatibility preflight passed for {node_count} node(s) "
+    f"in {deployment}; no changes made."
+)
+PY
+}
+
 run_full_setup() {
     pvn_setup_cluster=$1
     [ -x "$CONTROL_PLANE_BIN" ] ||
         fail "installed control-plane tool is unavailable: $CONTROL_PLANE_BIN"
 
+    preflight_control_plane "$pvn_setup_cluster"
     echo "Planning the three-NIC PVN topology; no changes are made by this step."
     run_topology plan '' ''
     echo "Applying the approved topology on every online PVE node."
@@ -378,6 +475,7 @@ prompt_full_setup() {
     [ -x "$TOPOLOGY_BIN" ] || fail "installed topology tool is unavailable: $TOPOLOGY_BIN"
     [ -x "$CONTROL_PLANE_BIN" ] ||
         fail "installed control-plane tool is unavailable: $CONTROL_PLANE_BIN"
+    preflight_control_plane "$pvn_setup_cluster"
     GENEVE_CIDR=$(prompt_path PVN_GENEVE_CIDR "Dedicated Geneve IPv4 CIDR")
     PROVIDER_CIDR=$(prompt_path PVN_PROVIDER_CIDR "Provider-uplink IPv4 CIDR")
     run_topology plan '' ''

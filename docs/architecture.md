@@ -14,16 +14,17 @@ package. There is no container runtime and no separate appliance VM.
 - `pvn-control-db`, OVN NB/SB, and `ovn-northd`: installed everywhere but
   enabled only on selected central voters.
 
-The central placement policy is deterministic:
+The current automated bootstrap has two deterministic placements:
 
-| Online eligible nodes | Central voters | Mode |
+| Online PVE nodes | Central voters | Mode |
 | --- | ---: | --- |
-| 1-2 | 1 | standalone; a two-node cluster has no central HA |
-| 3-4 | 3 | Raft |
-| 5 or more | 5 | Raft |
+| 1 | 1 | standalone |
+| 3 | 3 | Raft |
 
-Existing healthy voters are retained. Increasing from standalone to Raft is
-an explicit operation because it changes the on-disk database service model.
+Two-, four-, and five-or-more-node clusters are rejected by the full-setup
+compatibility preflight before topology changes. Supporting those sizes needs
+an explicit voter-placement and membership-change workflow; the package-only
+installer remains usable without activating PVN.
 
 ## Source of truth
 
