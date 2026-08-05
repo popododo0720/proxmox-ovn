@@ -31,6 +31,7 @@ ControlPlaneError = module["ControlPlaneError"]
 Discovery = module["Discovery"]
 LedgerStore = module["LedgerStore"]
 Node = module["Node"]
+SystemBackend = module["SystemBackend"]
 DATABASES = module["DATABASES"]
 
 
@@ -40,7 +41,7 @@ def discovery(count=3, package="0.1.1"):
         ("pve-b", 2, "192.0.2.12", "198.51.100.12"),
         ("pve-c", 3, "192.0.2.13", "198.51.100.13"),
     )[:count]
-    nodes = tuple(Node(name, node_id, control, geneve, "br-provider",
+    nodes = tuple(Node(name, node_id, control, geneve, "ens4", "ens5", "br-provider",
                        package, 1450, index == 0)
                   for index, (name, node_id, control, geneve) in enumerate(records))
     mode = "standalone" if count == 1 else "raft"
@@ -150,6 +151,119 @@ def expect_error(action, text):
         assert text in str(error), (text, str(error))
     else:
         raise AssertionError("expected ControlPlaneError")
+
+
+def canonical_topology_fixture(root):
+    records = (
+        ("pve-a", 1, "192.0.2.11", "198.51.100.11"),
+        ("pve-b", 2, "192.0.2.12", "198.51.100.12"),
+        ("pve-c", 3, "192.0.2.13", "198.51.100.13"),
+    )
+    members = {
+        "nodename": "pve-a",
+        "version": 7,
+        "cluster": {"name": "test-cluster", "version": 3, "nodes": 3, "quorate": 1},
+        "nodelist": {
+            name: {"id": node_id, "online": 1, "ip": management}
+            for name, node_id, management, _ in records
+        },
+    }
+    membership = {
+        "cluster_name": "test-cluster",
+        "nodes": [
+            {"name": name, "node_id": node_id, "management_ip": management}
+            for name, node_id, management, _ in records
+        ],
+    }
+    topology = {
+        "schema": 1,
+        "phase": "complete",
+        "cluster_name": "test-cluster",
+        "membership_snapshot": membership,
+        "membership_hash": module["sha256"](
+            json.dumps(membership, sort_keys=True, separators=(",", ":")).encode()
+        ),
+        "nodes": [
+            {
+                "name": name,
+                "node_id": node_id,
+                "management_ip": management,
+                "control_ip": management,
+                "geneve_ip": geneve,
+                "geneve_interface": "ens4",
+                "provider_interface": "ens5",
+            }
+            for name, node_id, management, geneve in records
+        ],
+        "guest_mtu": 1300,
+        "provider_bridge": "br-provider",
+        "physnet": "provider",
+        "provider_readiness": {
+            "operator_ack": True,
+            "ack_phrase": "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP",
+            "live_arbitrary_mac_l2_verified": False,
+            "basis": "operator-ack-only",
+        },
+    }
+    members_path = root / "members.json"
+    topology_path = root / "topology.json"
+    members_path.write_text(json.dumps(members))
+    topology_path.write_text(json.dumps(topology))
+    args = types.SimpleNamespace(
+        members=str(members_path),
+        topology_ledger=str(topology_path),
+        config=str(root / "config.json"),
+        private_dir=str(root / "private"),
+        ssh_key=str(root / "ssh-key"),
+        nodes_dir=str(root / "nodes"),
+        python="python3",
+    )
+    backend = SystemBackend(args)
+    backend._validate_ssh = lambda _records: None
+    probes = {
+        name: {
+            "hostname": name,
+            "package_version": "0.1.1",
+            "pve_version": "9.2.2",
+            "addresses": [
+                {"ip": management, "interface": "vmbr0", "mtu": 1500},
+                {"ip": geneve, "interface": "ens4", "mtu": 1442},
+            ],
+            "bridges": {"br-int": True, "br-provider": True},
+        }
+        for name, _, management, geneve in records
+    }
+    backend._remote = lambda name, _action, _payload: copy.deepcopy(probes[name])
+    return backend, topology_path, topology
+
+
+# Control-plane discovery consumes the exact completed topology ledger contract.
+with tempfile.TemporaryDirectory() as temporary:
+    backend, topology_path, topology = canonical_topology_fixture(pathlib.Path(temporary))
+    found = backend.discover()
+    assert found.guest_mtu == 1300
+    assert found.nodes[0].geneve_interface == "ens4"
+    assert found.nodes[0].provider_interface == "ens5"
+
+    invalid = copy.deepcopy(topology)
+    invalid["phase"] = "network-staged"
+    topology_path.write_text(json.dumps(invalid))
+    expect_error(backend.discover, "phase complete")
+
+    invalid = copy.deepcopy(topology)
+    invalid["membership_hash"] = "0" * 64
+    topology_path.write_text(json.dumps(invalid))
+    expect_error(backend.discover, "snapshot/hash")
+
+    invalid = copy.deepcopy(topology)
+    invalid["provider_readiness"]["operator_ack"] = False
+    topology_path.write_text(json.dumps(invalid))
+    expect_error(backend.discover, "operator acknowledgement")
+
+    invalid = copy.deepcopy(topology)
+    invalid["guest_mtu"] = 1400
+    topology_path.write_text(json.dumps(invalid))
+    expect_error(backend.discover, "exceeds effective Geneve MTU")
 
 
 with tempfile.TemporaryDirectory() as temporary:

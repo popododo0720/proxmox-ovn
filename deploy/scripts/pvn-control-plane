@@ -41,6 +41,7 @@ DEFAULT_CONFIG = "/etc/pve/pvn/config.json"
 DEFAULT_SSH_KEY = "/root/.ssh/id_rsa"
 DEFAULT_NODES_DIR = "/etc/pve/nodes"
 SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
+PROVIDER_ACK = "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP"
 DATABASES = {
     "PVN_Control": 6646,
     "OVN_Northbound": 6643,
@@ -101,6 +102,8 @@ class Node:
     node_id: int
     control_ip: str
     geneve_ip: str
+    geneve_interface: str
+    provider_interface: str
     provider_bridge: str
     package_version: str
     geneve_mtu: int
@@ -112,6 +115,8 @@ class Node:
             "node_id": self.node_id,
             "control_ip": self.control_ip,
             "geneve_ip": self.geneve_ip,
+            "geneve_interface": self.geneve_interface,
+            "provider_interface": self.provider_interface,
             "provider_bridge": self.provider_bridge,
             "package_version": self.package_version,
             "geneve_mtu": self.geneve_mtu,
@@ -274,7 +279,8 @@ if action == "probe":
     for link in json.loads(run(["ip", "-j", "address", "show"]).stdout):
         for address in link.get("addr_info", []):
             if address.get("family") == "inet" and address.get("scope") == "global":
-                addresses.append({"ip": address["local"], "mtu": int(link["mtu"])})
+                addresses.append({"ip": address["local"], "interface": link["ifname"],
+                                  "mtu": int(link["mtu"])})
     bridges = {}
     for bridge in payload["bridges"]:
         bridges[bridge] = run(["ovs-vsctl", "--timeout=10", "br-exists", bridge], check=False).returncode == 0
@@ -434,19 +440,57 @@ class SystemBackend:
             cluster_version = 0
         if len(nodelist) not in {1, 3}:
             raise ControlPlaneError("control-plane bootstrap supports exactly one or three nodes")
+        if any(not isinstance(name, str) or not isinstance(member, dict)
+               for name, member in nodelist.items()):
+            raise ControlPlaneError(".members nodelist contains a malformed node")
+        if any(type(member.get("id")) is not int for member in nodelist.values()):
+            raise ControlPlaneError(".members nodelist contains an invalid node id")
 
-        if topology.get("version") != 1 or topology.get("cluster") != confirmation:
-            raise ControlPlaneError("topology ledger version/cluster does not match PVE membership")
+        if topology.get("schema") != 1 or topology.get("phase") != "complete" or \
+                topology.get("cluster_name") != cluster_name:
+            raise ControlPlaneError(
+                "topology ledger must be schema 1, phase complete, and match the PVE cluster"
+            )
+        membership_snapshot = {
+            "cluster_name": cluster_name,
+            "nodes": [
+                {"name": safe_name(name, "PVE node name"),
+                 "node_id": member.get("id"),
+                 "management_ip": ipv4(member.get("ip"), f"PVE node {name} management IP")}
+                for name, member in sorted(
+                    nodelist.items(), key=lambda item: (item[1].get("id", -1), item[0])
+                )
+            ],
+        }
+        membership_hash = sha256(json.dumps(
+            membership_snapshot, sort_keys=True, separators=(",", ":")
+        ).encode())
+        if topology.get("membership_snapshot") != membership_snapshot or \
+                topology.get("membership_hash") != membership_hash:
+            raise ControlPlaneError("topology membership snapshot/hash differs from .members")
+        readiness = topology.get("provider_readiness")
+        if not isinstance(readiness, dict) or readiness.get("operator_ack") is not True or \
+                readiness.get("ack_phrase") != PROVIDER_ACK:
+            raise ControlPlaneError("topology provider readiness lacks the exact operator acknowledgement")
+        if readiness.get("live_arbitrary_mac_l2_verified") is not False or \
+                readiness.get("basis") != "operator-ack-only":
+            raise ControlPlaneError("topology provider readiness has an unsupported verification basis")
         topology_nodes = topology.get("nodes")
-        if not isinstance(topology_nodes, dict) or set(topology_nodes) != set(nodelist):
+        if not isinstance(topology_nodes, list) or not all(isinstance(item, dict) for item in topology_nodes):
+            raise ControlPlaneError("topology ledger nodes must be a list of objects")
+        topology_by_name = {
+            item.get("name"): item for item in topology_nodes
+            if isinstance(item.get("name"), str)
+        }
+        if len(topology_by_name) != len(topology_nodes) or set(topology_by_name) != set(nodelist):
             raise ControlPlaneError("topology ledger node set differs from PVE membership")
         guest_mtu = topology.get("guest_mtu")
-        if type(guest_mtu) is not int or not 576 <= guest_mtu <= 9000:
+        if type(guest_mtu) is not int or not 1280 <= guest_mtu <= 9000:
             raise ControlPlaneError("topology guest_mtu is invalid")
-        physnet = safe_name(topology.get("physnet", "provider"), "topology physnet")
-        provider_default = safe_name(topology.get("provider_bridge", "br-provider"), "provider bridge")
+        physnet = safe_name(topology.get("physnet"), "topology physnet")
+        provider_default = safe_name(topology.get("provider_bridge"), "provider bridge")
 
-        records: list[tuple[int, str, str, str, str]] = []
+        records: list[tuple[int, str, str, str, str, str, str]] = []
         seen_ids: set[int] = set()
         seen_addresses: set[str] = set()
         providers: set[str] = set()
@@ -455,32 +499,40 @@ class SystemBackend:
             if not isinstance(member, dict) or member.get("online") != 1:
                 raise ControlPlaneError(f"PVE node {name} is offline or malformed")
             node_id = member.get("id")
-            if type(node_id) is not int or node_id < 0 or node_id in seen_ids:
+            if type(node_id) is not int or node_id <= 0 or node_id in seen_ids:
                 raise ControlPlaneError(f"PVE node {name} has an invalid/duplicate node id")
             seen_ids.add(node_id)
             management = ipv4(member.get("ip"), f"PVE node {name} management IP")
-            item = topology_nodes[name]
-            if not isinstance(item, dict):
-                raise ControlPlaneError(f"topology node {name} is malformed")
+            item = topology_by_name[name]
+            if item.get("node_id") != node_id or item.get("management_ip") != management:
+                raise ControlPlaneError(f"topology node {name} identity differs from .members")
             control = ipv4(item.get("control_ip"), f"node {name} control_ip")
             geneve = ipv4(item.get("geneve_ip"), f"node {name} geneve_ip")
+            geneve_interface = safe_name(
+                item.get("geneve_interface"), f"node {name} geneve interface"
+            )
+            provider_interface = safe_name(
+                item.get("provider_interface"), f"node {name} provider interface"
+            )
+            if geneve_interface == provider_interface:
+                raise ControlPlaneError(f"node {name} reuses one interface for Geneve/provider")
             if control != management:
                 raise ControlPlaneError(f"node {name} control_ip differs from .members management IP")
             if control == geneve or control in seen_addresses or geneve in seen_addresses:
                 raise ControlPlaneError(f"node {name} topology addresses are not unique")
             seen_addresses.update({control, geneve})
-            provider = safe_name(item.get("provider_bridge", provider_default), f"node {name} provider bridge")
-            providers.add(provider)
-            records.append((node_id, name, control, geneve, provider))
+            providers.add(provider_default)
+            records.append((node_id, name, control, geneve, geneve_interface,
+                            provider_interface, provider_default))
         if len(providers) != 1:
             raise ControlPlaneError("all nodes must use the same provider bridge name")
 
         self.local_name = local_name
-        self.node_addresses = {name: control for _, name, control, _, _ in records}
+        self.node_addresses = {name: control for _, name, control, _, _, _, _ in records}
         self._validate_ssh(records)
         nodes: list[Node] = []
         versions: set[str] = set()
-        for node_id, name, control, geneve, provider in sorted(records):
+        for node_id, name, control, geneve, geneve_interface, provider_interface, provider in sorted(records):
             probe = self._remote(name, "probe", {"bridges": ["br-int", provider]})
             self.probes[name] = probe
             if not str(probe.get("pve_version", "")).startswith("9."):
@@ -489,18 +541,30 @@ class SystemBackend:
             if not version:
                 raise ControlPlaneError(f"node {name} has no installed pvn-node package")
             versions.add(version)
-            addresses = {entry.get("ip"): entry.get("mtu") for entry in probe.get("addresses", [])}
+            addresses = {
+                entry.get("ip"): (entry.get("interface"), entry.get("mtu"))
+                for entry in probe.get("addresses", [])
+            }
             if control not in addresses or geneve not in addresses:
                 raise ControlPlaneError(f"node {name} does not own its ledger control/geneve IP")
+            if addresses[geneve][0] != geneve_interface:
+                raise ControlPlaneError(f"node {name} Geneve IP/interface differs from the ledger")
             if not all(probe.get("bridges", {}).get(bridge) for bridge in ["br-int", provider]):
                 raise ControlPlaneError(f"node {name} is missing the topology OVS bridges")
             hostname = str(probe.get("hostname", "")).split(".", 1)[0]
             if hostname != name:
                 raise ControlPlaneError(f"SSH target {name} reports hostname {probe.get('hostname')!r}")
-            nodes.append(Node(name, node_id, control, geneve, provider, version,
-                              int(addresses[geneve]), name == local_name))
+            nodes.append(Node(name, node_id, control, geneve, geneve_interface,
+                              provider_interface, provider, version,
+                              int(addresses[geneve][1]), name == local_name))
         if len(versions) != 1:
             raise ControlPlaneError("pvn-node package versions differ across PVE nodes")
+        effective_geneve_mtu = min(node.geneve_mtu for node in nodes)
+        if guest_mtu > effective_geneve_mtu - 100:
+            raise ControlPlaneError(
+                f"topology guest_mtu {guest_mtu} exceeds effective Geneve MTU "
+                f"{effective_geneve_mtu} minus 100"
+            )
         return Discovery(mode, confirmation, cluster_name, local_name,
                          int(members.get("version", 0)), cluster_version,
                          sha256(canonical_json(topology)), guest_mtu, physnet,
@@ -519,7 +583,9 @@ class SystemBackend:
             if any(info.get("exists") for info in probe.get("databases", {}).values()):
                 raise ControlPlaneError(f"node {node.name} has unledgered central database state")
 
-    def _validate_ssh(self, records: list[tuple[int, str, str, str, str]]) -> None:
+    def _validate_ssh(
+        self, records: list[tuple[int, str, str, str, str, str, str]]
+    ) -> None:
         if len(records) == 1:
             return
         metadata = self.ssh_key.lstat()
@@ -527,7 +593,7 @@ class SystemBackend:
             raise ControlPlaneError("native PVE SSH identity is not a regular file")
         if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
             raise ControlPlaneError("native PVE SSH identity owner/mode is unsafe")
-        for _, name, _, _, _ in records:
+        for _, name, _, _, _, _, _ in records:
             if name == self.local_name:
                 continue
             known = self.nodes_dir / name / "ssh_known_hosts"
