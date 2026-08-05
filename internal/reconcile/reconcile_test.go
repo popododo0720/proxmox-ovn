@@ -45,6 +45,54 @@ func (r *blockingRenderer) Delete(ctx context.Context, resource model.Resource) 
 	return r.delegate.Delete(ctx, resource)
 }
 
+// unfencedRevisionRenderer deliberately lets an older render overwrite a
+// newer one, matching the failure mode the controller must correct across
+// independent manager processes.
+type unfencedRevisionRenderer struct {
+	mu            sync.Mutex
+	blockRevision int64
+	started       chan struct{}
+	release       chan struct{}
+	once          sync.Once
+	revision      int64
+	calls         int
+}
+
+func (r *unfencedRevisionRenderer) Render(ctx context.Context, resource model.Resource) error {
+	if resource.GetMetadata().Revision == r.blockRevision {
+		r.once.Do(func() { close(r.started) })
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.release:
+		}
+	}
+	r.mu.Lock()
+	r.revision = resource.GetMetadata().Revision
+	r.calls++
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *unfencedRevisionRenderer) Delete(context.Context, model.Resource) error {
+	r.mu.Lock()
+	r.revision = 0
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *unfencedRevisionRenderer) state() (int64, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.revision, r.calls
+}
+
+func (r *unfencedRevisionRenderer) drift(revision int64) {
+	r.mu.Lock()
+	r.revision = revision
+	r.mu.Unlock()
+}
+
 func createProject(t *testing.T, store controlstore.Store) *model.Project {
 	t.Helper()
 	resource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool"}, "create-project")
@@ -324,5 +372,85 @@ func TestControllerCleansRenderThatRacesWithDistributedDelete(t *testing.T) {
 	}
 	if calls := delegate.DeleteCalls(model.KindProject, project.ID); calls != 2 {
 		t.Fatalf("delete calls=%d, want distributed delete plus stale cleanup", calls)
+	}
+}
+
+func TestControllersCorrectOutOfOrderDesiredRevisions(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := &unfencedRevisionRenderer{
+		blockRevision: project.Revision,
+		started:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	oldController := NewController(store, renderer)
+	newController := NewController(store, renderer)
+
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- oldController.Reconcile(context.Background(), model.KindProject, project.ID)
+	}()
+	<-renderer.started
+
+	project.Description = "new desired revision"
+	updated, _, err := store.Update(context.Background(), project, project.Revision, "update-while-rendering")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newController.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if revision, _ := renderer.state(); revision != updated.GetMetadata().Revision {
+		t.Fatalf("new manager rendered revision %d, want %d", revision, updated.GetMetadata().Revision)
+	}
+
+	close(renderer.release)
+	if err := <-oldDone; err != nil {
+		t.Fatal(err)
+	}
+	if revision, calls := renderer.state(); revision != updated.GetMetadata().Revision || calls != 3 {
+		t.Fatalf("final renderer revision=%d calls=%d, want revision=%d and old/new/correction", revision, calls, updated.GetMetadata().Revision)
+	}
+}
+
+func TestReconcileAllRepairsReadyResourceDrift(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := &unfencedRevisionRenderer{blockRevision: -1}
+	controller := NewController(store, renderer)
+	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	renderer.drift(0)
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if revision, calls := renderer.state(); revision != project.Revision || calls != 2 {
+		t.Fatalf("periodic audit revision=%d calls=%d, want revision=%d calls=2", revision, calls, project.Revision)
+	}
+}
+
+func TestControllersShareRunningOperationLease(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := &unfencedRevisionRenderer{
+		blockRevision: project.Revision,
+		started:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	first := NewController(store, renderer)
+	second := NewController(store, renderer)
+	done := make(chan error, 1)
+	go func() { done <- first.Reconcile(context.Background(), model.KindProject, project.ID) }()
+	<-renderer.started
+	if err := second.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(renderer.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, calls := renderer.state(); calls != 1 {
+		t.Fatalf("renderer calls=%d, want one durable operation owner", calls)
 	}
 }

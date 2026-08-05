@@ -25,11 +25,20 @@ type Controller struct {
 	locks    map[string]*sync.Mutex
 }
 
+const (
+	operationLease       = 2 * time.Minute
+	maxConvergencePasses = 8
+)
+
 func NewController(store controlstore.Store, renderer Renderer) *Controller {
 	return &Controller{store: store, renderer: renderer, locks: make(map[string]*sync.Mutex)}
 }
 
 func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) error {
+	return c.reconcile(ctx, kind, id, false)
+}
+
+func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, force bool) error {
 	if c == nil || c.store == nil || c.renderer == nil {
 		return errors.New("reconciler is not configured")
 	}
@@ -57,7 +66,7 @@ func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) 
 		return nil
 	}
 	defer lock.Unlock()
-	if meta.AppliedRevision >= meta.Revision && meta.State == model.ResourceReady {
+	if !force && meta.AppliedRevision >= meta.Revision && meta.State == model.ResourceReady {
 		return nil
 	}
 
@@ -81,9 +90,12 @@ func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) 
 		}
 		op = latest.(*model.Operation)
 	}
-	if op.OperationStatus == model.OperationSucceeded {
+	if op.OperationStatus == model.OperationSucceeded && !force {
 		_, markErr := c.store.MarkReconciled(ctx, kind, id, meta.Revision, nil)
 		return markErr
+	}
+	if op.OperationStatus == model.OperationRunning && operationIsLeased(op, time.Now().UTC()) {
+		return nil
 	}
 
 	now := time.Now().UTC()
@@ -91,26 +103,15 @@ func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) 
 	op.StartedAt = &now
 	updated, _, updateErr := c.store.Update(ctx, op, op.Revision, "")
 	if updateErr != nil {
+		if errors.Is(updateErr, controlstore.ErrPrecondition) {
+			// Another manager won the durable operation claim.
+			return nil
+		}
 		return fmt.Errorf("start reconcile operation: %w", updateErr)
 	}
 	op = updated.(*model.Operation)
 
-	renderErr := c.renderer.Render(ctx, resource)
-	staleDelete := false
-	latest, latestErr := c.store.Get(ctx, kind, id)
-	if errors.Is(latestErr, controlstore.ErrNotFound) || (latestErr == nil && latest.GetMetadata().State == model.ResourceDeleting) {
-		// Render and delete are separate systems, so the desired row can be
-		// deleted while an older manager is still writing OVN. An idempotent
-		// cleanup after the render closes that race and prevents orphan rows.
-		staleDelete = true
-		renderErr = c.renderer.Delete(ctx, resource)
-	} else if latestErr != nil && renderErr == nil {
-		renderErr = fmt.Errorf("reload desired state after render: %w", latestErr)
-	}
-	var markErr error
-	if !staleDelete {
-		_, markErr = c.store.MarkReconciled(ctx, kind, id, meta.Revision, renderErr)
-	}
+	renderErr, markErr := c.renderUntilStable(ctx, resource)
 	completed := time.Now().UTC()
 	op.CompletedAt = &completed
 	if renderErr != nil {
@@ -145,12 +146,65 @@ func (c *Controller) ReconcileAll(ctx context.Context) error {
 			continue
 		}
 		for _, resource := range resources {
-			if err := c.Reconcile(ctx, kind, resource.GetMetadata().ID); err != nil {
+			// A forced pass repairs OVN drift left by a manager that died
+			// between an external write and desired-state confirmation.
+			if err := c.reconcile(ctx, kind, resource.GetMetadata().ID, true); err != nil {
 				failures = append(failures, err)
 			}
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (c *Controller) renderUntilStable(ctx context.Context, initial model.Resource) (error, error) {
+	desired := initial
+	for pass := 0; pass < maxConvergencePasses; pass++ {
+		renderErr := c.renderer.Render(ctx, desired)
+		latest, latestErr := c.store.Get(ctx, desired.ResourceKind(), desired.GetMetadata().ID)
+		if errors.Is(latestErr, controlstore.ErrNotFound) || (latestErr == nil && latest.GetMetadata().State == model.ResourceDeleting) {
+			// Desired state can be removed while an older manager is still
+			// writing OVN. Idempotent cleanup prevents a persistent orphan.
+			return c.renderer.Delete(ctx, desired), nil
+		}
+		if latestErr != nil {
+			if renderErr != nil {
+				return renderErr, latestErr
+			}
+			return nil, fmt.Errorf("reload desired state after render: %w", latestErr)
+		}
+		if latest.GetMetadata().Revision != desired.GetMetadata().Revision {
+			// A newer revision won while this manager was rendering. Apply it
+			// before allowing the older writer to finish last.
+			desired = latest
+			continue
+		}
+		_, markErr := c.store.MarkReconciled(ctx, desired.ResourceKind(), desired.GetMetadata().ID, desired.GetMetadata().Revision, renderErr)
+		if renderErr != nil || markErr != nil {
+			return renderErr, markErr
+		}
+		confirmed, confirmErr := c.store.Get(ctx, desired.ResourceKind(), desired.GetMetadata().ID)
+		if errors.Is(confirmErr, controlstore.ErrNotFound) || (confirmErr == nil && confirmed.GetMetadata().State == model.ResourceDeleting) {
+			return c.renderer.Delete(ctx, desired), nil
+		}
+		if confirmErr != nil {
+			return nil, fmt.Errorf("confirm desired state after render: %w", confirmErr)
+		}
+		if confirmed.GetMetadata().Revision != desired.GetMetadata().Revision {
+			desired = confirmed
+			continue
+		}
+		return nil, nil
+	}
+	err := fmt.Errorf("%s %q changed during %d consecutive render passes", desired.ResourceKind(), desired.GetMetadata().ID, maxConvergencePasses)
+	_, markErr := c.store.MarkReconciled(ctx, desired.ResourceKind(), desired.GetMetadata().ID, desired.GetMetadata().Revision, err)
+	return err, markErr
+}
+
+func operationIsLeased(operation *model.Operation, now time.Time) bool {
+	if operation == nil || operation.StartedAt == nil {
+		return false
+	}
+	return now.Sub(operation.StartedAt.UTC()) < operationLease
 }
 
 var dependencyOrder = []model.Kind{
