@@ -71,8 +71,13 @@ class FakeBackend:
         self.pki_pin_check = None
         self.pristine = True
         self.crash_after_init = None
+        self.discoveries = 0
+        self.discover_hook = None
 
     def discover(self):
+        self.discoveries += 1
+        if self.discover_hook is not None:
+            self.discover_hook(self)
         return self.found
 
     def assert_pristine(self, found):
@@ -191,6 +196,14 @@ def expect_error(action, text):
         assert text in str(error), (text, str(error))
     else:
         raise AssertionError("expected ControlPlaneError")
+
+
+def drift_topology(found_backend):
+    found_backend.found = Discovery(**{
+        **found_backend.found.__dict__,
+        "topology_sha256": "b" * 64,
+    })
+    found_backend.discover_hook = None
 
 
 lease_temporary = tempfile.TemporaryDirectory()
@@ -749,6 +762,44 @@ with tempfile.TemporaryDirectory() as temporary:
     backend.found = original
     backend.pki_variant = "two"
     expect_error(lambda: control.apply("test-cluster"), "PKI fingerprint drift")
+
+
+# Topology/membership is re-read before every destructive or activation boundary.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(discovery())
+    backend.discover_hook = lambda current: (
+        drift_topology(current) if current.discoveries == 3 else None
+    )
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    expect_error(lambda: control.apply("test-cluster"), "activation refused")
+    assert not backend.control_dbs and backend.central == [] and backend.nodes == []
+
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(discovery())
+
+    def drift_after_control_init(current):
+        if current.control_dbs and not current.central:
+            drift_topology(current)
+
+    backend.discover_hook = drift_after_control_init
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    expect_error(lambda: control.apply("test-cluster"), "central target activation")
+    assert "init:pve-a" in backend.log and backend.central == [] and backend.nodes == []
+
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(discovery())
+
+    def drift_before_transport(current):
+        if len(current.central) == len(current.found.nodes) and not current.nodes:
+            drift_topology(current)
+
+    backend.discover_hook = drift_before_transport
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    expect_error(lambda: control.apply("test-cluster"), "transport target activation")
+    assert backend.central == ["pve-a", "pve-b", "pve-c"] and backend.nodes == []
 
 
 # Partial second-voter join is resumed forward. Nothing is deleted or rolled back.

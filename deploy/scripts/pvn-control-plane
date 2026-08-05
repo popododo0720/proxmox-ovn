@@ -1433,6 +1433,9 @@ class ControlPlane:
             for index, node in enumerate(discovery.nodes, 1):
                 if ledger["central_complete"] >= index:
                     continue
+                self._revalidate_activation(
+                    discovery, ledger, f"Control DB initialization on {node.name}"
+                )
                 # Existing files are adopted only after their Raft cluster ID
                 # matches the durable pin. A newly created seed is pinned before
                 # activation; a crash before that ledger write fails closed.
@@ -1456,6 +1459,9 @@ class ControlPlane:
                         raise ControlPlaneError(
                             f"node {node.name} Control DB cluster ID drift from the ledger"
                         )
+                self._revalidate_activation(
+                    discovery, ledger, f"central target activation on {node.name}"
+                )
                 self.backend.activate_central(node)
                 cids = self._wait_central(discovery, index, ledger["db_cluster_ids"])
                 if not ledger["db_cluster_ids"]:
@@ -1470,6 +1476,9 @@ class ControlPlane:
             for index, node in enumerate(discovery.nodes, 1):
                 if ledger["nodes_complete"] >= index:
                     continue
+                self._revalidate_activation(
+                    discovery, ledger, f"transport target activation on {node.name}"
+                )
                 self.backend.activate_node(node)
                 status = self.backend.node_status(node)
                 if not status.get("ready") or not status.get("marker", True):
@@ -1482,10 +1491,26 @@ class ControlPlane:
                 status = self.backend.node_status(node)
                 if not status.get("ready"):
                     raise ControlPlaneError(f"final readiness drift on {node.name}")
+            self._revalidate_activation(discovery, ledger, "final completion")
             ledger["phase"] = "complete"
             self.store.update(ledger)
             return {"complete": True, "cluster_uuid": ledger["cluster_uuid"],
                     "phase": ledger["phase"], "nodes": len(discovery.nodes)}
+
+    def _revalidate_activation(
+        self, expected: Discovery, ledger: dict[str, Any], boundary: str
+    ) -> None:
+        live = self.backend.discover()
+        if live.snapshot() != expected.snapshot():
+            raise ControlPlaneError(
+                f"membership/topology/package drift before {boundary}; activation refused"
+            )
+        persisted = self.store.load()
+        if persisted is None or persisted != ledger:
+            raise ControlPlaneError(
+                f"control-plane ledger changed before {boundary}; activation refused"
+            )
+        self._verify_ledger(live, persisted)
 
     @staticmethod
     def _verify_ledger(discovery: Discovery, ledger: dict[str, Any]) -> None:
