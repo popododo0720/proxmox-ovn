@@ -20,9 +20,19 @@ import (
 )
 
 var (
-	ErrNotManaged  = errors.New("interface is not managed by PVN")
-	ErrAmbiguous   = errors.New("interface maps to multiple PVN ports")
-	ErrNotBindable = errors.New("PVN port is not bindable")
+	ErrNotManaged      = errors.New("interface is not managed by PVN")
+	ErrAmbiguous       = errors.New("interface maps to multiple PVN ports")
+	ErrNotBindable     = errors.New("PVN port is not bindable")
+	ErrStaleGeneration = errors.New("PVN port report generation is stale")
+	ErrRuntimeUnixOnly = errors.New("PVN runtime reports require a Unix manager socket")
+)
+
+const (
+	PortStatusUnbound   = "unbound"
+	PortStatusBinding   = "binding"
+	PortStatusBound     = "bound"
+	PortStatusDetaching = "detaching"
+	PortStatusError     = "error"
 )
 
 type InterfaceRef struct {
@@ -41,10 +51,24 @@ type Resolution struct {
 	Status           string
 }
 
+type PortReport struct {
+	PortID     string
+	Generation string
+	Status     string
+}
+
+type NodeHeartbeat struct {
+	Name          string
+	ChassisID     string
+	Roles         []string
+	RolesExplicit bool
+}
+
 // ManagerClient resolves the identity encoded in a local PVE TAP name to the
 // one logical switch port PVN expects on this chassis.
 type ManagerClient interface {
 	ResolveInterface(context.Context, InterfaceRef) (Resolution, error)
+	ReportPort(context.Context, PortReport) error
 }
 
 type HTTPManagerClientConfig struct {
@@ -55,8 +79,9 @@ type HTTPManagerClientConfig struct {
 }
 
 type HTTPManagerClient struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL       string
+	httpClient    *http.Client
+	runtimeSocket bool
 }
 
 func NewHTTPManagerClient(config HTTPManagerClientConfig) (*HTTPManagerClient, error) {
@@ -73,7 +98,8 @@ func NewHTTPManagerClient(config HTTPManagerClientConfig) (*HTTPManagerClient, e
 	}
 
 	var httpClient *http.Client
-	if parsed.Scheme == "unix" {
+	runtimeSocket := parsed.Scheme == "unix"
+	if runtimeSocket {
 		if parsed.Host != "" || !filepath.IsAbs(parsed.Path) {
 			return nil, errors.New("PVN manager Unix URL must contain an absolute socket path and no host")
 		}
@@ -96,7 +122,7 @@ func NewHTTPManagerClient(config HTTPManagerClientConfig) (*HTTPManagerClient, e
 			return nil, err
 		}
 	}
-	return &HTTPManagerClient{baseURL: baseURL, httpClient: httpClient}, nil
+	return &HTTPManagerClient{baseURL: baseURL, httpClient: httpClient, runtimeSocket: runtimeSocket}, nil
 }
 
 func cloneHTTPClient(source *http.Client) *http.Client {
@@ -221,13 +247,105 @@ func (client *HTTPManagerClient) ResolveInterface(ctx context.Context, reference
 		RequestedChassis: decoded.RequestedChassis,
 		Status:           decoded.Status,
 	}
-	if result.Status != "binding" {
-		return Resolution{}, fmt.Errorf("%w: status is %q", ErrNotBindable, result.Status)
-	}
-	if result.PortID == "" || result.LSPName == "" || result.MACAddress == "" || result.Generation == "" || result.RequestedChassis == "" {
-		return Resolution{}, errors.New("PVN manager returned an incomplete port resolution")
+	switch result.Status {
+	case PortStatusBinding, PortStatusBound:
+		if result.PortID == "" || result.LSPName == "" || result.MACAddress == "" || result.Generation == "" || result.RequestedChassis == "" {
+			return Resolution{}, errors.New("PVN manager returned an incomplete bindable port resolution")
+		}
+	case PortStatusDetaching, PortStatusUnbound, PortStatusError:
+		if result.PortID == "" || result.Generation == "" {
+			return Resolution{}, errors.New("PVN manager returned an incomplete port cleanup resolution")
+		}
+	default:
+		return Resolution{}, fmt.Errorf("PVN manager returned unknown port status %q", result.Status)
 	}
 	return result, nil
+}
+
+func (client *HTTPManagerClient) ReportPort(ctx context.Context, report PortReport) error {
+	if !client.runtimeSocket {
+		return ErrRuntimeUnixOnly
+	}
+	if report.PortID == "" || (report.Status != PortStatusBound && report.Status != PortStatusUnbound) {
+		return errors.New("port ID and a bound or unbound report status are required")
+	}
+	generation, err := strconv.ParseInt(report.Generation, 10, 64)
+	if err != nil || generation < 1 {
+		return errors.New("port report generation must be a positive integer")
+	}
+	payload, err := json.Marshal(map[string]any{"generation": generation, "status": report.Status})
+	if err != nil {
+		return err
+	}
+	endpoint := client.baseURL + "/api/v1/runtime/ports/" + url.PathEscape(report.PortID) + "/report"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("report port state to PVN manager: %w", err)
+	}
+	defer response.Body.Close()
+	responsePayload, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("read PVN manager report response: %w", err)
+	}
+	if response.StatusCode == http.StatusOK {
+		return nil
+	}
+	if response.StatusCode == http.StatusConflict {
+		var failure struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(responsePayload, &failure) == nil && failure.Error.Code == "stale_generation" {
+			return ErrStaleGeneration
+		}
+	}
+	return fmt.Errorf("PVN manager returned HTTP %d for port report: %s", response.StatusCode, strings.TrimSpace(string(responsePayload)))
+}
+
+func (client *HTTPManagerClient) HeartbeatNode(ctx context.Context, heartbeat NodeHeartbeat) error {
+	if !client.runtimeSocket {
+		return ErrRuntimeUnixOnly
+	}
+	if strings.TrimSpace(heartbeat.Name) == "" || strings.TrimSpace(heartbeat.ChassisID) == "" {
+		return errors.New("node name and chassis ID are required")
+	}
+	payload := map[string]any{"name": heartbeat.Name, "chassis_id": heartbeat.ChassisID}
+	if heartbeat.RolesExplicit {
+		if len(heartbeat.Roles) == 0 {
+			return errors.New("an explicit node role list must not be empty")
+		}
+		payload["roles"] = heartbeat.Roles
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, client.baseURL+"/api/v1/runtime/nodes/heartbeat", bytes.NewReader(encoded))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("send node heartbeat to PVN manager: %w", err)
+	}
+	defer response.Body.Close()
+	responsePayload, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("read PVN manager heartbeat response: %w", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("PVN manager returned HTTP %d for node heartbeat: %s", response.StatusCode, strings.TrimSpace(string(responsePayload)))
+	}
+	return nil
 }
 
 func decodeGeneration(raw json.RawMessage) (string, error) {

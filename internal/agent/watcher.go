@@ -33,15 +33,17 @@ type WatcherConfig struct {
 }
 
 type ScanReport struct {
-	Scanned      int `json:"scanned"`
-	Candidates   int `json:"candidates"`
-	Bound        int `json:"bound"`
-	AlreadyBound int `json:"already_bound"`
-	Unbound      int `json:"unbound"`
-	Unknown      int `json:"unknown"`
-	Ambiguous    int `json:"ambiguous"`
-	Conflicts    int `json:"conflicts"`
-	Errors       int `json:"errors"`
+	Scanned         int `json:"scanned"`
+	Candidates      int `json:"candidates"`
+	Bound           int `json:"bound"`
+	AlreadyBound    int `json:"already_bound"`
+	Unbound         int `json:"unbound"`
+	ReportedBound   int `json:"reported_bound"`
+	ReportedUnbound int `json:"reported_unbound"`
+	Unknown         int `json:"unknown"`
+	Ambiguous       int `json:"ambiguous"`
+	Conflicts       int `json:"conflicts"`
+	Errors          int `json:"errors"`
 }
 
 type WatcherStatus struct {
@@ -163,12 +165,39 @@ func (watcher *Watcher) ScanOnce(ctx context.Context) (ScanReport, error) {
 			}
 			continue
 		}
-
 		if ownedByAnotherController(ovsInterface.ExternalIDs) {
 			report.Conflicts++
 			watcher.logger.Warn("leaving OVS interface owned by another controller unchanged", "interface", ovsInterface.Name)
 			continue
 		}
+
+		switch resolution.Status {
+		case PortStatusDetaching, PortStatusUnbound, PortStatusError:
+			if ovsInterface.ExternalIDs["managed-by"] == ovs.ManagedByPVN {
+				if err := watcher.binder.ClearManagedBinding(ctx, ovsInterface.Name); err != nil {
+					report.Errors++
+					scanErrors = append(scanErrors, err)
+					continue
+				}
+				report.Unbound++
+			}
+			if resolution.Status == PortStatusDetaching {
+				if err := watcher.manager.ReportPort(ctx, PortReport{PortID: resolution.PortID, Generation: resolution.Generation, Status: PortStatusUnbound}); err != nil {
+					report.Errors++
+					scanErrors = append(scanErrors, fmt.Errorf("report %s unbound: %w", ovsInterface.Name, err))
+				} else {
+					report.ReportedUnbound++
+				}
+			}
+			continue
+		case PortStatusBinding, PortStatusBound:
+			// Continue with the binding checks below.
+		default:
+			report.Errors++
+			scanErrors = append(scanErrors, fmt.Errorf("resolve %s: unknown port status %q", ovsInterface.Name, resolution.Status))
+			continue
+		}
+
 		// requested-chassis is an OVN Northbound LSP option, owned by the
 		// manager reconciler. It does not belong in local Interface external
 		// IDs; the agent uses it as a guard against binding a TAP on the wrong
@@ -197,6 +226,14 @@ func (watcher *Watcher) ScanOnce(ctx context.Context) (ScanReport, error) {
 		}
 		if bindingMatches(ovsInterface.ExternalIDs, binding) {
 			report.AlreadyBound++
+			if resolution.Status == PortStatusBinding && strings.EqualFold(ovsInterface.ExternalIDs["ovn-installed"], "true") {
+				if err := watcher.manager.ReportPort(ctx, PortReport{PortID: resolution.PortID, Generation: resolution.Generation, Status: PortStatusBound}); err != nil {
+					report.Errors++
+					scanErrors = append(scanErrors, fmt.Errorf("report %s bound: %w", ovsInterface.Name, err))
+				} else {
+					report.ReportedBound++
+				}
+			}
 			continue
 		}
 		if err := watcher.binder.SetManagedBinding(ctx, ovsInterface.Name, binding); err != nil {

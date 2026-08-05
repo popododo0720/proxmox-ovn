@@ -22,6 +22,7 @@ import (
 )
 
 const defaultHealthListen = "127.0.0.1:9476"
+const nodeHeartbeatInterval = 30 * time.Second
 
 type agentConfig struct {
 	configPath           string
@@ -35,6 +36,8 @@ type agentConfig struct {
 	ovsVSCTL             string
 	ovsTimeout           int
 	healthListen         string
+	nodeRoles            []string
+	nodeRolesExplicit    bool
 	once                 bool
 	version              bool
 }
@@ -76,6 +79,16 @@ func run(arguments []string, getenv func(string) string, hostname func() (string
 	if err != nil {
 		return err
 	}
+	heartbeat := agent.NodeHeartbeat{
+		Name: config.node, ChassisID: chassisID,
+		Roles: config.nodeRoles, RolesExplicit: config.nodeRolesExplicit,
+	}
+	heartbeatCtx, heartbeatCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err = managerClient.HeartbeatNode(heartbeatCtx, heartbeat)
+	heartbeatCancel()
+	if err != nil {
+		return fmt.Errorf("register node with PVN manager: %w", err)
+	}
 	watcher, err := agent.NewWatcher(agent.WatcherConfig{
 		Node:      config.node,
 		ChassisID: chassisID,
@@ -113,6 +126,7 @@ func run(arguments []string, getenv func(string) string, hostname func() (string
 
 	watchErrors := make(chan error, 1)
 	go func() { watchErrors <- watcher.Run(ctx) }()
+	go runNodeHeartbeats(ctx, managerClient, heartbeat, logger)
 
 	var server *http.Server
 	serverErrors := make(chan error, 1)
@@ -229,6 +243,14 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 	if value := getenv("PVN_HEALTH_LISTEN"); value != "" {
 		defaults.healthListen = value
 	}
+	if value := getenv("PVN_NODE_ROLES"); value != "" {
+		roles, parseErr := parseNodeRoles(value)
+		if parseErr != nil {
+			return agentConfig{}, fmt.Errorf("parse PVN_NODE_ROLES: %w", parseErr)
+		}
+		defaults.nodeRoles = roles
+		defaults.nodeRolesExplicit = true
+	}
 
 	flags := flag.NewFlagSet("pvn-agent", flag.ContinueOnError)
 	flags.StringVar(&defaults.configPath, "config", defaults.configPath, "cluster configuration JSON")
@@ -260,6 +282,48 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 		return agentConfig{}, errors.New("watch interval and OVS timeout must be positive")
 	}
 	return defaults, nil
+}
+
+func parseNodeRoles(value string) ([]string, error) {
+	seen := make(map[string]bool, 3)
+	for _, raw := range strings.Split(value, ",") {
+		role := strings.TrimSpace(raw)
+		if role != "compute" && role != "gateway" && role != "central" {
+			return nil, fmt.Errorf("unknown node role %q", role)
+		}
+		if seen[role] {
+			return nil, fmt.Errorf("duplicate node role %q", role)
+		}
+		seen[role] = true
+	}
+	roles := make([]string, 0, len(seen))
+	for _, role := range []string{"compute", "gateway", "central"} {
+		if seen[role] {
+			roles = append(roles, role)
+		}
+	}
+	if len(roles) == 0 {
+		return nil, errors.New("at least one node role is required")
+	}
+	return roles, nil
+}
+
+func runNodeHeartbeats(ctx context.Context, client *agent.HTTPManagerClient, heartbeat agent.NodeHeartbeat, logger *slog.Logger) {
+	ticker := time.NewTicker(nodeHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			heartbeatCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := client.HeartbeatNode(heartbeatCtx, heartbeat)
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				logger.Error("PVN node heartbeat failed", "error", err)
+			}
+		}
+	}
 }
 
 func findConfigPath(arguments []string, environmentValue string) (string, error) {

@@ -116,6 +116,10 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.resolvePort(writer, request)
 		return
 	}
+	if portID, action, ok := parsePortActionPath(request.URL.Path); ok {
+		s.portAction(writer, request, portID, action)
+		return
+	}
 	s.resource(writer, request)
 }
 
@@ -126,11 +130,16 @@ func (s *Server) RuntimeHandler() http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Header().Set("X-Content-Type-Options", "nosniff")
-		if request.URL.Path != "/api/v1/runtime/ports/resolve" {
+		switch {
+		case request.URL.Path == "/api/v1/runtime/ports/resolve":
+			s.resolvePort(writer, request)
+		case isRuntimePortReportPath(request.URL.Path):
+			s.reportPort(writer, request)
+		case request.URL.Path == "/api/v1/runtime/nodes/heartbeat":
+			s.heartbeatNode(writer, request)
+		default:
 			writeError(writer, http.StatusNotFound, "not_found", "endpoint was not found", nil)
-			return
 		}
-		s.resolvePort(writer, request)
 	})
 }
 
@@ -486,8 +495,26 @@ func (s *Server) resolvePort(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusNotFound, "port_not_found", "no PVN port matches this VM NIC", nil)
 		return
 	}
-	if !port.AdminStateUp || port.BindingStatus != model.PortBinding || port.LSPName == "" || port.MACAddress == "" || port.Generation < 1 {
+	if port.LSPName == "" || port.Generation < 1 {
+		writeError(writer, http.StatusConflict, "port_not_bindable", "the matching PVN port has incomplete runtime identity", map[string]any{"status": port.BindingStatus})
+		return
+	}
+	if (port.BindingStatus == model.PortBinding || port.BindingStatus == model.PortBound) &&
+		(!port.AdminStateUp || port.MACAddress == "" || port.RequestedChassis == "") {
 		writeError(writer, http.StatusConflict, "port_not_bindable", "the matching PVN port is not bindable", map[string]any{"status": port.BindingStatus})
+		return
+	}
+	if (port.BindingStatus == model.PortBinding || port.BindingStatus == model.PortBound) &&
+		(port.State != model.ResourceReady || port.AppliedRevision != port.Revision) {
+		writeError(writer, http.StatusConflict, "port_not_bindable", "the matching PVN port has not been realized in OVN", map[string]any{
+			"status": port.BindingStatus, "state": port.State, "revision": port.Revision, "applied_revision": port.AppliedRevision,
+		})
+		return
+	}
+	if port.BindingStatus != model.PortBinding && port.BindingStatus != model.PortBound &&
+		port.BindingStatus != model.PortDetaching && port.BindingStatus != model.PortUnbound &&
+		port.BindingStatus != model.PortBindingError {
+		writeError(writer, http.StatusConflict, "port_not_bindable", "the matching PVN port has an unknown binding status", map[string]any{"status": port.BindingStatus})
 		return
 	}
 	writeJSON(writer, http.StatusOK, resolvedPort{PortID: port.ID, LSPName: port.LSPName, MACAddress: port.MACAddress, Generation: port.Generation, RequestedChassis: port.RequestedChassis, Status: port.BindingStatus})

@@ -171,6 +171,7 @@ func TestCRUDValidationReferencesAndListFilter(t *testing.T) {
 
 func setupPort(t *testing.T, store controlstore.Store, nodeID string, vmid int, nic, mac, requested string, status model.PortBindingStatus, adminUp bool) *model.Port {
 	t.Helper()
+	ensureAPINode(t, store, nodeID, requested)
 	projects, _ := store.List(context.Background(), model.KindProject, controlstore.ListOptions{})
 	var project *model.Project
 	var network *model.Network
@@ -194,7 +195,34 @@ func setupPort(t *testing.T, store controlstore.Store, nodeID string, vmid int, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return created.(*model.Port)
+	ready, err := store.MarkReconciled(context.Background(), model.KindPort, created.GetMetadata().ID, created.GetMetadata().Revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ready.(*model.Port)
+}
+
+func ensureAPINode(t *testing.T, store controlstore.Store, id string, requestedChassis ...string) *model.Node {
+	t.Helper()
+	resource, err := store.Get(context.Background(), model.KindNode, id)
+	if err == nil {
+		return resource.(*model.Node)
+	}
+	if !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatal(err)
+	}
+	chassisID := "chassis-" + id
+	if len(requestedChassis) > 0 && requestedChassis[0] != "" {
+		chassisID = requestedChassis[0]
+	}
+	created, _, err := store.Create(context.Background(), &model.Node{
+		Metadata: model.Metadata{ID: id}, Name: id, ChassisID: chassisID,
+		Roles: []model.NodeRole{model.NodeRoleCompute}, Enabled: true,
+	}, "test-node-"+id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created.(*model.Node)
 }
 
 func TestRuntimePortResolverUnixOnlyBypass(t *testing.T) {
@@ -233,14 +261,13 @@ func TestRuntimePortResolverErrors(t *testing.T) {
 		t.Fatalf("missing status=%d", missing.Code)
 	}
 	setupPort(t, store, "node-a", 100, "net0", "02:00:00:00:00:01", "pve01", model.PortBindingError, true)
-	notBindable := request(t, server.RuntimeHandler(), http.MethodGet, "/api/v1/runtime/ports/resolve?node=pve01&vmid=100&nic=net0", nil, nil)
-	if notBindable.Code != http.StatusConflict {
-		t.Fatalf("not-bindable status=%d body=%s", notBindable.Code, notBindable.Body.String())
+	cleanup := request(t, server.RuntimeHandler(), http.MethodGet, "/api/v1/runtime/ports/resolve?node=pve01&vmid=100&nic=net0", nil, nil)
+	if cleanup.Code != http.StatusOK {
+		t.Fatalf("cleanup resolution status=%d body=%s", cleanup.Code, cleanup.Body.String())
 	}
-	setupPort(t, store, "node-b", 100, "net0", "02:00:00:00:00:02", "pve01", model.PortBinding, true)
-	ambiguous := request(t, server.RuntimeHandler(), http.MethodGet, "/api/v1/runtime/ports/resolve?node=pve01&vmid=100&nic=net0", nil, nil)
-	if ambiguous.Code != http.StatusConflict {
-		t.Fatalf("ambiguous status=%d body=%s", ambiguous.Code, ambiguous.Body.String())
+	var cleanupPort resolvedPort
+	if err := json.Unmarshal(cleanup.Body.Bytes(), &cleanupPort); err != nil || cleanupPort.Status != model.PortBindingError {
+		t.Fatalf("cleanup resolution = %#v err=%v", cleanupPort, err)
 	}
 }
 
@@ -385,6 +412,7 @@ func TestServerManagedMetadataAndPortBindingFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	network := networkResource.(*model.Network)
+	ensureAPINode(t, store, "pve01", "chassis-01")
 	permissions := map[string]any{
 		"/pool/pool-tenant": map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "SDN.Use": true},
 		"/vms/100":          map[string]bool{"VM.Config.Network": true},
@@ -453,6 +481,7 @@ func TestAttachedPortRequiresUseAndVMNetworkPrivileges(t *testing.T) {
 		t.Fatal(err)
 	}
 	network := networkResource.(*model.Network)
+	ensureAPINode(t, store, "pve01", "chassis-01")
 	portResource, _, err := store.Create(context.Background(), &model.Port{
 		ProjectID: project.ID, NetworkID: network.ID, Name: "attached", MACAddress: "02:00:00:00:00:12",
 		AdminStateUp: true, NodeID: "pve01", VMID: 100, NIC: "net0", RequestedChassis: "chassis-01",

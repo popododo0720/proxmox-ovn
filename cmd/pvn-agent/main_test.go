@@ -18,6 +18,7 @@ func TestParseConfigUsesEnvironmentAndFlags(t *testing.T) {
 	configPath, systemIDPath := writeAgentConfig(t)
 	environment := map[string]string{
 		"PVN_NODE_NAME":      "pve-env",
+		"PVN_NODE_ROLES":     "central, compute, gateway",
 		"PVN_MANAGER_URL":    "unix:///run/pvn/from-env.sock",
 		"PVN_MANAGER_CA":     "/etc/pve/pve-root-ca.pem",
 		"PVN_WATCH_INTERVAL": "5s",
@@ -29,8 +30,21 @@ func TestParseConfigUsesEnvironmentAndFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.node != "pve-flag" || got.bridge != "br-pvn" || got.managerURL != "unix:///run/pvn/from-env.sock" || got.managerCA != "/etc/pve/pve-root-ca.pem" || got.systemIDFile != systemIDPath || got.watchInterval != 5*time.Second || !got.once {
+	if got.node != "pve-flag" || got.bridge != "br-pvn" || got.managerURL != "unix:///run/pvn/from-env.sock" || got.managerCA != "/etc/pve/pve-root-ca.pem" || got.systemIDFile != systemIDPath || got.watchInterval != 5*time.Second || !got.once || !got.nodeRolesExplicit {
 		t.Fatalf("config = %#v", got)
+	}
+	wantRoles := []string{"compute", "gateway", "central"}
+	if fmt.Sprint(got.nodeRoles) != fmt.Sprint(wantRoles) {
+		t.Fatalf("node roles=%v want=%v", got.nodeRoles, wantRoles)
+	}
+}
+
+func TestParseNodeRolesRejectsUnknownAndDuplicateRoles(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"", "compute,compute", "compute,router"} {
+		if _, err := parseNodeRoles(value); err == nil {
+			t.Fatalf("parseNodeRoles(%q) unexpectedly succeeded", value)
+		}
 	}
 }
 
@@ -85,6 +99,7 @@ func writeAgentConfig(t *testing.T) (string, string) {
   "cluster": {"id":"lab","reconcile_every":30000000000,"orphan_grace":300000000000,"require_all_nodes":true,"supported_pve_major":9},
   "manager": {"listen_address":":8443","public_port":8443,"pve_url":"https://127.0.0.1:8006","unix_socket":"/run/pvn/manager.sock","web_root":"/usr/share/pvn/web"},
   "agent": {"poll_every":2000000000,"bridge":"br-json","manager_url":"unix:///run/pvn/from-json.sock","manager_ca":"/json/ca.pem","system_id_file":%q},
+  "ovn": {"control_db":["unix:/run/pvn/control.sock"],"northbound":["unix:/run/ovn/ovnnb_db.sock"],"southbound":["unix:/run/ovn/ovnsb_db.sock"]},
   "networking": {"encap_type":"geneve","guest_mtu":1400,"physnet":"provider","provider_bridge":"br-provider"},
   "security": {"session_ttl":900000000000}
 }`, systemIDPath)
