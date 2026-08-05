@@ -85,6 +85,14 @@ grep -q '^LoadCredential=pvn-config:/etc/pve/pvn/config.json$' deploy/systemd/pv
     echo "the unprivileged manager must receive pmxcfs config as a credential" >&2
     exit 1
 }
+grep -q '^LoadCredential=pvn-pve-ca:/etc/pve/pve-root-ca.pem$' deploy/systemd/pvn-manager.service || {
+    echo "the unprivileged manager must receive the PVE CA as a credential" >&2
+    exit 1
+}
+grep -q '^Environment=PVN_PVE_CA_FILE=%d/pvn-pve-ca$' deploy/systemd/pvn-manager.service || {
+    echo "the manager must validate PVE with its credential CA copy" >&2
+    exit 1
+}
 grep -q '^ExecStart=/usr/sbin/pvn-manager --config %d/pvn-config$' deploy/systemd/pvn-manager.service || {
     echo "the unprivileged manager must read its credential copy" >&2
     exit 1

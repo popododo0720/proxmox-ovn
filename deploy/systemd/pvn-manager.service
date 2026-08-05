@@ -16,11 +16,14 @@ RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
 EnvironmentFile=/etc/pvn/node.env
 LoadCredential=pvn-config:/etc/pve/pvn/config.json
+LoadCredential=pvn-pve-ca:/etc/pve/pve-root-ca.pem
 LoadCredential=pvn-tls-cert:/etc/pve/local/pve-ssl.pem
 LoadCredential=pvn-tls-key:/etc/pve/local/pve-ssl.key
+Environment=PVN_PVE_CA_FILE=%d/pvn-pve-ca
 Environment=PVN_TLS_CERT=%d/pvn-tls-cert
 Environment=PVN_TLS_KEY=%d/pvn-tls-key
 ExecStartPre=/usr/bin/test -r %d/pvn-config
+ExecStartPre=/usr/bin/test -r %d/pvn-pve-ca
 ExecStart=/usr/sbin/pvn-manager --config %d/pvn-config
 Restart=on-failure
 RestartSec=3s
