@@ -1,7 +1,7 @@
 proxmox-ovn (0.2.11) unstable; urgency=medium
 
   * Reconnect long-running managers after PVN Control DB rolling restarts.
-  * Use OVN 25.03-compatible UUID lookups and atomic attached rows.
+  * Use OVN 25.03-compatible UUID lookups, port states, and attached rows.
   * Stabilize multi-role node heartbeats across OVSDB set ordering.
   * Coordinate drift audits and recover abandoned or superseded operations.
   * Batch periodic snapshots to avoid repeated full control DB decoding.
