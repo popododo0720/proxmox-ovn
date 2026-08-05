@@ -44,7 +44,7 @@ vet:
 fmt-check:
 	@test -z "$$(gofmt -l .)" || { gofmt -d $$(gofmt -l .); exit 1; }
 
-package-check:
+package-check: build
 	packaging/tests/package-check.sh
 
 deb: package-check web-build ui-test
