@@ -23,15 +23,6 @@ LOADER_TARGET=${3:-$DEFAULT_LOADER}
 
 case "$ACTION" in install|remove) ;; *) usage ;; esac
 
-[ -f "$TEMPLATE" ] || {
-    echo "PVN UI: PVE template is missing; leaving the Proxmox UI unchanged" >&2
-    exit 0
-}
-[ ! -L "$TEMPLATE" ] || {
-    echo "PVN UI: refusing a symlinked PVE template; leaving it unchanged" >&2
-    exit 0
-}
-
 if [ "$ACTION" = install ]; then
     PVE_VERSION=${PVN_PVE_VERSION:-}
     if [ -z "$PVE_VERSION" ] && command -v dpkg-query >/dev/null 2>&1; then
@@ -47,19 +38,30 @@ if [ "$ACTION" = install ]; then
     esac
 fi
 
+[ -f "$TEMPLATE" ] || {
+    echo "PVN UI: PVE template is missing; leaving the Proxmox UI unchanged" >&2
+    [ "$ACTION" != install ] || exit 1
+    exit 0
+}
+[ ! -L "$TEMPLATE" ] || {
+    echo "PVN UI: refusing a symlinked PVE template; leaving it unchanged" >&2
+    [ "$ACTION" != install ] || exit 1
+    exit 0
+}
+
 [ -f "$SOURCE_LOADER" ] || SOURCE_LOADER="$LOADER_TARGET"
 [ "$ACTION" != install ] || [ -f "$SOURCE_LOADER" ] || {
     echo "PVN UI: loader source is missing; leaving the Proxmox UI unchanged" >&2
-    exit 0
+    exit 1
 }
 if [ "$ACTION" = install ]; then
     [ ! -L "$LOADER_TARGET" ] || {
         echo "PVN UI: refusing a symlinked loader target; leaving the Proxmox UI unchanged" >&2
-        exit 0
+        exit 1
     }
     [ -d "$(dirname "$LOADER_TARGET")" ] || {
         echo "PVN UI: loader target directory is missing; leaving the Proxmox UI unchanged" >&2
-        exit 0
+        exit 1
     }
 fi
 
@@ -90,7 +92,7 @@ case "$ACTION" in
             }
         ' "$TEMPLATE" > "$TMP" || {
             echo "PVN UI: unknown or malformed PVE 9 template signature; leaving the Proxmox UI unchanged" >&2
-            exit 0
+            exit 1
         }
         if ! cmp -s "$TEMPLATE" "$TMP"; then
             mv "$TMP" "$TEMPLATE"

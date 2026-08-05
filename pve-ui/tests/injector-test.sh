@@ -33,7 +33,10 @@ cmp "$FIXTURE" "$WORK/index.html.tpl"
 
 printf '%s\n' '<html><body>' '<!-- PVN-LOADER:BEGIN -->' '</body></html>' > "$WORK/broken.tpl"
 cp "$WORK/broken.tpl" "$WORK/broken-before.tpl"
-PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/broken.tpl" "$WORK/js/pvn-loader.js" 2>/dev/null
+if PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/broken.tpl" "$WORK/js/pvn-loader.js" 2>/dev/null; then
+    echo "malformed supported PVE 9 template unexpectedly succeeded" >&2
+    exit 1
+fi
 cmp "$WORK/broken-before.tpl" "$WORK/broken.tpl"
 
 cp "$FIXTURE" "$WORK/unsupported.tpl"
@@ -43,9 +46,23 @@ cmp "$FIXTURE" "$WORK/unsupported.tpl"
 
 printf '%s\n' '<!doctype html>' '<html><head></head><body></body></html>' > "$WORK/unknown.tpl"
 cp "$WORK/unknown.tpl" "$WORK/unknown-before.tpl"
-PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/unknown.tpl" "$WORK/js/unknown-loader.js" 2>/dev/null
+if PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/unknown.tpl" "$WORK/js/unknown-loader.js" 2>/dev/null; then
+    echo "unknown supported PVE 9 template unexpectedly succeeded" >&2
+    exit 1
+fi
 cmp "$WORK/unknown-before.tpl" "$WORK/unknown.tpl"
 [ ! -e "$WORK/js/unknown-loader.js" ]
+
+if PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/missing.tpl" "$WORK/js/missing-loader.js" 2>/dev/null; then
+    echo "missing supported PVE 9 template unexpectedly succeeded" >&2
+    exit 1
+fi
+
+ln -s "$FIXTURE" "$WORK/symlink.tpl"
+if PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/symlink.tpl" "$WORK/js/symlink-loader.js" 2>/dev/null; then
+    echo "symlinked supported PVE 9 template unexpectedly succeeded" >&2
+    exit 1
+fi
 
 mkdir -p "$WORK/packaged/js"
 cp "$FIXTURE" "$WORK/packaged/index.html.tpl"
