@@ -3,6 +3,9 @@ package ovnnb
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -93,11 +96,34 @@ func TestClientProbeUsesConfiguredClusterAndWaitsForSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(runner.arguments, " ")
-	if !strings.Contains(joined, "--db=unix:/run/ovn/ovnnb_db.sock") || !strings.Contains(joined, "--wait=sb") || !strings.Contains(joined, "list NB_Global") {
+	if !strings.Contains(joined, "--no-syslog --verbose=console:warn") ||
+		!strings.Contains(joined, "--db=unix:/run/ovn/ovnnb_db.sock") ||
+		!strings.Contains(joined, "--wait=sb") || !strings.Contains(joined, "list NB_Global") {
 		t.Fatalf("probe arguments = %v", runner.arguments)
 	}
 	runner.err = errors.New("unreachable")
 	if err := client.Probe(context.Background()); err == nil || !strings.Contains(err.Error(), "probe OVN Northbound") {
 		t.Fatalf("probe error = %v", err)
+	}
+}
+
+func TestClientQuietLoggingPreservesCommandFailure(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "ovn-nbctl")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf '%s\\n' 'simulated OVN error' >&2\nexit 23\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewClient(ClientConfig{
+		Binary: binary, Database: []string{"unix:/run/ovn/ovnnb_db.sock"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Probe(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "simulated OVN error") {
+		t.Fatalf("probe error = %v", err)
+	}
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 23 {
+		t.Fatalf("probe did not preserve exit status 23: %v", err)
 	}
 }

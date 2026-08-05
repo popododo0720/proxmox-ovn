@@ -66,7 +66,16 @@ func NewClient(config ClientConfig) (*Client, error) {
 	} else if timeout < 0 || timeout > 3600 {
 		return nil, errors.New("OVN command timeout must be between 1 and 3600 seconds")
 	}
-	base := []string{"--timeout=" + strconv.Itoa(timeout), "--db=" + strings.Join(config.Database, ",")}
+	// ovn-nbctl logs every mutating command, including addresses and external
+	// IDs, to syslog at info level by default.  Keep routine command payloads
+	// out of the manager journal while retaining warnings and errors in the
+	// captured console output.
+	base := []string{
+		"--no-syslog",
+		"--verbose=console:warn",
+		"--timeout=" + strconv.Itoa(timeout),
+		"--db=" + strings.Join(config.Database, ","),
+	}
 	usesTLS := false
 	for _, endpoint := range config.Database {
 		usesTLS = usesTLS || strings.HasPrefix(endpoint, "ssl:")
