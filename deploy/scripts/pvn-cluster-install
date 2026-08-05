@@ -8,23 +8,40 @@ PROGRAM=${0##*/}
 PHASE=
 INVENTORY=
 IDENTITY=
+LOCAL_PVE=false
 DEB=
 APPLY=false
 CONFIRM=
 SSH_BIN=${PVN_SSH_BIN:-ssh}
 SCP_BIN=${PVN_SCP_BIN:-scp}
+CP_BIN=${PVN_CP_BIN:-cp}
+LOCAL_SH_BIN=${PVN_LOCAL_SH_BIN:-sh}
+PYTHON_BIN=${PVN_PYTHON_BIN:-python3}
+PVECM_BIN=${PVN_PVECM_BIN:-pvecm}
+PVE_MEMBERS_FILE=${PVN_PVE_MEMBERS_FILE:-/etc/pve/.members}
+PVE_COROSYNC_CONF=${PVN_PVE_COROSYNC_CONF:-/etc/pve/corosync.conf}
+PVE_NODES_DIR=${PVN_PVE_NODES_DIR:-/etc/pve/nodes}
+PVE_CLUSTER_IDENTITY=${PVN_PVE_IDENTITY:-/root/.ssh/id_rsa}
 CURRENT_HOST=
 CURRENT_REMOTE_DEB=
 STAGED_RECORDS=
+PVE_MODE=
+PVE_LOCAL_NODE=
+PVE_NODE_RECORDS=
+PVE_DISCOVERY_SNAPSHOT=
+PVE_CONFIRM_ID=
 
 usage() {
     cat >&2 <<EOF
 usage:
+  $PROGRAM preflight --local-pve
+  $PROGRAM install --local-pve --deb FILE [--apply --confirm DEPLOYMENT_ID]
   $PROGRAM preflight --inventory FILE --identity PRIVATE_KEY
   $PROGRAM install --inventory FILE --identity PRIVATE_KEY --deb FILE [--apply --confirm CLUSTER_ID]
 
 preflight is always read-only. install is also read-only unless --apply and a
---confirm value matching the PVE cluster name reported by pvecm are both used.
+matching --confirm value are both used. --local-pve discovers a local standalone
+PVE node or every online member of its quorate PVE cluster.
 EOF
     exit 2
 }
@@ -56,6 +73,10 @@ while [ "$#" -gt 0 ]; do
             IDENTITY=$2
             shift 2
             ;;
+        --local-pve)
+            LOCAL_PVE=true
+            shift
+            ;;
         --deb)
             need_value "$@"
             DEB=$2
@@ -80,22 +101,37 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$PHASE" ] || usage
-[ -n "$INVENTORY" ] || usage
-[ -n "$IDENTITY" ] || usage
-[ -r "$INVENTORY" ] && [ -f "$INVENTORY" ] ||
-    fail "inventory is not a readable regular file: $INVENTORY"
-[ -r "$IDENTITY" ] && [ -f "$IDENTITY" ] ||
-    fail "SSH identity is not a readable regular file: $IDENTITY"
-[ ! -L "$IDENTITY" ] || fail "SSH identity must not be a symlink: $IDENTITY"
 
-identity_owner=$(stat -c '%u' "$IDENTITY" 2>/dev/null || true)
-identity_mode=$(stat -c '%a' "$IDENTITY" 2>/dev/null || true)
-[ "$identity_owner" = "$(id -u)" ] ||
-    fail "SSH identity must be owned by the deployment user"
-case "$identity_mode" in
-    400|600) ;;
-    *) fail "SSH identity mode must be 0400 or 0600 (found ${identity_mode:-unknown})" ;;
-esac
+validate_identity() {
+    pvn_identity=$1
+    [ -r "$pvn_identity" ] && [ -f "$pvn_identity" ] ||
+        fail "SSH identity is not a readable regular file: $pvn_identity"
+    [ ! -L "$pvn_identity" ] ||
+        fail "SSH identity must not be a symlink: $pvn_identity"
+
+    pvn_identity_owner=$(stat -c '%u' "$pvn_identity" 2>/dev/null || true)
+    pvn_identity_mode=$(stat -c '%a' "$pvn_identity" 2>/dev/null || true)
+    [ "$pvn_identity_owner" = "$(id -u)" ] ||
+        fail "SSH identity must be owned by the deployment user"
+    case "$pvn_identity_mode" in
+        400|600) ;;
+        *)
+            fail "SSH identity mode must be 0400 or 0600 (found ${pvn_identity_mode:-unknown})"
+            ;;
+    esac
+}
+
+if [ "$LOCAL_PVE" = true ]; then
+    [ -z "$INVENTORY" ] && [ -z "$IDENTITY" ] ||
+        fail "--local-pve cannot be combined with --inventory or --identity"
+    [ "$(id -u)" -eq 0 ] || fail "--local-pve must run as root on a PVE node"
+else
+    [ -n "$INVENTORY" ] || usage
+    [ -n "$IDENTITY" ] || usage
+    [ -r "$INVENTORY" ] && [ -f "$INVENTORY" ] ||
+        fail "inventory is not a readable regular file: $INVENTORY"
+    validate_identity "$IDENTITY"
+fi
 
 case "$PHASE" in
     preflight)
@@ -120,40 +156,47 @@ case "$PHASE" in
         ;;
 esac
 
-for command_name in "$SSH_BIN" sed awk grep wc stat id; do
+for command_name in sed awk grep wc stat id; do
     command -v "$command_name" >/dev/null 2>&1 ||
         fail "required command is unavailable: $command_name"
 done
 
-# Read only the one supported field. Never source an inventory: doing so would
-# execute arbitrary shell code on the deployment host.
-inventory_values=$(sed -n \
-    's/^[[:space:]]*PVN_TARGET_NODES[[:space:]]*=[[:space:]]*//p' \
-    "$INVENTORY")
-inventory_lines=$(printf '%s\n' "$inventory_values" | awk 'NF { count++ } END { print count + 0 }')
-[ "$inventory_lines" -eq 1 ] ||
-    fail "inventory must contain exactly one PVN_TARGET_NODES assignment"
-
-case "$inventory_values" in
-    \"*\") inventory_values=${inventory_values#\"}; inventory_values=${inventory_values%\"} ;;
-    \'*\') inventory_values=${inventory_values#\'}; inventory_values=${inventory_values%\'} ;;
-esac
-
 NODES=
 NODE_COUNT=0
-for node in $inventory_values; do
-    case "$node" in
-        ''|*[!A-Za-z0-9._-]*|-*)
-            fail "unsafe node name in inventory: $node"
-            ;;
+
+if [ "$LOCAL_PVE" = false ]; then
+    command -v "$SSH_BIN" >/dev/null 2>&1 ||
+        fail "required command is unavailable: $SSH_BIN"
+
+    # Read only the one supported field. Never source an inventory: doing so
+    # would execute arbitrary shell code on the deployment host.
+    inventory_values=$(sed -n \
+        's/^[[:space:]]*PVN_TARGET_NODES[[:space:]]*=[[:space:]]*//p' \
+        "$INVENTORY")
+    inventory_lines=$(printf '%s\n' "$inventory_values" |
+        awk 'NF { count++ } END { print count + 0 }')
+    [ "$inventory_lines" -eq 1 ] ||
+        fail "inventory must contain exactly one PVN_TARGET_NODES assignment"
+
+    case "$inventory_values" in
+        \"*\") inventory_values=${inventory_values#\"}; inventory_values=${inventory_values%\"} ;;
+        \'*\') inventory_values=${inventory_values#\'}; inventory_values=${inventory_values%\'} ;;
     esac
-    case " $NODES " in
-        *" $node "*) fail "duplicate node in inventory: $node" ;;
-    esac
-    NODES=${NODES:+$NODES }$node
-    NODE_COUNT=$((NODE_COUNT + 1))
-done
-[ "$NODE_COUNT" -gt 0 ] || fail "inventory contains no target nodes"
+
+    for node in $inventory_values; do
+        case "$node" in
+            ''|*[!A-Za-z0-9._-]*|-*)
+                fail "unsafe node name in inventory: $node"
+                ;;
+        esac
+        case " $NODES " in
+            *" $node "*) fail "duplicate node in inventory: $node" ;;
+        esac
+        NODES=${NODES:+$NODES }$node
+        NODE_COUNT=$((NODE_COUNT + 1))
+    done
+    [ "$NODE_COUNT" -gt 0 ] || fail "inventory contains no target nodes"
+fi
 
 ssh_run() {
     pvn_ssh_host=$1
