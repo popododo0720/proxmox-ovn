@@ -54,10 +54,13 @@ type DeletionReconciler interface {
 }
 
 type Options struct {
-	Store           controlstore.Store
-	Reconciler      Reconciler
-	SessionProvider SessionProvider
-	Logger          *slog.Logger
+	Store            controlstore.Store
+	Reconciler       Reconciler
+	SessionProvider  SessionProvider
+	Logger           *slog.Logger
+	RequireAllNodes  bool
+	NodeHeartbeatTTL time.Duration
+	Clock            func() time.Time
 }
 
 type Server struct {
@@ -65,6 +68,7 @@ type Server struct {
 	reconciler      Reconciler
 	sessionProvider SessionProvider
 	logger          *slog.Logger
+	clusterGate     *clusterCapacityGate
 }
 
 type sessionContextKey struct{}
@@ -76,7 +80,16 @@ func New(options Options) (*Server, error) {
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
-	return &Server{store: options.Store, reconciler: options.Reconciler, sessionProvider: options.SessionProvider, logger: options.Logger}, nil
+	if options.Clock == nil {
+		options.Clock = time.Now
+	}
+	if options.NodeHeartbeatTTL <= 0 {
+		options.NodeHeartbeatTTL = 2 * time.Minute
+	}
+	return &Server{
+		store: options.Store, reconciler: options.Reconciler, sessionProvider: options.SessionProvider,
+		logger: options.Logger, clusterGate: newClusterCapacityGate(options.RequireAllNodes, options.NodeHeartbeatTTL, options.Clock),
+	}, nil
 }
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -156,7 +169,12 @@ func (s *Server) health(writer http.ResponseWriter, request *http.Request) {
 		methodNotAllowed(writer, http.MethodGet)
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"data": map[string]any{"status": "ok", "time": time.Now().UTC()}})
+	status := s.clusterGate.status(request.Context(), s.store)
+	code := http.StatusOK
+	if !status.Ready {
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(writer, code, map[string]any{"data": map[string]any{"status": status.Label(), "time": s.clusterGate.now().UTC(), "cluster": status}})
 }
 
 func (s *Server) session(writer http.ResponseWriter, request *http.Request) {
@@ -309,6 +327,9 @@ func (s *Server) create(writer http.ResponseWriter, request *http.Request, kind 
 	}
 	if err := s.authorizeWrite(request.Context(), resource, nil); err != nil {
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error(), nil)
+		return
+	}
+	if kind == model.KindPort && !s.requireClusterCapacity(writer, request) {
 		return
 	}
 	created, replayed, err := s.store.Create(request.Context(), resource, key)

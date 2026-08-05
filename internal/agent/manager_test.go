@@ -210,7 +210,7 @@ func TestHTTPManagerClientSendsNodeHeartbeatRolesOnlyWhenExplicit(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	received := make(chan map[string]any, 2)
+	received := make(chan map[string]any, 3)
 	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost || request.URL.Path != "/api/v1/runtime/nodes/heartbeat" {
 			t.Errorf("request = %s %s", request.Method, request.URL.Path)
@@ -244,6 +244,19 @@ func TestHTTPManagerClientSendsNodeHeartbeatRolesOnlyWhenExplicit(t *testing.T) 
 	explicit := <-received
 	if !reflect.DeepEqual(explicit["roles"], []any{"compute", "gateway", "central"}) {
 		t.Fatalf("explicit heartbeat roles=%#v", explicit["roles"])
+	}
+	quorate := true
+	if err := client.HeartbeatNode(context.Background(), NodeHeartbeat{
+		Name: "pve-a", ChassisID: "chassis-a", OnlineNodes: []string{"pve-a", "pve-b"}, Quorate: &quorate,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	membership := <-received
+	if !reflect.DeepEqual(membership["online_nodes"], []any{"pve-a", "pve-b"}) || membership["quorate"] != true {
+		t.Fatalf("membership heartbeat=%#v", membership)
+	}
+	if err := client.HeartbeatNode(context.Background(), NodeHeartbeat{Name: "pve-a", ChassisID: "chassis-a", OnlineNodes: []string{"pve-a"}}); err == nil {
+		t.Fatal("partial membership heartbeat unexpectedly accepted")
 	}
 }
 

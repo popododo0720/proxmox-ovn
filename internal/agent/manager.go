@@ -62,6 +62,8 @@ type NodeHeartbeat struct {
 	ChassisID     string
 	Roles         []string
 	RolesExplicit bool
+	OnlineNodes   []string
+	Quorate       *bool
 }
 
 // ManagerClient resolves the identity encoded in a local PVE TAP name to the
@@ -322,6 +324,16 @@ func (client *HTTPManagerClient) HeartbeatNode(ctx context.Context, heartbeat No
 			return errors.New("an explicit node role list must not be empty")
 		}
 		payload["roles"] = heartbeat.Roles
+	}
+	if (heartbeat.OnlineNodes == nil) != (heartbeat.Quorate == nil) {
+		return errors.New("online node membership and quorum state must be supplied together")
+	}
+	if heartbeat.OnlineNodes != nil {
+		if len(heartbeat.OnlineNodes) == 0 {
+			return errors.New("online node membership must not be empty")
+		}
+		payload["online_nodes"] = heartbeat.OnlineNodes
+		payload["quorate"] = *heartbeat.Quorate
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

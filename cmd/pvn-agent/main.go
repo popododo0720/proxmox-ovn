@@ -19,6 +19,7 @@ import (
 	"github.com/pvnstack/proxmox-ovn/internal/buildinfo"
 	pvnconfig "github.com/pvnstack/proxmox-ovn/internal/config"
 	"github.com/pvnstack/proxmox-ovn/internal/ovs"
+	"github.com/pvnstack/proxmox-ovn/internal/pve"
 )
 
 const defaultHealthListen = "127.0.0.1:9476"
@@ -36,6 +37,8 @@ type agentConfig struct {
 	ovsVSCTL             string
 	ovsTimeout           int
 	healthListen         string
+	membershipFile       string
+	requireAllNodes      bool
 	nodeRoles            []string
 	nodeRolesExplicit    bool
 	once                 bool
@@ -83,6 +86,12 @@ func run(arguments []string, getenv func(string) string, hostname func() (string
 		Name: config.node, ChassisID: chassisID,
 		Roles: config.nodeRoles, RolesExplicit: config.nodeRolesExplicit,
 	}
+	if config.requireAllNodes {
+		heartbeat, err = heartbeatWithMembership(heartbeat, config.membershipFile)
+		if err != nil {
+			return err
+		}
+	}
 	heartbeatCtx, heartbeatCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	err = managerClient.HeartbeatNode(heartbeatCtx, heartbeat)
 	heartbeatCancel()
@@ -126,7 +135,7 @@ func run(arguments []string, getenv func(string) string, hostname func() (string
 
 	watchErrors := make(chan error, 1)
 	go func() { watchErrors <- watcher.Run(ctx) }()
-	go runNodeHeartbeats(ctx, managerClient, heartbeat, logger)
+	go runNodeHeartbeats(ctx, managerClient, heartbeat, config.membershipFile, config.requireAllNodes, logger)
 
 	var server *http.Server
 	serverErrors := make(chan error, 1)
@@ -185,16 +194,18 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 	}
 
 	defaults := agentConfig{
-		configPath:    configPath,
-		node:          clusterConfig.Cluster.NodeName,
-		bridge:        clusterConfig.Agent.Bridge,
-		managerURL:    clusterConfig.Agent.ManagerURL,
-		managerCA:     clusterConfig.Agent.ManagerCA,
-		systemIDFile:  clusterConfig.Agent.SystemIDFile,
-		watchInterval: clusterConfig.Agent.PollEvery,
-		ovsVSCTL:      "ovs-vsctl",
-		ovsTimeout:    5,
-		healthListen:  defaultHealthListen,
+		configPath:      configPath,
+		node:            clusterConfig.Cluster.NodeName,
+		bridge:          clusterConfig.Agent.Bridge,
+		managerURL:      clusterConfig.Agent.ManagerURL,
+		managerCA:       clusterConfig.Agent.ManagerCA,
+		systemIDFile:    clusterConfig.Agent.SystemIDFile,
+		watchInterval:   clusterConfig.Agent.PollEvery,
+		ovsVSCTL:        "ovs-vsctl",
+		ovsTimeout:      5,
+		healthListen:    defaultHealthListen,
+		membershipFile:  pve.DefaultMembershipFile,
+		requireAllNodes: clusterConfig.Cluster.RequireAllNodes,
 	}
 
 	// These settings describe only this process or node, so allowing them to
@@ -243,6 +254,9 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 	if value := getenv("PVN_HEALTH_LISTEN"); value != "" {
 		defaults.healthListen = value
 	}
+	if value := getenv("PVN_MEMBERSHIP_FILE"); value != "" {
+		defaults.membershipFile = value
+	}
 	if value := getenv("PVN_NODE_ROLES"); value != "" {
 		roles, parseErr := parseNodeRoles(value)
 		if parseErr != nil {
@@ -264,6 +278,7 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 	flags.StringVar(&defaults.ovsVSCTL, "ovs-vsctl", defaults.ovsVSCTL, "ovs-vsctl binary path")
 	flags.IntVar(&defaults.ovsTimeout, "ovs-timeout", defaults.ovsTimeout, "ovs-vsctl timeout in seconds")
 	flags.StringVar(&defaults.healthListen, "health-listen", defaults.healthListen, "health HTTP listen address (empty disables)")
+	flags.StringVar(&defaults.membershipFile, "membership-file", defaults.membershipFile, "PVE pmxcfs membership JSON")
 	flags.BoolVar(&defaults.once, "once", false, "scan once and exit")
 	flags.BoolVar(&defaults.version, "version", false, "print version and exit")
 	if err := flags.Parse(arguments); err != nil {
@@ -275,8 +290,8 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 	if defaults.configPath != configPath {
 		return agentConfig{}, errors.New("internal error: --config was not applied before loading configuration")
 	}
-	if defaults.node == "" || defaults.bridge == "" || defaults.managerURL == "" || defaults.systemIDFile == "" {
-		return agentConfig{}, errors.New("node, bridge, manager URL, and system ID file are required")
+	if defaults.node == "" || defaults.bridge == "" || defaults.managerURL == "" || defaults.systemIDFile == "" || (defaults.requireAllNodes && defaults.membershipFile == "") {
+		return agentConfig{}, errors.New("node, bridge, manager URL, system ID file, and required membership file must be configured")
 	}
 	if defaults.watchInterval <= 0 || defaults.ovsTimeout <= 0 {
 		return agentConfig{}, errors.New("watch interval and OVS timeout must be positive")
@@ -308,7 +323,7 @@ func parseNodeRoles(value string) ([]string, error) {
 	return roles, nil
 }
 
-func runNodeHeartbeats(ctx context.Context, client *agent.HTTPManagerClient, heartbeat agent.NodeHeartbeat, logger *slog.Logger) {
+func runNodeHeartbeats(ctx context.Context, client *agent.HTTPManagerClient, heartbeat agent.NodeHeartbeat, membershipFile string, requireAllNodes bool, logger *slog.Logger) {
 	ticker := time.NewTicker(nodeHeartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -316,14 +331,36 @@ func runNodeHeartbeats(ctx context.Context, client *agent.HTTPManagerClient, hea
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			current := heartbeat
+			if requireAllNodes {
+				var err error
+				current, err = heartbeatWithMembership(current, membershipFile)
+				if err != nil {
+					logger.Error("read PVE cluster membership for heartbeat", "error", err)
+					continue
+				}
+			}
 			heartbeatCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := client.HeartbeatNode(heartbeatCtx, heartbeat)
+			err := client.HeartbeatNode(heartbeatCtx, current)
 			cancel()
 			if err != nil && ctx.Err() == nil {
 				logger.Error("PVN node heartbeat failed", "error", err)
 			}
 		}
 	}
+}
+
+func heartbeatWithMembership(heartbeat agent.NodeHeartbeat, path string) (agent.NodeHeartbeat, error) {
+	membership, err := pve.ReadClusterMembership(path)
+	if err != nil {
+		return heartbeat, err
+	}
+	if membership.Reporter != heartbeat.Name {
+		return heartbeat, fmt.Errorf("PVE membership reporter %q does not match PVN node %q", membership.Reporter, heartbeat.Name)
+	}
+	heartbeat.OnlineNodes = append([]string(nil), membership.OnlineNodes...)
+	heartbeat.Quorate = &membership.Quorate
+	return heartbeat, nil
 }
 
 func findConfigPath(arguments []string, environmentValue string) (string, error) {

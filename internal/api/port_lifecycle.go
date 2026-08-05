@@ -167,6 +167,9 @@ func (s *Server) attachPort(writer http.ResponseWriter, request *http.Request, p
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error(), nil)
 		return
 	}
+	if !s.requireClusterCapacity(writer, request) {
+		return
+	}
 
 	op, replayed, err := s.beginPortAction(request.Context(), portActionAttach, current.ID, expected, key, input)
 	if err != nil {

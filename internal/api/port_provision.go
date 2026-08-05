@@ -103,6 +103,9 @@ func (s *Server) provisionPort(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusConflict, "provider_network_port", "tenant VM ports cannot be provisioned on an external or provider-backed network", nil)
 		return
 	}
+	if !s.requireClusterCapacity(writer, request) {
+		return
+	}
 	operation, replayed, err := s.beginPortProvision(request.Context(), key, identity, port.ID)
 	if err != nil {
 		s.storeError(writer, err)

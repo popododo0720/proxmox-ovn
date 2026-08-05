@@ -66,6 +66,23 @@ func TestReadSystemIDSupportsOVSFileFormats(t *testing.T) {
 	}
 }
 
+func TestHeartbeatWithMembershipRequiresMatchingReporter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".members")
+	if err := os.WriteFile(path, []byte(`{"nodename":"pve-a","cluster":{"quorate":1},"nodelist":{"pve-a":{"online":1},"pve-b":{"online":1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, err := heartbeatWithMembership(agent.NodeHeartbeat{Name: "pve-a", ChassisID: "chassis-a"}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if heartbeat.Quorate == nil || !*heartbeat.Quorate || fmt.Sprint(heartbeat.OnlineNodes) != "[pve-a pve-b]" {
+		t.Fatalf("heartbeat=%#v", heartbeat)
+	}
+	if _, err := heartbeatWithMembership(agent.NodeHeartbeat{Name: "pve-b", ChassisID: "chassis-b"}, path); err == nil {
+		t.Fatal("mismatched membership reporter unexpectedly accepted")
+	}
+}
+
 func TestHealthHandlerReflectsWatcherReadiness(t *testing.T) {
 	t.Parallel()
 

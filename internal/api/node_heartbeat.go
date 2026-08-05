@@ -15,9 +15,11 @@ import (
 const maxHeartbeatWriteAttempts = 8
 
 type nodeHeartbeatRequest struct {
-	Name      string            `json:"name"`
-	ChassisID string            `json:"chassis_id"`
-	Roles     *[]model.NodeRole `json:"roles,omitempty"`
+	Name        string            `json:"name"`
+	ChassisID   string            `json:"chassis_id"`
+	Roles       *[]model.NodeRole `json:"roles,omitempty"`
+	OnlineNodes *[]string         `json:"online_nodes,omitempty"`
+	Quorate     *bool             `json:"quorate,omitempty"`
 }
 
 func (s *Server) heartbeatNode(writer http.ResponseWriter, request *http.Request) {
@@ -29,12 +31,16 @@ func (s *Server) heartbeatNode(writer http.ResponseWriter, request *http.Request
 	if !decodeActionBody(writer, request, &heartbeat) {
 		return
 	}
+	if s.clusterGate.required && (heartbeat.OnlineNodes == nil || heartbeat.Quorate == nil) {
+		writeError(writer, http.StatusBadRequest, "membership_required", "online_nodes and quorate are required when cluster.require_all_nodes is enabled", nil)
+		return
+	}
 	explicitRoles, err := canonicalHeartbeatRoles(heartbeat.Roles)
 	if err != nil {
 		s.storeError(writer, err)
 		return
 	}
-	observedAt := time.Now().UTC()
+	observedAt := s.clusterGate.now().UTC()
 	for attempt := 0; attempt < maxHeartbeatWriteAttempts; attempt++ {
 		current, err := s.findHeartbeatNode(request.Context(), heartbeat.Name, heartbeat.ChassisID)
 		if err != nil {
@@ -63,6 +69,9 @@ func (s *Server) heartbeatNode(writer http.ResponseWriter, request *http.Request
 				return
 			}
 			ready := s.markHeartbeatNodeReady(request.Context(), created.(*model.Node))
+			if !s.recordHeartbeatMembership(writer, heartbeat, observedAt) {
+				return
+			}
 			setETag(writer, ready.Revision)
 			if replayed {
 				writer.Header().Set("Idempotency-Replayed", "true")
@@ -90,11 +99,25 @@ func (s *Server) heartbeatNode(writer http.ResponseWriter, request *http.Request
 			return
 		}
 		ready := s.markHeartbeatNodeReady(request.Context(), updated.(*model.Node))
+		if !s.recordHeartbeatMembership(writer, heartbeat, observedAt) {
+			return
+		}
 		setETag(writer, ready.Revision)
 		writeJSON(writer, http.StatusOK, map[string]any{"data": ready})
 		return
 	}
 	writeError(writer, http.StatusConflict, "heartbeat_conflict", "node heartbeat could not be serialized after concurrent updates", nil)
+}
+
+func (s *Server) recordHeartbeatMembership(writer http.ResponseWriter, heartbeat nodeHeartbeatRequest, observedAt time.Time) bool {
+	if heartbeat.OnlineNodes == nil || heartbeat.Quorate == nil {
+		return true
+	}
+	if err := s.clusterGate.report(heartbeat.Name, *heartbeat.OnlineNodes, *heartbeat.Quorate, observedAt); err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_membership", err.Error(), nil)
+		return false
+	}
+	return true
 }
 
 func (s *Server) findHeartbeatNode(ctx context.Context, name, chassisID string) (*model.Node, error) {

@@ -27,24 +27,25 @@ import (
 )
 
 type managerConfig struct {
-	listen         string
-	unixSocket     string
-	tlsCert        string
-	tlsKey         string
-	pveAPIURL      string
-	pveCAFile      string
-	clusterName    string
-	webRoot        string
-	frameAncestors []string
-	controlDB      []string
-	northbound     []string
-	ovnTLSCA       string
-	ovnTLSCert     string
-	ovnTLSKey      string
-	reconcileEvery time.Duration
-	insecureNoAuth bool
-	shutdownWait   time.Duration
-	sessionTTL     time.Duration
+	listen          string
+	unixSocket      string
+	tlsCert         string
+	tlsKey          string
+	pveAPIURL       string
+	pveCAFile       string
+	clusterName     string
+	webRoot         string
+	frameAncestors  []string
+	controlDB       []string
+	northbound      []string
+	ovnTLSCA        string
+	ovnTLSCert      string
+	ovnTLSKey       string
+	reconcileEvery  time.Duration
+	requireAllNodes bool
+	insecureNoAuth  bool
+	shutdownWait    time.Duration
+	sessionTTL      time.Duration
 }
 
 func main() {
@@ -158,7 +159,10 @@ func run(arguments []string) error {
 		}
 		sessionProvider = provider
 	}
-	handler, err := api.New(api.Options{Store: store, Reconciler: controller, SessionProvider: sessionProvider, Logger: logger})
+	handler, err := api.New(api.Options{
+		Store: store, Reconciler: controller, SessionProvider: sessionProvider, Logger: logger,
+		RequireAllNodes: defaults.requireAllNodes, NodeHeartbeatTTL: 2 * time.Minute,
+	})
 	if err != nil {
 		return err
 	}
@@ -275,6 +279,7 @@ func applyClusterConfig(target *managerConfig, clusterConfig pvnconfig.Config, e
 	target.ovnTLSCert = clusterConfig.OVN.TLSCert
 	target.ovnTLSKey = clusterConfig.OVN.TLSKey
 	target.reconcileEvery = clusterConfig.Cluster.ReconcileEvery
+	target.requireAllNodes = clusterConfig.Cluster.RequireAllNodes
 }
 
 func containsSSL(endpoints []string) bool {
