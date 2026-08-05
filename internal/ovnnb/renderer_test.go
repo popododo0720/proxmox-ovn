@@ -46,9 +46,45 @@ type providerPortRunner struct {
 	owned  bool
 }
 
+type uuidLookupRunner struct {
+	arguments []string
+	output    []byte
+	err       error
+}
+
+type attachedRaceRunner struct {
+	uuid   string
+	exists bool
+	calls  [][]string
+}
+
+func (runner *uuidLookupRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
+	runner.arguments = append([]string(nil), arguments...)
+	return runner.output, runner.err
+}
+
+func (runner *attachedRaceRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
+	runner.calls = append(runner.calls, append([]string(nil), arguments...))
+	joined := strings.Join(arguments, " ")
+	if strings.Contains(joined, "get NAT "+runner.uuid+" _uuid") {
+		if runner.exists {
+			return []byte(runner.uuid + "\n"), nil
+		}
+		return nil, nil
+	}
+	if strings.Contains(joined, "create NAT") {
+		runner.exists = true
+		return []byte("transaction error: UUID already exists"), errors.New("exit status 1")
+	}
+	return nil, nil
+}
+
 func (runner *activeActiveRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
 	joined := strings.Join(arguments, " ")
-	if strings.Contains(joined, "find Logical_Switch _uuid="+runner.uuid) {
+	if strings.Contains(joined, "_uuid=") {
+		return nil, errors.New("unsupported _uuid find condition")
+	}
+	if strings.Contains(joined, "get Logical_Switch "+runner.uuid+" _uuid") {
 		runner.mu.Lock()
 		if runner.created {
 			runner.mu.Unlock()
@@ -81,7 +117,10 @@ func (runner *recordingRunner) Run(_ context.Context, _ string, arguments ...str
 	defer runner.mu.Unlock()
 	runner.calls = append(runner.calls, append([]string(nil), arguments...))
 	joined := strings.Join(arguments, " ")
-	if strings.Contains(joined, "find DHCP_Options") {
+	if strings.Contains(joined, "_uuid=") {
+		return nil, errors.New("unsupported _uuid find condition")
+	}
+	if strings.Contains(joined, "get DHCP_Options "+testOVSUUID+" _uuid") {
 		if runner.dhcpCreated {
 			return []byte(testOVSUUID + "\n"), nil
 		}
@@ -126,10 +165,13 @@ func (runner *providerPortRunner) Run(ctx context.Context, binary string, argume
 	output, err := runner.recordingRunner.Run(ctx, binary, arguments...)
 	joined := strings.Join(arguments, " ")
 	if strings.Contains(joined, "find Logical_Switch_Port") {
-		if strings.Contains(joined, "name=") && runner.exists {
-			return []byte(runner.uuid + "\n"), nil
+		if strings.Contains(joined, "external_ids:pvn-managed") {
+			if runner.exists && runner.owned {
+				return []byte(runner.uuid + "\n"), nil
+			}
+			return nil, nil
 		}
-		if strings.Contains(joined, "_uuid="+runner.uuid) && runner.exists && runner.owned {
+		if strings.Contains(joined, "name=") && runner.exists {
 			return []byte(runner.uuid + "\n"), nil
 		}
 	}
@@ -157,6 +199,62 @@ func (runner *recordingRunner) contains(parts ...string) bool {
 		}
 	}
 	return false
+}
+
+func TestFindUUIDUsesOVN2503GetSemantics(t *testing.T) {
+	wanted := deterministicUUID("lookup-row")
+	other := deterministicUUID("other-row")
+	for name, test := range map[string]struct {
+		output  string
+		want    string
+		wantErr bool
+	}{
+		"missing":   {},
+		"found":     {output: wanted + "\n", want: wanted},
+		"malformed": {output: "not-a-uuid\n", wantErr: true},
+		"mismatch":  {output: other + "\n", wantErr: true},
+		"multiple":  {output: wanted + "\n" + wanted + "\n", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &uuidLookupRunner{output: []byte(test.output)}
+			renderer := newTestRenderer(t, runner, controlstore.NewMemory())
+			found, err := renderer.findUUID(context.Background(), "Logical_Switch", wanted)
+			if (err != nil) != test.wantErr || found != test.want {
+				t.Fatalf("findUUID() found=%q err=%v", found, err)
+			}
+			joined := strings.Join(runner.arguments, " ")
+			if !strings.Contains(joined, "--bare -- --if-exists get Logical_Switch "+wanted+" _uuid") || strings.Contains(joined, "_uuid=") {
+				t.Fatalf("findUUID arguments=%v", runner.arguments)
+			}
+		})
+	}
+	runner := &uuidLookupRunner{}
+	renderer := newTestRenderer(t, runner, controlstore.NewMemory())
+	if _, err := renderer.findUUID(context.Background(), "Logical_Switch", "not-a-uuid"); err == nil || len(runner.arguments) != 0 {
+		t.Fatalf("unsafe UUID lookup err=%v arguments=%v", err, runner.arguments)
+	}
+}
+
+func TestEnsureAttachedRowRecoversDeterministicUUIDRace(t *testing.T) {
+	uuid := deterministicUUID("router-snat:race")
+	parent := deterministicUUID("logical-router:race")
+	runner := &attachedRaceRunner{uuid: uuid}
+	renderer := newTestRenderer(t, runner, controlstore.NewMemory())
+	assignments := []string{stringAssignment("type", "snat"), stringAssignment("logical_ip", "10.42.0.0/24")}
+	if err := renderer.ensureAttachedRow(context.Background(), "NAT", uuid, assignments, "Logical_Router", parent, "nat"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 4 {
+		t.Fatalf("race calls=%v", runner.calls)
+	}
+	create := strings.Join(runner.calls[1], " ")
+	retry := strings.Join(runner.calls[3], " ")
+	if !strings.Contains(create, "--id="+uuid+" create NAT") || !strings.Contains(create, "add Logical_Router "+parent+" nat "+uuid) {
+		t.Fatalf("create did not atomically attach non-root row: %v", runner.calls[1])
+	}
+	if !strings.Contains(retry, "set NAT "+uuid) || !strings.Contains(retry, "add Logical_Router "+parent+" nat "+uuid) {
+		t.Fatalf("race retry did not update and reattach winner: %v", runner.calls[3])
+	}
 }
 
 func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
@@ -276,7 +374,7 @@ func TestNetworkProviderChangeUpdatesOwnedLocalnetMapping(t *testing.T) {
 	}
 
 	port := "pvn-localnet-" + compact(network.ID)
-	if !runner.contains("find Logical_Switch_Port", "_uuid="+runner.uuid,
+	if !runner.contains("find Logical_Switch_Port", stringAssignment("name", port),
 		stringAssignment("type", "localnet"),
 		mapAssignment("external_ids", "pvn-managed", "true"),
 		mapAssignment("external_ids", "pvn-kind", model.KindProviderSegment.String()),
@@ -468,13 +566,22 @@ func TestRouterRendersCentralizedGatewayDefaultRouteAndSNAT(t *testing.T) {
 		{"lrp-add " + logicalRouterUUID(fixture.router.ID) + " " + routerPort, "192.0.2.10/24"},
 		{"lsp-add " + logicalSwitchUUID(fixture.externalNetwork.ID) + " " + switchPort, "lsp-set-type " + switchPort + " router", "router-port=" + routerPort, "nat-addresses=router"},
 		{"create Logical_Router_Static_Route", routeUUID, `ip_prefix="0.0.0.0/0"`, `nexthop="192.0.2.1"`, `output_port="` + routerPort + `"`},
-		{"add Logical_Router " + logicalRouterUUID(fixture.router.ID) + " static_routes " + routeUUID},
+		{"create Logical_Router_Static_Route", "add Logical_Router " + logicalRouterUUID(fixture.router.ID) + " static_routes " + routeUUID},
 		{"lrp-set-gateway-chassis " + routerPort + " chassis-a 32767", "lrp-set-gateway-chassis " + routerPort + " chassis-b 32766"},
 		{"create NAT", snatUUID, `type="snat"`, `external_ip="192.0.2.10"`, `logical_ip="10.42.0.0/24"`},
-		{"add Logical_Router " + logicalRouterUUID(fixture.router.ID) + " nat " + snatUUID},
+		{"create NAT", "add Logical_Router " + logicalRouterUUID(fixture.router.ID) + " nat " + snatUUID},
 	} {
 		if !runner.contains(expected...) {
 			t.Errorf("no OVN command contains %v; calls=%v", expected, runner.calls)
+		}
+	}
+	for _, call := range runner.calls {
+		joined := strings.Join(call, " ")
+		if strings.Contains(joined, "create Logical_Router_Static_Route") && !strings.Contains(joined, "add Logical_Router "+logicalRouterUUID(fixture.router.ID)+" static_routes "+routeUUID) {
+			t.Fatalf("non-root route was created without its parent reference: %v", call)
+		}
+		if strings.Contains(joined, "create NAT") && strings.Contains(joined, `external_ids:pvn-kind="router-snat"`) && !strings.Contains(joined, "add Logical_Router "+logicalRouterUUID(fixture.router.ID)+" nat "+snatUUID) {
+			t.Fatalf("non-root SNAT was created without its parent reference: %v", call)
 		}
 	}
 	if runner.contains("chassis-disabled") {

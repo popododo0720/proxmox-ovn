@@ -240,7 +240,7 @@ func (renderer *Renderer) subnet(ctx context.Context, subnet *model.Subnet) erro
 		return err
 	}
 	uuid := deterministicUUID("dhcp-options:" + subnet.ID)
-	existing, err := renderer.findOne(ctx, "DHCP_Options", "_uuid="+uuid)
+	existing, err := renderer.findUUID(ctx, "DHCP_Options", uuid)
 	if err != nil {
 		return err
 	}
@@ -255,7 +255,7 @@ func (renderer *Renderer) subnet(ctx context.Context, subnet *model.Subnet) erro
 		)
 		if createErr != nil {
 			// Another active manager may have won the deterministic-UUID race.
-			found, findErr := renderer.findOne(ctx, "DHCP_Options", "_uuid="+uuid)
+			found, findErr := renderer.findUUID(ctx, "DHCP_Options", uuid)
 			if findErr != nil || found == "" {
 				return wrapRender("subnet DHCP", subnet.ID, createErr)
 			}
@@ -410,7 +410,7 @@ func (renderer *Renderer) portDHCP(ctx context.Context, port *model.Port) error 
 			continue
 		}
 		uuid := deterministicUUID("dhcp-options:" + fixed.SubnetID)
-		found, err := renderer.findOne(ctx, "DHCP_Options", "_uuid="+uuid)
+		found, err := renderer.findUUID(ctx, "DHCP_Options", uuid)
 		if err != nil {
 			return err
 		}
@@ -628,11 +628,11 @@ func (renderer *Renderer) renderRouterDefaultRoute(ctx context.Context, router *
 		mapAssignment("external_ids", "pvn-router", router.ID),
 		mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(router.Revision, 10)),
 	}
-	if err := renderer.ensureRow(ctx, "Logical_Router_Static_Route", uuid, assignments); err != nil {
+	if err := renderer.ensureAttachedRow(ctx, "Logical_Router_Static_Route", uuid, assignments,
+		"Logical_Router", logicalRouterUUID(router.ID), "static_routes"); err != nil {
 		return wrapRender("router default route", router.ID, err)
 	}
-	_, err := renderer.client.run(ctx, "--", "add", "Logical_Router", logicalRouterUUID(router.ID), "static_routes", uuid)
-	return wrapRender("router default route membership", router.ID, err)
+	return nil
 }
 
 func (renderer *Renderer) syncGatewayChassis(ctx context.Context, routerID, routerPort string, desired []string) error {
@@ -832,11 +832,9 @@ func (renderer *Renderer) reconcileRouterSNAT(ctx context.Context, router *model
 				mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(router.Revision, 10)),
 				mapAssignment("external_ids", "pvn-interface-revision", strconv.FormatInt(routerInterface.Revision, 10)),
 			}
-			if err := renderer.ensureRow(ctx, "NAT", uuid, assignments); err != nil {
+			if err := renderer.ensureAttachedRow(ctx, "NAT", uuid, assignments,
+				"Logical_Router", logicalRouterUUID(router.ID), "nat"); err != nil {
 				return wrapRender("router SNAT", routerInterface.ID, err)
-			}
-			if _, err := renderer.client.run(ctx, "--", "add", "Logical_Router", logicalRouterUUID(router.ID), "nat", uuid); err != nil {
-				return wrapRender("router SNAT membership", routerInterface.ID, err)
 			}
 		}
 	}
@@ -1008,7 +1006,7 @@ func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.Floa
 		mapAssignment("external_ids", "pvn-project", floatingIP.ProjectID),
 		mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(floatingIP.Revision, 10)),
 	}
-	existing, findErr := renderer.findOne(ctx, "NAT", "_uuid="+uuid)
+	existing, findErr := renderer.findUUID(ctx, "NAT", uuid)
 	if findErr != nil {
 		return findErr
 	}
@@ -1032,7 +1030,7 @@ func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.Floa
 	_, err = renderer.client.run(ctx, args...)
 	if err != nil && existing == "" {
 		// Deterministic UUIDs turn active-active creates into a harmless race.
-		if found, retryErr := renderer.findOne(ctx, "NAT", "_uuid="+uuid); retryErr == nil && found != "" {
+		if found, retryErr := renderer.findUUID(ctx, "NAT", uuid); retryErr == nil && found != "" {
 			return renderer.floatingIP(ctx, floatingIP)
 		}
 	}
@@ -1184,7 +1182,7 @@ func (renderer *Renderer) ownedProviderPort(ctx context.Context, networkID, port
 		return existing, err
 	}
 	owned, err := renderer.findMany(ctx, "Logical_Switch_Port",
-		"_uuid="+existing,
+		stringAssignment("name", port),
 		stringAssignment("type", "localnet"),
 		mapAssignment("external_ids", "pvn-managed", "true"),
 		mapAssignment("external_ids", "pvn-kind", model.KindProviderSegment.String()),
@@ -1205,7 +1203,7 @@ func (renderer *Renderer) securityGroup(ctx context.Context, group *model.Securi
 	}
 	name := portGroup(group.ID)
 	uuid := deterministicUUID("port-group:" + group.ID)
-	existing, err := renderer.findOne(ctx, "Port_Group", "_uuid="+uuid)
+	existing, err := renderer.findUUID(ctx, "Port_Group", uuid)
 	if err != nil {
 		return err
 	}
@@ -1213,7 +1211,7 @@ func (renderer *Renderer) securityGroup(ctx context.Context, group *model.Securi
 	if existing == "" {
 		args := append([]string{"--", "--id=" + uuid, "create", "Port_Group", stringAssignment("name", name)}, metadata...)
 		if _, createErr := renderer.client.run(ctx, args...); createErr != nil {
-			found, findErr := renderer.findOne(ctx, "Port_Group", "_uuid="+uuid)
+			found, findErr := renderer.findUUID(ctx, "Port_Group", uuid)
 			if findErr != nil || found == "" {
 				return wrapRender("security group", group.ID, createErr)
 			}
@@ -1304,7 +1302,7 @@ func (renderer *Renderer) securityGroupRule(ctx context.Context, rule *model.Sec
 
 func (renderer *Renderer) ensureACL(ctx context.Context, group, owner, direction string, priority int, match, action string, revision int64) error {
 	uuid := deterministicUUID("acl:" + owner)
-	existing, err := renderer.findOne(ctx, "ACL", "_uuid="+uuid)
+	existing, err := renderer.findUUID(ctx, "ACL", uuid)
 	if err != nil {
 		return err
 	}
@@ -1348,7 +1346,7 @@ func (renderer *Renderer) ensureACL(ctx context.Context, group, owner, direction
 		}
 		_, err = renderer.client.run(ctx, args...)
 		if err != nil {
-			if found, findErr := renderer.findOne(ctx, "ACL", "_uuid="+uuid); findErr == nil && found != "" {
+			if found, findErr := renderer.findUUID(ctx, "ACL", uuid); findErr == nil && found != "" {
 				return renderer.ensureACL(ctx, group, owner, direction, priority, match, action, revision)
 			}
 		}
@@ -1420,6 +1418,30 @@ func (renderer *Renderer) findOne(ctx context.Context, table, condition string) 
 	return lines[0], nil
 }
 
+func (renderer *Renderer) findUUID(ctx context.Context, table, uuid string) (string, error) {
+	if err := safeUUID(uuid); err != nil {
+		return "", err
+	}
+	output, err := renderer.client.run(ctx, "--bare", "--", "--if-exists", "get", table, uuid, "_uuid")
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) == 0 {
+		return "", nil
+	}
+	if len(fields) != 1 {
+		return "", fmt.Errorf("OVN returned multiple UUIDs while looking up %s row %q", table, uuid)
+	}
+	if err := safeUUID(fields[0]); err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(fields[0], uuid) {
+		return "", fmt.Errorf("OVN returned UUID %q while looking up %s row %q", fields[0], table, uuid)
+	}
+	return fields[0], nil
+}
+
 func (renderer *Renderer) findMany(ctx context.Context, table string, conditions ...string) ([]string, error) {
 	arguments := append([]string{"--bare", "--columns=_uuid", "find", table}, conditions...)
 	output, err := renderer.client.run(ctx, arguments...)
@@ -1442,7 +1464,7 @@ func (renderer *Renderer) findMany(ctx context.Context, table string, conditions
 }
 
 func (renderer *Renderer) ensureRow(ctx context.Context, table, uuid string, assignments []string) error {
-	existing, err := renderer.findOne(ctx, table, "_uuid="+uuid)
+	existing, err := renderer.findUUID(ctx, table, uuid)
 	if err != nil {
 		return err
 	}
@@ -1452,13 +1474,44 @@ func (renderer *Renderer) ensureRow(ctx context.Context, table, uuid string, ass
 			return nil
 		} else {
 			// All managers derive the same UUID, so a concurrent winner is safe.
-			found, findErr := renderer.findOne(ctx, table, "_uuid="+uuid)
+			found, findErr := renderer.findUUID(ctx, table, uuid)
 			if findErr != nil || found == "" {
 				return createErr
 			}
 		}
 	}
 	args := append([]string{"set", table, uuid}, assignments...)
+	_, err = renderer.client.run(ctx, args...)
+	return err
+}
+
+func (renderer *Renderer) ensureAttachedRow(ctx context.Context, table, uuid string, assignments []string, parentTable, parent, column string) error {
+	existing, err := renderer.findUUID(ctx, table, uuid)
+	if err != nil {
+		return err
+	}
+	args := []string{"--"}
+	if existing == "" {
+		args = append(args, "--id="+uuid, "create", table)
+	} else {
+		args = append(args, "set", table, uuid)
+	}
+	args = append(args, assignments...)
+	args = append(args, "--", "add", parentTable, parent, column, uuid)
+	if _, err := renderer.client.run(ctx, args...); err == nil {
+		return nil
+	} else if existing != "" {
+		return err
+	} else {
+		// A second manager can win the deterministic UUID insert while this
+		// transaction is in flight. Retry only after confirming that exact row.
+		found, findErr := renderer.findUUID(ctx, table, uuid)
+		if findErr != nil || found == "" {
+			return err
+		}
+	}
+	args = append([]string{"--", "set", table, uuid}, assignments...)
+	args = append(args, "--", "add", parentTable, parent, column, uuid)
 	_, err = renderer.client.run(ctx, args...)
 	return err
 }
