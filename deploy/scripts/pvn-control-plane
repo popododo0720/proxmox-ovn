@@ -41,6 +41,7 @@ DEFAULT_SSH_KEY = "/root/.ssh/id_rsa"
 DEFAULT_NODES_DIR = "/etc/pve/nodes"
 DEFAULT_LEASE_BIN = "/usr/lib/pvn/pvn-cluster-lease"
 LEASE_DOMAIN = "control-plane"
+MAX_KNOWN_HOSTS_BYTES = 1024 * 1024
 SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
 PROVIDER_ACK = "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP"
 DATABASES = {
@@ -1109,15 +1110,70 @@ class SystemBackend:
         metadata = self.ssh_key.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ControlPlaneError("native PVE SSH identity is not a regular file")
-        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
+        if metadata.st_nlink != 1 or metadata.st_uid != 0 or \
+                stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
             raise ControlPlaneError("native PVE SSH identity owner/mode is unsafe")
         for _, name, _, _, _, _, _ in records:
             if name == self.local_name:
                 continue
             known = self.nodes_dir / name / "ssh_known_hosts"
-            data = known.read_text(encoding="ascii")
-            lines = [line for line in data.splitlines() if line and not line.startswith("#")]
-            if not lines or any(line.split()[0] != name for line in lines):
+            try:
+                metadata = known.lstat()
+            except OSError as error:
+                raise ControlPlaneError(
+                    f"cannot inspect native known_hosts for {name}: {error}"
+                ) from error
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ControlPlaneError(
+                    f"native known_hosts for {name} is not a regular non-symlink file"
+                )
+            if metadata.st_nlink != 1 or metadata.st_uid != 0 or \
+                    stat.S_IMODE(metadata.st_mode) & 0o022:
+                raise ControlPlaneError(
+                    f"native known_hosts for {name} owner/link/mode is unsafe"
+                )
+            if metadata.st_size > MAX_KNOWN_HOSTS_BYTES:
+                raise ControlPlaneError(f"native known_hosts for {name} exceeds 1 MiB")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(known, flags)
+                try:
+                    opened = os.fstat(descriptor)
+                    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        raise ControlPlaneError(
+                            f"native known_hosts for {name} changed while opening"
+                        )
+                    chunks: list[bytes] = []
+                    total = 0
+                    while True:
+                        chunk = os.read(descriptor, min(65536, MAX_KNOWN_HOSTS_BYTES + 1 - total))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total > MAX_KNOWN_HOSTS_BYTES:
+                            raise ControlPlaneError(
+                                f"native known_hosts for {name} exceeds 1 MiB"
+                            )
+                finally:
+                    os.close(descriptor)
+            except ControlPlaneError:
+                raise
+            except OSError as error:
+                raise ControlPlaneError(
+                    f"cannot securely read native known_hosts for {name}: {error}"
+                ) from error
+            try:
+                data = b"".join(chunks).decode("ascii")
+            except UnicodeDecodeError as error:
+                raise ControlPlaneError(
+                    f"native known_hosts for {name} is not ASCII"
+                ) from error
+            lines = [
+                line.split() for line in data.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            if not lines or any(len(line) < 3 or line[0] != name for line in lines):
                 raise ControlPlaneError(f"native known_hosts does not exclusively pin {name}")
 
     def _remote(self, name: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1127,12 +1183,16 @@ class SystemBackend:
             known = str(self.nodes_dir / name / "ssh_known_hosts")
             remote_command = f"python3 -c {shlex.quote(REMOTE_HELPER)} {shlex.quote(action)}"
             command = [
-                "ssh", "-i", str(self.ssh_key), "-o", "BatchMode=yes",
+                "ssh", "-F", "/dev/null", "-e", "none", "-i", str(self.ssh_key),
+                "-o", "BatchMode=yes",
                 "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
                 "-o", "PubkeyAuthentication=yes", "-o", "PreferredAuthentications=publickey",
                 "-o", "IdentitiesOnly=yes", "-o", "NumberOfPasswordPrompts=0",
-                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known}",
-                "-o", f"HostKeyAlias={name}", "-o", "ConnectTimeout=10", "--",
+                "-o", "StrictHostKeyChecking=yes", "-o", "CheckHostIP=no",
+                "-o", "VerifyHostKeyDNS=no", "-o", "UpdateHostKeys=no",
+                "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", f"UserKnownHostsFile={known}", "-o", f"HostKeyAlias={name}",
+                "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1", "--",
                 f"root@{self.node_addresses[name]}", remote_command,
             ]
         result = subprocess.run(command, input=canonical_json(payload).decode(), text=True,

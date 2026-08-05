@@ -37,6 +37,7 @@ LedgerStore = module["LedgerStore"]
 Node = module["Node"]
 SystemBackend = module["SystemBackend"]
 DATABASES = module["DATABASES"]
+MAX_KNOWN_HOSTS_BYTES = module["MAX_KNOWN_HOSTS_BYTES"]
 
 
 def discovery(count=3, package="0.1.1"):
@@ -352,6 +353,84 @@ with tempfile.TemporaryDirectory() as temporary:
         lambda: backend.prepare_pki(str(uuid.uuid4()), found.nodes, {}),
         "legacy shared PKI",
     )
+
+
+# Native PVE SSH trust files and the SSH process are both tightly isolated.
+with tempfile.TemporaryDirectory() as temporary:
+    root = pathlib.Path(temporary)
+    backend, _, _ = canonical_topology_fixture(root)
+    backend.local_name = "pve-a"
+    backend.node_addresses = {
+        "pve-a": "192.0.2.11", "pve-b": "192.0.2.12", "pve-c": "192.0.2.13",
+    }
+    backend.ssh_key.write_text("test-private-identity\n")
+    backend.ssh_key.chmod(0o600)
+    records = [
+        (1, "pve-a", "192.0.2.11", "198.51.100.11", "ens4", "ens5", "br-provider"),
+        (2, "pve-b", "192.0.2.12", "198.51.100.12", "ens4", "ens5", "br-provider"),
+        (3, "pve-c", "192.0.2.13", "198.51.100.13", "ens4", "ens5", "br-provider"),
+    ]
+
+    def write_known(name, data=None):
+        directory = backend.nodes_dir / name
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "ssh_known_hosts"
+        if os.path.lexists(path):
+            path.unlink()
+        path.write_bytes(data if data is not None else (
+            f"# PVE pin\n{name} ssh-ed25519 AAAAC3NzaTest{name}\n".encode()
+        ))
+        path.chmod(0o640)
+        return path
+
+    pve_b_known = write_known("pve-b")
+    write_known("pve-c")
+    SystemBackend._validate_ssh(backend, records)
+
+    pve_b_known.chmod(0o662)
+    expect_error(lambda: SystemBackend._validate_ssh(backend, records), "owner/link/mode")
+    pve_b_known.chmod(0o640)
+    hardlink = root / "known-hosts-hardlink"
+    os.link(pve_b_known, hardlink)
+    expect_error(lambda: SystemBackend._validate_ssh(backend, records), "owner/link/mode")
+    hardlink.unlink()
+    pve_b_known = write_known("pve-b", b"wrong ssh-ed25519 AAAAC3NzaWrong\n")
+    expect_error(lambda: SystemBackend._validate_ssh(backend, records), "exclusively pin")
+    pve_b_known = write_known("pve-b", b"x" * (MAX_KNOWN_HOSTS_BYTES + 1))
+    expect_error(lambda: SystemBackend._validate_ssh(backend, records), "exceeds 1 MiB")
+    real_pin = root / "real-known-hosts"
+    real_pin.write_text("pve-b ssh-ed25519 AAAAC3NzaReal\n")
+    real_pin.chmod(0o640)
+    pve_b_known.unlink()
+    pve_b_known.symlink_to(real_pin)
+    expect_error(lambda: SystemBackend._validate_ssh(backend, records), "non-symlink")
+    pve_b_known = write_known("pve-b")
+    SystemBackend._validate_ssh(backend, records)
+
+    captured = []
+    real_run = module["subprocess"].run
+
+    def capture_run(command, **_kwargs):
+        captured.append(command)
+        return types.SimpleNamespace(returncode=0, stdout="{}\n", stderr="")
+
+    module["subprocess"].run = capture_run
+    try:
+        assert SystemBackend._remote(backend, "pve-b", "node-status", {}) == {}
+    finally:
+        module["subprocess"].run = real_run
+    command = captured[0]
+    assert command[:6] == ["ssh", "-F", "/dev/null", "-e", "none", "-i"]
+    command_text = " ".join(command)
+    for option in (
+        "BatchMode=yes", "PasswordAuthentication=no", "KbdInteractiveAuthentication=no",
+        "PubkeyAuthentication=yes", "PreferredAuthentications=publickey",
+        "IdentitiesOnly=yes", "NumberOfPasswordPrompts=0", "StrictHostKeyChecking=yes",
+        "CheckHostIP=no", "VerifyHostKeyDNS=no", "UpdateHostKeys=no",
+        "GlobalKnownHostsFile=/dev/null", "ConnectionAttempts=1",
+        f"UserKnownHostsFile={pve_b_known}", "HostKeyAlias=pve-b",
+    ):
+        assert option in command_text, option
 
 
 # Exercise the real remote PKI helper in isolated roots. Private keys never
