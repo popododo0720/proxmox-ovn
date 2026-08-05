@@ -1,3 +1,10 @@
+proxmox-ovn (0.2.7) unstable; urgency=medium
+
+  * Pin PVN Control DB joins to the ledger Raft cluster ID.
+  * Resume exact central-N package upgrade windows safely.
+
+ -- PVN Project <root@localhost>  Wed, 05 Aug 2026 10:47:27 +0000
+
 proxmox-ovn (0.2.6) unstable; urgency=medium
 
   * Safely resume staged seed crash-window deployments after package upgrades.
