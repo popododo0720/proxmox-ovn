@@ -21,7 +21,7 @@ jobs:
         run: >-
           apt-get update &&
           apt-get install -y --no-install-recommends
-          ca-certificates file gh git make systemd
+          ca-certificates file gh git make python3 systemd
 
       - uses: actions/checkout@v4
         with:

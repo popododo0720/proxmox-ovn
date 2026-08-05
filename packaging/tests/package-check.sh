@@ -4,13 +4,31 @@ set -eu
 repo=$(CDPATH= cd -P "$(dirname "$0")/../.." && pwd)
 cd "$repo"
 
-for script in deploy/scripts/* packaging/debian/pvn-node.postinst packaging/debian/pvn-node.prerm packaging/debian/pvn-node.postrm pve-ui/inject.sh; do
+for script in deploy/scripts/*; do
+    case "$(sed -n '1p' "$script")" in
+        *python3*)
+            python3 - "$script" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+compile(path.read_bytes(), str(path), "exec")
+PY
+            ;;
+        *) sh -n "$script" ;;
+    esac
+done
+for script in packaging/debian/pvn-node.postinst packaging/debian/pvn-node.prerm \
+    packaging/debian/pvn-node.postrm pve-ui/inject.sh
+do
     sh -n "$script"
 done
 
 deploy/tests/pvn-cluster-install-test.sh
 deploy/tests/pvn-install-test.sh
 deploy/tests/pvn-ovn-db-listeners-test.sh
+deploy/tests/pvn-topology-test.sh
+deploy/tests/pvn-control-plane-test.sh
 
 if grep -R -n -E '(^|[[:space:]])(ovs-vsctl|ip)[[:space:]].*(add-br|add-port).*br-provider' deploy packaging; then
     echo "package must never create or attach a physical provider bridge" >&2
@@ -254,6 +272,8 @@ for path in \
     usr/lib/pvn/pvn-node-ready \
     usr/lib/pvn/pvn-guest-gate \
     usr/lib/pvn/pvn-ui-verify \
+    usr/lib/pvn/pvn-topology \
+    usr/lib/pvn/pvn-control-plane \
     usr/lib/systemd/system/pvn-node.target \
     usr/lib/systemd/system/pvn-node-ready.service \
     usr/lib/systemd/system/pvn-guest-gate.service \
@@ -284,6 +304,10 @@ done
 package_version=$(dpkg-deb -f "$deb" Version)
 dpkg-deb -f "$deb" Depends | grep -Eq '(^|, )curl([ ,]|$)' || {
     echo "built package does not depend on curl for agent readiness" >&2
+    exit 1
+}
+dpkg-deb -f "$deb" Depends | grep -Eq '(^|, )python3([ ,]|$)' || {
+    echo "built package does not depend on Python for cluster orchestration" >&2
     exit 1
 }
 "$package_root/usr/sbin/pvn-manager" --version | grep -Fq "pvn-manager $package_version (" || {

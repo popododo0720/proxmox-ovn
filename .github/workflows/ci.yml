@@ -13,7 +13,7 @@ jobs:
     container: debian:13
     steps:
       - name: Install Debian 13 prerequisites
-        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates file git make systemd
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates file git make python3 systemd
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
@@ -38,7 +38,7 @@ jobs:
     container: debian:13
     steps:
       - name: Install Debian 13 prerequisites
-        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates file git make systemd
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates file git make python3 systemd
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
