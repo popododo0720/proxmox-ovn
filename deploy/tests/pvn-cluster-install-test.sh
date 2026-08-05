@@ -234,7 +234,8 @@ action=$1
 domain=$2
 token=${3:-}
 path=$PVN_TEST_GLOBAL_LOCK
-[ "$domain" = install ]
+[ "$domain" = mutation ]
+printf '%s %s\n' "$action" "$domain" >> "$PVN_TEST_LEASE_LOG"
 case "$action" in
     acquire)
         [ ! -e "$path" ] || {
@@ -265,6 +266,8 @@ export PVN_TEST_LOG=$LOG
 export PVN_TEST_REMOTE_SCRIPT=$REMOTE_SCRIPT
 export PVN_TEST_STATE=$WORK/state
 export PVN_INSTALL_LOCK_FILE=$WORK/install.lock
+export PVN_TEST_LEASE_LOG=$WORK/lease.log
+: > "$PVN_TEST_LEASE_LOG"
 mkdir "$PVN_TEST_STATE"
 
 INVENTORY=$WORK/inventory
@@ -619,6 +622,7 @@ fi
 
 # Standalone mode has one explicit confirmation token and never uses SSH/SCP.
 : > "$LOG"
+: > "$PVN_TEST_LEASE_LOG"
 reset_state
 write_standalone_members
 rm -f "$PVE_COROSYNC"
@@ -632,6 +636,10 @@ if grep -Eq '^ssh |^scp ' "$LOG"; then
 fi
 [ ! -e "$PVE_GLOBAL_LOCK" ] ||
     fail "standalone apply created a cluster-global lock"
+grep -Fxq 'acquire mutation' "$PVN_TEST_LEASE_LOG" ||
+    fail "standalone apply did not acquire the shared mutation lease"
+grep -Fxq 'release mutation' "$PVN_TEST_LEASE_LOG" ||
+    fail "standalone apply did not release the shared mutation lease"
 grep -q 'standalone-pve-solo' "$WORK/local-standalone.out" ||
     fail "standalone confirmation ID is missing from output"
 

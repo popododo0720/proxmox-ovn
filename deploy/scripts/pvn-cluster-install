@@ -513,7 +513,7 @@ if [ "$LOCAL_PVE" = true ]; then
 fi
 
 acquire_pve_global_lock() {
-    [ "$LOCAL_PVE" = true ] && [ "$PVE_MODE" = cluster ] || return 0
+    [ "$LOCAL_PVE" = true ] || return 0
     [ -x "$CLUSTER_LEASE_BIN" ] ||
         fail "PVE cluster lease helper is unavailable: $CLUSTER_LEASE_BIN"
     PVE_GLOBAL_LOCK_TOKEN=$("$PYTHON_BIN" -c \
@@ -523,19 +523,19 @@ acquire_pve_global_lock() {
         ''|*[!0-9a-f]*) fail "cluster-global lock returned an invalid owner token" ;;
     esac
     pvn_lock_owner=$("$PYTHON_BIN" -c \
-        'import json,sys,time; print(json.dumps({"domain":"install","deployment":sys.argv[1],"node":sys.argv[2],"pid":int(sys.argv[3]),"started":int(time.time()),"token":sys.argv[4]},sort_keys=True,separators=(",",":")))' \
+        'import json,sys,time; print(json.dumps({"domain":"mutation","deployment":sys.argv[1],"node":sys.argv[2],"pid":int(sys.argv[3]),"started":int(time.time()),"token":sys.argv[4]},sort_keys=True,separators=(",",":")))' \
         "$PVE_CONFIRM_ID" "$PVE_LOCAL_NODE" "$$" "$PVE_GLOBAL_LOCK_TOKEN") ||
         fail "could not create the PVE cluster-global install owner record"
     printf '%s\n' "$pvn_lock_owner" |
-        "$CLUSTER_LEASE_BIN" acquire install "$PVE_GLOBAL_LOCK_TOKEN" >/dev/null ||
-        fail "could not acquire the PVE cluster-global install lease"
+        "$CLUSTER_LEASE_BIN" acquire mutation "$PVE_GLOBAL_LOCK_TOKEN" >/dev/null ||
+        fail "could not acquire the PVE cluster-global mutation lease"
     PVE_GLOBAL_LOCK_HELD=true
 }
 
 release_pve_global_lock() {
     [ "$PVE_GLOBAL_LOCK_HELD" = true ] || return 0
-    if ! "$CLUSTER_LEASE_BIN" release install "$PVE_GLOBAL_LOCK_TOKEN"; then
-        echo "$PROGRAM: warning: cluster-global install lease was not removed; run pvn-cluster-lease show install" >&2
+    if ! "$CLUSTER_LEASE_BIN" release mutation "$PVE_GLOBAL_LOCK_TOKEN"; then
+        echo "$PROGRAM: warning: cluster-global mutation lease was not removed; run pvn-cluster-lease show mutation" >&2
         return 1
     fi
     PVE_GLOBAL_LOCK_HELD=false
