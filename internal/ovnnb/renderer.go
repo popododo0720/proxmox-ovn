@@ -371,12 +371,15 @@ func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
 			addresses = append(addresses, fixed.Address)
 		}
 	}
-	enabled := port.AdminStateUp && port.BindingStatus != model.PortUnbound && port.BindingStatus != model.PortDetaching && port.BindingStatus != model.PortBindingError
+	enabledState := "disabled"
+	if port.AdminStateUp && port.BindingStatus != model.PortUnbound && port.BindingStatus != model.PortDetaching && port.BindingStatus != model.PortBindingError {
+		enabledState = "enabled"
+	}
 	arguments := []string{
 		"--", "--may-exist", "lsp-add", logicalSwitchUUID(network.ID), port.LSPName,
 		"--", "lsp-set-addresses", port.LSPName, strings.Join(addresses, " "),
 		"--", "lsp-set-port-security", port.LSPName, strings.Join(addresses, " "),
-		"--", "lsp-set-enabled", port.LSPName, strconv.FormatBool(enabled),
+		"--", "lsp-set-enabled", port.LSPName, enabledState,
 		"--", "set", "Logical_Switch_Port", port.LSPName,
 	}
 	arguments = append(arguments, metadataAssignments(port, map[string]string{"pvn-project": port.ProjectID, "pvn-network": port.NetworkID})...)

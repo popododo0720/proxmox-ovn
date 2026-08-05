@@ -299,7 +299,7 @@ func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
 		{"create DHCP_Options", `cidr="10.42.0.0/24"`},
 		{"dhcp-options-set-options", "server_id=10.42.0.1", "mtu=1400"},
 		{"create Port_Group", portGroup(group.ID), `external_ids:pvn-id="sg-1"`},
-		{"lsp-add " + logicalSwitchUUID(network.ID) + " pvn-port-1", "lsp-set-enabled pvn-port-1 true"},
+		{"lsp-add " + logicalSwitchUUID(network.ID) + " pvn-port-1", "lsp-set-enabled pvn-port-1 enabled"},
 		{"lsp-set-options pvn-port-1 requested-chassis=chassis-a"},
 		{"lsp-set-dhcpv4-options pvn-port-1 " + testOVSUUID},
 		{"get Logical_Switch_Port pvn-port-1", "add Port_Group " + portGroup(group.ID) + " ports @lsp"},
@@ -307,6 +307,35 @@ func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
 		if !runner.contains(expected...) {
 			t.Errorf("no OVN command contains %v; calls=%v", expected, runner.calls)
 		}
+	}
+}
+
+func TestRendererDisablesUnboundPortWithOVNState(t *testing.T) {
+	ctx := context.Background()
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{
+		Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1",
+	}).(*model.Project)
+	network := mustCreate(t, store, &model.Network{
+		Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private", MTU: 1400,
+	}).(*model.Network)
+	subnet := mustCreate(t, store, &model.Subnet{
+		Metadata: model.Metadata{ID: "subnet-1"}, ProjectID: project.ID, NetworkID: network.ID,
+		Name: "private-v4", CIDR: "10.42.0.0/24", GatewayIP: "10.42.0.1",
+	}).(*model.Subnet)
+	port := mustCreate(t, store, &model.Port{
+		Metadata: model.Metadata{ID: "port-1"}, ProjectID: project.ID, NetworkID: network.ID, Name: "vm100-net0",
+		MACAddress: "02:00:00:00:00:10", FixedIPs: []model.FixedIP{{SubnetID: subnet.ID, Address: "10.42.0.10"}},
+		AdminStateUp: true, BindingStatus: model.PortUnbound,
+	}).(*model.Port)
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(ctx, port); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.contains("lsp-set-enabled pvn-port-1 disabled") {
+		t.Fatalf("unbound port did not use the OVN disabled state: %v", runner.calls)
 	}
 }
 
