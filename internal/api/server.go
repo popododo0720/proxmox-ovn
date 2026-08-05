@@ -61,6 +61,8 @@ type Options struct {
 	RequireAllNodes  bool
 	NodeHeartbeatTTL time.Duration
 	Clock            func() time.Time
+	GuestMTU         int
+	Physnet          string
 }
 
 type Server struct {
@@ -69,6 +71,8 @@ type Server struct {
 	sessionProvider SessionProvider
 	logger          *slog.Logger
 	clusterGate     *clusterCapacityGate
+	guestMTU        int
+	physnet         string
 }
 
 type sessionContextKey struct{}
@@ -86,9 +90,16 @@ func New(options Options) (*Server, error) {
 	if options.NodeHeartbeatTTL <= 0 {
 		options.NodeHeartbeatTTL = 2 * time.Minute
 	}
+	if options.GuestMTU == 0 {
+		options.GuestMTU = 1400
+	}
+	if options.GuestMTU < 576 || options.GuestMTU > 9000 {
+		return nil, errors.New("API guest MTU must be between 576 and 9000")
+	}
 	return &Server{
 		store: options.Store, reconciler: options.Reconciler, sessionProvider: options.SessionProvider,
 		logger: options.Logger, clusterGate: newClusterCapacityGate(options.RequireAllNodes, options.NodeHeartbeatTTL, options.Clock),
+		guestMTU: options.GuestMTU, physnet: strings.TrimSpace(options.Physnet),
 	}, nil
 }
 
@@ -315,6 +326,10 @@ func (s *Server) create(writer http.ResponseWriter, request *http.Request, kind 
 	if err != nil {
 		return
 	}
+	if err := s.applyNetworkPolicy(resource); err != nil {
+		s.storeError(writer, err)
+		return
+	}
 	if !metadataEmpty(resource.GetMetadata()) {
 		writeError(writer, http.StatusBadRequest, "invalid_request", "server-managed metadata must be omitted when creating a resource", nil)
 		return
@@ -358,6 +373,10 @@ func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind 
 		return
 	}
 	meta := resource.GetMetadata()
+	if err := s.applyNetworkPolicy(resource); err != nil {
+		s.storeError(writer, err)
+		return
+	}
 	if meta.ID != "" && meta.ID != id {
 		writeError(writer, http.StatusBadRequest, "invalid_request", "body id does not match URL", nil)
 		return

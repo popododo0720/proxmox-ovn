@@ -43,6 +43,8 @@ type managerConfig struct {
 	ovnTLSKey       string
 	reconcileEvery  time.Duration
 	requireAllNodes bool
+	guestMTU        int
+	physnet         string
 	insecureNoAuth  bool
 	shutdownWait    time.Duration
 	sessionTTL      time.Duration
@@ -162,6 +164,7 @@ func run(arguments []string) error {
 	handler, err := api.New(api.Options{
 		Store: store, Reconciler: controller, SessionProvider: sessionProvider, Logger: logger,
 		RequireAllNodes: defaults.requireAllNodes, NodeHeartbeatTTL: 2 * time.Minute,
+		GuestMTU: defaults.guestMTU, Physnet: defaults.physnet,
 	})
 	if err != nil {
 		return err
@@ -280,6 +283,8 @@ func applyClusterConfig(target *managerConfig, clusterConfig pvnconfig.Config, e
 	target.ovnTLSKey = clusterConfig.OVN.TLSKey
 	target.reconcileEvery = clusterConfig.Cluster.ReconcileEvery
 	target.requireAllNodes = clusterConfig.Cluster.RequireAllNodes
+	target.guestMTU = clusterConfig.Networking.GuestMTU
+	target.physnet = clusterConfig.Networking.Physnet
 }
 
 func containsSSL(endpoints []string) bool {
