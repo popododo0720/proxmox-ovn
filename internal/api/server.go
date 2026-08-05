@@ -109,10 +109,6 @@ func New(options Options) (*Server, error) {
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
-	if request.URL.Path == "/api/v1/health" {
-		s.health(writer, request)
-		return
-	}
 	if request.URL.Path == "/api/v1/session" {
 		s.session(writer, request)
 		return
@@ -138,6 +134,10 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		request = request.WithContext(context.WithValue(request.Context(), sessionContextKey{}, session))
+	}
+	if request.URL.Path == "/api/v1/health" {
+		s.health(writer, request)
+		return
 	}
 	if request.URL.Path == "/api/v1/runtime/ports/resolve" {
 		s.resolvePort(writer, request)

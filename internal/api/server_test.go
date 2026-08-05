@@ -84,6 +84,10 @@ func TestHealthAndSession(t *testing.T) {
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated session status=%d", response.Code)
 	}
+	health = request(t, unauthenticated, http.MethodGet, "/api/v1/health", nil, nil)
+	if health.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated health status=%d body=%s", health.Code, health.Body.String())
+	}
 }
 
 func TestCRUDRevisionAndIdempotency(t *testing.T) {
