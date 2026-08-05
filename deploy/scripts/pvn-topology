@@ -13,9 +13,11 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import fcntl
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -25,10 +27,13 @@ from typing import Any
 
 PROGRAM = Path(sys.argv[0]).name
 MEMBERS_FILE = Path(os.environ.get("PVN_TOPOLOGY_MEMBERS_FILE", "/etc/pve/.members"))
-KNOWN_HOSTS_FILE = Path(
-    os.environ.get("PVN_TOPOLOGY_KNOWN_HOSTS_FILE", "/etc/pve/priv/known_hosts")
+PVE_NODES_DIR = Path(os.environ.get("PVN_TOPOLOGY_NODES_DIR", "/etc/pve/nodes"))
+PVE_IDENTITY_FILE = Path(
+    os.environ.get("PVN_TOPOLOGY_IDENTITY_FILE", "/root/.ssh/id_rsa")
 )
 LOCK_FILE = Path(os.environ.get("PVN_TOPOLOGY_LOCK_FILE", "/run/lock/pvn-topology.lock"))
+LEASE_BIN = os.environ.get("PVN_TOPOLOGY_LEASE_BIN", "/usr/lib/pvn/pvn-cluster-lease")
+LEASE_DOMAIN = "topology"
 SSH_BIN = os.environ.get("PVN_TOPOLOGY_SSH_BIN", "ssh")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -78,7 +83,7 @@ def parse_cidr(value: str, option: str) -> ipaddress.IPv4Network:
     return network
 
 
-def discover_members() -> tuple[str, list[dict[str, Any]]]:
+def discover_members() -> tuple[str, str, list[dict[str, Any]]]:
     try:
         data = json.loads(read_limited(MEMBERS_FILE, 1024 * 1024))
     except json.JSONDecodeError as exc:
@@ -98,6 +103,13 @@ def discover_members() -> tuple[str, list[dict[str, Any]]]:
     declared = cluster.get("nodes")
     if not isinstance(declared, int) or declared != len(nodelist):
         fail("PVE cluster node count does not match /etc/pve/.members")
+    local_name = data.get("nodename")
+    if (
+        not isinstance(local_name, str)
+        or not SAFE_NAME.fullmatch(local_name)
+        or local_name not in nodelist
+    ):
+        fail("local PVE nodename is empty, unsafe, or absent from membership")
 
     nodes: list[dict[str, Any]] = []
     seen_ids: set[int] = set()
@@ -130,20 +142,39 @@ def discover_members() -> tuple[str, list[dict[str, Any]]]:
     if len(nodes) != declared:
         fail("not every declared PVE member is online")
     nodes.sort(key=lambda item: (item["id"], item["name"]))
-    return cluster_name, nodes
+    return cluster_name, local_name, nodes
 
 
-def validate_known_hosts() -> None:
+def validate_ssh_files(nodes: list[dict[str, Any]]) -> None:
     try:
-        info = KNOWN_HOSTS_FILE.lstat()
+        identity_info = PVE_IDENTITY_FILE.lstat()
     except OSError as exc:
-        fail(f"cannot inspect Proxmox cluster known_hosts {KNOWN_HOSTS_FILE}: {exc}")
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        fail(f"{KNOWN_HOSTS_FILE} must be a regular, non-symlink file")
-    if info.st_uid != 0 or info.st_mode & 0o022:
-        fail(f"{KNOWN_HOSTS_FILE} must be root-owned and not group/world writable")
-    if info.st_size == 0:
-        fail(f"{KNOWN_HOSTS_FILE} is empty")
+        fail(f"cannot inspect Proxmox cluster identity {PVE_IDENTITY_FILE}: {exc}")
+    if stat.S_ISLNK(identity_info.st_mode) or not stat.S_ISREG(identity_info.st_mode):
+        fail(f"{PVE_IDENTITY_FILE} must be a regular, non-symlink file")
+    if identity_info.st_uid != 0 or stat.S_IMODE(identity_info.st_mode) not in (0o400, 0o600):
+        fail(f"{PVE_IDENTITY_FILE} must be root-owned with mode 0400 or 0600")
+
+    for node in nodes:
+        known_hosts = PVE_NODES_DIR / node["name"] / "ssh_known_hosts"
+        try:
+            info = known_hosts.lstat()
+        except OSError as exc:
+            fail(f"cannot inspect PVE host-key pin {known_hosts}: {exc}")
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            fail(f"{known_hosts} must be a regular, non-symlink file")
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            fail(f"{known_hosts} must be root-owned and not group/world writable")
+        text = read_limited(known_hosts, 1024 * 1024)
+        entries = [
+            line.split()
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if not entries:
+            fail(f"{known_hosts} contains no pinned host key")
+        if any(len(entry) < 3 or entry[0] != node["name"] for entry in entries):
+            fail(f"{known_hosts} does not exclusively pin alias {node['name']}")
 
 
 REMOTE_HELPER = r'''
@@ -184,11 +215,11 @@ def emit(**values):
     print(json.dumps(values, sort_keys=True, separators=(",", ":")))
 
 
-def run(argv, timeout=30, check=True):
+def run(argv, timeout=30, check=True, input_text=None):
     try:
         result = subprocess.run(
             argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout, check=False,
+            input=input_text, timeout=timeout, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         abort("command failed: %s: %s" % (argv[0], exc))
@@ -196,6 +227,266 @@ def run(argv, timeout=30, check=True):
         detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
         abort("command failed: %s: %s" % (argv[0], detail[:500]))
     return result
+
+
+PVE_CAS_HELPER = r"""
+use strict;
+use warnings;
+
+use Digest::SHA qw(sha256_hex);
+use Encode qw(encode);
+use Fcntl qw(:DEFAULT);
+use JSON::PP qw(decode_json encode_json);
+
+my $action = shift // die "missing CAS action\n";
+my $raw = '';
+my $buffer;
+while (1) {
+    my $read = read(STDIN, $buffer, 8192);
+    defined($read) or die "cannot read CAS request: $!\n";
+    last if $read == 0;
+    $raw .= $buffer;
+    length($raw) <= 8 * 1024 * 1024 or die "CAS request is too large\n";
+}
+my $request = decode_json($raw);
+ref($request) eq 'HASH' or die "CAS request must be an object\n";
+
+my $interfaces = '/etc/network/interfaces';
+my $pending = '/etc/network/interfaces.new';
+my $network_lock = '/etc/network/.pve-interfaces.lock';
+my $corosync = '/etc/pve/corosync.conf';
+my $corosync_new = '/etc/pve/corosync.conf.new';
+
+sub read_bytes {
+    my ($path, $optional) = @_;
+    return undef if $optional && !-e $path && !-l $path;
+    my $flags = O_RDONLY;
+    $flags |= O_NOFOLLOW if defined(&O_NOFOLLOW);
+    sysopen(my $handle, $path, $flags) or die "cannot open $path: $!\n";
+    binmode($handle);
+    my $content = '';
+    while (1) {
+        my $read = read($handle, my $chunk, 8192);
+        defined($read) or die "cannot read $path: $!\n";
+        last if $read == 0;
+        $content .= $chunk;
+        length($content) <= 4 * 1024 * 1024 or die "$path is unexpectedly large\n";
+    }
+    close($handle) or die "cannot close $path: $!\n";
+    return $content;
+}
+
+sub hash_path {
+    my ($path, $optional) = @_;
+    my $content = read_bytes($path, $optional);
+    return undef if !defined($content);
+    return sha256_hex($content);
+}
+
+sub write_exclusive {
+    my ($path, $content) = @_;
+    my $flags = O_WRONLY | O_CREAT | O_EXCL;
+    $flags |= O_NOFOLLOW if defined(&O_NOFOLLOW);
+    sysopen(my $handle, $path, $flags, 0600) or die "cannot create $path: $!\n";
+    binmode($handle);
+    my $ok = eval {
+        print {$handle} $content or die "cannot write $path: $!\n";
+        close($handle) or die "cannot close $path: $!\n";
+        1;
+    };
+    if (!$ok) {
+        my $error = $@ || "unknown write failure\n";
+        close($handle);
+        unlink($path);
+        die $error;
+    }
+}
+
+sub locked_network {
+    my ($code) = @_;
+    require PVE::Tools;
+    my $result = PVE::Tools::lock_file($network_lock, 10, $code);
+    my $error = $@;
+    defined($error) && length($error) and die "network config lock failed: $error";
+    return $result;
+}
+
+sub safe_iface {
+    my ($value) = @_;
+    defined($value) && !ref($value) && $value =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+        or die "unsafe interface name\n";
+    return $value;
+}
+
+sub safe_mtu {
+    my ($value) = @_;
+    defined($value) && !ref($value) && "$value" =~ /\A[0-9]+\z/
+        && $value >= 1280 && $value <= 65520
+        or die "unsafe MTU\n";
+    return int($value);
+}
+
+if ($action eq 'stage-network') {
+    require PVE::INotify;
+    my $result = locked_network(sub {
+        hash_path($interfaces, 0) eq $request->{expected_current_sha256}
+            or die "interfaces failed compare-and-swap before staging\n";
+        !-e $pending && !-l $pending or die "pending network configuration already exists\n";
+        my $geneve = safe_iface($request->{geneve}->{interface});
+        my $provider = safe_iface($request->{provider}->{interface});
+        my $geneve_mtu = safe_mtu($request->{geneve}->{mtu});
+        my $provider_mtu = safe_mtu($request->{provider}->{mtu});
+        my $integration_mtu = safe_mtu($request->{effective_underlay_mtu});
+        my $config = PVE::INotify::read_file('interfaces');
+        my $ifaces = $config->{ifaces};
+        ref($ifaces) eq 'HASH' or die "PVE interfaces object is invalid\n";
+        ref($ifaces->{$geneve}) eq 'HASH' && $ifaces->{$geneve}->{type} eq 'eth'
+            or die "Geneve interface changed before staging\n";
+        ref($ifaces->{$provider}) eq 'HASH' && $ifaces->{$provider}->{type} eq 'eth'
+            or die "provider interface changed before staging\n";
+        !$ifaces->{'br-int'} && !$ifaces->{'br-provider'}
+            or die "PVN bridge appeared before staging\n";
+        for my $name (keys %$ifaces) {
+            next if $name eq $geneve || $name eq $provider;
+            my $row = $ifaces->{$name};
+            next if ref($row) ne 'HASH';
+            my $ports = join(' ', map { $row->{$_} // '' } qw(bridge_ports ovs_ports slaves ovs_bonds));
+            my %used = map { $_ => 1 } grep { length($_) } split(/\s+/, $ports);
+            !$used{$geneve} && !$used{$provider}
+                or die "candidate interface became owned by $name\n";
+        }
+
+        $ifaces->{$geneve}->{mtu} = $geneve_mtu;
+        $ifaces->{'br-int'} = {
+            type => 'OVSBridge', autostart => 1, mtu => $integration_mtu,
+            families => ['inet'], method => 'manual', method6 => 'manual',
+        };
+        $ifaces->{'br-provider'} = {
+            type => 'OVSBridge', autostart => 1, mtu => $provider_mtu,
+            ovs_ports => $provider, families => ['inet'], method => 'manual',
+            method6 => 'manual',
+        };
+        my $provider_row = $ifaces->{$provider};
+        delete $provider_row->{$_}
+            for qw(address netmask gateway cidr address6 netmask6 gateway6 cidr6);
+        $provider_row->{type} = 'OVSPort';
+        $provider_row->{ovs_bridge} = 'br-provider';
+        $provider_row->{autostart} = 0;
+        $provider_row->{mtu} = $provider_mtu;
+        $provider_row->{families} = ['inet'];
+        $provider_row->{method} = 'manual';
+        $provider_row->{method6} = 'manual';
+
+        my $desired;
+        my $ok = eval {
+            PVE::INotify::write_file('interfaces', $config);
+            $desired = hash_path($pending, 0);
+            1;
+        };
+        if (!$ok) {
+            my $error = $@ || "unknown PVE network write failure\n";
+            unlink($pending) if -e $pending || -l $pending;
+            die $error;
+        }
+        return $desired;
+    });
+    print encode_json({ desired_sha256 => $result }), "\n";
+    exit 0;
+}
+
+if ($action eq 'apply-network') {
+    my $result = locked_network(sub {
+        hash_path($interfaces, 0) eq $request->{expected_current_sha256}
+            or die "interfaces changed before network apply\n";
+        hash_path($pending, 0) eq $request->{expected_pending_sha256}
+            or die "pending interfaces failed compare-and-swap\n";
+        rename($pending, $interfaces) or die "cannot atomically install pending interfaces: $!\n";
+        my $written = hash_path($interfaces, 0);
+        $written eq $request->{expected_pending_sha256}
+            or die "installed interfaces hash differs from candidate\n";
+        return $written;
+    });
+    print encode_json({ interfaces_sha256 => $result }), "\n";
+    exit 0;
+}
+
+if ($action eq 'discard-network') {
+    my $result = locked_network(sub {
+        my $pending_hash = hash_path($pending, 1);
+        return 0 if !defined($pending_hash);
+        $pending_hash eq $request->{expected_pending_sha256}
+            or die "refusing to discard unrelated pending network changes\n";
+        unlink($pending) or die "cannot discard owned pending interfaces: $!\n";
+        return 1;
+    });
+    print encode_json({ discarded => $result ? JSON::PP::true : JSON::PP::false }), "\n";
+    exit 0;
+}
+
+if ($action eq 'write-pending') {
+    my $content = encode('UTF-8', $request->{content});
+    sha256_hex($content) eq $request->{content_sha256}
+        or die "rollback interfaces content hash mismatch\n";
+    my $result = locked_network(sub {
+        hash_path($interfaces, 0) eq $request->{expected_current_sha256}
+            or die "interfaces changed before rollback staging\n";
+        my $pending_hash = hash_path($pending, 1);
+        if (defined($pending_hash)) {
+            return $pending_hash if $pending_hash eq $request->{content_sha256};
+            defined($request->{replace_pending_sha256})
+                && $pending_hash eq $request->{replace_pending_sha256}
+                or die "refusing rollback with unrelated pending network changes\n";
+            unlink($pending) or die "cannot remove owned pending interfaces: $!\n";
+        }
+        write_exclusive($pending, $content);
+        return hash_path($pending, 0);
+    });
+    print encode_json({ pending_sha256 => $result }), "\n";
+    exit 0;
+}
+
+if ($action eq 'apply-corosync') {
+    my $content = encode('UTF-8', $request->{content});
+    sha256_hex($content) eq $request->{content_sha256}
+        or die "Corosync candidate hash mismatch\n";
+    require PVE::Cluster;
+    PVE::Cluster::cfs_update(1);
+    my $result = PVE::Cluster::cfs_lock_file('corosync.conf', 10, sub {
+        hash_path($corosync, 0) eq $request->{expected_current_sha256}
+            or die "corosync.conf failed compare-and-swap\n";
+        !-e $corosync_new && !-l $corosync_new
+            or die "unrelated corosync.conf.new already exists\n";
+        write_exclusive($corosync_new, $content);
+        if (!rename($corosync_new, $corosync)) {
+            my $error = $!;
+            unlink($corosync_new);
+            die "cannot atomically install corosync.conf candidate: $error\n";
+        }
+        return hash_path($corosync, 0);
+    });
+    my $error = $@;
+    defined($error) && length($error) and die "Corosync config lock failed: $error";
+    print encode_json({ corosync_sha256 => $result }), "\n";
+    exit 0;
+}
+
+die "unknown PVE CAS action\n";
+"""
+
+
+def pve_cas(action, request, timeout=30):
+    result = run(
+        ["perl", "-e", PVE_CAS_HELPER, action],
+        timeout=timeout,
+        input_text=json.dumps(request, sort_keys=True, separators=(",", ":")),
+    )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        abort("invalid PVE CAS helper response: %s" % exc)
+    if not isinstance(value, dict):
+        abort("PVE CAS helper returned a non-object")
+    return value
 
 
 def read_regular(path, limit=4 * 1024 * 1024, root_only=True):
@@ -510,7 +801,7 @@ def read_ledger():
 
 def build_probe(request):
     check_activation_absent()
-    require_commands(("ip", "pvecm", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "corosync", "corosync-cfgtool"))
+    require_commands(("ip", "pvecm", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "corosync", "corosync-cfgtool", "perl"))
     check_pve_packages()
     cluster_status(request["node_count"], request["cluster_name"])
 
@@ -619,7 +910,9 @@ def build_probe(request):
         and provider["interface"] in str(api.get("br-provider", {}).get("ovs_ports", "")).split()
         and br_int_live and br_provider_live
         and provider_ovs_bridge == "br-provider"
-        and int(geneve_api.get("mtu", geneve["mtu"])) == geneve["max_mtu"]
+        and int(geneve_api.get("mtu", geneve["mtu"])) == geneve["mtu"]
+        and int(api.get("br-int", {}).get("mtu", 0)) == request["effective_underlay_mtu"]
+        and int(api.get("br-provider", {}).get("mtu", 0)) == provider["mtu"]
     )
     if not desired:
         if journal and not provider_ipv4:
@@ -638,7 +931,7 @@ def build_probe(request):
         pending_sha = sha_file(PENDING)
         if not journal or pending_sha != journal.get("desired_interfaces_sha256"):
             abort("unrelated pending PVE network changes exist")
-    _ledger_text, ledger_sha = read_ledger()
+    ledger_text, ledger_sha = read_ledger()
 
     return {
         "node": node,
@@ -655,6 +948,7 @@ def build_probe(request):
         "provider": provider,
         "network_state": "desired" if desired else "initial",
         "journal_phase": journal.get("phase") if journal else None,
+        "ledger_text": ledger_text,
         "ledger_sha256": ledger_sha,
         "activation_safe": True,
     }
@@ -744,13 +1038,16 @@ def validate_corosync(request):
 
 
 def apply_corosync(request):
-    current = sha_file(COROSYNC)
-    if current != request["expected_sha256"]:
-        abort("corosync.conf changed before apply")
     candidate = request["candidate"]
     if sha_text(candidate) != request["candidate_sha256"]:
         abort("corosync candidate hash mismatch")
-    atomic_write(COROSYNC, candidate, 0o600)
+    result = pve_cas("apply-corosync", {
+        "expected_current_sha256": request["expected_sha256"],
+        "content": candidate,
+        "content_sha256": request["candidate_sha256"],
+    })
+    if result.get("corosync_sha256") != request["candidate_sha256"]:
+        abort("Corosync CAS helper installed an unexpected candidate")
     run(["corosync-cfgtool", "-R"])
     emit(corosync_sha256=sha_file(COROSYNC))
 
@@ -765,7 +1062,13 @@ def restore_corosync(request):
     candidate = request["rollback_candidate"]
     if sha_text(candidate) != request["rollback_sha256"]:
         abort("Corosync rollback candidate hash mismatch")
-    atomic_write(COROSYNC, candidate, 0o600)
+    result = pve_cas("apply-corosync", {
+        "expected_current_sha256": request["failed_candidate_sha256"],
+        "content": candidate,
+        "content_sha256": request["rollback_sha256"],
+    })
+    if result.get("corosync_sha256") != request["rollback_sha256"]:
+        abort("Corosync CAS helper installed an unexpected rollback")
     run(["corosync-cfgtool", "-R"])
     emit(restored=True, corosync_sha256=sha_file(COROSYNC))
 
@@ -801,13 +1104,11 @@ def verify_cluster(request):
     emit(verified=True, corosync_sha256=current_sha)
 
 
-def pvesh(*args):
-    return run(["pvesh", *args])
-
-
-def discard_pending(node):
-    if PENDING.exists() or PENDING.is_symlink():
-        pvesh("delete", "/nodes/%s/network" % node)
+def discard_pending(expected_sha256):
+    response = pve_cas("discard-network", {
+        "expected_pending_sha256": expected_sha256,
+    })
+    return response.get("discarded") is True
 
 
 def assert_staged_network(node, request):
@@ -816,14 +1117,18 @@ def assert_staged_network(node, request):
     provider = rows.get(request["provider"]["interface"], {})
     br_int = rows.get("br-int", {})
     br_provider = rows.get("br-provider", {})
-    if geneve.get("type") != "eth" or int(geneve.get("mtu", 0)) != request["geneve"]["max_mtu"]:
-        abort("staged Geneve NIC does not have its actual max MTU")
+    if geneve.get("type") != "eth" or int(geneve.get("mtu", 0)) != request["geneve"]["mtu"]:
+        abort("staged Geneve NIC does not preserve its verified live MTU")
     if provider.get("type") != "OVSPort" or provider.get("ovs_bridge") != "br-provider":
         abort("staged provider NIC is not an OVS port")
     if any(provider.get(key) for key in ("cidr", "address", "gateway", "cidr6", "address6", "gateway6")):
         abort("staged provider NIC still has L3 configuration")
     if br_int.get("type") != "OVSBridge" or br_provider.get("type") != "OVSBridge":
         abort("staged PVN OVS bridges are missing")
+    if int(br_int.get("mtu", 0)) != request["effective_underlay_mtu"]:
+        abort("staged integration bridge MTU differs from the safe live underlay MTU")
+    if int(br_provider.get("mtu", 0)) != request["provider"]["mtu"]:
+        abort("staged provider bridge does not preserve the verified live provider MTU")
     if request["provider"]["interface"] not in str(br_provider.get("ovs_ports", "")).split():
         abort("staged provider bridge does not contain the physical NIC")
 
@@ -846,55 +1151,34 @@ def stage_network(request):
         abort("unrelated pending PVE network changes exist")
 
     node = request["node"]
+    owned_desired = None
     try:
-        pvesh("set", "/nodes/%s/network/%s" % (node, request["geneve"]["interface"]),
-              "-mtu", str(request["geneve"]["max_mtu"]))
-        pvesh("create", "/nodes/%s/network" % node,
-              "-iface", "br-int", "-type", "OVSBridge", "-autostart", "1",
-              "-mtu", str(request["effective_underlay_mtu"]))
-        pvesh("create", "/nodes/%s/network" % node,
-              "-iface", "br-provider", "-type", "OVSBridge", "-autostart", "1",
-              "-ovs_ports", request["provider"]["interface"],
-              "-mtu", str(request["provider"]["max_mtu"]))
-        pvesh("set", "/nodes/%s/network/%s" % (node, request["provider"]["interface"]),
-              "-type", "OVSPort", "-ovs_bridge", "br-provider", "-autostart", "0",
-              "-mtu", str(request["provider"]["max_mtu"]),
-              "-delete", "cidr,cidr6,gateway,gateway6")
+        response = pve_cas("stage-network", {
+            "expected_current_sha256": journal["before_interfaces_sha256"],
+            "geneve": request["geneve"],
+            "provider": request["provider"],
+            "effective_underlay_mtu": request["effective_underlay_mtu"],
+        })
+        owned_desired = response.get("desired_sha256")
+        if not isinstance(owned_desired, str) or not SHA256.fullmatch(owned_desired):
+            abort("PVE network CAS helper returned an invalid candidate hash")
+        if sha_file(PENDING) != owned_desired:
+            abort("pending interfaces changed immediately after atomic staging")
         run(["ifquery", "-i", str(PENDING), "-a"])
         assert_staged_network(node, request)
-        desired_sha = sha_file(PENDING)
-        journal["desired_interfaces_sha256"] = desired_sha
+        if sha_file(PENDING) != owned_desired:
+            abort("pending interfaces changed during validation")
+        journal["desired_interfaces_sha256"] = owned_desired
         journal["phase"] = "network-staged"
         save_journal(journal)
-        emit(noop=False, desired_interfaces_sha256=desired_sha)
-    except Exception:
-        try:
-            discard_pending(node)
-        except Exception:
-            pass
+        emit(noop=False, desired_interfaces_sha256=owned_desired)
+    except Exception as error:
+        if owned_desired:
+            try:
+                discard_pending(owned_desired)
+            except Exception as cleanup_error:
+                abort("%s; owned pending cleanup also failed: %s" % (error, cleanup_error))
         raise
-
-
-def wait_pve_task(node, output):
-    text = output.strip()
-    try:
-        upid = json.loads(text)
-    except json.JSONDecodeError:
-        upid = text
-    if not isinstance(upid, str) or not upid.startswith("UPID:"):
-        abort("PVE network reload did not return a task UPID")
-    deadline = time.monotonic() + 90
-    while time.monotonic() < deadline:
-        status = parse_json_command([
-            "pvesh", "get", "/nodes/%s/tasks/%s/status" % (node, upid),
-            "--output-format", "json",
-        ])
-        if status.get("status") == "stopped":
-            if status.get("exitstatus") != "OK":
-                abort("PVE network reload failed: %s" % status.get("exitstatus"))
-            return
-        time.sleep(1)
-    abort("PVE network reload timed out")
 
 
 def apply_network(request):
@@ -910,10 +1194,13 @@ def apply_network(request):
         return
     if current != journal["before_interfaces_sha256"]:
         abort("interfaces changed before network apply")
-    if sha_file(PENDING) != desired:
-        abort("staged interfaces failed compare-and-swap")
-    output = pvesh("set", "/nodes/%s/network" % request["node"], "--output-format", "json").stdout
-    wait_pve_task(request["node"], output)
+    result = pve_cas("apply-network", {
+        "expected_current_sha256": journal["before_interfaces_sha256"],
+        "expected_pending_sha256": desired,
+    })
+    if result.get("interfaces_sha256") != desired:
+        abort("PVE network CAS helper installed an unexpected candidate")
+    run(["ifreload", "-a"], timeout=90)
     if sha_file(INTERFACES) != desired:
         abort("PVE network API did not install the staged file")
     journal["phase"] = "network-applied-unverified"
@@ -952,10 +1239,7 @@ def rollback_network(request):
     before = journal.get("before_interfaces_sha256")
     current = sha_file(INTERFACES)
     if PENDING.exists() or PENDING.is_symlink():
-        pending_sha = sha_file(PENDING)
-        if pending_sha != desired:
-            abort("refusing rollback with unrelated pending network changes")
-        discard_pending(request["node"])
+        discard_pending(desired)
     if current == before:
         journal["phase"] = "network-rolled-back"
         save_journal(journal)
@@ -970,10 +1254,22 @@ def rollback_network(request):
     content = read_regular(backup)
     if sha_text(content) != before:
         abort("interfaces backup hash mismatch")
-    atomic_write(PENDING, content, 0o600)
+    staged = pve_cas("write-pending", {
+        "expected_current_sha256": desired,
+        "replace_pending_sha256": desired,
+        "content": content,
+        "content_sha256": before,
+    })
+    if staged.get("pending_sha256") != before:
+        abort("network rollback CAS helper staged an unexpected backup")
     run(["ifquery", "-i", str(PENDING), "-a"])
-    output = pvesh("set", "/nodes/%s/network" % request["node"], "--output-format", "json").stdout
-    wait_pve_task(request["node"], output)
+    applied = pve_cas("apply-network", {
+        "expected_current_sha256": desired,
+        "expected_pending_sha256": before,
+    })
+    if applied.get("interfaces_sha256") != before:
+        abort("network rollback CAS helper installed an unexpected backup")
+    run(["ifreload", "-a"], timeout=90)
     if sha_file(INTERFACES) != before:
         abort("interfaces rollback did not restore the immutable backup")
     journal["phase"] = "network-rolled-back"
@@ -990,10 +1286,8 @@ def discard_stage(request):
     if not (PENDING.exists() or PENDING.is_symlink()):
         emit(noop=True)
         return
-    if sha_file(PENDING) != journal.get("desired_interfaces_sha256"):
-        abort("refusing to discard unrelated pending network changes")
-    discard_pending(request["node"])
-    emit(noop=False)
+    discarded = discard_pending(journal.get("desired_interfaces_sha256"))
+    emit(noop=not discarded)
 
 
 def record_phase(request):
@@ -1039,6 +1333,33 @@ def verify_ledger(request):
     emit(ledger_sha256=current_hash)
 
 
+def restore_ledger(request):
+    check_activation_absent()
+    original = request.get("original_ledger")
+    original_hash = request.get("original_ledger_sha256")
+    failed_hash = request.get("failed_ledger_sha256")
+    if original is None:
+        if original_hash is not None:
+            abort("absent original ledger has a non-empty hash")
+    elif not isinstance(original, str) or sha_text(original) != original_hash:
+        abort("original shared topology ledger hash mismatch")
+    _current_text, current_hash = read_ledger()
+    if current_hash == original_hash:
+        emit(noop=True, ledger_sha256=current_hash)
+        return
+    if current_hash != failed_hash:
+        abort("refusing shared ledger rollback after unrelated drift")
+    if original is None:
+        LEDGER_FILE.unlink()
+        emit(noop=False, ledger_sha256=None)
+        return
+    atomic_write(LEDGER_FILE, original, 0o600)
+    _text, restored_hash = read_ledger()
+    if restored_hash != original_hash:
+        abort("shared topology ledger rollback did not persist")
+    emit(noop=False, ledger_sha256=restored_hash)
+
+
 def main():
     if os.geteuid() != 0:
         abort("remote helper must run as root")
@@ -1066,6 +1387,7 @@ def main():
         "record-phase": lambda: record_phase(request),
         "write-ledger": lambda: write_ledger(request),
         "verify-ledger": lambda: verify_ledger(request),
+        "restore-ledger": lambda: restore_ledger(request),
     }
     handler = handlers.get(action)
     if not handler:
@@ -1085,6 +1407,9 @@ def ssh_request(node: dict[str, Any], action: str, request: dict[str, Any], time
     encoded = canonical_json(request).encode().hex()
     argv = [
         SSH_BIN,
+        "-F", "/dev/null",
+        "-e", "none",
+        "-i", str(PVE_IDENTITY_FILE),
         "-o", "BatchMode=yes",
         "-o", "PasswordAuthentication=no",
         "-o", "KbdInteractiveAuthentication=no",
@@ -1097,7 +1422,7 @@ def ssh_request(node: dict[str, Any], action: str, request: dict[str, Any], time
         "-o", "VerifyHostKeyDNS=no",
         "-o", "UpdateHostKeys=no",
         "-o", "GlobalKnownHostsFile=/dev/null",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS_FILE}",
+        "-o", f"UserKnownHostsFile={PVE_NODES_DIR / node['name'] / 'ssh_known_hosts'}",
         "-o", f"HostKeyAlias={node['name']}",
         "-o", "ConnectTimeout=10",
         "-o", "ConnectionAttempts=1",
@@ -1153,6 +1478,16 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
     ledger_sha = report.get("ledger_sha256")
     if ledger_sha is not None and (not isinstance(ledger_sha, str) or not SHA256.fullmatch(ledger_sha)):
         fail(f"invalid topology ledger hash from {node['name']}")
+    ledger_text = report.get("ledger_text")
+    if ledger_sha is None:
+        if ledger_text is not None:
+            fail(f"unexpected topology ledger content from {node['name']}")
+    elif (
+        not isinstance(ledger_text, str)
+        or len(ledger_text) > 1024 * 1024
+        or digest_text(ledger_text) != ledger_sha
+    ):
+        fail(f"invalid topology ledger content from {node['name']}")
     for role, cidr in (("geneve", spec["geneve_cidr"]), ("provider", spec["provider_cidr"])):
         value = report.get(role)
         if not isinstance(value, dict) or not isinstance(value.get("interface"), str):
@@ -1255,8 +1590,23 @@ def build_plan(
         for node, report in zip(nodes, reports)
     }
     management_by_node = {node["name"]: node["ip"] for node in nodes}
+    provider_by_node = {
+        node["name"]: report["provider"]["address"].split("/", 1)[0]
+        for node, report in zip(nodes, reports)
+    }
     matching_rings = []
     for ring, addresses in rings.items():
+        provider_matches = []
+        for node in nodes:
+            value = addresses.get(node["name"])
+            provider_matches.append(
+                value is not None
+                and address_matches(value, node, provider_by_node[node["name"]])
+            )
+        if any(provider_matches):
+            fail(
+                f"Corosync ring{ring} uses a provider NIC; refusing to remove its L3 configuration"
+            )
         matches = []
         for node in nodes:
             value = addresses.get(node["name"])
@@ -1285,9 +1635,10 @@ def build_plan(
             "original_addresses": geneve_by_node,
         }
 
-    effective = min(
-        value[role]["max_mtu"] for value in reports for role in ("geneve", "provider")
-    )
+    # A device's max_mtu is only a driver/hardware ceiling.  It says nothing
+    # about the configured OpenStack path and is commonly 65535 on virtio.
+    # Never raise a NIC above the live MTU that the provider already supplied.
+    effective = min(value[role]["mtu"] for value in reports for role in ("geneve", "provider"))
     ceiling = effective - 100
     default_guest = (ceiling // 100) * 100
     if default_guest < 1280:
@@ -1321,7 +1672,8 @@ def print_plan(
             f"  {node['name']}: management={node['ip']} "
             f"geneve={report['geneve']['interface']}:{report['geneve']['address']} "
             f"provider={report['provider']['interface']}:{report['provider']['address']} "
-            f"max-mtu={min(report['geneve']['max_mtu'], report['provider']['max_mtu'])} "
+            f"live-mtu={min(report['geneve']['mtu'], report['provider']['mtu'])} "
+            f"hardware-max-mtu={min(report['geneve']['max_mtu'], report['provider']['max_mtu'])} "
             f"state={report['network_state']}"
         )
     if plan["corosync"]:
@@ -1349,6 +1701,68 @@ def acquire_lock():
         os.close(fd)
         fail("another pvn-topology apply is running on this node")
     return fd
+
+
+def acquire_global_lock(cluster_name: str, node_name: str, transaction: str) -> str:
+    lease_path = Path(LEASE_BIN)
+    if not lease_path.is_absolute():
+        fail("PVN_TOPOLOGY_LEASE_BIN must be an absolute path")
+    try:
+        lease_info = lease_path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect cluster lease helper {lease_path}: {exc}")
+    if stat.S_ISLNK(lease_info.st_mode) or not stat.S_ISREG(lease_info.st_mode):
+        fail(f"cluster lease helper must be a regular non-symlink file: {lease_path}")
+    if lease_info.st_uid != 0 or lease_info.st_mode & 0o022:
+        fail("cluster lease helper must be root-owned and not group/world writable")
+    if not lease_info.st_mode & 0o111 or not os.access(lease_path, os.X_OK):
+        fail(f"cluster lease helper is not executable: {lease_path}")
+    token = secrets.token_hex(24)
+    owner = {
+        "cluster": cluster_name,
+        "domain": LEASE_DOMAIN,
+        "node": node_name,
+        "pid": os.getpid(),
+        "started": int(time.time()),
+        "transaction": transaction,
+        "token": token,
+    }
+    try:
+        result = subprocess.run(
+            [LEASE_BIN, "acquire", LEASE_DOMAIN, token],
+            input=canonical_json(owner) + "\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"cluster-global topology lease helper failed: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
+        fail(
+            f"could not acquire cluster-global topology lease: {detail[:800]}; "
+            f"inspect it with '{LEASE_BIN} show {LEASE_DOMAIN}' and release it only if stale"
+        )
+    return token
+
+
+def release_global_lock(token: str) -> None:
+    try:
+        result = subprocess.run(
+            [LEASE_BIN, "release", LEASE_DOMAIN, token],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"cluster-global topology lease helper failed during release: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
+        fail(f"refusing to release cluster-global topology lease: {detail[:800]}")
 
 
 def wait_cluster_verification(
@@ -1483,38 +1897,67 @@ def apply_topology(
             ssh_request(node, "record-phase", request)
 
     reports = probe_all(cluster_name, nodes, spec, transaction)
-    staged: list[dict[str, Any]] = []
     requests: dict[str, dict[str, Any]] = {}
+    for node, report in zip(nodes, reports):
+        request = dict(base[node["name"]])
+        request.update({
+            "geneve": report["geneve"],
+            "provider": report["provider"],
+            "effective_underlay_mtu": plan["effective_underlay_mtu"],
+        })
+        requests[node["name"]] = request
+
+    staged: list[dict[str, Any]] = []
+    rollback_nodes: list[dict[str, Any]] = [
+        node
+        for node, report in zip(nodes, reports)
+        if report["network_state"] == "desired" and report.get("journal_phase") != "complete"
+    ]
+    ledger_write_attempted = False
+    ledger_restore_node = None
+    ledger_restore_request = None
+
+    def unwind_network(error: TopologyError) -> None:
+        rollback_errors = []
+        rollback_names = {node["name"] for node in rollback_nodes}
+        for changed_node in reversed(rollback_nodes):
+            try:
+                print(f"[{changed_node['name']}] rollback transaction-owned network state")
+                ssh_request(
+                    changed_node, "rollback-network", requests[changed_node["name"]], timeout=150
+                )
+            except TopologyError as rollback_error:
+                rollback_errors.append(f"{changed_node['name']}: {rollback_error}")
+        for staged_node in reversed(staged):
+            if staged_node["name"] in rollback_names:
+                continue
+            try:
+                ssh_request(staged_node, "discard-stage", requests[staged_node["name"]])
+            except TopologyError as discard_error:
+                rollback_errors.append(f"{staged_node['name']} pending: {discard_error}")
+        if rollback_errors:
+            fail(f"{error}; transaction rollback was incomplete: {'; '.join(rollback_errors)}")
+        fail(f"{error}; all transaction-owned network changes were rolled back")
+
     try:
         for node, report in zip(nodes, reports):
-            request = dict(base[node["name"]])
-            request.update({
-                "geneve": report["geneve"],
-                "provider": report["provider"],
-                "effective_underlay_mtu": plan["effective_underlay_mtu"],
-            })
-            requests[node["name"]] = request
             if report["network_state"] == "desired":
                 continue
             print(f"[{node['name']}] stage and validate PVE network API candidate")
-            ssh_request(node, "stage-network", request)
+            ssh_request(node, "stage-network", requests[node["name"]])
             staged.append(node)
-    except TopologyError:
-        for staged_node in reversed(staged):
-            try:
-                ssh_request(staged_node, "discard-stage", requests[staged_node["name"]])
-            except TopologyError:
-                pass
-        raise
 
-    for index, node in enumerate(nodes):
-        report = reports[index]
-        request = requests[node["name"]]
-        if report["network_state"] == "desired":
-            print(f"[{node['name']}] exact network state already present; no-op")
-            continue
-        print(f"[{node['name']}] apply staged network through PVE API/ifreload")
-        try:
+        for index, node in enumerate(nodes):
+            report = reports[index]
+            request = requests[node["name"]]
+            if report["network_state"] == "desired":
+                print(f"[{node['name']}] exact network state already present; no-op")
+                continue
+            if node["name"] not in {item["name"] for item in rollback_nodes}:
+                # Include the current node before apply: a lost SSH response can
+                # mean the atomic rename happened even though the caller saw a failure.
+                rollback_nodes.append(node)
+            print(f"[{node['name']}] atomically apply staged network and run ifreload")
             ssh_request(node, "apply-network", request, timeout=150)
             verify_request = dict(request)
             verify_request["geneve_peers"] = [
@@ -1522,82 +1965,89 @@ def apply_topology(
                 for other in reports if other["node"] != node["name"]
             ]
             ssh_request(node, "verify-network", verify_request, timeout=60)
-        except TopologyError as apply_error:
+        final_reports = probe_all(cluster_name, nodes, spec, transaction)
+        incomplete = [report["node"] for report in final_reports if report["network_state"] != "desired"]
+        if incomplete:
+            fail("final exact-state sweep failed on: " + ", ".join(incomplete))
+
+        existing_ledger_states = {
+            (report.get("ledger_sha256"), report.get("ledger_text"))
+            for report in final_reports
+        }
+        if len(existing_ledger_states) != 1:
+            fail("nodes do not expose one identical shared topology ledger state")
+        previous_ledger_sha, previous_ledger_text = next(iter(existing_ledger_states))
+        membership_snapshot = {
+            "cluster_name": cluster_name,
+            "nodes": [
+                {"name": node["name"], "node_id": node["id"], "management_ip": node["ip"]}
+                for node in nodes
+            ],
+        }
+        ledger = {
+            "schema": 1,
+            "phase": "complete",
+            "cluster_name": cluster_name,
+            "membership_snapshot": membership_snapshot,
+            "membership_hash": digest_text(canonical_json(membership_snapshot)),
+            "nodes": [
+                {
+                    "name": node["name"],
+                    "node_id": node["id"],
+                    "management_ip": node["ip"],
+                    "control_ip": node["ip"],
+                    "geneve_ip": report["geneve"]["address"].split("/", 1)[0],
+                    "geneve_interface": report["geneve"]["interface"],
+                    "provider_interface": report["provider"]["interface"],
+                }
+                for node, report in zip(nodes, final_reports)
+            ],
+            "guest_mtu": spec["guest_mtu"],
+            "provider_bridge": "br-provider",
+            "physnet": "provider",
+            "provider_readiness": {
+                "operator_ack": True,
+                "ack_phrase": PROVIDER_ACK,
+                "live_arbitrary_mac_l2_verified": False,
+                "basis": "operator-ack-only",
+            },
+        }
+        ledger_text = json.dumps(ledger, sort_keys=True, indent=2) + "\n"
+        ledger_sha = digest_text(ledger_text)
+        coordinator = nodes[0]
+        ledger_request = dict(base[coordinator["name"]])
+        ledger_request.update({
+            "ledger": ledger_text,
+            "ledger_sha256": ledger_sha,
+            "expected_ledger_sha256": previous_ledger_sha,
+        })
+        ledger_restore_node = coordinator
+        ledger_restore_request = dict(base[coordinator["name"]])
+        ledger_restore_request.update({
+            "original_ledger": previous_ledger_text,
+            "original_ledger_sha256": previous_ledger_sha,
+            "failed_ledger_sha256": ledger_sha,
+        })
+        print(f"[{coordinator['name']}] atomically publish root-private shared topology ledger")
+        ledger_write_attempted = True
+        ssh_request(coordinator, "write-ledger", ledger_request)
+        for node in nodes:
+            verify_request = dict(base[node["name"]])
+            verify_request["ledger_sha256"] = ledger_sha
+            ssh_request(node, "verify-ledger", verify_request)
+        for node in nodes:
+            request = dict(base[node["name"]])
+            request["phase"] = "complete"
+            ssh_request(node, "record-phase", request)
+    except TopologyError as topology_error:
+        if ledger_write_attempted and ledger_restore_node and ledger_restore_request:
             try:
-                ssh_request(node, "rollback-network", request, timeout=150)
-            except TopologyError as rollback_error:
-                fail(f"{apply_error}; current-node rollback also failed: {rollback_error}")
-            for later in nodes[index + 1 :]:
-                later_request = requests.get(later["name"])
-                if later_request:
-                    try:
-                        ssh_request(later, "discard-stage", later_request)
-                    except TopologyError:
-                        pass
-            fail(f"{apply_error}; {node['name']} was rolled back and later nodes were not applied")
-
-    final_reports = probe_all(cluster_name, nodes, spec, transaction)
-    incomplete = [report["node"] for report in final_reports if report["network_state"] != "desired"]
-    if incomplete:
-        fail("final exact-state sweep failed on: " + ", ".join(incomplete))
-
-    existing_ledgers = {report.get("ledger_sha256") for report in final_reports}
-    if len(existing_ledgers) != 1:
-        fail("nodes do not expose one identical shared topology ledger state")
-    membership_snapshot = {
-        "cluster_name": cluster_name,
-        "nodes": [
-            {"name": node["name"], "node_id": node["id"], "management_ip": node["ip"]}
-            for node in nodes
-        ],
-    }
-    ledger = {
-        "schema": 1,
-        "phase": "complete",
-        "cluster_name": cluster_name,
-        "membership_snapshot": membership_snapshot,
-        "membership_hash": digest_text(canonical_json(membership_snapshot)),
-        "nodes": [
-            {
-                "name": node["name"],
-                "node_id": node["id"],
-                "management_ip": node["ip"],
-                "control_ip": node["ip"],
-                "geneve_ip": report["geneve"]["address"].split("/", 1)[0],
-                "geneve_interface": report["geneve"]["interface"],
-                "provider_interface": report["provider"]["interface"],
-            }
-            for node, report in zip(nodes, final_reports)
-        ],
-        "guest_mtu": spec["guest_mtu"],
-        "provider_bridge": "br-provider",
-        "physnet": "provider",
-        "provider_readiness": {
-            "operator_ack": True,
-            "ack_phrase": PROVIDER_ACK,
-            "live_arbitrary_mac_l2_verified": False,
-            "basis": "operator-ack-only",
-        },
-    }
-    ledger_text = json.dumps(ledger, sort_keys=True, indent=2) + "\n"
-    ledger_sha = digest_text(ledger_text)
-    coordinator = nodes[0]
-    ledger_request = dict(base[coordinator["name"]])
-    ledger_request.update({
-        "ledger": ledger_text,
-        "ledger_sha256": ledger_sha,
-        "expected_ledger_sha256": next(iter(existing_ledgers)),
-    })
-    print(f"[{coordinator['name']}] atomically publish root-private shared topology ledger")
-    ssh_request(coordinator, "write-ledger", ledger_request)
-    for node in nodes:
-        verify_request = dict(base[node["name"]])
-        verify_request["ledger_sha256"] = ledger_sha
-        ssh_request(node, "verify-ledger", verify_request)
-    for node in nodes:
-        request = dict(base[node["name"]])
-        request["phase"] = "complete"
-        ssh_request(node, "record-phase", request)
+                ssh_request(ledger_restore_node, "restore-ledger", ledger_restore_request)
+            except TopologyError as ledger_error:
+                topology_error = TopologyError(
+                    f"{topology_error}; shared ledger rollback also failed: {ledger_error}"
+                )
+        unwind_network(topology_error)
     print(f"PVN topology applied and verified on all {len(nodes)} nodes in cluster {cluster_name}.")
     print("PVN activation markers and central/node targets remain untouched and inactive.")
 
@@ -1627,7 +2077,7 @@ def main() -> int:
     provider = parse_cidr(args.provider_cidr, "--provider-cidr")
     if geneve.overlaps(provider):
         fail("Geneve and provider CIDRs must not overlap")
-    cluster_name, nodes = discover_members()
+    cluster_name, local_name, nodes = discover_members()
     if args.operation == "apply":
         if args.provider_port_ready != PROVIDER_ACK:
             fail(f"apply requires --provider-port-ready {PROVIDER_ACK}")
@@ -1635,7 +2085,7 @@ def main() -> int:
             fail(f"apply requires exact --confirm {cluster_name}")
     elif args.provider_port_ready or args.confirm is not None:
         fail("--provider-port-ready and --confirm are apply-only")
-    validate_known_hosts()
+    validate_ssh_files(nodes)
 
     spec = {
         "cluster_name": cluster_name,
@@ -1644,8 +2094,15 @@ def main() -> int:
     }
     transaction = digest_text(canonical_json(spec))[:24]
     lock_fd = None
+    global_lock_token = None
     if args.operation == "apply":
         lock_fd = acquire_lock()
+        try:
+            global_lock_token = acquire_global_lock(cluster_name, local_name, transaction)
+        except Exception:
+            os.close(lock_fd)
+            lock_fd = None
+            raise
     try:
         reports = probe_all(cluster_name, nodes, spec, transaction)
         plan = build_plan(cluster_name, nodes, reports, spec)
@@ -1672,6 +2129,11 @@ def main() -> int:
         apply_topology(cluster_name, nodes, spec, transaction, reports, plan)
         return 0
     finally:
+        if global_lock_token is not None:
+            try:
+                release_global_lock(global_lock_token)
+            except TopologyError as exc:
+                print(f"{PROGRAM}: warning: {exc}", file=sys.stderr)
         if lock_fd is not None:
             os.close(lock_fd)
 
