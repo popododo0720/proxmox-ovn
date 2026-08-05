@@ -194,12 +194,13 @@ systemctl --no-pager --full status \
 The marker is the explicit local opt-in; enabling the target without it starts
 nothing. `pvn-node-ready.service` allows up to roughly 90 seconds for the
 manager runtime socket, required services, the agent's loopback `/healthz`
-endpoint, the installed PVE UI hook, and `pvnctl doctor` to become healthy. The
-agent endpoint remains unhealthy until at least one TAP binding scan succeeds;
-manager socket creation also proves its startup PVN Control and OVN NB probes
-passed. Keep the packaged `PVN_HEALTH_LISTEN` and `PVN_AGENT_HEALTH_URL` values
-unchanged. This is a bounded local startup check, not continuous health
-monitoring.
+endpoint, OVN controller Southbound status, the installed PVE UI hook, and
+`pvnctl doctor` to become healthy. The controller must report exactly
+`connected`; a running process is insufficient. The agent endpoint remains
+unhealthy until at least one TAP binding scan succeeds; manager socket creation
+also proves its startup PVN Control and OVN NB probes passed. Keep the packaged
+`PVN_HEALTH_LISTEN` and `PVN_AGENT_HEALTH_URL` values unchanged. This is a
+bounded local startup check, not continuous health monitoring.
 
 At boot, `pvn-guest-gate.service` leaves normal PVE behavior unchanged when
 the local marker is absent. When the marker exists, a failed readiness check
