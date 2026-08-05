@@ -10,12 +10,16 @@ SCRIPT=$REPO/deploy/scripts/pvn-control-plane
 PVN_CONTROL_PLANE_SCRIPT=$SCRIPT python3 <<'PY'
 import base64
 import copy
+import hashlib
 import json
 import os
 import pathlib
+import re
+import subprocess
 import tempfile
 import sys
 import types
+import uuid
 
 script_path = pathlib.Path(os.environ["PVN_CONTROL_PLANE_SCRIPT"])
 source = script_path.read_text()
@@ -62,6 +66,8 @@ class FakeBackend:
         self.cids = {name: f"cid-{index}" for index, name in enumerate(DATABASES, 1)}
         self.block_at = None
         self.pki_variant = "one"
+        self.pki_installed = set()
+        self.pki_pin_check = None
         self.pristine = True
         self.crash_after_init = None
 
@@ -81,22 +87,40 @@ class FakeBackend:
         elif self.shared != encoded:
             raise ControlPlaneError("config drift")
 
-    def ensure_pki(self, cluster_id, nodes):
-        fingerprints = {"ca": "ca-" + self.pki_variant}
-        bundles = {}
+    def prepare_pki(self, cluster_id, nodes, expected_fingerprints):
+        fingerprint = lambda value: hashlib.sha256(value.encode()).hexdigest()
+        fingerprints = {
+            "ca_certificate_sha256": fingerprint("ca-" + self.pki_variant),
+            "nodes": {},
+        }
         for node in nodes:
-            fingerprints[node.name] = "cert-" + self.pki_variant + "-" + node.name
-            bundles[node.name] = [self.file("/etc/pvn/pki/ca.pem", "ca"),
-                                  self.file("/etc/pvn/pki/node.pem", node.name),
-                                  self.file("/etc/pvn/pki/node-key.pem", "key-" + node.name)]
+            fingerprints["nodes"][node.name] = {
+                "certificate_sha256": fingerprint(
+                    "cert-" + self.pki_variant + "-" + node.name
+                ),
+                "public_key_sha256": fingerprint("public-key-" + node.name),
+            }
         if not any(entry.startswith("pki:") for entry in self.log):
             self.log.append("pki:" + cluster_id)
-        return fingerprints, bundles
+        installations = {
+            node.name: {
+                "name": node.name,
+                "ca": "public-ca",
+                "certificate": "public-certificate-" + node.name,
+            }
+            for node in nodes
+        }
+        return fingerprints, installations
 
-    @staticmethod
-    def file(path, value):
-        return {"path": path, "content": base64.b64encode(value.encode()).decode(),
-                "mode": "0640", "group": "pvn"}
+    def install_pki(self, nodes, installations):
+        if self.pki_pin_check is not None:
+            assert self.pki_pin_check(), "public certificates installed before ledger PKI pin"
+        encoded = json.dumps(installations, sort_keys=True)
+        assert "PRIVATE KEY" not in encoded and "node-key.pem" not in encoded
+        for node in nodes:
+            if node.name not in self.pki_installed:
+                self.pki_installed.add(node.name)
+                self.log.append("pki-install:" + node.name)
 
     def stage(self, node, files):
         snapshot = json.dumps(files, sort_keys=True)
@@ -319,11 +343,269 @@ with tempfile.TemporaryDirectory() as temporary:
     expect_error(backend.discover, "exceeds effective Geneve MTU")
 
 
+# Legacy pmxcfs key material is never adopted or copied automatically.
+with tempfile.TemporaryDirectory() as temporary:
+    backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary))
+    found = backend.discover()
+    (backend.private_dir / "pki").mkdir(parents=True)
+    expect_error(
+        lambda: backend.prepare_pki(str(uuid.uuid4()), found.nodes, {}),
+        "legacy shared PKI",
+    )
+
+
+# Exercise the real remote PKI helper in isolated roots. Private keys never
+# enter a request, response, shared ledger, or generic staged-file payload.
+with tempfile.TemporaryDirectory() as temporary:
+    root = pathlib.Path(temporary)
+    cluster_id = str(uuid.uuid4())
+    pvnctl = script_path.parents[2] / "bin" / "pvnctl"
+    assert pvnctl.is_file() and os.access(pvnctl, os.X_OK), "build bin/pvnctl before package tests"
+    config_path = root / "config.json"
+    config_path.write_text(json.dumps(ControlPlane._render_config(discovery(), cluster_id)))
+    fake_bin = root / "bin"
+    fake_bin.mkdir(mode=0o700)
+    fake_hostname = fake_bin / "hostname"
+    fake_hostname.write_text('#!/bin/sh\nprintf "%s\\n" "$PVN_TEST_HOSTNAME"\n')
+    fake_hostname.chmod(0o755)
+    transcripts = []
+
+    node_roots = {}
+    ca_dirs = {}
+    helper_sources = {}
+    for node in discovery().nodes:
+        node_root = root / "nodes" / node.name
+        node_root.mkdir(mode=0o700, parents=True)
+        pki_dir = node_root / "pki"
+        ca_parent = root / "ca-roots" / node.name
+        ca_parent.mkdir(mode=0o700, parents=True)
+        ca_dir = ca_parent / "pvn-ca"
+        source = module["REMOTE_HELPER"]
+        replacements = {
+            'PKI_DIR = pathlib.Path("/etc/pvn/pki")': f"PKI_DIR = pathlib.Path({str(pki_dir)!r})",
+            'CA_DIR = pathlib.Path("/var/lib/pvn-ca")': f"CA_DIR = pathlib.Path({str(ca_dir)!r})",
+            'PVN_CONFIG = "/etc/pve/pvn/config.json"': f"PVN_CONFIG = {str(config_path)!r}",
+            'PVNCTL_BIN = "/usr/sbin/pvnctl"': f"PVNCTL_BIN = {str(pvnctl)!r}",
+            'PVN_GROUP = "pvn"': 'PVN_GROUP = "root"',
+        }
+        for old, new in replacements.items():
+            assert old in source
+            source = source.replace(old, new, 1)
+        node_roots[node.name] = node_root
+        ca_dirs[node.name] = ca_dir
+        helper_sources[node.name] = source
+
+    def helper_call(node_name, action, request, succeeds=True, source=None):
+        raw = json.dumps(request, sort_keys=True)
+        command = [sys.executable, "-c", source or helper_sources[node_name], action]
+        environment = {
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "PVN_TEST_HOSTNAME": node_name,
+        }
+        result = subprocess.run(command, input=raw, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=environment, check=False)
+        transcript = "\n".join((" ".join(command), raw, result.stdout, result.stderr))
+        transcripts.append(transcript)
+        assert "-----BEGIN PRIVATE KEY-----" not in transcript
+        if not succeeds:
+            assert result.returncode != 0, (action, result.stdout, result.stderr)
+            return (result.stderr or result.stdout).strip()
+        assert result.returncode == 0, (action, result.stdout, result.stderr)
+        return json.loads(result.stdout)
+
+    requests = []
+    public_keys = {}
+    for node in discovery().nodes:
+        identity = {
+            "cluster_id": cluster_id,
+            "seed_name": "pve-a",
+            "name": node.name,
+            "addresses": [node.control_ip, node.geneve_ip],
+            "expected_public_key_sha256": None,
+        }
+        response = helper_call(node.name, "pki-csr", identity)
+        public_keys[node.name] = response["public_key_sha256"]
+        requests.append({
+            "name": node.name,
+            "addresses": identity["addresses"],
+            "csr": response["csr"],
+            "public_key_sha256": response["public_key_sha256"],
+            "expected_certificate_sha256": None,
+        })
+    assert len(set(public_keys.values())) == 3
+    signed = helper_call("pve-a", "pki-sign", {
+        "cluster_id": cluster_id,
+        "seed_name": "pve-a",
+        "expected_ca_sha256": None,
+        "requests": requests,
+    })
+    assert set(signed["nodes"]) == set(public_keys)
+    assert "-----BEGIN PRIVATE KEY-----" not in json.dumps(signed)
+    ca_key = ca_dirs["pve-a"] / "ca-key.pem"
+    ca_key_stat = ca_key.stat()
+    assert (ca_key_stat.st_uid, ca_key_stat.st_gid,
+            ca_key_stat.st_mode & 0o777, ca_key_stat.st_nlink) == (0, 0, 0o600, 1)
+    assert all(not os.path.lexists(ca_dirs[name]) for name in ("pve-b", "pve-c"))
+    for node in discovery().nodes:
+        key = node_roots[node.name] / "pki" / "node-key.pem"
+        key_stat = key.stat()
+        assert (key_stat.st_uid, key_stat.st_gid,
+                key_stat.st_mode & 0o777, key_stat.st_nlink) == (0, 0, 0o640, 1)
+        assert not (node_roots[node.name] / "pki" / "node.pem").exists()
+        certificate = signed["nodes"][node.name]
+        installed = helper_call(node.name, "pki-install", {
+            "name": node.name,
+            "addresses": [node.control_ip, node.geneve_ip],
+            "ca": signed["ca"],
+            "ca_sha256": signed["ca_sha256"],
+            **certificate,
+        })
+        assert installed["public_key_sha256"] == public_keys[node.name]
+
+    # Exact pinned rerun is idempotent.
+    pinned_requests = []
+    for node in discovery().nodes:
+        response = helper_call(node.name, "pki-csr", {
+            "cluster_id": cluster_id,
+            "seed_name": "pve-a",
+            "name": node.name,
+            "addresses": [node.control_ip, node.geneve_ip],
+            "expected_public_key_sha256": public_keys[node.name],
+        })
+        pinned_requests.append({
+            "name": node.name,
+            "addresses": [node.control_ip, node.geneve_ip],
+            "csr": response["csr"],
+            "public_key_sha256": public_keys[node.name],
+            "expected_certificate_sha256": signed["nodes"][node.name]["certificate_sha256"],
+        })
+    rerun = helper_call("pve-a", "pki-sign", {
+        "cluster_id": cluster_id,
+        "seed_name": "pve-a",
+        "expected_ca_sha256": signed["ca_sha256"],
+        "requests": pinned_requests,
+    })
+    assert rerun["ca_sha256"] == signed["ca_sha256"]
+    assert {name: item["certificate_sha256"] for name, item in rerun["nodes"].items()} == {
+        name: item["certificate_sha256"] for name, item in signed["nodes"].items()
+    }
+
+    # Identity, signature, seed-only, and hardlink guards fail closed.
+    wrong_pin = copy.deepcopy({
+        "cluster_id": cluster_id, "seed_name": "pve-a", "name": "pve-b",
+        "addresses": ["192.0.2.12", "198.51.100.12"],
+        "expected_public_key_sha256": "0" * 64,
+    })
+    assert "ledger pin" in helper_call("pve-b", "pki-csr", wrong_pin, False)
+    altered = copy.deepcopy(pinned_requests[0])
+    damaged = bytearray(base64.b64decode(altered["csr"]))
+    damaged[-24] ^= 1
+    altered["csr"] = base64.b64encode(damaged).decode()
+    assert "CSR" in helper_call("pve-a", "pki-sign", {
+        "cluster_id": cluster_id, "seed_name": "pve-a",
+        "expected_ca_sha256": signed["ca_sha256"], "requests": [altered],
+    }, False)
+    assert "pinned seed" in helper_call("pve-b", "pki-sign", {
+        "cluster_id": cluster_id, "seed_name": "pve-a",
+        "expected_ca_sha256": signed["ca_sha256"], "requests": pinned_requests,
+    }, False, helper_sources["pve-a"])
+    ca_dirs["pve-b"].mkdir(mode=0o700)
+    assert "forbidden seed CA" in helper_call("pve-b", "pki-csr", wrong_pin, False)
+    os.link(ca_key, ca_dirs["pve-a"] / "ca-key-hardlink")
+    assert "hard link" in helper_call("pve-a", "pki-sign", {
+        "cluster_id": cluster_id, "seed_name": "pve-a",
+        "expected_ca_sha256": signed["ca_sha256"], "requests": pinned_requests,
+    }, False)
+    os.link(node_roots["pve-a"] / "pki" / "owner.json",
+            node_roots["pve-a"] / "node-owner-hardlink")
+    assert "hard link" in helper_call("pve-a", "pki-csr", {
+        "cluster_id": cluster_id, "seed_name": "pve-a", "name": "pve-a",
+        "addresses": ["192.0.2.11", "198.51.100.11"],
+        "expected_public_key_sha256": public_keys["pve-a"],
+    }, False)
+    pve_b_certificate = signed["nodes"]["pve-b"]
+    os.link(node_roots["pve-b"] / "pki" / "node.pem",
+            node_roots["pve-b"] / "node-certificate-hardlink")
+    assert "hard link" in helper_call("pve-b", "pki-install", {
+        "name": "pve-b", "addresses": ["192.0.2.12", "198.51.100.12"],
+        "ca": signed["ca"], "ca_sha256": signed["ca_sha256"],
+        **pve_b_certificate,
+    }, False)
+    extra_link = node_roots["pve-c"] / "node-key-hardlink"
+    os.link(node_roots["pve-c"] / "pki" / "node-key.pem", extra_link)
+    assert "hard link" in helper_call("pve-c", "pki-csr", {
+        "cluster_id": cluster_id, "seed_name": "pve-a", "name": "pve-c",
+        "addresses": ["192.0.2.13", "198.51.100.13"],
+        "expected_public_key_sha256": public_keys["pve-c"],
+    }, False)
+
+    # Owner-intent-only crash states resume without adopting unowned keys.
+    crash_node_root = root / "nodes" / "pve-d"
+    crash_node_root.mkdir(mode=0o700)
+    crash_pki = crash_node_root / "pki"
+    crash_pki.mkdir(mode=0o750)
+    crash_owner = {
+        "schema": 1, "cluster_uuid": cluster_id, "name": "pve-d",
+        "addresses": ["192.0.2.14", "198.51.100.14"],
+    }
+    (crash_pki / "owner.json").write_text(json.dumps(crash_owner) + "\n")
+    (crash_pki / "owner.json").chmod(0o600)
+    crash_ca_parent = root / "ca-roots" / "pve-d"
+    crash_ca_parent.mkdir(mode=0o700)
+    crash_source = helper_sources["pve-a"].replace(
+        f"PKI_DIR = pathlib.Path({str(node_roots['pve-a'] / 'pki')!r})",
+        f"PKI_DIR = pathlib.Path({str(crash_pki)!r})",
+    ).replace(
+        f"CA_DIR = pathlib.Path({str(ca_dirs['pve-a'])!r})",
+        f"CA_DIR = pathlib.Path({str(crash_ca_parent / 'pvn-ca')!r})",
+    )
+    resumed = helper_call("pve-d", "pki-csr", {
+        "cluster_id": cluster_id, "seed_name": "pve-a", "name": "pve-d",
+        "addresses": crash_owner["addresses"], "expected_public_key_sha256": None,
+    }, source=crash_source)
+    assert re.fullmatch(r"[0-9a-f]{64}", resumed["public_key_sha256"])
+
+    crash_seed_parent = root / "crash-seed"
+    crash_seed_parent.mkdir(mode=0o700)
+    crash_seed_ca = crash_seed_parent / "pvn-ca"
+    crash_seed_ca.mkdir(mode=0o700)
+    (crash_seed_ca / "owner.json").write_text(json.dumps({
+        "schema": 1, "cluster_uuid": cluster_id,
+    }) + "\n")
+    (crash_seed_ca / "owner.json").chmod(0o600)
+    crash_issued = crash_seed_ca / "issued"
+    crash_issued.mkdir(mode=0o700)
+    issued_owner = {
+        "schema": 1,
+        "cluster_uuid": cluster_id,
+        "name": "pve-a",
+        "addresses": ["192.0.2.11", "198.51.100.11"],
+        "public_key_sha256": public_keys["pve-a"],
+    }
+    (crash_issued / "pve-a.json").write_text(json.dumps(issued_owner) + "\n")
+    (crash_issued / "pve-a.json").chmod(0o600)
+    crash_seed_source = helper_sources["pve-a"].replace(
+        f"CA_DIR = pathlib.Path({str(ca_dirs['pve-a'])!r})",
+        f"CA_DIR = pathlib.Path({str(crash_seed_ca)!r})",
+    )
+    crash_request = copy.deepcopy(pinned_requests[0])
+    crash_request["expected_certificate_sha256"] = None
+    crash_signed = helper_call("pve-a", "pki-sign", {
+        "cluster_id": cluster_id, "seed_name": "pve-a",
+        "expected_ca_sha256": None, "requests": [crash_request],
+    }, source=crash_seed_source)
+    assert crash_signed["nodes"]["pve-a"]["public_key_sha256"] == public_keys["pve-a"]
+    crash_ca_key_stat = (crash_seed_ca / "ca-key.pem").stat()
+    assert (crash_ca_key_stat.st_mode & 0o777, crash_ca_key_stat.st_nlink) == (0o600, 1)
+
+
 with tempfile.TemporaryDirectory() as temporary:
     root = pathlib.Path(temporary)
     store = LedgerStore(root / "private")
     backend = FakeBackend(discovery())
     control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    backend.pki_pin_check = lambda: bool(store.load()["cert_fingerprints"])
 
     # A plan is read-only and exposes the exact apply confirmation.
     plan = control.plan()
@@ -345,6 +627,7 @@ with tempfile.TemporaryDirectory() as temporary:
     ], ordered
     for name, staged in backend.staged.items():
         decoded = json.loads(staged)
+        assert all(not item["path"].startswith("/etc/pvn/pki/") for item in decoded)
         listener = next(item for item in decoded if item["path"].endswith("ovn-listeners.env"))
         text = base64.b64decode(listener["content"]).decode()
         expected_ip = next(node.control_ip for node in backend.found.nodes if node.name == name)

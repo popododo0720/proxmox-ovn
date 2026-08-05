@@ -260,7 +260,15 @@ class LedgerStore:
 
 
 REMOTE_HELPER = r'''
-import base64, grp, hashlib, json, os, pathlib, pwd, stat, subprocess, sys
+import base64, grp, hashlib, ipaddress, json, os, pathlib, pwd, re, secrets, stat, subprocess, sys
+
+SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
+PKI_DIR = pathlib.Path("/etc/pvn/pki")
+CA_DIR = pathlib.Path("/var/lib/pvn-ca")
+PVN_CONFIG = "/etc/pve/pvn/config.json"
+PVNCTL_BIN = "/usr/sbin/pvnctl"
+OPENSSL_BIN = "/usr/bin/openssl"
+PVN_GROUP = "pvn"
 
 def fail(message):
     print(message, file=sys.stderr)
@@ -274,11 +282,181 @@ def run(arguments, check=True):
         fail(f"{' '.join(arguments)}: {result.stderr.strip() or result.stdout.strip()}")
     return result
 
-def digest(path):
+def run_binary(arguments, input_data=None, check=True):
+    result = subprocess.run(arguments, input=input_data, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, check=False,
+                            env={**os.environ, "LC_ALL": "C"})
+    if check and result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        fail(f"{' '.join(arguments)}: {detail}")
+    return result
+
+def safe_name(value, label):
+    if not isinstance(value, str) or not SAFE_NAME.fullmatch(value) or value in (".", ".."):
+        fail(f"{label} is unsafe or empty")
+    return value
+
+def ipv4(value, label):
     try:
-        return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
-    except FileNotFoundError:
-        return None
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        fail(f"{label} is not an IP address")
+    if address.version != 4 or address.is_unspecified or address.is_multicast:
+        fail(f"{label} must be a usable IPv4 address")
+    return str(address)
+
+def node_identity(value):
+    if not isinstance(value, dict):
+        fail("node certificate request is not an object")
+    name = safe_name(value.get("name"), "node certificate name")
+    raw_addresses = value.get("addresses")
+    if not isinstance(raw_addresses, list) or len(raw_addresses) != 2:
+        fail(f"node {name} certificate requires exactly two IP addresses")
+    addresses = [ipv4(item, f"node {name} certificate IP") for item in raw_addresses]
+    if len(set(addresses)) != 2:
+        fail(f"node {name} certificate IP addresses are not unique")
+    return name, addresses
+
+def require_regular(path, uid, gid, mode, label):
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect {label}: {error}")
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        fail(f"{label} is not a regular non-symlink file")
+    if metadata.st_nlink != 1:
+        fail(f"{label} must have exactly one hard link")
+    if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (uid, gid, mode):
+        fail(f"{label} owner/group/mode drift")
+
+def ensure_directory(path, gid, mode, label):
+    if os.path.lexists(path):
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            fail(f"{label} is not a real directory")
+        if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, gid, mode):
+            fail(f"{label} owner/group/mode drift")
+        return
+    path.mkdir(mode=mode)
+    os.chown(path, 0, gid)
+    os.chmod(path, mode)
+
+def require_protected_parent(path, label):
+    try:
+        metadata = path.parent.lstat()
+    except OSError as error:
+        fail(f"cannot inspect parent of {label}: {error}")
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0:
+        fail(f"parent of {label} must be a root-owned real directory")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        fail(f"parent of {label} must not be group/world writable")
+
+def install_exact(path, data, uid, gid, mode, label):
+    if os.path.lexists(path):
+        require_regular(path, uid, gid, mode, label)
+        if path.read_bytes() != data:
+            fail(f"{label} content drift")
+        return
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+        os.fchmod(descriptor, mode)
+        os.fchown(descriptor, uid, gid)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+
+def decode_blob(value, label):
+    if not isinstance(value, str) or len(value) > 131072:
+        fail(f"{label} is missing or too large")
+    try:
+        data = base64.b64decode(value, validate=True)
+    except Exception:
+        fail(f"{label} is not valid base64")
+    if not data or len(data) > 65536:
+        fail(f"{label} decoded size is invalid")
+    return data
+
+def public_fingerprint(kind, path):
+    commands = {
+        "private": [OPENSSL_BIN, "pkey", "-in", str(path), "-pubout"],
+        "csr": [OPENSSL_BIN, "req", "-in", str(path), "-pubkey", "-noout"],
+        "certificate": [OPENSSL_BIN, "x509", "-in", str(path), "-pubkey", "-noout"],
+    }
+    pem = run(commands[kind]).stdout.encode()
+    if b"-----BEGIN PUBLIC KEY-----" not in pem:
+        fail(f"cannot extract {kind} public key")
+    der = run_binary([OPENSSL_BIN, "pkey", "-pubin", "-outform", "DER"], pem).stdout
+    return hashlib.sha256(der).hexdigest()
+
+def certificate_fingerprint(path):
+    der = run_binary([OPENSSL_BIN, "x509", "-in", str(path), "-outform", "DER"]).stdout
+    return hashlib.sha256(der).hexdigest()
+
+def exact_subject(kind, path, name):
+    command = [OPENSSL_BIN, kind, "-in", str(path), "-noout", "-subject", "-nameopt", "RFC2253"]
+    subject = run(command).stdout.strip().replace(" ", "")
+    if subject != f"subject=CN={name},O=PVN":
+        fail(f"{kind} subject does not match node {name}")
+
+def verify_node_certificate(path, ca_path, name, addresses, public_key):
+    if run([OPENSSL_BIN, "verify", "-CAfile", str(ca_path), str(path)], check=False).returncode != 0:
+        fail(f"node certificate verification failed for {name}")
+    if run([OPENSSL_BIN, "x509", "-in", str(path), "-noout", "-checkend", "86400"],
+           check=False).returncode != 0:
+        fail(f"node certificate expires within 24 hours for {name}")
+    exact_subject("x509", path, name)
+    if run([OPENSSL_BIN, "x509", "-in", str(path), "-noout", "-checkhost", name],
+           check=False).returncode != 0:
+        fail(f"node certificate lacks DNS identity {name}")
+    for address in addresses:
+        if run([OPENSSL_BIN, "x509", "-in", str(path), "-noout", "-checkip", address],
+               check=False).returncode != 0:
+            fail(f"node certificate lacks IP identity {address}")
+    san_text = run([
+        OPENSSL_BIN, "x509", "-in", str(path), "-noout", "-ext", "subjectAltName",
+    ]).stdout
+    found_sans = set(re.findall(r"DNS:[^,\s]+|IP Address:[0-9.]+", san_text))
+    expected_sans = {"DNS:" + name, *("IP Address:" + item for item in addresses)}
+    if found_sans != expected_sans:
+        fail(f"node certificate SAN set differs for {name}")
+    details = run([OPENSSL_BIN, "x509", "-in", str(path), "-noout", "-text"]).stdout
+    required = (
+        "X509v3 Basic Constraints: critical",
+        "CA:FALSE",
+        "X509v3 Key Usage: critical",
+        "Digital Signature",
+        "TLS Web Server Authentication",
+        "TLS Web Client Authentication",
+    )
+    if any(item not in details for item in required) or "CA:TRUE" in details:
+        fail(f"node certificate constraints/key usages differ for {name}")
+    if public_fingerprint("certificate", path) != public_key:
+        fail(f"node certificate public key differs for {name}")
+
+def verify_ca_pair(certificate, private_key):
+    require_regular(certificate, 0, 0, 0o644, "seed CA certificate")
+    require_regular(private_key, 0, 0, 0o600, "seed CA private key")
+    if public_fingerprint("certificate", certificate) != public_fingerprint("private", private_key):
+        fail("seed CA certificate/private key mismatch")
+    if run([OPENSSL_BIN, "verify", "-CAfile", str(certificate), str(certificate)],
+           check=False).returncode != 0:
+        fail("seed CA certificate is not a valid self-signed CA")
+    if run([OPENSSL_BIN, "x509", "-in", str(certificate), "-noout", "-checkend", "86400"],
+           check=False).returncode != 0:
+        fail("seed CA certificate expires within 24 hours")
+
+def read_owner(path, label):
+    require_regular(path, 0, 0, 0o600, label)
+    try:
+        value = json.loads(path.read_text())
+    except Exception:
+        fail(f"{label} is invalid JSON")
+    if not isinstance(value, dict):
+        fail(f"{label} is not an object")
+    return value
 
 def db_info(path):
     result = {"exists": os.path.exists(path)}
@@ -314,15 +492,31 @@ if action == "probe":
     bridges = {}
     for bridge in payload["bridges"]:
         bridges[bridge] = run(["ovs-vsctl", "--timeout=10", "br-exists", bridge], check=False).returncode == 0
+    pvn_gid = grp.getgrnam(PVN_GROUP).gr_gid
+    node_key = PKI_DIR / "node-key.pem"
+    node_public_key = None
+    if os.path.lexists(node_key):
+        require_regular(node_key, 0, pvn_gid, 0o640, "node private key")
+        node_public_key = public_fingerprint("private", node_key)
+    certificate_hashes = {}
+    for label, path in (("ca", PKI_DIR / "ca.pem"), ("cert", PKI_DIR / "node.pem")):
+        if os.path.lexists(path):
+            require_regular(path, 0, pvn_gid, 0o644, f"node {label} certificate")
+            certificate_hashes[label] = certificate_fingerprint(path)
+        else:
+            certificate_hashes[label] = None
     print(json.dumps({
         "hostname": run(["hostname", "--fqdn"], check=False).stdout.strip() or run(["hostname"]).stdout.strip(),
         "package_version": version,
         "pve_version": pve,
         "addresses": addresses,
         "bridges": bridges,
-        "cert_hashes": {name: digest(path) for name, path in {
-            "ca": "/etc/pvn/pki/ca.pem", "cert": "/etc/pvn/pki/node.pem",
-            "key": "/etc/pvn/pki/node-key.pem"}.items()},
+        "cert_hashes": {
+            **certificate_hashes,
+            "public_key": node_public_key,
+        },
+        "pki_owner_present": os.path.lexists(PKI_DIR / "owner.json"),
+        "seed_ca_present": os.path.lexists(CA_DIR),
         "central_marker": os.path.exists("/etc/pvn/central/enabled"),
         "node_marker": os.path.exists("/etc/pvn/node-enabled"),
         "central_active": run(["systemctl", "is-active", "pvn-central.target"], check=False).stdout.strip() == "active",
@@ -334,13 +528,277 @@ if action == "probe":
         },
     }, sort_keys=True))
 
+elif action == "pki-csr":
+    if not PKI_DIR.is_absolute():
+        fail("node PKI directory must be absolute")
+    name, addresses = node_identity(payload)
+    cluster_id = safe_name(payload.get("cluster_id"), "PVN cluster UUID")
+    seed_name = safe_name(payload.get("seed_name"), "PVN seed node")
+    hostname = run(["hostname", "--fqdn"], check=False).stdout.strip() or run(["hostname"]).stdout.strip()
+    if hostname.split(".", 1)[0] != name:
+        fail(f"node PKI request hostname differs from {name}")
+    if name != seed_name and os.path.lexists(CA_DIR):
+        fail(f"non-seed node {name} contains forbidden seed CA state")
+    expected_public_key = payload.get("expected_public_key_sha256")
+    if expected_public_key is not None and (
+            not isinstance(expected_public_key, str) or
+            not re.fullmatch(r"[0-9a-f]{64}", expected_public_key)):
+        fail(f"node {name} expected public-key fingerprint is invalid")
+    pvn_gid = grp.getgrnam(PVN_GROUP).gr_gid
+    ensure_directory(PKI_DIR, pvn_gid, 0o750, "node PKI directory")
+    node_key = PKI_DIR / "node-key.pem"
+    owner_path = PKI_DIR / "owner.json"
+    expected_owner = {
+        "schema": 1,
+        "cluster_uuid": cluster_id,
+        "name": name,
+        "addresses": addresses,
+    }
+    if os.path.lexists(owner_path):
+        if read_owner(owner_path, "node PKI owner record") != expected_owner:
+            fail(f"node {name} PKI owner record drift")
+    else:
+        if os.path.lexists(node_key):
+            fail(f"node {name} private key has no PKI owner record")
+        install_exact(
+            owner_path, (json.dumps(expected_owner, sort_keys=True) + "\n").encode(),
+            0, 0, 0o600, "node PKI owner record",
+        )
+    if not os.path.lexists(node_key):
+        if expected_public_key is not None:
+            fail(f"node {name} ledger-pinned private key is missing; refusing regeneration")
+        temporary = PKI_DIR / f".node-key.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        try:
+            run([OPENSSL_BIN, "genpkey", "-algorithm", "ED25519", "-out", str(temporary)])
+            os.chown(temporary, 0, pvn_gid)
+            os.chmod(temporary, 0o640)
+            if os.path.lexists(node_key):
+                fail("node private key appeared concurrently")
+            os.replace(temporary, node_key)
+        finally:
+            try: temporary.unlink()
+            except FileNotFoundError: pass
+    require_regular(node_key, 0, pvn_gid, 0o640, "node private key")
+    public_key = public_fingerprint("private", node_key)
+    if expected_public_key is not None and public_key != expected_public_key:
+        fail(f"node {name} public key differs from the ledger pin")
+    san = "subjectAltName=DNS:" + name + "," + ",".join("IP:" + item for item in addresses)
+    csr = run([
+        OPENSSL_BIN, "req", "-new", "-key", str(node_key), "-subj", f"/O=PVN/CN={name}",
+        "-addext", san,
+        "-addext", "basicConstraints=critical,CA:FALSE",
+        "-addext", "keyUsage=critical,digitalSignature",
+        "-addext", "extendedKeyUsage=serverAuth,clientAuth",
+    ]).stdout.encode()
+    if not csr.startswith(b"-----BEGIN CERTIFICATE REQUEST-----"):
+        fail("OpenSSL did not return a PEM certificate request")
+    print(json.dumps({
+        "csr": base64.b64encode(csr).decode(),
+        "public_key_sha256": public_key,
+    }, sort_keys=True))
+
+elif action == "pki-sign":
+    if not CA_DIR.is_absolute():
+        fail("seed CA directory must be absolute")
+    cluster_id = safe_name(payload.get("cluster_id"), "PVN cluster UUID")
+    seed_name = safe_name(payload.get("seed_name"), "PVN seed node")
+    hostname = run(["hostname", "--fqdn"], check=False).stdout.strip() or run(["hostname"]).stdout.strip()
+    if hostname.split(".", 1)[0] != seed_name:
+        fail(f"CA signing host is not the pinned seed {seed_name}")
+    expected_ca_hash = payload.get("expected_ca_sha256")
+    if expected_ca_hash is not None and (
+            not isinstance(expected_ca_hash, str) or
+            not re.fullmatch(r"[0-9a-f]{64}", expected_ca_hash)):
+        fail("ledger-pinned CA certificate fingerprint is invalid")
+    requests = payload.get("requests")
+    if not isinstance(requests, list) or not requests:
+        fail("node certificate requests must be a non-empty list")
+    require_protected_parent(CA_DIR, "seed CA directory")
+    ensure_directory(CA_DIR, 0, 0o700, "seed CA directory")
+    issued_dir = CA_DIR / "issued"
+    ensure_directory(issued_dir, 0, 0o700, "seed issued-certificate directory")
+    ca_certificate = CA_DIR / "ca.pem"
+    ca_key = CA_DIR / "ca-key.pem"
+    ca_owner = CA_DIR / "owner.json"
+    has_certificate = os.path.lexists(ca_certificate)
+    has_key = os.path.lexists(ca_key)
+    if has_certificate != has_key:
+        fail("partial seed-local CA state")
+    expected_ca_owner = {"schema": 1, "cluster_uuid": cluster_id}
+    if os.path.lexists(ca_owner):
+        if read_owner(ca_owner, "seed CA owner record") != expected_ca_owner:
+            fail("seed CA owner record differs from this PVN cluster")
+    else:
+        if has_certificate:
+            fail("existing seed CA is missing its owner record")
+        install_exact(
+            ca_owner, (json.dumps(expected_ca_owner, sort_keys=True) + "\n").encode(),
+            0, 0, 0o600, "seed CA owner record",
+        )
+    if not has_certificate:
+        if expected_ca_hash is not None:
+            fail("ledger-pinned seed CA pair is missing; refusing regeneration")
+        run([
+            PVNCTL_BIN, "pki", "init-ca", "--config", PVN_CONFIG,
+            "--directory", str(CA_DIR), "--confirm", cluster_id,
+        ])
+    verify_ca_pair(ca_certificate, ca_key)
+    ca_hash = certificate_fingerprint(ca_certificate)
+    if expected_ca_hash is not None and ca_hash != expected_ca_hash:
+        fail("seed CA certificate differs from the ledger pin")
+
+    signed = {}
+    seen_names = set()
+    for request in requests:
+        name, addresses = node_identity(request)
+        if name in seen_names:
+            fail(f"duplicate node certificate request for {name}")
+        seen_names.add(name)
+        public_key = request.get("public_key_sha256")
+        if not isinstance(public_key, str) or not re.fullmatch(r"[0-9a-f]{64}", public_key):
+            fail(f"node {name} public-key fingerprint is invalid")
+        expected_certificate_hash = request.get("expected_certificate_sha256")
+        if expected_certificate_hash is not None and (
+                not isinstance(expected_certificate_hash, str) or
+                not re.fullmatch(r"[0-9a-f]{64}", expected_certificate_hash)):
+            fail(f"node {name} expected certificate fingerprint is invalid")
+        csr_data = decode_blob(request.get("csr"), f"node {name} CSR")
+        csr_path = issued_dir / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.csr.tmp"
+        extension_path = issued_dir / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.ext.tmp"
+        certificate_path = issued_dir / f"{name}.pem"
+        owner_path = issued_dir / f"{name}.json"
+        temporary_certificate = issued_dir / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.crt.tmp"
+        install_exact(csr_path, csr_data, 0, 0, 0o600, f"temporary CSR for {name}")
+        try:
+            if run([OPENSSL_BIN, "req", "-in", str(csr_path), "-noout", "-verify"],
+                   check=False).returncode != 0:
+                fail(f"node {name} CSR signature is invalid")
+            exact_subject("req", csr_path, name)
+            if public_fingerprint("csr", csr_path) != public_key:
+                fail(f"node {name} CSR public key differs from its fingerprint")
+            expected_owner = {
+                "schema": 1,
+                "cluster_uuid": cluster_id,
+                "name": name,
+                "addresses": addresses,
+                "public_key_sha256": public_key,
+            }
+            if os.path.lexists(owner_path):
+                if read_owner(owner_path, f"seed-issued owner record for {name}") != expected_owner:
+                    fail(f"seed-issued certificate identity drift for {name}")
+            else:
+                if os.path.lexists(certificate_path):
+                    fail(f"seed-issued certificate for {name} lacks an owner record")
+                install_exact(
+                    owner_path, (json.dumps(expected_owner, sort_keys=True) + "\n").encode(),
+                    0, 0, 0o600, f"seed-issued owner record for {name}",
+                )
+            if os.path.lexists(certificate_path):
+                require_regular(certificate_path, 0, 0, 0o644,
+                                f"seed-issued certificate for {name}")
+            else:
+                if expected_certificate_hash is not None:
+                    fail(f"ledger-pinned certificate for {name} is missing; refusing reissue")
+                extensions = (
+                    "[pvn_node]\n"
+                    "basicConstraints=critical,CA:FALSE\n"
+                    "keyUsage=critical,digitalSignature\n"
+                    "extendedKeyUsage=serverAuth,clientAuth\n"
+                    "subjectAltName=DNS:" + name + "," +
+                    ",".join("IP:" + item for item in addresses) + "\n"
+                ).encode()
+                install_exact(extension_path, extensions, 0, 0, 0o600,
+                              f"temporary extensions for {name}")
+                run([
+                    OPENSSL_BIN, "x509", "-req", "-in", str(csr_path),
+                    "-CA", str(ca_certificate), "-CAkey", str(ca_key),
+                    "-set_serial", "0x" + secrets.token_hex(20), "-days", "730",
+                    "-extfile", str(extension_path), "-extensions", "pvn_node",
+                    "-out", str(temporary_certificate),
+                ])
+                os.chown(temporary_certificate, 0, 0)
+                os.chmod(temporary_certificate, 0o644)
+                if os.path.lexists(certificate_path):
+                    fail(f"seed-issued certificate for {name} appeared concurrently")
+                os.replace(temporary_certificate, certificate_path)
+                require_regular(certificate_path, 0, 0, 0o644,
+                                f"seed-issued certificate for {name}")
+            verify_node_certificate(certificate_path, ca_certificate, name, addresses, public_key)
+            certificate_hash = certificate_fingerprint(certificate_path)
+            if expected_certificate_hash is not None and certificate_hash != expected_certificate_hash:
+                fail(f"seed-issued certificate for {name} differs from the ledger pin")
+            signed[name] = {
+                "certificate": base64.b64encode(certificate_path.read_bytes()).decode(),
+                "certificate_sha256": certificate_hash,
+                "public_key_sha256": public_key,
+            }
+        finally:
+            for temporary in (csr_path, extension_path, temporary_certificate):
+                try: temporary.unlink()
+                except FileNotFoundError: pass
+    print(json.dumps({
+        "ca": base64.b64encode(ca_certificate.read_bytes()).decode(),
+        "ca_sha256": ca_hash,
+        "nodes": signed,
+    }, sort_keys=True))
+
+elif action == "pki-install":
+    if not PKI_DIR.is_absolute():
+        fail("node PKI directory must be absolute")
+    name, addresses = node_identity(payload)
+    pvn_gid = grp.getgrnam(PVN_GROUP).gr_gid
+    ensure_directory(PKI_DIR, pvn_gid, 0o750, "node PKI directory")
+    node_key = PKI_DIR / "node-key.pem"
+    require_regular(node_key, 0, pvn_gid, 0o640, "node private key")
+    public_key = payload.get("public_key_sha256")
+    certificate_hash = payload.get("certificate_sha256")
+    ca_hash = payload.get("ca_sha256")
+    for value, label in ((public_key, "public key"), (certificate_hash, "certificate"),
+                         (ca_hash, "CA certificate")):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            fail(f"node {name} {label} fingerprint is invalid")
+    if public_fingerprint("private", node_key) != public_key:
+        fail(f"node {name} local private key differs from its signed public key")
+    ca_data = decode_blob(payload.get("ca"), f"node {name} CA certificate")
+    certificate_data = decode_blob(payload.get("certificate"), f"node {name} certificate")
+    temporary_ca = PKI_DIR / f".ca.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    temporary_certificate = PKI_DIR / f".node.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    install_exact(temporary_ca, ca_data, 0, pvn_gid, 0o644,
+                  f"temporary CA certificate for {name}")
+    install_exact(temporary_certificate, certificate_data, 0, pvn_gid, 0o644,
+                  f"temporary node certificate for {name}")
+    try:
+        if certificate_fingerprint(temporary_ca) != ca_hash:
+            fail(f"node {name} CA certificate fingerprint differs")
+        if certificate_fingerprint(temporary_certificate) != certificate_hash:
+            fail(f"node {name} certificate fingerprint differs")
+        verify_node_certificate(
+            temporary_certificate, temporary_ca, name, addresses, public_key,
+        )
+        install_exact(PKI_DIR / "ca.pem", ca_data, 0, pvn_gid, 0o644,
+                      f"installed CA certificate for {name}")
+        install_exact(PKI_DIR / "node.pem", certificate_data, 0, pvn_gid, 0o644,
+                      f"installed node certificate for {name}")
+    finally:
+        for temporary in (temporary_ca, temporary_certificate):
+            try: temporary.unlink()
+            except FileNotFoundError: pass
+    print(json.dumps({
+        "ca_sha256": ca_hash,
+        "certificate_sha256": certificate_hash,
+        "public_key_sha256": public_key,
+    }, sort_keys=True))
+
 elif action == "stage":
-    pvn_gid = grp.getgrnam("pvn").gr_gid
+    pvn_gid = grp.getgrnam(PVN_GROUP).gr_gid
     for item in payload["files"]:
         path = pathlib.Path(item["path"])
-        if not str(path).startswith("/etc/pvn/") or ".." in path.parts:
+        if not path.is_absolute() or pathlib.Path("/etc/pvn") not in path.parents or \
+                ".." in path.parts:
             fail(f"unsafe staged path: {path}")
-        data = base64.b64decode(item["content"])
+        if path == PKI_DIR or PKI_DIR in path.parents:
+            fail("PKI material must use the dedicated local CSR/install actions")
+        data = decode_blob(item.get("content"), f"staged content for {path}")
         mode = int(item["mode"], 8)
         gid = pvn_gid if item["group"] == "pvn" else 0
         path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
@@ -610,6 +1068,11 @@ class SystemBackend:
                               int(addresses[geneve][1]), name == local_name))
         if len(versions) != 1:
             raise ControlPlaneError("pvn-node package versions differ across PVE nodes")
+        for node in nodes[1:]:
+            if self.probes[node.name].get("seed_ca_present"):
+                raise ControlPlaneError(
+                    f"non-seed node {node.name} contains forbidden seed CA state"
+                )
         effective_geneve_mtu = min(node.geneve_mtu for node in nodes)
         if guest_mtu > effective_geneve_mtu - 100:
             raise ControlPlaneError(
@@ -631,6 +1094,10 @@ class SystemBackend:
                 )
             if any(probe.get("cert_hashes", {}).values()):
                 raise ControlPlaneError(f"node {node.name} has unledgered PVN PKI state")
+            if probe.get("pki_owner_present"):
+                raise ControlPlaneError(f"node {node.name} has an unledgered PKI owner record")
+            if probe.get("seed_ca_present"):
+                raise ControlPlaneError(f"node {node.name} has unledgered seed CA state")
             if any(info.get("exists") for info in probe.get("databases", {}).values()):
                 raise ControlPlaneError(f"node {node.name} has unledgered central database state")
 
@@ -696,44 +1163,103 @@ class SystemBackend:
             os.close(descriptor)
         os.replace(temporary, self.config_path)
 
-    def ensure_pki(self, cluster_id: str, nodes: tuple[Node, ...]) -> tuple[dict[str, str], dict[str, list[dict[str, str]]]]:
-        root = self.private_dir / "pki"
-        ca_dir = root / "ca"
-        ca_cert, ca_key = ca_dir / "ca.pem", ca_dir / "ca-key.pem"
-        if ca_cert.exists() != ca_key.exists():
-            raise ControlPlaneError("partial private CA state; refusing automatic cleanup")
-        if not ca_cert.exists():
-            subprocess.run(["/usr/sbin/pvnctl", "pki", "init-ca", "--config", str(self.config_path),
-                            "--directory", str(ca_dir), "--confirm", cluster_id], check=True)
-        fingerprints: dict[str, str] = {"ca": sha256(ca_cert.read_bytes())}
-        bundles: dict[str, list[dict[str, str]]] = {}
+    def prepare_pki(
+        self, cluster_id: str, nodes: tuple[Node, ...], expected_fingerprints: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        if os.path.lexists(self.private_dir / "pki"):
+            raise ControlPlaneError(
+                "legacy shared PKI exists in pmxcfs; remove it only after manual key-state audit"
+            )
+        expected_nodes = expected_fingerprints.get("nodes", {}) if expected_fingerprints else {}
+        seed = nodes[0]
+        requests: list[dict[str, Any]] = []
+        public_keys: dict[str, str] = {}
         for node in nodes:
-            directory = root / "nodes" / node.name
-            cert, key = directory / "node.pem", directory / "node-key.pem"
-            if cert.exists() != key.exists():
-                raise ControlPlaneError(f"partial certificate state for {node.name}")
-            if not cert.exists():
-                subprocess.run([
-                    "/usr/sbin/pvnctl", "pki", "issue-node", "--config", str(self.config_path),
-                    "--ca-cert", str(ca_cert), "--ca-key", str(ca_key),
-                    "--directory", str(directory), "--name", node.name, "--dns", node.name,
-                    "--ips", f"{node.control_ip},{node.geneve_ip}", "--confirm", cluster_id,
-                ], check=True)
-            verify = subprocess.run(["openssl", "verify", "-CAfile", str(ca_cert), str(cert)],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if verify.returncode != 0:
-                raise ControlPlaneError(f"certificate verification failed for {node.name}")
-            fingerprints[node.name] = sha256(cert.read_bytes())
-            bundles[node.name] = [
-                self._file("/etc/pvn/pki/ca.pem", ca_cert.read_bytes(), "0644"),
-                self._file("/etc/pvn/pki/node.pem", cert.read_bytes(), "0644"),
-                self._file("/etc/pvn/pki/node-key.pem", key.read_bytes(), "0640"),
-            ]
-        return fingerprints, bundles
+            expected_node = expected_nodes.get(node.name, {})
+            identity = {
+                "cluster_id": cluster_id,
+                "seed_name": seed.name,
+                "name": node.name,
+                "addresses": [node.control_ip, node.geneve_ip],
+                "expected_public_key_sha256": expected_node.get("public_key_sha256"),
+            }
+            response = self._remote(node.name, "pki-csr", identity)
+            csr = response.get("csr")
+            public_key = response.get("public_key_sha256")
+            if not isinstance(csr, str) or not csr or not isinstance(public_key, str) or \
+                    not re.fullmatch(r"[0-9a-f]{64}", public_key):
+                raise ControlPlaneError(f"node {node.name} returned an invalid CSR response")
+            requests.append({
+                "name": node.name,
+                "addresses": [node.control_ip, node.geneve_ip],
+                "csr": csr,
+                "public_key_sha256": public_key,
+                "expected_certificate_sha256": expected_node.get("certificate_sha256"),
+            })
+            public_keys[node.name] = public_key
 
-    @staticmethod
-    def _file(path: str, data: bytes, mode: str) -> dict[str, str]:
-        return {"path": path, "content": base64.b64encode(data).decode(), "mode": mode, "group": "pvn"}
+        signed = self._remote(seed.name, "pki-sign", {
+            "cluster_id": cluster_id,
+            "seed_name": seed.name,
+            "expected_ca_sha256": expected_fingerprints.get("ca_certificate_sha256")
+            if expected_fingerprints else None,
+            "requests": requests,
+        })
+        ca = signed.get("ca")
+        ca_hash = signed.get("ca_sha256")
+        certificates = signed.get("nodes")
+        if not isinstance(ca, str) or not ca or not isinstance(ca_hash, str) or \
+                not re.fullmatch(r"[0-9a-f]{64}", ca_hash):
+            raise ControlPlaneError("seed returned an invalid CA certificate response")
+        if not isinstance(certificates, dict) or set(certificates) != {node.name for node in nodes}:
+            raise ControlPlaneError("seed returned an incomplete node certificate set")
+
+        fingerprints: dict[str, Any] = {"ca_certificate_sha256": ca_hash, "nodes": {}}
+        installations: dict[str, dict[str, Any]] = {}
+        for node in nodes:
+            certificate = certificates[node.name]
+            if not isinstance(certificate, dict):
+                raise ControlPlaneError(f"seed returned an invalid certificate for {node.name}")
+            certificate_data = certificate.get("certificate")
+            certificate_hash = certificate.get("certificate_sha256")
+            public_key = certificate.get("public_key_sha256")
+            if not isinstance(certificate_data, str) or not certificate_data or \
+                    not isinstance(certificate_hash, str) or \
+                    not re.fullmatch(r"[0-9a-f]{64}", certificate_hash) or \
+                    public_key != public_keys[node.name]:
+                raise ControlPlaneError(f"seed certificate identity differs for {node.name}")
+            installations[node.name] = {
+                "name": node.name,
+                "addresses": [node.control_ip, node.geneve_ip],
+                "ca": ca,
+                "ca_sha256": ca_hash,
+                "certificate": certificate_data,
+                "certificate_sha256": certificate_hash,
+                "public_key_sha256": public_key,
+            }
+            fingerprints["nodes"][node.name] = {
+                "certificate_sha256": certificate_hash,
+                "public_key_sha256": public_key,
+            }
+        if expected_fingerprints and fingerprints != expected_fingerprints:
+            raise ControlPlaneError("prepared PKI fingerprints drift from the control-plane ledger")
+        return fingerprints, installations
+
+    def install_pki(
+        self, nodes: tuple[Node, ...], installations: dict[str, dict[str, Any]]
+    ) -> None:
+        if set(installations) != {node.name for node in nodes}:
+            raise ControlPlaneError("prepared PKI installation set is incomplete")
+        for node in nodes:
+            request = installations[node.name]
+            installed = self._remote(node.name, "pki-install", request)
+            expected = {
+                "ca_sha256": request["ca_sha256"],
+                "certificate_sha256": request["certificate_sha256"],
+                "public_key_sha256": request["public_key_sha256"],
+            }
+            if installed != expected:
+                raise ControlPlaneError(f"node {node.name} installed PKI fingerprint drift")
 
     def stage(self, node: Node, files: list[dict[str, str]]) -> None:
         self._remote(node.name, "stage", {"files": files})
@@ -782,8 +1308,8 @@ class ControlPlane:
             "existing_phase": ledger.get("phase") if ledger else None,
             "actions": [
                 "freeze membership/topology/package in the private pmxcfs ledger",
-                "render shared config and preserve a private cluster CA",
-                "stage unique node PKI and exact local/central environment",
+                "render shared config and preserve a seed-local private cluster CA",
+                "generate node-local keys, sign CSRs, then stage exact local/central environment",
                 "bootstrap central voters one at a time with exact three-DB health gates",
                 "activate transport nodes one at a time after central convergence",
             ],
@@ -817,16 +1343,19 @@ class ControlPlane:
 
             config = self._render_config(discovery, ledger["cluster_uuid"])
             self.backend.ensure_shared_config(config)
-            fingerprints, bundles = self.backend.ensure_pki(ledger["cluster_uuid"], discovery.nodes)
+            fingerprints, installations = self.backend.prepare_pki(
+                ledger["cluster_uuid"], discovery.nodes, ledger["cert_fingerprints"]
+            )
             if ledger["cert_fingerprints"] and ledger["cert_fingerprints"] != fingerprints:
                 raise ControlPlaneError("PKI fingerprint drift from the control-plane ledger")
             if not ledger["cert_fingerprints"]:
                 ledger["cert_fingerprints"] = fingerprints
                 self.store.update(ledger)
+            self.backend.install_pki(discovery.nodes, installations)
 
             seed = discovery.nodes[0]
             for index, node in enumerate(discovery.nodes):
-                files = bundles[node.name] + self._render_node_files(discovery, node, seed)
+                files = self._render_node_files(discovery, node, seed)
                 self.backend.stage(node, files)
             if ledger["phase"] == "planned":
                 ledger["phase"] = "staged"
@@ -906,6 +1435,23 @@ class ControlPlane:
             raise ControlPlaneError("ledger node progress is invalid")
         if ledger.get("nodes_complete", 0) and ledger.get("central_complete") != count:
             raise ControlPlaneError("ledger activates nodes before all central voters")
+        pki = ledger.get("cert_fingerprints")
+        if not isinstance(pki, dict):
+            raise ControlPlaneError("ledger PKI fingerprints are invalid")
+        if pki:
+            ca_hash = pki.get("ca_certificate_sha256")
+            node_pins = pki.get("nodes")
+            if set(pki) != {"ca_certificate_sha256", "nodes"} or \
+                    not isinstance(ca_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", ca_hash) or \
+                    not isinstance(node_pins, dict) or \
+                    set(node_pins) != {node.name for node in discovery.nodes}:
+                raise ControlPlaneError("ledger PKI fingerprint set is invalid")
+            for name, pins in node_pins.items():
+                if not isinstance(pins, dict) or \
+                        set(pins) != {"certificate_sha256", "public_key_sha256"} or \
+                        any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                            for value in pins.values()):
+                    raise ControlPlaneError(f"ledger PKI fingerprints for {name} are invalid")
         if "control_db_cluster_id" not in ledger:
             raise ControlPlaneError("ledger lacks the Control DB cluster ID pin field")
         control_cid = ledger.get("control_db_cluster_id")
