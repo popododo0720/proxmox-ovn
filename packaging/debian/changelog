@@ -1,3 +1,9 @@
+proxmox-ovn (0.2.6) unstable; urgency=medium
+
+  * Safely resume staged seed crash-window deployments after package upgrades.
+
+ -- PVN Project <root@localhost>  Wed, 05 Aug 2026 10:14:59 +0000
+
 proxmox-ovn (0.2.5) unstable; urgency=medium
 
   * Support every positive odd central voter count with five-node coverage.
