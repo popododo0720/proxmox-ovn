@@ -32,6 +32,14 @@ grep -q '/usr/lib/pvn/pvn-ui-verify' packaging/debian/pvn-node.postinst || {
     echo "package configuration must verify the installed PVE UI hook" >&2
     exit 1
 }
+if grep -n 'systemctl restart.*|| true' packaging/debian/pvn-node.postinst; then
+    echo "active-node upgrade restart failures must fail package configuration" >&2
+    exit 1
+fi
+grep -q 'PVN node stack failed to restart during package upgrade' packaging/debian/pvn-node.postinst || {
+    echo "active-node upgrade must report a failed restart" >&2
+    exit 1
+}
 grep -q 'PVN_CONTROL_PORT must be 6645' deploy/scripts/pvn-control-db-run || {
     echo "PVN Control client port must be pinned to 6645" >&2
     exit 1

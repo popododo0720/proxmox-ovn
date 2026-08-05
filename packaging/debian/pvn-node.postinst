@@ -55,7 +55,17 @@ install_ui
 # after staging shared config, local config, PKI, and both OVS bridges. During
 # upgrades only already-active node services are restarted.
 if systemctl is-active --quiet pvn-node.target; then
-    systemctl restart pvn-ovn-host-config.service ovn-controller.service pvn-manager.service pvn-agent.service pvn-node-ready.service >/dev/null 2>&1 || true
+    if ! systemctl restart \
+        pvn-ovn-host-config.service ovn-controller.service \
+        pvn-manager.service pvn-agent.service pvn-node-ready.service
+    then
+        echo "PVN node stack failed to restart during package upgrade" >&2
+        systemctl --no-pager --full status \
+            pvn-node.target pvn-node-ready.service \
+            pvn-ovn-host-config.service ovn-controller.service \
+            pvn-manager.service pvn-agent.service >&2 || true
+        exit 1
+    fi
 else
     systemctl stop ovn-controller.service >/dev/null 2>&1 || true
 fi
