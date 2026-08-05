@@ -152,6 +152,26 @@ type FloatingIP struct {
 func (*FloatingIP) ResourceKind() Kind { return KindFloatingIP }
 func (f *FloatingIP) Validate() error  { return validateFloatingIP(f) }
 
+// MarkPending resets the realized status while a desired revision is waiting
+// for OVN reconciliation. Reserved (unassociated) addresses remain down after
+// a successful pass; only a complete router/port association can be active.
+func (f *FloatingIP) MarkPending() {
+	f.FloatingStatus = FloatingIPDown
+}
+
+// MarkReconciled records the realized state of the exact desired revision.
+func (f *FloatingIP) MarkReconciled(renderErr error) {
+	if renderErr != nil {
+		f.FloatingStatus = FloatingIPError
+		return
+	}
+	if f.RouterID != "" && f.PortID != "" && f.FixedIPAddress != "" {
+		f.FloatingStatus = FloatingIPActive
+		return
+	}
+	f.FloatingStatus = FloatingIPDown
+}
+
 type ProviderNetwork struct {
 	Metadata
 	Name             string `json:"name"`

@@ -294,10 +294,16 @@ export function PortsPage() {
   </div>;
 }
 
+export function floatingIPDisplayStatus(item: FloatingIP): string {
+  const lifecycle = String(item.state || '').toLowerCase();
+  if (lifecycle === 'pending' || lifecycle === 'deleting' || lifecycle === 'error') return lifecycle;
+  return String(item.status || item.state || 'unknown');
+}
+
 export function FloatingIPsPage() {
   return <ResourcePage<FloatingIP>
     title="Floating IPs"
-    description="North-south addresses translated at the active gateway chassis."
+    description="North-south addresses are pending while OVN applies them, active when associated NAT is realized, and down while reserved."
     endpoint="/floating-ips"
     columns={[
       { key: 'address', label: 'Floating IP', className: 'mono-cell', render: (item) => <strong>{item.address || item.name || item.id}</strong> },
@@ -305,7 +311,7 @@ export function FloatingIPsPage() {
       { key: 'port_id', label: 'Port', className: 'mono-cell' },
       { key: 'router_id', label: 'Router', className: 'mono-cell' },
       { key: 'project_id', label: 'Project', className: 'mono-cell' },
-      { key: 'status', label: 'State' },
+      { key: 'status', label: 'State', render: (item) => <StatusPill value={floatingIPDisplayStatus(item)} /> },
     ]}
     createLabel="Floating IP"
     createFields={[

@@ -362,6 +362,10 @@ func (s *Server) create(writer http.ResponseWriter, request *http.Request, kind 
 			return
 		}
 	}
+	if floatingIP, ok := resource.(*model.FloatingIP); ok && floatingIP.FloatingStatus != "" {
+		writeError(writer, http.StatusBadRequest, "server_managed_field", "status is server-managed", nil)
+		return
+	}
 	if err := s.authorizeWrite(request.Context(), resource, nil); err != nil {
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error(), nil)
 		return
@@ -427,6 +431,13 @@ func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind 
 			oldPort := current.(*model.Port)
 			if !samePortBindingFields(port, oldPort) {
 				writeError(writer, http.StatusBadRequest, "server_managed_field", "node_id, vmid, nic, requested_chassis, binding_status, lsp_name, and generation are server-managed", nil)
+				return
+			}
+		}
+		if floatingIP, ok := resource.(*model.FloatingIP); ok {
+			oldFloatingIP := current.(*model.FloatingIP)
+			if floatingIP.FloatingStatus != "" && floatingIP.FloatingStatus != oldFloatingIP.FloatingStatus {
+				writeError(writer, http.StatusBadRequest, "server_managed_field", "status is server-managed", nil)
 				return
 			}
 		}

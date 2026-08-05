@@ -106,6 +106,9 @@ func (s *Memory) Create(ctx context.Context, resource model.Resource, key string
 		return nil, false, storeError(ErrAlreadyExists, "%s %q already exists", copyResource.ResourceKind(), meta.ID)
 	}
 	model.SetDefaults(copyResource)
+	if floatingIP, ok := copyResource.(*model.FloatingIP); ok {
+		floatingIP.MarkPending()
+	}
 	if err := copyResource.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -317,6 +320,9 @@ func (s *Memory) Update(ctx context.Context, resource model.Resource, expectedRe
 		return nil, false, err
 	}
 	model.SetDefaults(copyResource)
+	if floatingIP, ok := copyResource.(*model.FloatingIP); ok {
+		floatingIP.MarkPending()
+	}
 	if requestedOperation, ok := copyResource.(*model.Operation); ok {
 		storedOperation := current.(*model.Operation)
 		if leaseProtectedAction(storedOperation.Action) && storedOperation.OperationStatus == model.OperationRunning && requestedOperation.LeaseOwner != storedOperation.LeaseOwner {
@@ -580,6 +586,9 @@ func (s *Memory) BeginDelete(ctx context.Context, kind model.Kind, id string, ex
 	meta.State = model.ResourceDeleting
 	meta.LastError = ""
 	meta.UpdatedAt = s.now().UTC()
+	if floatingIP, ok := tombstone.(*model.FloatingIP); ok {
+		floatingIP.MarkPending()
+	}
 	s.resources[kind][id] = tombstone
 	result, err := model.Clone(tombstone)
 	if err != nil {
@@ -635,6 +644,9 @@ func (s *Memory) MarkReconciled(ctx context.Context, kind model.Kind, id string,
 			meta.State = model.ResourceError
 			meta.LastError = renderErr.Error()
 			meta.UpdatedAt = s.now().UTC()
+			if floatingIP, ok := resource.(*model.FloatingIP); ok {
+				floatingIP.MarkReconciled(renderErr)
+			}
 		}
 	} else {
 		if revision > meta.AppliedRevision {
@@ -644,6 +656,9 @@ func (s *Memory) MarkReconciled(ctx context.Context, kind model.Kind, id string,
 			meta.State = model.ResourceReady
 			meta.LastError = ""
 			meta.UpdatedAt = s.now().UTC()
+			if floatingIP, ok := resource.(*model.FloatingIP); ok {
+				floatingIP.MarkReconciled(nil)
+			}
 		}
 	}
 	return model.Clone(resource)

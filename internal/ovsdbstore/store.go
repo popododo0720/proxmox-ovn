@@ -154,6 +154,9 @@ func (s *Store) Create(ctx context.Context, resource model.Resource, key string)
 		return nil, false, storeError(controlstore.ErrConflict, "operation idempotency_key %q is reserved", operation.IdempotencyKey)
 	}
 	model.SetDefaults(candidate)
+	if floatingIP, ok := candidate.(*model.FloatingIP); ok {
+		floatingIP.MarkPending()
+	}
 	if err := candidate.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -426,6 +429,9 @@ func (s *Store) Update(ctx context.Context, resource model.Resource, expectedRev
 		return nil, false, storeError(controlstore.ErrConflict, "operation idempotency_key %q is reserved", operation.IdempotencyKey)
 	}
 	model.SetDefaults(requested)
+	if floatingIP, ok := requested.(*model.FloatingIP); ok {
+		floatingIP.MarkPending()
+	}
 	if operation, ok := requested.(*model.Operation); ok && leaseProtectedAction(operation.Action) && operation.OperationStatus == model.OperationRunning {
 		return nil, false, storeError(controlstore.ErrConflict, "%s operations must be started with a durable lease claim", operation.Action)
 	}
@@ -782,6 +788,9 @@ func (s *Store) BeginDelete(ctx context.Context, kind model.Kind, id string, exp
 		meta.State = model.ResourceDeleting
 		meta.LastError = ""
 		meta.UpdatedAt = now
+		if floatingIP, ok := tombstone.(*model.FloatingIP); ok {
+			floatingIP.MarkPending()
+		}
 		row, err := encodeResource(tombstone, current)
 		if err != nil {
 			return nil, false, err
@@ -879,6 +888,9 @@ func (s *Store) MarkReconciled(ctx context.Context, kind model.Kind, id string, 
 				meta.State = model.ResourceError
 				meta.LastError = truncateError(renderErr.Error())
 				meta.UpdatedAt = s.now().UTC()
+				if floatingIP, ok := resource.(*model.FloatingIP); ok {
+					floatingIP.MarkReconciled(renderErr)
+				}
 				changed = true
 			}
 		} else {
@@ -890,6 +902,9 @@ func (s *Store) MarkReconciled(ctx context.Context, kind model.Kind, id string, 
 				meta.State = model.ResourceReady
 				meta.LastError = ""
 				meta.UpdatedAt = s.now().UTC()
+				if floatingIP, ok := resource.(*model.FloatingIP); ok {
+					floatingIP.MarkReconciled(nil)
+				}
 				changed = true
 			}
 		}

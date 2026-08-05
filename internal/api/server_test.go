@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
+	"github.com/popododo0720/proxmox-ovn/internal/reconcile"
 )
 
 func testServer(t *testing.T, store controlstore.Store, provider SessionProvider) *Server {
@@ -61,6 +63,94 @@ func createAPIProject(t *testing.T, server *Server) model.Project {
 		t.Fatalf("POST project status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	return decodeData[model.Project](t, recorder)
+}
+
+func createAPIResource(t *testing.T, store controlstore.Store, resource model.Resource, key string) model.Resource {
+	t.Helper()
+	created, replayed, err := store.Create(context.Background(), resource, key)
+	if err != nil || replayed {
+		t.Fatalf("Create(%s) replayed=%v err=%v", resource.ResourceKind(), replayed, err)
+	}
+	return created
+}
+
+func floatingIPAPIInput(t *testing.T, store controlstore.Store) model.FloatingIP {
+	t.Helper()
+	project := createAPIResource(t, store, &model.Project{Name: "tenant-fip", PoolID: "pool-fip"}, "api-fip-project").(*model.Project)
+	provider := createAPIResource(t, store, &model.ProviderNetwork{Name: "public-fip"}, "api-fip-provider").(*model.ProviderNetwork)
+	externalNetwork := createAPIResource(t, store, &model.Network{
+		ProjectID: project.ID, Name: "public-fip", External: true, ProviderNetworkID: provider.ID,
+	}, "api-fip-external-network").(*model.Network)
+	externalSubnet := createAPIResource(t, store, &model.Subnet{
+		ProjectID: project.ID, NetworkID: externalNetwork.ID, Name: "public-fip-v4", CIDR: "198.51.100.0/24",
+		GatewayIP: "198.51.100.1", AllocationPools: []model.IPRange{{Start: "198.51.100.2", End: "198.51.100.200"}},
+	}, "api-fip-external-subnet").(*model.Subnet)
+	privateNetwork := createAPIResource(t, store, &model.Network{ProjectID: project.ID, Name: "private-fip"}, "api-fip-private-network").(*model.Network)
+	privateSubnet := createAPIResource(t, store, &model.Subnet{
+		ProjectID: project.ID, NetworkID: privateNetwork.ID, Name: "private-fip-v4", CIDR: "10.20.0.0/24", GatewayIP: "10.20.0.1",
+	}, "api-fip-private-subnet").(*model.Subnet)
+	port := createAPIResource(t, store, &model.Port{
+		ProjectID: project.ID, NetworkID: privateNetwork.ID, Name: "api-fip-port", MACAddress: "02:00:00:00:20:10",
+		FixedIPs: []model.FixedIP{{SubnetID: privateSubnet.ID, Address: "10.20.0.10"}},
+	}, "api-fip-port").(*model.Port)
+	router := createAPIResource(t, store, &model.Router{
+		ProjectID: project.ID, Name: "api-fip-router", ExternalNetworkID: externalNetwork.ID,
+		ExternalSubnetID: externalSubnet.ID, ExternalIPAddress: "198.51.100.2", EnableSNAT: true,
+	}, "api-fip-router").(*model.Router)
+	createAPIResource(t, store, &model.RouterInterface{
+		ProjectID: project.ID, RouterID: router.ID, SubnetID: privateSubnet.ID,
+	}, "api-fip-router-interface")
+	return model.FloatingIP{
+		ProjectID: project.ID, ProviderNetworkID: provider.ID, Address: "198.51.100.10",
+		RouterID: router.ID, PortID: port.ID, FixedIPAddress: "10.20.0.10",
+	}
+}
+
+func TestFloatingIPAPIUsesServerManagedRealizedStatus(t *testing.T) {
+	store := controlstore.NewMemory()
+	input := floatingIPAPIInput(t, store)
+	controller := reconcile.NewController(store, reconcile.NewFakeRenderer())
+	server, err := New(Options{Store: store, Reconciler: controller})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spoofed := input
+	spoofed.FloatingStatus = model.FloatingIPActive
+	rejected := request(t, server, http.MethodPost, "/api/v1/floating-ips", spoofed, map[string]string{"Idempotency-Key": "api-fip-spoof-create"})
+	if rejected.Code != http.StatusBadRequest || !strings.Contains(rejected.Body.String(), "server-managed") {
+		t.Fatalf("spoofed create status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
+
+	createdResponse := request(t, server, http.MethodPost, "/api/v1/floating-ips", input, map[string]string{"Idempotency-Key": "api-fip-create"})
+	if createdResponse.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createdResponse.Code, createdResponse.Body.String())
+	}
+	created := decodeData[model.FloatingIP](t, createdResponse)
+	if created.State != model.ResourceReady || created.FloatingStatus != model.FloatingIPActive || created.AppliedRevision != created.Revision {
+		t.Fatalf("created floating IP=%#v", created)
+	}
+
+	created.PortID = ""
+	created.FixedIPAddress = ""
+	updatedResponse := request(t, server, http.MethodPut, "/api/v1/floating-ips/"+created.ID, created, map[string]string{
+		"Idempotency-Key": "api-fip-reserve", "If-Match": `"1"`,
+	})
+	if updatedResponse.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updatedResponse.Code, updatedResponse.Body.String())
+	}
+	updated := decodeData[model.FloatingIP](t, updatedResponse)
+	if updated.State != model.ResourceReady || updated.FloatingStatus != model.FloatingIPDown || updated.AppliedRevision != updated.Revision {
+		t.Fatalf("updated floating IP=%#v", updated)
+	}
+
+	updated.FloatingStatus = model.FloatingIPActive
+	rejected = request(t, server, http.MethodPut, "/api/v1/floating-ips/"+updated.ID, updated, map[string]string{
+		"Idempotency-Key": "api-fip-spoof-update", "If-Match": `"2"`,
+	})
+	if rejected.Code != http.StatusBadRequest || !strings.Contains(rejected.Body.String(), "server-managed") {
+		t.Fatalf("spoofed update status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
 }
 
 func TestHealthAndSession(t *testing.T) {

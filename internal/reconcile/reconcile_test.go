@@ -166,6 +166,65 @@ func createProject(t *testing.T, store controlstore.Store) *model.Project {
 	return resource.(*model.Project)
 }
 
+func createAssociatedFloatingIP(t *testing.T, store controlstore.Store) *model.FloatingIP {
+	t.Helper()
+	project := createProject(t, store)
+	provider, _, err := store.Create(context.Background(), &model.ProviderNetwork{Name: "public"}, "fip-provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalNetwork, _, err := store.Create(context.Background(), &model.Network{
+		ProjectID: project.ID, Name: "public", External: true, ProviderNetworkID: provider.GetMetadata().ID,
+	}, "fip-external-network")
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalSubnet, _, err := store.Create(context.Background(), &model.Subnet{
+		ProjectID: project.ID, NetworkID: externalNetwork.GetMetadata().ID, Name: "public-v4",
+		CIDR: "192.0.2.0/24", GatewayIP: "192.0.2.1", AllocationPools: []model.IPRange{{Start: "192.0.2.2", End: "192.0.2.200"}},
+	}, "fip-external-subnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateNetwork, _, err := store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "fip-private-network")
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateSubnet, _, err := store.Create(context.Background(), &model.Subnet{
+		ProjectID: project.ID, NetworkID: privateNetwork.GetMetadata().ID, Name: "private-v4", CIDR: "10.0.0.0/24", GatewayIP: "10.0.0.1",
+	}, "fip-private-subnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, _, err := store.Create(context.Background(), &model.Port{
+		ProjectID: project.ID, NetworkID: privateNetwork.GetMetadata().ID, Name: "vm-port", MACAddress: "02:00:00:00:00:10",
+		FixedIPs: []model.FixedIP{{SubnetID: privateSubnet.GetMetadata().ID, Address: "10.0.0.10"}},
+	}, "fip-port")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, _, err := store.Create(context.Background(), &model.Router{
+		ProjectID: project.ID, Name: "router", ExternalNetworkID: externalNetwork.GetMetadata().ID,
+		ExternalSubnetID: externalSubnet.GetMetadata().ID, ExternalIPAddress: "192.0.2.2", EnableSNAT: true,
+	}, "fip-router")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Create(context.Background(), &model.RouterInterface{
+		ProjectID: project.ID, RouterID: router.GetMetadata().ID, SubnetID: privateSubnet.GetMetadata().ID,
+	}, "fip-router-interface"); err != nil {
+		t.Fatal(err)
+	}
+	floatingIP, _, err := store.Create(context.Background(), &model.FloatingIP{
+		ProjectID: project.ID, ProviderNetworkID: provider.GetMetadata().ID, Address: "192.0.2.10",
+		RouterID: router.GetMetadata().ID, PortID: port.GetMetadata().ID, FixedIPAddress: "10.0.0.10",
+	}, "fip-create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return floatingIP.(*model.FloatingIP)
+}
+
 func waitForRenewalSpan(t *testing.T, renewed <-chan time.Time, span time.Duration) {
 	t.Helper()
 	deadline := time.NewTimer(3 * time.Second)
@@ -269,6 +328,115 @@ func TestControllerFailureCanBeRetried(t *testing.T) {
 	operations, _ := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
 	if len(operations) != 1 || operations[0].(*model.Operation).OperationStatus != model.OperationSucceeded {
 		t.Fatalf("retry operation = %#v", operations)
+	}
+}
+
+func TestControllerTracksFloatingIPRealizedLifecycle(t *testing.T) {
+	store := controlstore.NewMemory()
+	floatingIP := createAssociatedFloatingIP(t, store)
+	if floatingIP.State != model.ResourcePending || floatingIP.FloatingStatus != model.FloatingIPDown {
+		t.Fatalf("created floating IP state=%s status=%s", floatingIP.State, floatingIP.FloatingStatus)
+	}
+
+	renderer := NewFakeRenderer()
+	controller := NewController(store, renderer)
+	if err := controller.Reconcile(context.Background(), model.KindFloatingIP, floatingIP.ID); err != nil {
+		t.Fatal(err)
+	}
+	realizedResource, err := store.Get(context.Background(), model.KindFloatingIP, floatingIP.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realized := realizedResource.(*model.FloatingIP)
+	if realized.State != model.ResourceReady || realized.FloatingStatus != model.FloatingIPActive {
+		t.Fatalf("realized floating IP state=%s status=%s", realized.State, realized.FloatingStatus)
+	}
+
+	routerID, portID, fixedIPAddress := realized.RouterID, realized.PortID, realized.FixedIPAddress
+	realized.FixedIPAddress = ""
+	realized.PortID = ""
+	reservedResource, _, err := store.Update(context.Background(), realized, realized.Revision, "fip-reserve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved := reservedResource.(*model.FloatingIP)
+	if reserved.State != model.ResourcePending || reserved.FloatingStatus != model.FloatingIPDown {
+		t.Fatalf("pending reserved floating IP state=%s status=%s", reserved.State, reserved.FloatingStatus)
+	}
+	if err := controller.Reconcile(context.Background(), model.KindFloatingIP, floatingIP.ID); err != nil {
+		t.Fatal(err)
+	}
+	reservedResource, err = store.Get(context.Background(), model.KindFloatingIP, floatingIP.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved = reservedResource.(*model.FloatingIP)
+	if reserved.State != model.ResourceReady || reserved.FloatingStatus != model.FloatingIPDown {
+		t.Fatalf("realized reserved floating IP state=%s status=%s", reserved.State, reserved.FloatingStatus)
+	}
+
+	reserved.RouterID = routerID
+	reserved.PortID = portID
+	reserved.FixedIPAddress = fixedIPAddress
+	pendingResource, _, err := store.Update(context.Background(), reserved, reserved.Revision, "fip-reassociate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := pendingResource.(*model.FloatingIP)
+	renderer.SetFailure(model.KindFloatingIP, floatingIP.ID, errors.New("OVN unavailable"))
+	if err := controller.Reconcile(context.Background(), model.KindFloatingIP, floatingIP.ID); err == nil {
+		t.Fatal("floating IP render failure was not returned")
+	}
+	failedResource, err := store.Get(context.Background(), model.KindFloatingIP, floatingIP.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := failedResource.(*model.FloatingIP)
+	if failed.State != model.ResourceError || failed.FloatingStatus != model.FloatingIPError || failed.AppliedRevision != reserved.Revision {
+		t.Fatalf("failed floating IP=%#v", failed)
+	}
+
+	renderer.SetFailure(model.KindFloatingIP, floatingIP.ID, nil)
+	if err := controller.Reconcile(context.Background(), model.KindFloatingIP, floatingIP.ID); err != nil {
+		t.Fatal(err)
+	}
+	recoveredResource, err := store.Get(context.Background(), model.KindFloatingIP, floatingIP.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := recoveredResource.(*model.FloatingIP)
+	if recovered.State != model.ResourceReady || recovered.FloatingStatus != model.FloatingIPActive || recovered.AppliedRevision != pending.Revision {
+		t.Fatalf("recovered floating IP=%#v", recovered)
+	}
+
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindFloatingIP, floatingIP.ID, recovered.Revision, "fip-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleting := tombstone.(*model.FloatingIP)
+	if deleting.State != model.ResourceDeleting || deleting.FloatingStatus != model.FloatingIPDown {
+		t.Fatalf("deleting floating IP state=%s status=%s", deleting.State, deleting.FloatingStatus)
+	}
+	renderer.SetDeleteFailure(model.KindFloatingIP, floatingIP.ID, errors.New("OVN unavailable"))
+	if err := controller.Delete(context.Background(), deleting); err == nil {
+		t.Fatal("floating IP delete failure was not returned")
+	}
+	storedTombstone, err := store.Get(context.Background(), model.KindFloatingIP, floatingIP.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value := storedTombstone.(*model.FloatingIP); value.State != model.ResourceDeleting || value.FloatingStatus != model.FloatingIPDown {
+		t.Fatalf("retryable floating IP tombstone=%#v", value)
+	}
+	renderer.SetDeleteFailure(model.KindFloatingIP, floatingIP.ID, nil)
+	if err := controller.Delete(context.Background(), deleting); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindFloatingIP, floatingIP.ID, deleting.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(context.Background(), model.KindFloatingIP, floatingIP.ID); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("deleted floating IP Get() error=%v", err)
 	}
 }
 

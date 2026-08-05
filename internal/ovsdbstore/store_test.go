@@ -212,7 +212,39 @@ func TestStorePersistsEveryResourceKindAndFiltersInternalRows(t *testing.T) {
 	allocation := mustCreate(t, store, &model.IPAllocation{ProjectID: project.ID, SubnetID: subnet.ID, PortID: port.ID, Address: "10.10.0.10", State: model.IPAllocated}, "allocation")
 	router := mustCreate(t, store, &model.Router{ProjectID: project.ID, Name: "router", ExternalNetworkID: external.ID, ExternalSubnetID: externalSubnet.ID, ExternalIPAddress: "198.51.100.2", EnableSNAT: true}, "router").(*model.Router)
 	interfaceResource := mustCreate(t, store, &model.RouterInterface{ProjectID: project.ID, RouterID: router.ID, SubnetID: subnet.ID, PortID: port.ID}, "router-interface")
-	floating := mustCreate(t, store, &model.FloatingIP{ProjectID: project.ID, ProviderNetworkID: provider.ID, Address: "198.51.100.10", PortID: port.ID, FixedIPAddress: "10.10.0.10", RouterID: router.ID}, "floating")
+	floating := mustCreate(t, store, &model.FloatingIP{ProjectID: project.ID, ProviderNetworkID: provider.ID, Address: "198.51.100.10", PortID: port.ID, FixedIPAddress: "10.10.0.10", RouterID: router.ID}, "floating").(*model.FloatingIP)
+	if floating.FloatingStatus != model.FloatingIPDown || floating.State != model.ResourcePending {
+		t.Fatalf("new floating IP state=%s status=%s", floating.State, floating.FloatingStatus)
+	}
+	realizedFloating, err := store.MarkReconciled(context.Background(), model.KindFloatingIP, floating.ID, floating.Revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	floating = realizedFloating.(*model.FloatingIP)
+	if floating.FloatingStatus != model.FloatingIPActive || floating.State != model.ResourceReady {
+		t.Fatalf("realized floating IP state=%s status=%s", floating.State, floating.FloatingStatus)
+	}
+	pendingFloating, _, err := store.Update(context.Background(), floating, floating.Revision, "floating-update")
+	if err != nil {
+		t.Fatal(err)
+	}
+	floating = pendingFloating.(*model.FloatingIP)
+	if floating.FloatingStatus != model.FloatingIPDown || floating.State != model.ResourcePending {
+		t.Fatalf("updated floating IP state=%s status=%s", floating.State, floating.FloatingStatus)
+	}
+	failedFloating, err := store.MarkReconciled(context.Background(), model.KindFloatingIP, floating.ID, floating.Revision, errors.New("OVN unavailable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	floating = failedFloating.(*model.FloatingIP)
+	if floating.FloatingStatus != model.FloatingIPError || floating.State != model.ResourceError {
+		t.Fatalf("failed floating IP state=%s status=%s", floating.State, floating.FloatingStatus)
+	}
+	realizedFloating, err = store.MarkReconciled(context.Background(), model.KindFloatingIP, floating.ID, floating.Revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	floating = realizedFloating.(*model.FloatingIP)
 	operation := mustCreate(t, store, &model.Operation{Action: "bind", TargetKind: model.KindPort, TargetID: port.ID, TargetRevision: port.Revision}, "operation")
 	if operation.(*model.Operation).IdempotencyKey != "operation" {
 		t.Fatalf("operation idempotency key=%q", operation.(*model.Operation).IdempotencyKey)
