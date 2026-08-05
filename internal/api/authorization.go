@@ -11,7 +11,7 @@ import (
 const (
 	globalPath        = "/"
 	projectPoolPrefix = "/pool/"
-	networkPathPrefix = "/sdn/pvn/"
+	networkPathPrefix = "/sdn/zones/pvn/"
 )
 
 func (s *Server) authorizeRead(ctx context.Context, resource model.Resource) error {

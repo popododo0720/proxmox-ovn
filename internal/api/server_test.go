@@ -503,7 +503,7 @@ func TestAttachedPortRequiresUseAndVMNetworkPrivileges(t *testing.T) {
 	if deniedUse.Code != http.StatusForbidden {
 		t.Fatalf("attached update without SDN.Use status=%d body=%s", deniedUse.Code, deniedUse.Body.String())
 	}
-	permissions["/pool/pool-tenant"] = map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "SDN.Use": true}
+	permissions[networkPathPrefix+network.ID] = map[string]bool{"SDN.Use": true}
 	deniedVM := request(t, server, http.MethodPut, "/api/v1/ports/"+port.ID, port, map[string]string{"Idempotency-Key": "no-vm", "If-Match": `"1"`})
 	if deniedVM.Code != http.StatusForbidden {
 		t.Fatalf("attached update without VM.Config.Network status=%d body=%s", deniedVM.Code, deniedVM.Body.String())
