@@ -312,6 +312,9 @@ shared `/etc/pve/pvn/config.json` intentionally leaves `networking.encap_ip`
 empty. Use `--node-env /absolute/test/path` only for an isolated test fixture;
 the file is parsed as a strict, non-shell `KEY=VALUE` allowlist and fails closed
 when it is missing, malformed, duplicated, symlinked, or unsafely writable.
+The doctor also compares that effective address and `geneve` type with OVS
+`ovn-encap-ip`/`ovn-encap-type`, then verifies the address is present on a local
+interface whose MTU can carry the configured guest MTU plus encapsulation.
 
 At boot, `pvn-guest-gate.service` leaves normal PVE behavior unchanged when
 the local marker is absent. When the marker exists, a failed readiness check

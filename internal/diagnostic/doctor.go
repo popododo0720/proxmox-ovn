@@ -63,6 +63,10 @@ func Run(ctx context.Context, cfg config.Config, runner Runner) []Check {
 	}, "-t", "ovn-controller", "connection-status"))
 	checks = append(checks, commandCheck(ctx, runner, "chassis-system-id", "ovs-vsctl", nonEmptyOVSValue,
 		"--if-exists", "get", "Open_vSwitch", ".", "external_ids:system-id"))
+	checks = append(checks, commandCheck(ctx, runner, "ovn-encap-type", "ovs-vsctl", exactOVSValue(cfg.Networking.EncapType),
+		"--if-exists", "get", "Open_vSwitch", ".", "external_ids:ovn-encap-type"))
+	checks = append(checks, commandCheck(ctx, runner, "ovn-encap-ip", "ovs-vsctl", exactOVSValue(cfg.Networking.EncapIP),
+		"--if-exists", "get", "Open_vSwitch", ".", "external_ids:ovn-encap-ip"))
 	checks = append(checks, commandCheck(ctx, runner, "provider-bridge-mapping", "ovs-vsctl", func(output string) error {
 		mapping := cfg.Networking.Physnet + ":" + cfg.Networking.ProviderBridge
 		for _, candidate := range strings.Split(unquoteOVSValue(output), ",") {
@@ -150,6 +154,16 @@ func nonEmptyOVSValue(output string) error {
 		return fmt.Errorf("OVS value is not configured")
 	}
 	return nil
+}
+
+func exactOVSValue(expected string) func(string) error {
+	return func(output string) error {
+		actual := strings.TrimSpace(unquoteOVSValue(output))
+		if actual != expected {
+			return fmt.Errorf("OVS value %q does not match configured value %q", actual, expected)
+		}
+		return nil
+	}
 }
 
 func unquoteOVSValue(value string) string {

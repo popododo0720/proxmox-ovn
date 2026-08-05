@@ -46,6 +46,53 @@ func TestOVSValueValidation(t *testing.T) {
 	}
 }
 
+func TestExactOVSEncapValue(t *testing.T) {
+	for _, value := range []string{"geneve", `"geneve"`} {
+		if err := exactOVSValue("geneve")(value); err != nil {
+			t.Fatalf("matching OVS value %q failed: %v", value, err)
+		}
+	}
+	for _, value := range []string{"", "[]", "vxlan", `"192.0.2.11"`} {
+		if err := exactOVSValue("192.0.2.10")(value); err == nil {
+			t.Fatalf("mismatched OVS value %q unexpectedly passed", value)
+		}
+	}
+}
+
+func TestRunChecksActualOVSEncapsulation(t *testing.T) {
+	cfg := config.Default()
+	cfg.Cluster.ID = "lab"
+	cfg.Networking.EncapIP = "192.0.2.10"
+	cfg.OVN.ControlDB = []string{"unix:/run/pvn/control.sock"}
+	cfg.OVN.Northbound = []string{"unix:/run/ovn/ovnnb_db.sock"}
+	cfg.OVN.Southbound = []string{"unix:/run/ovn/ovnsb_db.sock"}
+	runner := fakeRunner{outputs: map[string]string{
+		"ovs-vsctl --if-exists get Open_vSwitch . external_ids:ovn-encap-type": `"geneve"`,
+		"ovs-vsctl --if-exists get Open_vSwitch . external_ids:ovn-encap-ip":   `"192.0.2.10"`,
+	}}
+	checks := Run(context.Background(), cfg, runner)
+	for _, name := range []string{"ovn-encap-type", "ovn-encap-ip"} {
+		if check := checkByName(checks, name); check.Status != Pass {
+			t.Fatalf("%s did not accept the configured OVS value: %+v", name, check)
+		}
+	}
+
+	runner.outputs["ovs-vsctl --if-exists get Open_vSwitch . external_ids:ovn-encap-ip"] = `"192.0.2.11"`
+	checks = Run(context.Background(), cfg, runner)
+	if check := checkByName(checks, "ovn-encap-ip"); check.Status != Fail || !strings.Contains(check.Message, "does not match") {
+		t.Fatalf("stale OVS encapsulation IP did not fail: %+v", check)
+	}
+}
+
+func checkByName(checks []Check, name string) Check {
+	for _, check := range checks {
+		if check.Name == name {
+			return check
+		}
+	}
+	return Check{Name: name, Status: Fail, Message: "check was not emitted"}
+}
+
 func TestRunReportsHostFailures(t *testing.T) {
 	cfg := config.Default()
 	cfg.Cluster.ID = "lab"
