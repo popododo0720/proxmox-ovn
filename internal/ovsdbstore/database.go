@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -52,6 +54,10 @@ type ovsDatabase struct {
 }
 
 func openDatabase(ctx context.Context, cfg Config) (*ovsDatabase, error) {
+	return openDatabaseWithLogOutput(ctx, cfg, os.Stderr)
+}
+
+func openDatabaseWithLogOutput(ctx context.Context, cfg Config, logOutput io.Writer) (*ovsDatabase, error) {
 	if err := validateConnectionConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -63,9 +69,11 @@ func openDatabase(ctx context.Context, cfg Config) (*ovsDatabase, error) {
 	for _, endpoint := range cfg.Endpoints {
 		options = append(options, client.WithEndpoint(endpoint))
 	}
+	libovsdbLogger := newLibovsdbLogger(logOutput)
 	options = append(options,
 		client.WithLeaderOnly(true),
 		client.WithReconnect(controlDBReconnectTimeout, newControlDBReconnectBackOff()),
+		client.WithLogger(&libovsdbLogger),
 	)
 	if cfg.TLSConfig != nil {
 		options = append(options, client.WithTLSConfig(cfg.TLSConfig.Clone()))

@@ -1,9 +1,12 @@
 package ovsdbstore
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,7 +66,8 @@ func TestOpenAgainstInMemoryOVSDBServer(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	live, err := openDatabase(ctx, Config{Endpoints: []string{fmt.Sprintf("unix:%s", socket)}})
+	var clientLogs lockedBuffer
+	live, err := openDatabaseWithLogOutput(ctx, Config{Endpoints: []string{fmt.Sprintf("unix:%s", socket)}}, &clientLogs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +131,37 @@ func TestOpenAgainstInMemoryOVSDBServer(t *testing.T) {
 	if err != nil || loaded.(*model.Project).Name != "tenant" {
 		t.Fatalf("Get after OVSDB reconnect loaded=%#v err=%v", loaded, err)
 	}
+	logs := clientLogs.String()
+	if !strings.Contains(logs, "reconnected - restarting monitors") {
+		t.Fatalf("reconnect diagnostic missing from client logs: %s", logs)
+	}
+	for _, forbidden := range []string{
+		"transacting operations",
+		"processing update",
+		"updating model",
+		"10.0.0.10",
+	} {
+		if strings.Contains(logs, forbidden) {
+			t.Fatalf("verbose OVSDB payload %q leaked into client logs: %s", forbidden, logs)
+		}
+	}
+}
+
+type lockedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(payload []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(payload)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
 }
 
 // libovsdb's in-memory server does not implement the RFC 7047 durable commit
