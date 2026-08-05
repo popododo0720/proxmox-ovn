@@ -209,7 +209,7 @@ def drift_topology(found_backend):
 lease_temporary = tempfile.TemporaryDirectory()
 lease_root = pathlib.Path(lease_temporary.name)
 lease_helper = lease_root / "pvn-cluster-lease"
-lease_state = lease_root / "control-plane.lease"
+lease_state = lease_root / "mutation.lease"
 lease_helper.write_text(r'''#!/usr/bin/python3
 import json
 import os
@@ -218,6 +218,8 @@ import sys
 
 state = pathlib.Path(os.environ["PVN_TEST_CP_LEASE"])
 action, domain, token = sys.argv[1:]
+if domain != "mutation":
+    raise SystemExit("unexpected lease domain")
 if action == "acquire":
     owner = json.load(sys.stdin)
     if owner.get("domain") != domain or owner.get("token") != token:
@@ -848,7 +850,7 @@ with tempfile.TemporaryDirectory() as temporary:
 # An existing cluster lease blocks apply and is never removed by a non-owner.
 with tempfile.TemporaryDirectory() as temporary:
     private = pathlib.Path(temporary) / "private"
-    owner = {"domain": "control-plane", "token": "b" * 32}
+    owner = {"domain": "mutation", "token": "b" * 32}
     lease_state.write_text(json.dumps(owner))
     store = LedgerStore(private)
     backend = FakeBackend(discovery())
