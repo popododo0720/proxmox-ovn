@@ -26,9 +26,15 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 	case *model.Project, *model.Node, *model.Operation:
 		return nil
 	case *model.ProviderNetwork:
-		if value.DefaultSegmentID != "" {
-			_, err := require(current, model.KindProviderSegment, value.DefaultSegmentID, "default_segment_id")
+		if value.DefaultSegmentID == "" {
+			return nil
+		}
+		segmentResource, err := require(current, model.KindProviderSegment, value.DefaultSegmentID, "default_segment_id")
+		if err != nil {
 			return err
+		}
+		if segmentResource.(*model.ProviderSegment).ProviderNetworkID != value.ID {
+			return storeError(controlstore.ErrConflict, "default segment belongs to a different provider network")
 		}
 	case *model.Network:
 		if err := project(value.ProjectID, "project_id"); err != nil {
@@ -61,34 +67,70 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 			return storeError(controlstore.ErrConflict, "network belongs to a different project")
 		}
 		for _, fixed := range value.FixedIPs {
-			subnet, err := require(current, model.KindSubnet, fixed.SubnetID, "fixed_ips.subnet_id")
+			subnetResource, err := require(current, model.KindSubnet, fixed.SubnetID, "fixed_ips.subnet_id")
 			if err != nil {
 				return err
 			}
-			if subnet.(*model.Subnet).NetworkID != value.NetworkID {
+			subnet := subnetResource.(*model.Subnet)
+			if subnet.NetworkID != value.NetworkID {
 				return storeError(controlstore.ErrConflict, "fixed IP subnet belongs to a different network")
+			}
+			if subnet.ProjectID != value.ProjectID {
+				return storeError(controlstore.ErrConflict, "fixed IP subnet belongs to a different project")
+			}
+			if fixed.Address != "" && !addressInIPv4Prefix(subnet.CIDR, fixed.Address) {
+				return storeError(controlstore.ErrConflict, "fixed IP address must belong to its subnet")
 			}
 		}
 		for _, groupID := range value.SecurityGroupIDs {
-			if _, err := require(current, model.KindSecurityGroup, groupID, "security_group_ids"); err != nil {
+			groupResource, err := require(current, model.KindSecurityGroup, groupID, "security_group_ids")
+			if err != nil {
 				return err
+			}
+			if groupResource.(*model.SecurityGroup).ProjectID != value.ProjectID {
+				return storeError(controlstore.ErrConflict, "security group belongs to a different project")
 			}
 		}
 		if value.NodeID != "" {
-			if _, err := require(current, model.KindNode, value.NodeID, "node_id"); err != nil {
+			nodeResource, err := require(current, model.KindNode, value.NodeID, "node_id")
+			if err != nil {
 				return err
 			}
+			if value.RequestedChassis != "" && nodeResource.(*model.Node).ChassisID != value.RequestedChassis {
+				return storeError(controlstore.ErrConflict, "requested chassis does not match the selected node")
+			}
+		} else if value.RequestedChassis != "" {
+			return storeError(controlstore.ErrConflict, "requested chassis requires a selected node")
 		}
 	case *model.IPAllocation:
 		if err := project(value.ProjectID, "project_id"); err != nil {
 			return err
 		}
-		if _, err := require(current, model.KindSubnet, value.SubnetID, "subnet_id"); err != nil {
+		subnetResource, err := require(current, model.KindSubnet, value.SubnetID, "subnet_id")
+		if err != nil {
 			return err
 		}
+		subnet := subnetResource.(*model.Subnet)
+		if subnet.ProjectID != value.ProjectID {
+			return storeError(controlstore.ErrConflict, "subnet belongs to a different project")
+		}
+		if !addressInIPv4Prefix(subnet.CIDR, value.Address) {
+			return storeError(controlstore.ErrConflict, "allocated address must belong to its subnet")
+		}
 		if value.PortID != "" {
-			if _, err := require(current, model.KindPort, value.PortID, "port_id"); err != nil {
+			portResource, err := require(current, model.KindPort, value.PortID, "port_id")
+			if err != nil {
 				return err
+			}
+			port := portResource.(*model.Port)
+			if port.ProjectID != value.ProjectID {
+				return storeError(controlstore.ErrConflict, "port belongs to a different project")
+			}
+			if port.NetworkID != subnet.NetworkID {
+				return storeError(controlstore.ErrConflict, "port belongs to a different network than the allocation subnet")
+			}
+			if !portHasFixedIP(port, value.SubnetID, value.Address) {
+				return storeError(controlstore.ErrConflict, "allocated address is not assigned to the port on this subnet")
 			}
 		}
 	case *model.Router:
@@ -104,12 +146,19 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 			if !external.External || external.ProviderNetworkID == "" {
 				return storeError(controlstore.ErrConflict, "external network must be external and provider-backed")
 			}
+			providerResource, err := require(current, model.KindProviderNetwork, external.ProviderNetworkID, "external_network_id.provider_network_id")
+			if err != nil {
+				return err
+			}
+			if external.ProjectID != value.ProjectID && !providerResource.(*model.ProviderNetwork).Shared {
+				return storeError(controlstore.ErrConflict, "external network belongs to another project and is not shared")
+			}
 			subnetResource, err := require(current, model.KindSubnet, value.ExternalSubnetID, "external_subnet_id")
 			if err != nil {
 				return err
 			}
 			subnet := subnetResource.(*model.Subnet)
-			if subnet.NetworkID != value.ExternalNetworkID {
+			if subnet.NetworkID != value.ExternalNetworkID || subnet.ProjectID != external.ProjectID {
 				return storeError(controlstore.ErrConflict, "external subnet belongs to a different network")
 			}
 			prefix, prefixErr := netip.ParsePrefix(subnet.CIDR)
@@ -125,32 +174,108 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 		if err := project(value.ProjectID, "project_id"); err != nil {
 			return err
 		}
-		if _, err := require(current, model.KindRouter, value.RouterID, "router_id"); err != nil {
+		routerResource, err := require(current, model.KindRouter, value.RouterID, "router_id")
+		if err != nil {
 			return err
 		}
-		if _, err := require(current, model.KindSubnet, value.SubnetID, "subnet_id"); err != nil {
+		if routerResource.(*model.Router).ProjectID != value.ProjectID {
+			return storeError(controlstore.ErrConflict, "router belongs to a different project")
+		}
+		subnetResource, err := require(current, model.KindSubnet, value.SubnetID, "subnet_id")
+		if err != nil {
 			return err
+		}
+		subnet := subnetResource.(*model.Subnet)
+		if subnet.ProjectID != value.ProjectID {
+			return storeError(controlstore.ErrConflict, "subnet belongs to a different project")
+		}
+		networkResource, err := require(current, model.KindNetwork, subnet.NetworkID, "subnet_id.network_id")
+		if err != nil {
+			return err
+		}
+		network := networkResource.(*model.Network)
+		if network.ProjectID != value.ProjectID {
+			return storeError(controlstore.ErrConflict, "router interface network belongs to a different project")
+		}
+		if network.External {
+			return storeError(controlstore.ErrConflict, "router interfaces can only use internal networks")
 		}
 		if value.PortID != "" {
-			if _, err := require(current, model.KindPort, value.PortID, "port_id"); err != nil {
+			portResource, err := require(current, model.KindPort, value.PortID, "port_id")
+			if err != nil {
 				return err
+			}
+			port := portResource.(*model.Port)
+			if port.ProjectID != value.ProjectID || port.NetworkID != subnet.NetworkID {
+				return storeError(controlstore.ErrConflict, "router interface port belongs to a different project or network")
+			}
+			if !portHasSubnet(port, value.SubnetID) {
+				return storeError(controlstore.ErrConflict, "router interface port has no fixed IP on the interface subnet")
 			}
 		}
 	case *model.FloatingIP:
 		if err := project(value.ProjectID, "project_id"); err != nil {
 			return err
 		}
-		if _, err := require(current, model.KindProviderNetwork, value.ProviderNetworkID, "provider_network_id"); err != nil {
+		providerResource, err := require(current, model.KindProviderNetwork, value.ProviderNetworkID, "provider_network_id")
+		if err != nil {
 			return err
 		}
-		if value.PortID != "" {
-			if _, err := require(current, model.KindPort, value.PortID, "port_id"); err != nil {
-				return err
-			}
+		if (value.PortID == "") != (value.FixedIPAddress == "") {
+			return storeError(controlstore.ErrConflict, "port and fixed IP address must be configured together")
+		}
+		if value.PortID != "" && value.RouterID == "" {
+			return storeError(controlstore.ErrConflict, "an associated floating IP requires a router")
 		}
 		if value.RouterID != "" {
-			if _, err := require(current, model.KindRouter, value.RouterID, "router_id"); err != nil {
+			routerResource, err := require(current, model.KindRouter, value.RouterID, "router_id")
+			if err != nil {
 				return err
+			}
+			router := routerResource.(*model.Router)
+			if router.ProjectID != value.ProjectID {
+				return storeError(controlstore.ErrConflict, "router belongs to a different project")
+			}
+			if router.ExternalNetworkID == "" || router.ExternalSubnetID == "" {
+				return storeError(controlstore.ErrConflict, "router has no external gateway")
+			}
+			externalNetworkResource, err := require(current, model.KindNetwork, router.ExternalNetworkID, "router_id.external_network_id")
+			if err != nil {
+				return err
+			}
+			externalNetwork := externalNetworkResource.(*model.Network)
+			if !externalNetwork.External || externalNetwork.ProviderNetworkID != value.ProviderNetworkID {
+				return storeError(controlstore.ErrConflict, "floating IP provider does not match the router external network")
+			}
+			if externalNetwork.ProjectID != value.ProjectID && !providerResource.(*model.ProviderNetwork).Shared {
+				return storeError(controlstore.ErrConflict, "router external network belongs to another project and is not shared")
+			}
+			externalSubnetResource, err := require(current, model.KindSubnet, router.ExternalSubnetID, "router_id.external_subnet_id")
+			if err != nil {
+				return err
+			}
+			externalSubnet := externalSubnetResource.(*model.Subnet)
+			if externalSubnet.NetworkID != externalNetwork.ID || externalSubnet.ProjectID != externalNetwork.ProjectID {
+				return storeError(controlstore.ErrConflict, "router external subnet does not belong to its external network")
+			}
+			if !addressInIPv4Prefix(externalSubnet.CIDR, value.Address) {
+				return storeError(controlstore.ErrConflict, "floating IP address must belong to the router external subnet")
+			}
+		}
+		if value.PortID != "" {
+			portResource, err := require(current, model.KindPort, value.PortID, "port_id")
+			if err != nil {
+				return err
+			}
+			port := portResource.(*model.Port)
+			if port.ProjectID != value.ProjectID {
+				return storeError(controlstore.ErrConflict, "port belongs to a different project")
+			}
+			if !portHasAddress(port, value.FixedIPAddress) {
+				return storeError(controlstore.ErrConflict, "fixed IP address is not assigned to the port")
+			}
+			if !routerReachesPortAddress(current, value.RouterID, port, value.FixedIPAddress) {
+				return storeError(controlstore.ErrConflict, "router has no interface on the floating IP port subnet")
 			}
 		}
 	case *model.ProviderSegment:
@@ -163,16 +288,73 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 		if err := project(value.ProjectID, "project_id"); err != nil {
 			return err
 		}
-		if _, err := require(current, model.KindSecurityGroup, value.SecurityGroupID, "security_group_id"); err != nil {
+		groupResource, err := require(current, model.KindSecurityGroup, value.SecurityGroupID, "security_group_id")
+		if err != nil {
 			return err
 		}
+		if groupResource.(*model.SecurityGroup).ProjectID != value.ProjectID {
+			return storeError(controlstore.ErrConflict, "security group belongs to a different project")
+		}
 		if value.RemoteGroupID != "" {
-			if _, err := require(current, model.KindSecurityGroup, value.RemoteGroupID, "remote_group_id"); err != nil {
+			remoteResource, err := require(current, model.KindSecurityGroup, value.RemoteGroupID, "remote_group_id")
+			if err != nil {
 				return err
+			}
+			if remoteResource.(*model.SecurityGroup).ProjectID != value.ProjectID {
+				return storeError(controlstore.ErrConflict, "remote security group belongs to a different project")
 			}
 		}
 	}
 	return nil
+}
+
+func addressInIPv4Prefix(cidr, address string) bool {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil || !prefix.Addr().Is4() {
+		return false
+	}
+	parsed, err := netip.ParseAddr(address)
+	return err == nil && parsed.Is4() && prefix.Contains(parsed)
+}
+
+func portHasFixedIP(port *model.Port, subnetID, address string) bool {
+	for _, fixed := range port.FixedIPs {
+		if fixed.SubnetID == subnetID && fixed.Address == address {
+			return true
+		}
+	}
+	return false
+}
+
+func portHasSubnet(port *model.Port, subnetID string) bool {
+	for _, fixed := range port.FixedIPs {
+		if fixed.SubnetID == subnetID {
+			return true
+		}
+	}
+	return false
+}
+
+func portHasAddress(port *model.Port, address string) bool {
+	for _, fixed := range port.FixedIPs {
+		if fixed.Address == address {
+			return true
+		}
+	}
+	return false
+}
+
+func routerReachesPortAddress(current *snapshot, routerID string, port *model.Port, address string) bool {
+	for _, entry := range current.resources[model.KindRouterInterface] {
+		routerInterface := entry.resource.(*model.RouterInterface)
+		if routerInterface.RouterID != routerID {
+			continue
+		}
+		if portHasFixedIP(port, routerInterface.SubnetID, address) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateUnique(current *snapshot, candidate model.Resource, ignoredID string) error {
@@ -237,6 +419,11 @@ func uniqueKeys(resource model.Resource) []string {
 		if value.NodeID != "" && value.VMID > 0 && value.NIC != "" {
 			result = append(result, fmt.Sprintf("node_id,vmid,nic=%s\x00%d\x00%s", value.NodeID, value.VMID, value.NIC))
 		}
+		for _, fixed := range value.FixedIPs {
+			if fixed.Address != "" {
+				result = append(result, "fixed_ips.subnet_id,address="+fixed.SubnetID+"\x00"+fixed.Address)
+			}
+		}
 		return result
 	case *model.IPAllocation:
 		return []string{"subnet_id,address=" + value.SubnetID + "\x00" + value.Address}
@@ -300,6 +487,16 @@ func conflictField(candidate, existing model.Resource) string {
 		}
 		if left.NodeID != "" && left.VMID > 0 && left.NIC != "" && left.NodeID == right.NodeID && left.VMID == right.VMID && left.NIC == right.NIC {
 			return "node_id,vmid,nic"
+		}
+		for _, leftIP := range left.FixedIPs {
+			if leftIP.Address == "" {
+				continue
+			}
+			for _, rightIP := range right.FixedIPs {
+				if leftIP.SubnetID == rightIP.SubnetID && leftIP.Address == rightIP.Address {
+					return "fixed_ips.subnet_id,address"
+				}
+			}
 		}
 	case *model.IPAllocation:
 		right := existing.(*model.IPAllocation)
@@ -375,11 +572,34 @@ func firstReference(current *snapshot, kind model.Kind, id string) string {
 			}
 		}
 	}
+	if kind == model.KindRouterInterface {
+		routerInterfaceEntry, ok := current.resources[kind][id]
+		if ok {
+			routerInterface := routerInterfaceEntry.resource.(*model.RouterInterface)
+			ids := make([]string, 0, len(current.resources[model.KindFloatingIP]))
+			for floatingID := range current.resources[model.KindFloatingIP] {
+				ids = append(ids, floatingID)
+			}
+			sortStrings(ids)
+			for _, floatingID := range ids {
+				floating := current.resources[model.KindFloatingIP][floatingID].resource.(*model.FloatingIP)
+				if floating.RouterID != routerInterface.RouterID || floating.PortID == "" {
+					continue
+				}
+				portEntry, exists := current.resources[model.KindPort][floating.PortID]
+				if exists && portHasFixedIP(portEntry.resource.(*model.Port), routerInterface.SubnetID, floating.FixedIPAddress) {
+					return fmt.Sprintf("%s %q", model.KindFloatingIP, floatingID)
+				}
+			}
+		}
+	}
 	return ""
 }
 
 func references(resource model.Resource, kind model.Kind, id string) bool {
 	switch value := resource.(type) {
+	case *model.ProviderNetwork:
+		return kind == model.KindProviderSegment && value.DefaultSegmentID == id
 	case *model.Network:
 		return (kind == model.KindProject && value.ProjectID == id) || (kind == model.KindProviderNetwork && value.ProviderNetworkID == id)
 	case *model.Subnet:
