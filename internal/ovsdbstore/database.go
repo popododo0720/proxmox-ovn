@@ -26,6 +26,12 @@ const (
 
 type rawDatabase map[string][]ovsdb.Row
 
+type rawRuntimePortLookup struct {
+	nodes    []ovsdb.Row
+	projects []ovsdb.Row
+	ports    []ovsdb.Row
+}
+
 type changeType uint8
 
 const (
@@ -44,6 +50,7 @@ type change struct {
 
 type database interface {
 	load(context.Context) (rawDatabase, error)
+	lookupRuntimePorts(context.Context, int, string) (rawRuntimePortLookup, error)
 	initialize(context.Context, ovsdb.Row) error
 	commit(context.Context, int64, []change, string) error
 	close()
@@ -160,6 +167,49 @@ func (d *ovsDatabase) load(ctx context.Context) (rawDatabase, error) {
 		raw[table] = results[index].Rows
 	}
 	return raw, nil
+}
+
+func (d *ovsDatabase) lookupRuntimePorts(ctx context.Context, vmid int, nic string) (rawRuntimePortLookup, error) {
+	operations := runtimePortLookupOperations(vmid, nic)
+	results, err := d.client.Transact(ctx, operations...)
+	if err != nil {
+		return rawRuntimePortLookup{}, fmt.Errorf("lookup runtime ports in PVN control database: %w", err)
+	}
+	if _, err := ovsdb.CheckOperationResults(results, operations); err != nil {
+		return rawRuntimePortLookup{}, fmt.Errorf("lookup runtime ports in PVN control database: %w", err)
+	}
+	if len(results) != len(operations) {
+		return rawRuntimePortLookup{}, fmt.Errorf("lookup runtime ports in PVN control database: expected %d results, got %d", len(operations), len(results))
+	}
+	return rawRuntimePortLookup{nodes: results[0].Rows, projects: results[1].Rows, ports: results[2].Rows}, nil
+}
+
+func runtimePortLookupOperations(vmid int, nic string) []ovsdb.Operation {
+	return []ovsdb.Operation{
+		{
+			Op:      ovsdb.OperationSelect,
+			Table:   controlschema.NodeTable,
+			Columns: []string{"_uuid", "id", "name", "chassis_id"},
+		},
+		{
+			Op:      ovsdb.OperationSelect,
+			Table:   controlschema.ProjectTable,
+			Columns: []string{"_uuid", "id"},
+		},
+		{
+			Op:    ovsdb.OperationSelect,
+			Table: controlschema.PortTable,
+			Where: []ovsdb.Condition{
+				ovsdb.NewCondition("vmid", ovsdb.ConditionEqual, vmid),
+				ovsdb.NewCondition("nic", ovsdb.ConditionEqual, nic),
+			},
+			Columns: []string{
+				"id", "revision", "applied_revision", "state", "project", "node",
+				"vmid", "nic", "lsp_name", "generation", "requested_chassis",
+				"mac_address", "admin_state_up", "binding_status",
+			},
+		},
+	}
 }
 
 func (d *ovsDatabase) initialize(ctx context.Context, lock ovsdb.Row) error {

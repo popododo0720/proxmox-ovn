@@ -23,6 +23,7 @@ type fakeDatabase struct {
 	epoch    int64
 	sequence int64
 	loads    int
+	lookups  int
 	closed   bool
 }
 
@@ -51,6 +52,64 @@ func (f *fakeDatabase) loadCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.loads
+}
+
+func (f *fakeDatabase) lookupRuntimePorts(ctx context.Context, vmid int, nic string) (rawRuntimePortLookup, error) {
+	if err := contextError(ctx); err != nil {
+		return rawRuntimePortLookup{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return rawRuntimePortLookup{}, errors.New("database closed")
+	}
+	f.lookups++
+	operations := runtimePortLookupOperations(vmid, nic)
+	selectRows := func(rows []ovsdb.Row, operation ovsdb.Operation) ([]ovsdb.Row, error) {
+		result := make([]ovsdb.Row, 0, len(rows))
+		for _, row := range rows {
+			if operation.Table == controlschema.PortTable {
+				rowVMID, err := rowInt64(row, "vmid")
+				if err != nil {
+					return nil, err
+				}
+				rowNIC, err := rowString(row, "nic")
+				if err != nil {
+					return nil, err
+				}
+				if rowVMID != int64(vmid) || rowNIC != nic {
+					continue
+				}
+			}
+			selected := make(ovsdb.Row, len(operation.Columns))
+			for _, column := range operation.Columns {
+				if value, exists := row[column]; exists {
+					selected[column] = cloneRow(ovsdb.Row{column: value})[column]
+				}
+			}
+			result = append(result, selected)
+		}
+		return result, nil
+	}
+	nodes, err := selectRows(f.rows[operations[0].Table], operations[0])
+	if err != nil {
+		return rawRuntimePortLookup{}, err
+	}
+	projects, err := selectRows(f.rows[operations[1].Table], operations[1])
+	if err != nil {
+		return rawRuntimePortLookup{}, err
+	}
+	ports, err := selectRows(f.rows[operations[2].Table], operations[2])
+	if err != nil {
+		return rawRuntimePortLookup{}, err
+	}
+	return rawRuntimePortLookup{nodes: nodes, projects: projects, ports: ports}, nil
+}
+
+func (f *fakeDatabase) lookupCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lookups
 }
 
 func (f *fakeDatabase) initialize(ctx context.Context, row ovsdb.Row) error {
@@ -285,6 +344,77 @@ func TestStorePersistsEveryResourceKindAndFiltersInternalRows(t *testing.T) {
 	ports, err := store.List(context.Background(), model.KindPort, controlstore.ListOptions{ProjectID: project.ID, NetworkID: network.ID, NodeID: node.ID, VMID: 100, NIC: "net0"})
 	if err != nil || len(ports) != 1 || ports[0].GetMetadata().ID != port.ID {
 		t.Fatalf("filtered ports=%#v err=%v", ports, err)
+	}
+}
+
+func TestStoreLookupRuntimePortsUsesTargetedReadAndResolvesAliases(t *testing.T) {
+	database := newFakeDatabase()
+	store := deterministicStore(database)
+	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "runtime-project").(*model.Project)
+	network := mustCreate(t, store, &model.Network{ProjectID: project.ID, Name: "private"}, "runtime-network").(*model.Network)
+	node := mustCreate(t, store, &model.Node{
+		Metadata: model.Metadata{ID: "node-a"}, Name: "pve-a", ChassisID: "chassis-a", Enabled: true,
+	}, "runtime-node").(*model.Node)
+	otherNode := mustCreate(t, store, &model.Node{
+		Metadata: model.Metadata{ID: "node-b"}, Name: "pve-b", ChassisID: "chassis-b", Enabled: true,
+	}, "runtime-other-node").(*model.Node)
+	port := mustCreate(t, store, &model.Port{
+		ProjectID: project.ID, NetworkID: network.ID, Name: "vm-100-net0", MACAddress: "02:00:00:00:00:0a",
+		AdminStateUp: true, BindingStatus: model.PortBinding, NodeID: node.ID, VMID: 100, NIC: "net0",
+		LSPName: "lsp-a", Generation: 9, RequestedChassis: node.ChassisID,
+	}, "runtime-port").(*model.Port)
+	mustCreate(t, store, &model.Port{
+		ProjectID: project.ID, NetworkID: network.ID, Name: "vm-100-net0-other-node", MACAddress: "02:00:00:00:00:0b",
+		AdminStateUp: true, BindingStatus: model.PortBinding, NodeID: otherNode.ID, VMID: 100, NIC: "net0",
+		LSPName: "lsp-other", Generation: 2, RequestedChassis: otherNode.ChassisID,
+	}, "runtime-other-port")
+
+	loadsBefore := database.loadCount()
+	for _, identity := range []string{node.ID, node.Name, node.ChassisID} {
+		matches, err := store.LookupRuntimePorts(context.Background(), identity, 100, "net0")
+		if err != nil || len(matches) != 1 {
+			t.Fatalf("LookupRuntimePorts(%q) matches=%#v err=%v", identity, matches, err)
+		}
+		match := matches[0]
+		if match.ID != port.ID || match.ProjectID != project.ID || match.NodeID != node.ID || match.MACAddress != port.MACAddress ||
+			match.LSPName != port.LSPName || match.Generation != port.Generation || match.BindingStatus != port.BindingStatus {
+			t.Fatalf("targeted runtime port=%#v", match)
+		}
+	}
+	if database.loadCount() != loadsBefore || database.lookupCount() != 3 {
+		t.Fatalf("runtime lookup reloaded full database: loads before=%d after=%d targeted=%d", loadsBefore, database.loadCount(), database.lookupCount())
+	}
+}
+
+func TestRuntimePortLookupOperationsAreTargeted(t *testing.T) {
+	operations := runtimePortLookupOperations(100, "net0")
+	if len(operations) != 3 || !controlschema.Schema().ValidateOperations(operations...) {
+		t.Fatalf("invalid runtime lookup operations: %#v", operations)
+	}
+	for _, operation := range operations {
+		if operation.Op != ovsdb.OperationSelect {
+			t.Fatalf("runtime lookup operation is not select: %#v", operation)
+		}
+	}
+	if len(operations[0].Columns) != 4 || len(operations[1].Columns) != 2 || len(operations[2].Where) != 2 {
+		t.Fatalf("runtime lookup is not narrowly projected/filtered: %#v", operations)
+	}
+	portColumns := make(map[string]bool, len(operations[2].Columns))
+	for _, column := range operations[2].Columns {
+		portColumns[column] = true
+	}
+	for _, required := range []string{
+		"id", "project", "node", "revision", "applied_revision", "state", "binding_status",
+		"lsp_name", "generation", "mac_address", "admin_state_up", "requested_chassis", "vmid", "nic",
+	} {
+		if !portColumns[required] {
+			t.Fatalf("runtime port select omitted %q: %v", required, operations[2].Columns)
+		}
+	}
+	for _, unrelated := range []string{"fixed_ips", "security_groups", "external_ids", "created_at", "updated_at"} {
+		if portColumns[unrelated] {
+			t.Fatalf("runtime port select includes unrelated %q: %v", unrelated, operations[2].Columns)
+		}
 	}
 }
 

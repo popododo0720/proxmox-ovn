@@ -360,6 +360,86 @@ func ensureAPINode(t *testing.T, store controlstore.Store, id string, requestedC
 	return created.(*model.Node)
 }
 
+type runtimeLookupObservingStore struct {
+	controlstore.Store
+	ports       []*model.Port
+	lookupCalls int
+	listCalls   int
+}
+
+func (s *runtimeLookupObservingStore) LookupRuntimePorts(context.Context, string, int, string) ([]*model.Port, error) {
+	s.lookupCalls++
+	return s.ports, nil
+}
+
+func (s *runtimeLookupObservingStore) List(context.Context, model.Kind, controlstore.ListOptions) ([]model.Resource, error) {
+	s.listCalls++
+	return nil, errors.New("generic list path must not be used")
+}
+
+type runtimeListOnlyStore struct {
+	controlstore.Store
+	listed []model.Kind
+}
+
+func (s *runtimeListOnlyStore) List(ctx context.Context, kind model.Kind, options controlstore.ListOptions) ([]model.Resource, error) {
+	s.listed = append(s.listed, kind)
+	return s.Store.List(ctx, kind, options)
+}
+
+func TestRuntimePortResolverUsesOptionalLookupAndKeepsListFallback(t *testing.T) {
+	fastBacking := controlstore.NewMemory()
+	fastProject, _, err := fastBacking.Create(context.Background(), &model.Project{Name: "fast", PoolID: "pool-fast"}, "fast-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fast := &runtimeLookupObservingStore{
+		Store: fastBacking,
+		ports: []*model.Port{{
+			Metadata:  model.Metadata{ID: "port-fast", Revision: 2, AppliedRevision: 2, State: model.ResourceReady},
+			ProjectID: fastProject.GetMetadata().ID, MACAddress: "02:00:00:00:00:01", AdminStateUp: true,
+			BindingStatus: model.PortBinding, VMID: 100, NIC: "net0", LSPName: "lsp-fast",
+			Generation: 3, RequestedChassis: "chassis-fast",
+		}},
+	}
+	allowedProvider := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
+		return Session{User: "auditor@pam", Permissions: map[string]any{
+			"/pool/pool-fast": map[string]bool{"SDN.Audit": true},
+		}}, nil
+	})
+	fastResponse := request(t, testServer(t, fast, allowedProvider), http.MethodGet, "/api/v1/runtime/ports/resolve?node=pve-fast&vmid=100&nic=net0", nil, nil)
+	if fastResponse.Code != http.StatusOK || fast.lookupCalls != 1 || fast.listCalls != 0 {
+		t.Fatalf("fast resolver status=%d lookups=%d lists=%d body=%s", fastResponse.Code, fast.lookupCalls, fast.listCalls, fastResponse.Body.String())
+	}
+	deniedProvider := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
+		return Session{User: "denied@pam", Permissions: map[string]any{}}, nil
+	})
+	deniedResponse := request(t, testServer(t, fast, deniedProvider), http.MethodGet, "/api/v1/runtime/ports/resolve?node=pve-fast&vmid=100&nic=net0", nil, nil)
+	if deniedResponse.Code != http.StatusNotFound || fast.lookupCalls != 2 || fast.listCalls != 0 {
+		t.Fatalf("hidden fast resolver status=%d lookups=%d lists=%d body=%s", deniedResponse.Code, fast.lookupCalls, fast.listCalls, deniedResponse.Body.String())
+	}
+	second := *fast.ports[0]
+	second.ID = "port-fast-2"
+	fast.ports = append(fast.ports, &second)
+	ambiguousResponse := request(t, testServer(t, fast, nil).RuntimeHandler(), http.MethodGet, "/api/v1/runtime/ports/resolve?node=pve-fast&vmid=100&nic=net0", nil, nil)
+	if ambiguousResponse.Code != http.StatusConflict || fast.lookupCalls != 3 || fast.listCalls != 0 {
+		t.Fatalf("ambiguous fast resolver status=%d lookups=%d lists=%d body=%s", ambiguousResponse.Code, fast.lookupCalls, fast.listCalls, ambiguousResponse.Body.String())
+	}
+
+	memory := controlstore.NewMemory()
+	node := ensureAPINode(t, memory, "node-fallback", "chassis-fallback")
+	setupPort(t, memory, node.ID, 101, "net1", "02:00:00:00:00:02", node.ChassisID, model.PortBinding, true)
+	fallback := &runtimeListOnlyStore{Store: memory}
+	fallbackResponse := request(t, testServer(t, fallback, nil).RuntimeHandler(), http.MethodGet, "/api/v1/runtime/ports/resolve?node=node-fallback&vmid=101&nic=net1", nil, nil)
+	if fallbackResponse.Code != http.StatusOK {
+		t.Fatalf("fallback resolver status=%d body=%s", fallbackResponse.Code, fallbackResponse.Body.String())
+	}
+	wantKinds := []model.Kind{model.KindNode, model.KindPort}
+	if fmt.Sprint(fallback.listed) != fmt.Sprint(wantKinds) {
+		t.Fatalf("fallback listed kinds=%v want %v", fallback.listed, wantKinds)
+	}
+}
+
 func TestRuntimePortResolverUnixOnlyBypass(t *testing.T) {
 	store := controlstore.NewMemory()
 	nodeResource, _, err := store.Create(context.Background(), &model.Node{Name: "pve01", ChassisID: "chassis-01", Enabled: true}, "node")

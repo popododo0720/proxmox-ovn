@@ -112,6 +112,13 @@ func TestOpenAgainstInMemoryOVSDBServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtimePorts, err := store.LookupRuntimePorts(ctx, "chassis-a", 100, "net0")
+	if err != nil || len(runtimePorts) != 1 {
+		t.Fatalf("targeted runtime port lookup ports=%#v err=%v", runtimePorts, err)
+	}
+	if runtimePorts[0].ID != portResource.GetMetadata().ID || runtimePorts[0].ProjectID != project.ID || runtimePorts[0].NodeID != nodeResource.GetMetadata().ID {
+		t.Fatalf("targeted runtime port lookup decoded wrong references: %#v", runtimePorts[0])
+	}
 	loadedPort, err := store.Get(ctx, model.KindPort, portResource.GetMetadata().ID)
 	if err != nil {
 		t.Fatal(err)
@@ -171,6 +178,10 @@ type inMemoryTestDatabase struct{ ovsDatabase *ovsDatabase }
 
 func (d *inMemoryTestDatabase) load(ctx context.Context) (rawDatabase, error) {
 	return d.ovsDatabase.load(ctx)
+}
+
+func (d *inMemoryTestDatabase) lookupRuntimePorts(ctx context.Context, vmid int, nic string) (rawRuntimePortLookup, error) {
+	return d.ovsDatabase.lookupRuntimePorts(ctx, vmid, nic)
 }
 
 func (d *inMemoryTestDatabase) initialize(ctx context.Context, row ovsdb.Row) error {

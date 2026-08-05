@@ -215,6 +215,38 @@ func (s *Memory) Snapshot(ctx context.Context, kinds []model.Kind, options ListO
 	return result, nil
 }
 
+// LookupRuntimePorts resolves node aliases and matching ports while holding one
+// read lock so callers cannot observe aliases and ports from different views.
+func (s *Memory) LookupRuntimePorts(ctx context.Context, nodeIdentity string, vmid int, nic string) ([]*model.Port, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	acceptedNodes := map[string]bool{nodeIdentity: true}
+	for _, resource := range s.resources[model.KindNode] {
+		node := resource.(*model.Node)
+		if node.ID == nodeIdentity || node.Name == nodeIdentity || node.ChassisID == nodeIdentity {
+			acceptedNodes[node.ID], acceptedNodes[node.Name], acceptedNodes[node.ChassisID] = true, true, true
+		}
+	}
+	matching := make([]*model.Port, 0, 1)
+	for _, resource := range s.resources[model.KindPort] {
+		port := resource.(*model.Port)
+		if port.VMID != vmid || port.NIC != nic || (!acceptedNodes[port.NodeID] && !acceptedNodes[port.RequestedChassis]) {
+			continue
+		}
+		copyResource, err := model.Clone(port)
+		if err != nil {
+			return nil, err
+		}
+		matching = append(matching, copyResource.(*model.Port))
+	}
+	sort.Slice(matching, func(i, j int) bool { return matching[i].ID < matching[j].ID })
+	return matching, nil
+}
+
 func (s *Memory) ObserveNodeHeartbeat(ctx context.Context, id string, expectedRevision int64, observedAt time.Time) (*model.Node, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err

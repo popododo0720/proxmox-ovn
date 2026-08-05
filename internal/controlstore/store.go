@@ -47,6 +47,17 @@ type ListOptions struct {
 // using the same semantics as List.
 type ResourceSnapshot map[model.Kind][]model.Resource
 
+// RuntimePortLookup is an optional optimized read path for the latency-sensitive
+// runtime port resolver. Implementations must resolve node ID, name, and chassis
+// aliases from the same store view used to select the matching VM NIC ports.
+// Returned ports may be runtime-only projections rather than complete resources;
+// they must populate ID, revision/applied revision/state, project ID, MAC address,
+// admin/binding state, node ID, VMID/NIC, LSP name, generation, and requested
+// chassis. Callers must not rely on other Port fields.
+type RuntimePortLookup interface {
+	LookupRuntimePorts(ctx context.Context, nodeIdentity string, vmid int, nic string) ([]*model.Port, error)
+}
+
 type Store interface {
 	Create(context.Context, model.Resource, string) (model.Resource, bool, error)
 	Get(context.Context, model.Kind, string) (model.Resource, error)

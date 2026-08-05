@@ -191,6 +191,47 @@ func TestMemorySnapshotPreservesListSemanticsAndIsolation(t *testing.T) {
 	}
 }
 
+func TestMemoryLookupRuntimePortsResolvesNodeAliasesAndClonesMatches(t *testing.T) {
+	store := deterministicStore()
+	project, network, _ := baseTopology(t, store)
+	nodeA := mustCreate(t, store, &model.Node{
+		Metadata: model.Metadata{ID: "node-a"}, Name: "pve-a", ChassisID: "chassis-a", Enabled: true,
+	}, "node-a").(*model.Node)
+	nodeB := mustCreate(t, store, &model.Node{
+		Metadata: model.Metadata{ID: "node-b"}, Name: "pve-b", ChassisID: "chassis-b", Enabled: true,
+	}, "node-b").(*model.Node)
+	portA := mustCreate(t, store, &model.Port{
+		ProjectID: project.ID, NetworkID: network.ID, Name: "vm-100-net0-a", MACAddress: "02:00:00:00:00:0a",
+		AdminStateUp: true, BindingStatus: model.PortBinding, NodeID: nodeA.ID, VMID: 100, NIC: "net0",
+		LSPName: "lsp-a", Generation: 7, RequestedChassis: nodeA.ChassisID,
+	}, "port-a").(*model.Port)
+	mustCreate(t, store, &model.Port{
+		ProjectID: project.ID, NetworkID: network.ID, Name: "vm-100-net0-b", MACAddress: "02:00:00:00:00:0b",
+		AdminStateUp: true, BindingStatus: model.PortBinding, NodeID: nodeB.ID, VMID: 100, NIC: "net0",
+		LSPName: "lsp-b", Generation: 8, RequestedChassis: nodeB.ChassisID,
+	}, "port-b")
+
+	for _, identity := range []string{nodeA.ID, nodeA.Name, nodeA.ChassisID} {
+		matches, err := store.LookupRuntimePorts(context.Background(), identity, 100, "net0")
+		if err != nil || len(matches) != 1 || matches[0].ID != portA.ID {
+			t.Fatalf("LookupRuntimePorts(%q) matches=%#v err=%v", identity, matches, err)
+		}
+	}
+	missing, err := store.LookupRuntimePorts(context.Background(), nodeA.Name, 100, "net1")
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("non-matching NIC ports=%#v err=%v", missing, err)
+	}
+	matches, err := store.LookupRuntimePorts(context.Background(), nodeA.Name, 100, "net0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches[0].LSPName = "caller-mutated"
+	loaded, err := store.Get(context.Background(), model.KindPort, portA.ID)
+	if err != nil || loaded.(*model.Port).LSPName != "lsp-a" {
+		t.Fatalf("lookup result mutation leaked into store: port=%#v err=%v", loaded, err)
+	}
+}
+
 func TestMemoryPrunesOnlyOldSupersededReconcileAudits(t *testing.T) {
 	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	store := NewMemory(WithClock(func() time.Time { return now }))

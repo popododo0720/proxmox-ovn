@@ -619,27 +619,10 @@ func (s *Server) resolvePort(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusBadRequest, "invalid_request", "node, positive vmid, and nic are required", nil)
 		return
 	}
-	acceptedNodes := map[string]bool{nodeName: true}
-	nodes, listNodeErr := s.store.List(request.Context(), model.KindNode, controlstore.ListOptions{})
-	if listNodeErr == nil {
-		for _, resource := range nodes {
-			node := resource.(*model.Node)
-			if node.Name == nodeName || node.ID == nodeName || node.ChassisID == nodeName {
-				acceptedNodes[node.ID], acceptedNodes[node.Name], acceptedNodes[node.ChassisID] = true, true, true
-			}
-		}
-	}
-	resources, err := s.store.List(request.Context(), model.KindPort, controlstore.ListOptions{VMID: vmid, NIC: nic})
+	matches, err := s.lookupRuntimePorts(request.Context(), nodeName, vmid, nic)
 	if err != nil {
 		s.storeError(writer, err)
 		return
-	}
-	matches := make([]*model.Port, 0, 1)
-	for _, resource := range resources {
-		port := resource.(*model.Port)
-		if acceptedNodes[port.NodeID] || acceptedNodes[port.RequestedChassis] {
-			matches = append(matches, port)
-		}
 	}
 	if len(matches) == 0 {
 		writeError(writer, http.StatusNotFound, "port_not_found", "no PVN port matches this VM NIC", nil)
@@ -677,6 +660,34 @@ func (s *Server) resolvePort(writer http.ResponseWriter, request *http.Request) 
 		return
 	}
 	writeJSON(writer, http.StatusOK, resolvedPort{PortID: port.ID, LSPName: port.LSPName, MACAddress: port.MACAddress, Generation: port.Generation, RequestedChassis: port.RequestedChassis, Status: port.BindingStatus})
+}
+
+func (s *Server) lookupRuntimePorts(ctx context.Context, nodeName string, vmid int, nic string) ([]*model.Port, error) {
+	if lookup, ok := s.store.(controlstore.RuntimePortLookup); ok {
+		return lookup.LookupRuntimePorts(ctx, nodeName, vmid, nic)
+	}
+	acceptedNodes := map[string]bool{nodeName: true}
+	nodes, listNodeErr := s.store.List(ctx, model.KindNode, controlstore.ListOptions{})
+	if listNodeErr == nil {
+		for _, resource := range nodes {
+			node := resource.(*model.Node)
+			if node.Name == nodeName || node.ID == nodeName || node.ChassisID == nodeName {
+				acceptedNodes[node.ID], acceptedNodes[node.Name], acceptedNodes[node.ChassisID] = true, true, true
+			}
+		}
+	}
+	resources, err := s.store.List(ctx, model.KindPort, controlstore.ListOptions{VMID: vmid, NIC: nic})
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]*model.Port, 0, 1)
+	for _, resource := range resources {
+		port := resource.(*model.Port)
+		if acceptedNodes[port.NodeID] || acceptedNodes[port.RequestedChassis] {
+			matches = append(matches, port)
+		}
+	}
+	return matches, nil
 }
 
 func decodeResource(writer http.ResponseWriter, request *http.Request, kind model.Kind) (model.Resource, error) {
