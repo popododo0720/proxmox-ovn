@@ -327,6 +327,35 @@ func TestRouterInterfaceReconcilesRouterSNAT(t *testing.T) {
 	}
 }
 
+func TestRouterInterfaceMovesItsPortsAtomicallyWhenSubnetChanges(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	runner := &movingGatewayRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), fixture.routerInterface); err != nil {
+		t.Fatal(err)
+	}
+	routerPort := "pvn-lrp-" + compact(fixture.routerInterface.ID)
+	switchPort := "pvn-rsp-" + compact(fixture.routerInterface.ID)
+	if !runner.contains("--if-exists lsp-del "+switchPort, "--if-exists lrp-del "+routerPort,
+		"--may-exist lsp-add "+logicalSwitchUUID(fixture.internalNetwork.ID)+" "+switchPort) {
+		t.Fatalf("router interface ports were not replaced in one OVN transaction: %v", runner.calls)
+	}
+}
+
+func TestRouterInterfaceDoesNotDeletePortsOnDatabaseFailure(t *testing.T) {
+	store, fixture := newNorthSouthFixture(t)
+	runner := &unavailableGatewayRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), fixture.routerInterface); err == nil || !strings.Contains(err.Error(), "database connection failed") {
+		t.Fatalf("database failure = %v", err)
+	}
+	if runner.contains("lsp-del", "lrp-del") {
+		t.Fatalf("router interface ports were deleted after inconclusive probes: %v", runner.calls)
+	}
+}
+
 func TestRouterSNATDisableRemovesOnlyManagedRows(t *testing.T) {
 	ctx := context.Background()
 	store, fixture := newNorthSouthFixture(t)

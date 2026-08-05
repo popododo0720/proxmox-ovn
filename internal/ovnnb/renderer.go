@@ -737,20 +737,43 @@ func (renderer *Renderer) routerInterface(ctx context.Context, routerInterface *
 	switchPort := "pvn-rsp-" + compact(routerInterface.ID)
 	mac := deterministicMAC("router:" + routerInterface.ID)
 	portNetwork := fmt.Sprintf("%s/%d", gateway, prefix.Bits())
-	args := []string{
-		"--", "--may-exist", "lrp-add", logicalRouterUUID(router.ID), routerPort, mac, portNetwork,
-		"--", "set", "Logical_Router_Port", routerPort, stringAssignment("mac", mac), stringAssignment("networks", portNetwork),
-		"--", "--may-exist", "lsp-add", logicalSwitchUUID(subnet.NetworkID), switchPort,
-		"--", "lsp-set-type", switchPort, "router",
-		"--", "lsp-set-addresses", switchPort, "router",
-		"--", "lsp-set-options", switchPort, "router-port=" + routerPort,
-		"--", "set", "Logical_Router_Port", routerPort,
-	}
-	args = append(args, metadataAssignments(routerInterface, map[string]string{"pvn-project": routerInterface.ProjectID})...)
+	args := renderer.routerInterfaceArgs(routerInterface, router.ID, subnet.NetworkID, routerPort, switchPort, mac, portNetwork, false)
 	if _, err = renderer.client.run(ctx, args...); err != nil {
-		return wrapRender("router interface", routerInterface.ID, err)
+		// The may-exist forms reject a changed subnet or logical switch. Probe
+		// both deterministic PVN port names before replacing them atomically;
+		// a lookup failure must never turn into a destructive move.
+		routerPortOutput, routerPortLookupErr := renderer.client.run(ctx, "--", "--if-exists", "get", "Logical_Router_Port", routerPort, "name")
+		switchPortOutput, switchPortLookupErr := renderer.client.run(ctx, "--", "--if-exists", "get", "Logical_Switch_Port", switchPort, "name")
+		if routerPortLookupErr != nil || switchPortLookupErr != nil || (len(strings.TrimSpace(string(routerPortOutput))) == 0 && len(strings.TrimSpace(string(switchPortOutput))) == 0) {
+			return wrapRender("router interface", routerInterface.ID, err)
+		}
+		args = renderer.routerInterfaceArgs(routerInterface, router.ID, subnet.NetworkID, routerPort, switchPort, mac, portNetwork, true)
+		if _, retryErr := renderer.client.run(ctx, args...); retryErr != nil {
+			return wrapRender("move router interface", routerInterface.ID, retryErr)
+		}
 	}
 	return renderer.reconcileRouterSNAT(ctx, router)
+}
+
+func (renderer *Renderer) routerInterfaceArgs(routerInterface *model.RouterInterface, routerID, networkID, routerPort, switchPort, mac, portNetwork string, move bool) []string {
+	args := make([]string, 0, 36)
+	if move {
+		args = append(args,
+			"--", "--if-exists", "lsp-del", switchPort,
+			"--", "--if-exists", "lrp-del", routerPort,
+		)
+	}
+	args = append(args,
+		"--", "--may-exist", "lrp-add", logicalRouterUUID(routerID), routerPort, mac, portNetwork,
+		"--", "set", "Logical_Router_Port", routerPort, stringAssignment("mac", mac), stringAssignment("networks", portNetwork),
+		"--", "--may-exist", "lsp-add", logicalSwitchUUID(networkID), switchPort,
+		"--", "lsp-set-type", switchPort, "router",
+		"--", "lsp-set-addresses", switchPort, "router",
+		"--", "lsp-set-options", switchPort, "router-port="+routerPort,
+		"--", "set", "Logical_Router_Port", routerPort,
+	)
+	args = append(args, metadataAssignments(routerInterface, map[string]string{"pvn-project": routerInterface.ProjectID})...)
+	return args
 }
 
 func (renderer *Renderer) reconcileRouterSNAT(ctx context.Context, router *model.Router) error {
