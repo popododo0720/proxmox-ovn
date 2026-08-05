@@ -4,10 +4,11 @@ PVN is a Proxmox VE 9 network manager backed by Open Virtual Network (OVN).
 It exposes an NSX/Neutron-style cloud networking model while keeping Proxmox
 as the compute control plane.
 
-The target deployment installs the same PVN node package on every Proxmox
-node. Each node runs the manager API/UI, a local TAP binding agent, Open
-vSwitch, and `ovn-controller`. A selected odd set of one, three, or five nodes
-also hosts the clustered PVN, OVN Northbound, and OVN Southbound databases.
+The installer puts the same PVN package on every online Proxmox node. Each
+node runs the manager API/UI, a local TAP binding agent, Open vSwitch, and
+`ovn-controller`. The current bootstrap supports either one standalone PVE
+node or a quorate three-node PVE cluster; in a three-node cluster all three
+nodes are database voters and transport nodes.
 
 ## Initial feature set
 
@@ -23,74 +24,56 @@ also hosts the clustered PVN, OVN Northbound, and OVN Southbound databases.
 PVE built-in SDN, BGP, IPv6, LXC, load balancing, metadata service, and live
 migration coordination are intentionally outside the first release.
 
-## Safe cluster package stage
+## Install
 
-The intended release entry point is a one-line installer hosted with the
-release artifacts:
-
-```sh
-bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)"
-```
-
-`RELEASE_HOST` is a placeholder: this repository does not currently publish a
-public installer URL. A locally hosted release directory must serve the
-versioned `pvn-node` DEB, `pvn-cluster-install`, and `SHA256SUMS`. The bootstrap
-downloads all three over HTTPS and verifies the DEB and cluster installer
-against `SHA256SUMS`. With no arguments it prompts for the inventory and SSH
-key paths and runs the read-only cluster preflight first. It then asks for the
-exact PVE cluster name; pressing Enter stops without installing, while entering
-the matching name is the explicit apply gate. The explicit hosted install form
-is still a dry run unless explicitly applied:
+Run this as `root` on any node in the target PVE cluster:
 
 ```sh
-bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)" pvn-install.sh \
-  install --inventory /path/to/inventory --identity /root/.ssh/id_ed25519 \
-  --release-base-url https://RELEASE_HOST/releases/v0.1.1
-# Re-run only after reviewing the dry-run output:
-bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)" pvn-install.sh \
-  install --inventory /path/to/inventory --identity /root/.ssh/id_ed25519 \
-  --release-base-url https://RELEASE_HOST/releases/v0.1.1 \
-  --apply --confirm CLUSTER_ID
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)"
 ```
 
-From a source checkout, build the DEB and run the underlying phased installer
-directly:
+The script discovers native PVE membership, requires every member to be online
+and quorate, downloads the release assets over HTTPS, verifies their SHA-256
+manifest, and runs a read-only preflight. Type the exact cluster name to install
+the package on every node. It then offers to configure the three-NIC topology
+and activate PVN; answering `n` leaves the package and Proxmox UI extension
+installed but all PVN/OVN services inactive.
+
+Full setup needs three distinct IPv4 networks:
+
+- the existing PVE management network;
+- a dedicated Geneve network; and
+- a provider network whose outer OpenStack ports permit arbitrary guest/router
+  MAC and IP addresses.
+
+The provider acknowledgement is deliberately required because full setup
+removes the provider NIC's host IP and attaches that NIC to `br-provider`.
+`br-int` and `br-provider` are created automatically. The installer migrates a
+Corosync ring off the Geneve NIC to the management network before changing
+host networking.
+
+Package-only non-interactive install:
 
 ```sh
-make deb
-PVN_INVENTORY=deploy/inventory/pve-cluster.example
-PVN_IDENTITY=/root/.ssh/id_ed25519
-PVN_DEB=dist/pvn-node_0.1.1_amd64.deb
-
-./deploy/scripts/pvn-cluster-install preflight \
-  --inventory "$PVN_INVENTORY" --identity "$PVN_IDENTITY"
-./deploy/scripts/pvn-cluster-install install \
-  --inventory "$PVN_INVENTORY" --identity "$PVN_IDENTITY" --deb "$PVN_DEB"
-# Re-run the printed command only after reviewing every node:
-./deploy/scripts/pvn-cluster-install install \
-  --inventory "$PVN_INVENTORY" --identity "$PVN_IDENTITY" --deb "$PVN_DEB" \
-  --apply --confirm CLUSTER_ID
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
+  pvn-install.sh install --apply --confirm CLUSTER_NAME
 ```
 
-`preflight` is always read-only, and `install` is a dry run unless both
-`--apply` and the exact cluster-name confirmation are supplied. SSH is root,
-public-key-only, non-interactive, and strict about known host keys. The apply
-stage distributes the verified package, masks Debian's aggregate OVN units,
-installs the same package on every node, and verifies that PVN remains
-inactive.
+Non-interactive full setup:
 
-This stage never chooses Geneve or control addresses, creates an OVS bridge,
-attaches a provider uplink, changes host networking, creates PKI or
-configuration, initializes central databases, or creates activation markers.
-Topology preparation, central bootstrap, and node activation remain separate
-operator-controlled phases.
+```sh
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
+  pvn-install.sh install --apply --confirm CLUSTER_NAME --full \
+  --geneve-cidr 192.168.100.0/24 \
+  --provider-cidr 192.168.200.0/24 \
+  --guest-mtu 1300 \
+  --provider-port-ready OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP
+```
 
-Package installation does not activate PVN networking. After staging shared
-config, node-local config, PKI, and operator-created OVS bridges, create the
-root-owned `/etc/pvn/node-enabled` marker and enable `pvn-node.target` on every
-online node. Central services use a separate marker and
-`pvn-central.target`; in a three-node cluster, all three nodes normally become
-Raft voters. Shared pmxcfs configuration alone never opts a node in.
+`preflight` and an `install` invocation without `--apply` are always read-only.
+Cluster SSH uses Proxmox's native root key and per-node host-key pins; password
+authentication is disabled. Cluster-wide leases prevent two nodes from
+starting the same install, topology, or control-plane operation concurrently.
 
 ## Development
 
