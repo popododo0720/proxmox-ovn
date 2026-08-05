@@ -45,7 +45,7 @@ case "$action" in
         version=absent
         if [ -e "$PVN_TEST_STATE/$host" ] || [ "${PVN_TEST_PREINSTALLED:-no}" = yes ]; then
             package=installed
-            version=0.1.0
+            version=${PVN_TEST_INSTALLED_VERSION:-0.1.0}
         fi
         case "$host" in
             node-a) hostname=pve-a; nodeid=0x00000001 ;;
@@ -90,7 +90,7 @@ field=
 for arg in "$@"; do field=$arg; done
 case "$field" in
     Package) printf 'pvn-node\n' ;;
-    Version) printf '0.1.0\n' ;;
+    Version) printf '%s\n' "${PVN_TEST_DEB_VERSION:-0.1.0}" ;;
     Architecture) printf 'amd64\n' ;;
     *) exit 1 ;;
 esac
@@ -258,6 +258,37 @@ PVN_TEST_PREINSTALLED=yes "$INSTALLER" install \
     > "$WORK/inert-retry.out"
 grep -q 'package=installed:0.1.0 inactive' "$WORK/inert-retry.out" ||
     fail "an installed but inert exact-version retry was not recognized"
+assert_no_mutation_calls
+
+: > "$LOG"
+reset_state
+PVN_TEST_PREINSTALLED=yes PVN_TEST_INSTALLED_VERSION=0.1.0 \
+    PVN_TEST_DEB_VERSION=0.1.1 "$INSTALLER" install \
+    --inventory "$INVENTORY" --identity "$IDENTITY" --deb "$DEB" \
+    > "$WORK/upgrade.out"
+grep -q '^Dry run: pvn-node 0.1.1' "$WORK/upgrade.out" ||
+    fail "a strict Debian-version upgrade was not accepted"
+assert_no_mutation_calls
+
+: > "$LOG"
+reset_state
+if PVN_TEST_PREINSTALLED=yes PVN_TEST_INSTALLED_VERSION=0.2.0 \
+    PVN_TEST_DEB_VERSION=0.1.1 "$INSTALLER" install \
+    --inventory "$INVENTORY" --identity "$IDENTITY" --deb "$DEB" \
+    > "$WORK/downgrade.out" 2>&1
+then
+    fail "a package downgrade unexpectedly succeeded"
+fi
+assert_no_mutation_calls
+
+DASH_DEB=$WORK/-pvn-node.deb
+: > "$DASH_DEB"
+: > "$LOG"
+reset_state
+"$INSTALLER" install --inventory "$INVENTORY" --identity "$IDENTITY" \
+    --deb "$DASH_DEB" > "$WORK/dash-deb.out"
+grep -q '^Dry run:' "$WORK/dash-deb.out" ||
+    fail "an option-like DEB filename was not safely canonicalized"
 assert_no_mutation_calls
 
 DUPLICATE_INVENTORY=$WORK/duplicate-inventory

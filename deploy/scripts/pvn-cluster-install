@@ -106,6 +106,13 @@ case "$PHASE" in
         [ -n "$DEB" ] || usage
         [ -r "$DEB" ] && [ -f "$DEB" ] ||
             fail "DEB is not a readable regular file: $DEB"
+        case "$DEB" in
+            */*) pvn_deb_dir=${DEB%/*}; pvn_deb_name=${DEB##*/} ;;
+            *) pvn_deb_dir=.; pvn_deb_name=$DEB ;;
+        esac
+        pvn_deb_dir=$(CDPATH= cd -P "$pvn_deb_dir" && pwd) ||
+            fail "cannot resolve DEB directory: $pvn_deb_dir"
+        DEB=$pvn_deb_dir/$pvn_deb_name
         if [ "$APPLY" = true ]; then
             [ -n "$CONFIRM" ] ||
                 fail "--apply requires --confirm CLUSTER_ID"
@@ -574,7 +581,7 @@ if [ "$PHASE" = preflight ]; then
     exit 0
 fi
 
-for command_name in "$SCP_BIN" dpkg-deb sha256sum; do
+for command_name in "$SCP_BIN" dpkg dpkg-deb sha256sum; do
     command -v "$command_name" >/dev/null 2>&1 ||
         fail "required command is unavailable: $command_name"
 done
@@ -615,7 +622,8 @@ for pvn_seen_version in $DISCOVERED_PACKAGE_VERSIONS; do
     case "$pvn_seen_version" in
         absent|"$DEB_VERSION") ;;
         *)
-            fail "installed pvn-node $pvn_seen_version is not an inert retry of $DEB_VERSION"
+            dpkg --compare-versions "$pvn_seen_version" lt "$DEB_VERSION" ||
+                fail "installed pvn-node $pvn_seen_version is newer than target $DEB_VERSION; downgrade refused"
             ;;
     esac
 done
