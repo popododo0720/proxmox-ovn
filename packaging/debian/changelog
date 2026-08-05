@@ -1,3 +1,10 @@
+proxmox-ovn (0.2.9) unstable; urgency=medium
+
+  * Treat the volatile PVE membership-view generation as non-topological.
+  * Preserve strict quorum, nodelist, cluster-version, and topology gates.
+
+ -- PVN Project <root@localhost>  Wed, 05 Aug 2026 11:40:00 +0000
+
 proxmox-ovn (0.2.8) unstable; urgency=medium
 
   * Keep OVN client listeners process-local on every central voter.
