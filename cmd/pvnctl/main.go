@@ -245,11 +245,18 @@ func nodeCommand(args []string) error {
 	flags := flag.NewFlagSet("node can-remove", flag.ContinueOnError)
 	_ = flags.Bool("local", false, "check the local node")
 	path := flags.String("state", nodestate.DefaultPath, "node state path")
+	configPath := flags.String("config", config.DefaultPath, "PVN config path")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	state, err := nodestate.Load(*path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if _, configErr := os.Stat(*configPath); errors.Is(configErr, os.ErrNotExist) {
+				fmt.Println("PVN is not configured on this node; package removal is safe")
+				return nil
+			}
+		}
 		return fmt.Errorf("cannot prove node is drained: %w", err)
 	}
 	if blockers := state.RemovalBlockers(); len(blockers) > 0 {

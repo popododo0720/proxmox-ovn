@@ -25,7 +25,14 @@ func TestNodeCanRemove(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := run([]string{"node", "can-remove", "--state", path}); err == nil {
+	configured := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configured, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"node", "can-remove", "--state", path, "--config", configured}); err == nil {
 		t.Fatal("missing state must fail closed")
+	}
+	if err := run([]string{"node", "can-remove", "--state", path, "--config", filepath.Join(t.TempDir(), "missing-config.json")}); err != nil {
+		t.Fatalf("unused package should be removable: %v", err)
 	}
 }
