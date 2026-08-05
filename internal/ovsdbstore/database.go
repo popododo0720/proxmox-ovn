@@ -6,13 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/ovsdb"
 	"github.com/popododo0720/proxmox-ovn/internal/controlschema"
 )
 
 var errSerialization = errors.New("PVN control database serialization conflict")
+
+const (
+	controlDBReconnectTimeout         = 5 * time.Second
+	controlDBReconnectInitialInterval = 250 * time.Millisecond
+	controlDBReconnectMaxInterval     = 5 * time.Second
+)
 
 type rawDatabase map[string][]ovsdb.Row
 
@@ -51,11 +59,14 @@ func openDatabase(ctx context.Context, cfg Config) (*ovsDatabase, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build PVN control database model: %w", err)
 	}
-	options := make([]client.Option, 0, len(cfg.Endpoints)+2)
+	options := make([]client.Option, 0, len(cfg.Endpoints)+3)
 	for _, endpoint := range cfg.Endpoints {
 		options = append(options, client.WithEndpoint(endpoint))
 	}
-	options = append(options, client.WithLeaderOnly(true))
+	options = append(options,
+		client.WithLeaderOnly(true),
+		client.WithReconnect(controlDBReconnectTimeout, newControlDBReconnectBackOff()),
+	)
 	if cfg.TLSConfig != nil {
 		options = append(options, client.WithTLSConfig(cfg.TLSConfig.Clone()))
 	}
@@ -72,6 +83,17 @@ func openDatabase(ctx context.Context, cfg Config) (*ovsDatabase, error) {
 		return nil, fmt.Errorf("monitor PVN control database: %w", err)
 	}
 	return &ovsDatabase{client: ovsClient}, nil
+}
+
+func newControlDBReconnectBackOff() *backoff.ExponentialBackOff {
+	retry := backoff.NewExponentialBackOff()
+	retry.InitialInterval = controlDBReconnectInitialInterval
+	retry.MaxInterval = controlDBReconnectMaxInterval
+	// A transient or prolonged control-plane restart must not permanently
+	// disable the long-running manager.
+	retry.MaxElapsedTime = 0
+	retry.Reset()
+	return retry
 }
 
 func validateConnectionConfig(cfg Config) error {

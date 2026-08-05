@@ -116,6 +116,17 @@ func TestOpenAgainstInMemoryOVSDBServer(t *testing.T) {
 	if len(port.FixedIPs) != 1 || port.FixedIPs[0].SubnetID != subnetResource.GetMetadata().ID || len(port.SecurityGroupIDs) != 1 || port.NodeID != nodeResource.GetMetadata().ID {
 		t.Fatalf("reference/map/set round trip failed: %#v", port)
 	}
+
+	// A rolling restart of the local clustered ovsdb-server closes this JSON-RPC
+	// connection. The long-running manager must reconnect and restore its monitor
+	// without requiring a process restart.
+	live.client.Disconnect()
+	reconnectCtx, reconnectCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer reconnectCancel()
+	loaded, err = store.Get(reconnectCtx, model.KindProject, created.GetMetadata().ID)
+	if err != nil || loaded.(*model.Project).Name != "tenant" {
+		t.Fatalf("Get after OVSDB reconnect loaded=%#v err=%v", loaded, err)
+	}
 }
 
 // libovsdb's in-memory server does not implement the RFC 7047 durable commit
