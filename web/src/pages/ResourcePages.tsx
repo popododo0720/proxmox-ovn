@@ -10,7 +10,9 @@ import type {
   ProviderNetwork,
   ProviderSegment,
   Router,
+  RouterInterface,
   SecurityGroup,
+  SecurityGroupRule,
   Subnet,
 } from '../api/types';
 import { ErrorState } from '../components/ErrorState';
@@ -88,26 +90,48 @@ export function NetworksPage() {
 }
 
 export function RoutersPage() {
-  return <ResourcePage<Router>
-    title="Routers"
-    description="Distributed east-west routing with optional centralized north-south SNAT."
-    endpoint="/routers"
-    columns={[
-      { key: 'name', label: 'Router', render: (item) => <strong>{item.name || item.id}</strong> },
-      { key: 'project_id', label: 'Project', className: 'mono-cell' },
-      { key: 'external_network_id', label: 'External network', className: 'mono-cell' },
-      { key: 'enable_snat', label: 'SNAT' },
-      { key: 'state', label: 'State' },
-    ]}
-    createLabel="Router"
-    createFields={[
-      { name: 'name', label: 'Name', required: true, placeholder: 'edge' },
-      { name: 'project_id', label: 'Project ID', required: true },
-      { name: 'external_network_id', label: 'External network ID' },
-      { name: 'enable_snat', label: 'Enable SNAT', type: 'checkbox', defaultValue: true },
-    ]}
-    allowDelete
-  />;
+  return <div className="stacked-pages">
+    <ResourcePage<Router>
+      title="Routers"
+      description="Distributed east-west routing with optional centralized north-south SNAT."
+      endpoint="/routers"
+      columns={[
+        { key: 'name', label: 'Router', render: (item) => <strong>{item.name || item.id}</strong> },
+        { key: 'project_id', label: 'Project', className: 'mono-cell' },
+        { key: 'external_network_id', label: 'External network', className: 'mono-cell' },
+        { key: 'enable_snat', label: 'SNAT' },
+        { key: 'state', label: 'State' },
+      ]}
+      createLabel="Router"
+      createFields={[
+        { name: 'name', label: 'Name', required: true, placeholder: 'edge' },
+        { name: 'project_id', label: 'Project ID', required: true },
+        { name: 'external_network_id', label: 'External network ID' },
+        { name: 'enable_snat', label: 'Enable SNAT', type: 'checkbox', defaultValue: true },
+      ]}
+      allowDelete
+    />
+    <ResourcePage<RouterInterface>
+      title="Router interfaces"
+      description="Subnet attachments rendered as logical router ports."
+      endpoint="/router-interfaces"
+      columns={[
+        { key: 'router_id', label: 'Router', className: 'mono-cell' },
+        { key: 'subnet_id', label: 'Subnet', className: 'mono-cell' },
+        { key: 'port_id', label: 'Logical port', className: 'mono-cell' },
+        { key: 'project_id', label: 'Project', className: 'mono-cell' },
+        { key: 'state', label: 'State' },
+      ]}
+      createLabel="Router interface"
+      createFields={[
+        { name: 'project_id', label: 'Project ID', required: true },
+        { name: 'router_id', label: 'Router ID', required: true },
+        { name: 'subnet_id', label: 'Subnet ID', required: true },
+      ]}
+      allowDelete
+      compact
+    />
+  </div>;
 }
 
 export function PortsPage() {
@@ -205,26 +229,59 @@ export function FloatingIPsPage() {
 }
 
 export function SecurityGroupsPage() {
-  return <ResourcePage<SecurityGroup>
-    title="Security groups"
-    description="Stateful OVN port-group policies for tenant ingress and egress."
-    endpoint="/security-groups"
-    columns={[
-      { key: 'name', label: 'Security group', render: (item) => <strong>{item.name || item.id}</strong> },
-      { key: 'project_id', label: 'Project', className: 'mono-cell' },
-      { key: 'description', label: 'Description' },
-      { key: 'rule_count', label: 'Rules' },
-      { key: 'state', label: 'State' },
-    ]}
-    createLabel="Security group"
-    createFields={[
-      { name: 'name', label: 'Name', required: true, placeholder: 'web-servers' },
-      { name: 'project_id', label: 'Project ID', required: true },
-      { name: 'description', label: 'Description' },
-      { name: 'stateful', label: 'Stateful', type: 'checkbox', defaultValue: true },
-    ]}
-    allowDelete
-  />;
+  return <div className="stacked-pages">
+    <ResourcePage<SecurityGroup>
+      title="Security groups"
+      description="Stateful OVN port-group policies for tenant ingress and egress."
+      endpoint="/security-groups"
+      columns={[
+        { key: 'name', label: 'Security group', render: (item) => <strong>{item.name || item.id}</strong> },
+        { key: 'project_id', label: 'Project', className: 'mono-cell' },
+        { key: 'description', label: 'Description' },
+        { key: 'stateful', label: 'Stateful' },
+        { key: 'state', label: 'State' },
+      ]}
+      createLabel="Security group"
+      createFields={[
+        { name: 'name', label: 'Name', required: true, placeholder: 'web-servers' },
+        { name: 'project_id', label: 'Project ID', required: true },
+        { name: 'description', label: 'Description' },
+        { name: 'stateful', label: 'Stateful', type: 'checkbox', defaultValue: true },
+      ]}
+      allowDelete
+    />
+    <ResourcePage<SecurityGroupRule>
+      title="Security group rules"
+      description="Ingress and egress matches compiled into OVN ACLs."
+      endpoint="/security-group-rules"
+      columns={[
+        { key: 'security_group_id', label: 'Security group', className: 'mono-cell' },
+        { key: 'direction', label: 'Direction' },
+        { key: 'protocol', label: 'Protocol' },
+        { key: 'port_range_min', label: 'Port from' },
+        { key: 'port_range_max', label: 'Port to' },
+        { key: 'remote_cidr', label: 'Remote CIDR', className: 'mono-cell' },
+        { key: 'action', label: 'Action' },
+        { key: 'state', label: 'State' },
+      ]}
+      createLabel="Security group rule"
+      createFields={[
+        { name: 'project_id', label: 'Project ID', required: true },
+        { name: 'security_group_id', label: 'Security group ID', required: true },
+        { name: 'direction', label: 'Direction', type: 'select', required: true, defaultValue: 'ingress', options: [{ label: 'Ingress', value: 'ingress' }, { label: 'Egress', value: 'egress' }] },
+        { name: 'ethertype', label: 'Ether type', type: 'select', required: true, defaultValue: 'IPv4', options: [{ label: 'IPv4', value: 'IPv4' }] },
+        { name: 'protocol', label: 'Protocol', type: 'select', options: [{ label: 'TCP', value: 'tcp' }, { label: 'UDP', value: 'udp' }, { label: 'ICMP', value: 'icmp' }] },
+        { name: 'port_range_min', label: 'Port range start', type: 'number' },
+        { name: 'port_range_max', label: 'Port range end', type: 'number' },
+        { name: 'remote_cidr', label: 'Remote IPv4 CIDR', placeholder: '0.0.0.0/0' },
+        { name: 'remote_group_id', label: 'Remote security group ID' },
+        { name: 'action', label: 'Action', type: 'select', required: true, defaultValue: 'allow', options: [{ label: 'Allow', value: 'allow' }, { label: 'Drop', value: 'drop' }] },
+        { name: 'description', label: 'Description' },
+      ]}
+      allowDelete
+      compact
+    />
+  </div>;
 }
 
 export function ProviderNetworksPage() {

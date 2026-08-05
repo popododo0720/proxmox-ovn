@@ -34,7 +34,7 @@ describe('ApiClient', () => {
 
     const createRequest = fetcher.mock.calls[1][1] as RequestInit;
     const createHeaders = new Headers(createRequest.headers);
-    expect(createHeaders.get('CSRFPreventionToken')).toBe('csrf');
+    expect(createHeaders.get('X-PVN-CSRF-Token')).toBe('csrf');
     expect(createHeaders.get('Idempotency-Key')).toBe('operation-1');
     expect(createRequest.credentials).toBe('include');
     const updateHeaders = new Headers((fetcher.mock.calls[2][1] as RequestInit).headers);

@@ -84,23 +84,14 @@ function SessionGate({ children }: { children: (session: SessionInfo) => React.R
 
 function AppShell({ session }: { session: SessionInfo }) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const [path, setPath] = useState(window.location.pathname);
+  const readRoute = () => window.location.hash.replace(/^#/, '').replace(/\/+$/, '') || '/';
+  const [route, setRoute] = useState(readRoute);
 
   useEffect(() => {
-    const update = () => setPath(window.location.pathname);
-    window.addEventListener('popstate', update);
-    return () => window.removeEventListener('popstate', update);
+    const update = () => setRoute(readRoute());
+    window.addEventListener('hashchange', update);
+    return () => window.removeEventListener('hashchange', update);
   }, []);
-
-  function navigate(event: React.MouseEvent<HTMLAnchorElement>, target: string) {
-    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    event.preventDefault();
-    if (window.location.pathname !== target) window.history.pushState(null, '', target);
-    setPath(target);
-    setMenuOpen(false);
-  }
-
-  const route = path.replace(/\/+$/, '') || '/';
   const page = route === '/' ? <OverviewPage />
     : route === '/projects' ? <ProjectsPage />
       : route === '/networks' ? <NetworksPage />
@@ -120,9 +111,9 @@ function AppShell({ session }: { session: SessionInfo }) {
           <span className="nav-caption">Cloud networking</span>
           {navigation.map((item) => (
             <a
-              href={item.to}
+              href={`#${item.to}`}
               key={item.to}
-              onClick={(event) => navigate(event, item.to)}
+              onClick={() => setMenuOpen(false)}
               className={`nav-link${route === item.to ? ' active' : ''}`}
             >
               <span className="nav-glyph" aria-hidden="true">{item.glyph}</span>

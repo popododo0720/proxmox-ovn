@@ -72,11 +72,18 @@ export interface Router extends BaseResource {
   enable_snat?: boolean;
 }
 
+export interface RouterInterface extends BaseResource {
+  project_id?: string;
+  router_id?: string;
+  subnet_id?: string;
+  port_id?: string;
+}
+
 export interface Port extends BaseResource {
   project_id?: string;
   network_id?: string;
   mac_address?: string;
-  fixed_ips?: Array<{ subnet_id?: string; address: string }>;
+  fixed_ips?: Array<{ subnet_id?: string; address?: string }>;
   node_id?: string;
   vmid?: number;
   nic?: string;
@@ -98,7 +105,21 @@ export interface FloatingIP extends BaseResource {
 export interface SecurityGroup extends BaseResource {
   project_id?: string;
   description?: string;
-  rule_count?: number;
+  stateful?: boolean;
+}
+
+export interface SecurityGroupRule extends BaseResource {
+  project_id?: string;
+  security_group_id?: string;
+  direction?: 'ingress' | 'egress' | string;
+  ethertype?: 'IPv4' | string;
+  protocol?: 'tcp' | 'udp' | 'icmp' | string;
+  port_range_min?: number;
+  port_range_max?: number;
+  remote_cidr?: string;
+  remote_group_id?: string;
+  action?: 'allow' | 'drop' | string;
+  description?: string;
 }
 
 export interface ProviderNetwork extends BaseResource {

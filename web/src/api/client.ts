@@ -13,7 +13,9 @@ import type {
   ProviderSegment,
   ResourceID,
   Router,
+  RouterInterface,
   SecurityGroup,
+  SecurityGroupRule,
   SessionInfo,
   Subnet,
 } from './types';
@@ -86,27 +88,28 @@ export class ApiClient {
   }
 
   private async request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+    const { body, query, idempotencyKey, revision, ...requestInit } = options;
     const url = new URL(`${this.baseURL}${path}`, window.location.origin);
-    for (const [key, value] of Object.entries(options.query ?? {})) {
+    for (const [key, value] of Object.entries(query ?? {})) {
       if (value !== undefined) url.searchParams.set(key, String(value));
     }
 
-    const method = (options.method || 'GET').toUpperCase();
-    const headers = new Headers(options.headers);
+    const method = (requestInit.method || 'GET').toUpperCase();
+    const headers = new Headers(requestInit.headers);
     headers.set('Accept', 'application/json');
-    if (options.body !== undefined) headers.set('Content-Type', 'application/json');
+    if (body !== undefined) headers.set('Content-Type', 'application/json');
     if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && this.csrfToken) {
-      headers.set('CSRFPreventionToken', this.csrfToken);
+      headers.set('X-PVN-CSRF-Token', this.csrfToken);
     }
-    if (options.idempotencyKey) headers.set('Idempotency-Key', options.idempotencyKey);
-    if (options.revision !== undefined) headers.set('If-Match', `"${options.revision}"`);
+    if (idempotencyKey) headers.set('Idempotency-Key', idempotencyKey);
+    if (revision !== undefined) headers.set('If-Match', `"${revision}"`);
 
     const response = await this.fetcher(url, {
-      ...options,
+      ...requestInit,
       method,
       headers,
       credentials: 'include',
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      body: body === undefined ? undefined : JSON.stringify(body),
     });
 
     const text = response.status === 204 ? '' : await response.text();
@@ -185,9 +188,11 @@ export class ApiClient {
   networks = () => this.list<Network>('/networks');
   subnets = () => this.list<Subnet>('/subnets');
   routers = () => this.list<Router>('/routers');
+  routerInterfaces = () => this.list<RouterInterface>('/router-interfaces');
   ports = () => this.list<Port>('/ports');
   floatingIPs = () => this.list<FloatingIP>('/floating-ips');
   securityGroups = () => this.list<SecurityGroup>('/security-groups');
+  securityGroupRules = () => this.list<SecurityGroupRule>('/security-group-rules');
   providerNetworks = () => this.list<ProviderNetwork>('/provider-networks');
   providerSegments = () => this.list<ProviderSegment>('/provider-segments');
   nodes = () => this.list<NodeStatus>('/nodes');
