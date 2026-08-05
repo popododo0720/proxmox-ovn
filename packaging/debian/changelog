@@ -1,3 +1,9 @@
+proxmox-ovn (0.1.1) unstable; urgency=medium
+
+  * Pass the PVE root CA to the unprivileged manager as a systemd credential.
+
+ -- PVN Project <root@localhost>  Wed, 05 Aug 2026 04:30:00 +0000
+
 proxmox-ovn (0.1.0) unstable; urgency=medium
 
   * Initial PVN development package.
