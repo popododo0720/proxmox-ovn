@@ -39,7 +39,7 @@ func ApplyOVN(ctx context.Context, runner Runner, config Config) error {
 			return commandError("verify OVS bridge "+bridge, output, err)
 		}
 	}
-	output, err := runner.Run(ctx, "ovs-vsctl", "--timeout=10", "get", "Open_vSwitch", ".", "external_ids:ovn-bridge-mappings")
+	output, err := runner.Run(ctx, "ovs-vsctl", "--timeout=10", "--if-exists", "get", "Open_vSwitch", ".", "external_ids:ovn-bridge-mappings")
 	if err != nil {
 		return commandError("read OVN bridge mappings", output, err)
 	}

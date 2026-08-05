@@ -23,10 +23,28 @@ func (runner *fakeRunner) Run(_ context.Context, name string, args ...string) ([
 	if len(args) > 1 && args[1] == "br-exists" {
 		return nil, nil
 	}
-	if len(args) > 1 && args[1] == "get" {
+	if len(args) > 2 && args[1] == "--if-exists" && args[2] == "get" {
 		return []byte(runner.mappings), nil
 	}
 	return nil, nil
+}
+
+func TestApplyOVNTreatsMissingBridgeMappingKeyAsEmpty(t *testing.T) {
+	runner := &fakeRunner{}
+	err := ApplyOVN(context.Background(), runner, Config{
+		IntegrationBridge: "br-int", ProviderBridge: "br-provider", PhysicalNetwork: "provider",
+		EncapType: "geneve", EncapIP: "192.0.2.10", Southbound: []string{"unix:/run/ovn/ovnsb.sock"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRead := []string{"--timeout=10", "--if-exists", "get", "Open_vSwitch", ".", "external_ids:ovn-bridge-mappings"}
+	if !reflect.DeepEqual(runner.calls[2].args, wantRead) {
+		t.Fatalf("get args = %#v", runner.calls[2].args)
+	}
+	if got := runner.calls[3].args[len(runner.calls[3].args)-1]; got != "external_ids:ovn-bridge-mappings=provider:br-provider" {
+		t.Fatalf("bridge mapping assignment = %q", got)
+	}
 }
 
 func TestApplyOVNPreservesExistingBridgeMappings(t *testing.T) {
@@ -83,11 +101,37 @@ func TestApplyOVNFailsBeforeMutationWhenBridgeIsMissing(t *testing.T) {
 	}
 }
 
+func TestApplyOVNPreservesOtherBridgeMappingReadErrors(t *testing.T) {
+	runner := &failingMappingReadRunner{}
+	err := ApplyOVN(context.Background(), runner, Config{
+		IntegrationBridge: "br-int", ProviderBridge: "br-provider", PhysicalNetwork: "provider",
+		EncapType: "geneve", EncapIP: "192.0.2.10", Southbound: []string{"unix:/run/ovn/ovnsb.sock"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "read OVN bridge mappings") || !strings.Contains(err.Error(), "database connection failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("mutating command unexpectedly ran: %#v", runner.calls)
+	}
+}
+
 type failingBridgeRunner struct{}
 
 func (*failingBridgeRunner) Run(_ context.Context, _ string, args ...string) ([]byte, error) {
 	if args[len(args)-1] == "br-provider" {
 		return []byte("no bridge named br-provider"), errors.New("exit status 2")
+	}
+	return nil, nil
+}
+
+type failingMappingReadRunner struct {
+	calls []call
+}
+
+func (runner *failingMappingReadRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	runner.calls = append(runner.calls, call{name: name, args: append([]string(nil), args...)})
+	if args[len(args)-1] == "external_ids:ovn-bridge-mappings" {
+		return []byte("database connection failed"), errors.New("exit status 1")
 	}
 	return nil, nil
 }
