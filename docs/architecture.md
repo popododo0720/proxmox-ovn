@@ -38,7 +38,8 @@ PVE permissions before each action:
 
 - read: `SDN.Audit`
 - network resource changes: `SDN.Allocate`
-- VM attachment: network `SDN.Use` and VM `VM.Config.Network`
+- VM attachment: network `SDN.Use` at `/sdn/zones/pvn/<network-id>` (or the
+  project pool/global scope) and VM `VM.Config.Network`
 - central, provider, and gateway changes: global administrator permission
 
 ## VM port lifecycle

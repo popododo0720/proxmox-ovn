@@ -207,8 +207,10 @@ the local marker is absent. When the marker exists, a failed readiness check
 fails that `pve-guests.service` start, so all guests on that host—not only PVN
 guests—remain stopped for operator review. The gate is a one-shot and is not
 coupled to later service failures, so it does not automatically stop already
-running guests. Do not start tenant workloads until every activated node is
-ready.
+running guests. It also cannot intercept a later manual VM start through the
+PVE UI/API; until a future PVE start/HA integration exists, enforce operational
+policy that tenant VMs start only while `pvn-node-ready.service` is active on
+their node. A VM started outside that policy can boot with a disconnected TAP.
 
 After changing `/etc/pve/pvn/config.json`, refresh the credential copy and
 local settings one node at a time:
