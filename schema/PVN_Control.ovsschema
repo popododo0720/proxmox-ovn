@@ -1,0 +1,294 @@
+{
+  "name": "PVN_Control",
+  "version": "1.0.0",
+  "cksum": "",
+  "tables": {
+    "Project": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "pool_id": {"type": "string"},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["pool_id"], ["name"]]
+    },
+    "ProviderNetwork": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "shared": {"type": "boolean"},
+        "default_segment": {"type": {"key": {"type": "uuid", "refTable": "ProviderSegment", "refType": "weak"}, "min": 0, "max": 1}},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["name"]]
+    },
+    "ProviderSegment": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "provider_network": {"type": {"key": {"type": "uuid", "refTable": "ProviderNetwork", "refType": "strong"}}},
+        "name": {"type": "string"},
+        "physical_network": {"type": "string"},
+        "network_type": {"type": {"key": {"type": "string", "enum": ["set", ["flat", "vlan"]]}}},
+        "vlan_id": {"type": {"key": {"type": "integer", "minInteger": 0, "maxInteger": 4094}}},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["provider_network", "name"], ["physical_network", "network_type", "vlan_id"]]
+    },
+    "Network": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "mtu": {"type": {"key": {"type": "integer", "minInteger": 576, "maxInteger": 9216}}},
+        "external": {"type": "boolean"},
+        "provider_network": {"type": {"key": {"type": "uuid", "refTable": "ProviderNetwork", "refType": "strong"}, "min": 0, "max": 1}},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["project", "name"]]
+    },
+    "Subnet": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "network": {"type": {"key": {"type": "uuid", "refTable": "Network", "refType": "strong"}}},
+        "name": {"type": "string"},
+        "cidr": {"type": "string"},
+        "gateway_ip": {"type": "string"},
+        "enable_dhcp": {"type": "boolean"},
+        "dns_nameservers": {"type": {"key": "string", "min": 0, "max": "unlimited"}},
+        "allocation_pools": {"type": {"key": "string", "min": 0, "max": "unlimited"}},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["network", "name"], ["network", "cidr"]]
+    },
+    "SecurityGroup": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "stateful": {"type": "boolean"},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["project", "name"]]
+    },
+    "SecurityGroupRule": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "security_group": {"type": {"key": {"type": "uuid", "refTable": "SecurityGroup", "refType": "strong"}}},
+        "direction": {"type": {"key": {"type": "string", "enum": ["set", ["ingress", "egress"]]}}},
+        "ethertype": {"type": {"key": {"type": "string", "enum": ["set", ["IPv4"]]}}},
+        "protocol": {"type": "string"},
+        "port_range_min": {"type": {"key": {"type": "integer", "minInteger": 0, "maxInteger": 65535}}},
+        "port_range_max": {"type": {"key": {"type": "integer", "minInteger": 0, "maxInteger": 65535}}},
+        "remote_cidr": {"type": "string"},
+        "remote_group": {"type": {"key": {"type": "uuid", "refTable": "SecurityGroup", "refType": "strong"}, "min": 0, "max": 1}},
+        "action": {"type": {"key": {"type": "string", "enum": ["set", ["allow", "drop"]]}}},
+        "description": {"type": "string"},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"]]
+    },
+    "Node": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "chassis_id": {"type": "string"},
+        "management_address": {"type": "string"},
+        "roles": {"type": {"key": {"type": "string", "enum": ["set", ["compute", "gateway", "central"]]}, "min": 0, "max": 3}},
+        "enabled": {"type": "boolean"},
+        "last_seen_at": {"type": "string"},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["name"], ["chassis_id"]]
+    },
+    "Port": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "network": {"type": {"key": {"type": "uuid", "refTable": "Network", "refType": "strong"}}},
+        "name": {"type": "string"},
+        "mac_address": {"type": "string"},
+        "fixed_ips": {"type": {"key": {"type": "uuid", "refTable": "Subnet", "refType": "strong"}, "value": "string", "min": 0, "max": "unlimited"}},
+        "security_groups": {"type": {"key": {"type": "uuid", "refTable": "SecurityGroup", "refType": "strong"}, "min": 0, "max": "unlimited"}},
+        "admin_state_up": {"type": "boolean"},
+        "binding_status": {"type": {"key": {"type": "string", "enum": ["set", ["unbound", "binding", "bound", "detaching", "error"]]}}},
+        "node": {"type": {"key": {"type": "uuid", "refTable": "Node", "refType": "weak"}, "min": 0, "max": 1}},
+        "vmid": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "nic": {"type": "string"},
+        "lsp_name": {"type": "string"},
+        "generation": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "requested_chassis": {"type": "string"},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["mac_address"], ["lsp_name"]]
+    },
+    "IPAllocation": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "subnet": {"type": {"key": {"type": "uuid", "refTable": "Subnet", "refType": "strong"}}},
+        "port": {"type": {"key": {"type": "uuid", "refTable": "Port", "refType": "strong"}, "min": 0, "max": 1}},
+        "address": {"type": "string"},
+        "allocation_state": {"type": {"key": {"type": "string", "enum": ["set", ["reserved", "allocated"]]}}},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["subnet", "address"]]
+    },
+    "Router": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "external_network": {"type": {"key": {"type": "uuid", "refTable": "Network", "refType": "strong"}, "min": 0, "max": 1}},
+        "enable_snat": {"type": "boolean"},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["project", "name"]]
+    },
+    "RouterInterface": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "router": {"type": {"key": {"type": "uuid", "refTable": "Router", "refType": "strong"}}},
+        "subnet": {"type": {"key": {"type": "uuid", "refTable": "Subnet", "refType": "strong"}}},
+        "port": {"type": {"key": {"type": "uuid", "refTable": "Port", "refType": "strong"}, "min": 0, "max": 1}},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["router", "subnet"]]
+    },
+    "FloatingIP": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "project": {"type": {"key": {"type": "uuid", "refTable": "Project", "refType": "strong"}}},
+        "provider_network": {"type": {"key": {"type": "uuid", "refTable": "ProviderNetwork", "refType": "strong"}}},
+        "address": {"type": "string"},
+        "port": {"type": {"key": {"type": "uuid", "refTable": "Port", "refType": "strong"}, "min": 0, "max": 1}},
+        "fixed_ip_address": {"type": "string"},
+        "router": {"type": {"key": {"type": "uuid", "refTable": "Router", "refType": "strong"}, "min": 0, "max": 1}},
+        "floating_status": {"type": {"key": {"type": "string", "enum": ["set", ["down", "active", "error"]]}}},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["provider_network", "address"]]
+    },
+    "Operation": {
+      "isRoot": true,
+      "columns": {
+        "id": {"type": "string"},
+        "action": {"type": "string"},
+        "target_kind": {"type": "string"},
+        "target_id": {"type": "string"},
+        "target_revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "operation_status": {"type": {"key": {"type": "string", "enum": ["set", ["queued", "running", "succeeded", "failed"]]}}},
+        "idempotency_key": {"type": "string"},
+        "error": {"type": "string"},
+        "started_at": {"type": "string"},
+        "completed_at": {"type": "string"},
+        "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
+        "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},
+        "state": {"type": {"key": {"type": "string", "enum": ["set", ["pending", "ready", "error", "deleting"]]}}},
+        "last_error": {"type": "string"},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"},
+        "external_ids": {"type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"}}
+      },
+      "indexes": [["id"], ["idempotency_key"], ["target_kind", "target_id", "target_revision"]]
+    }
+  }
+}
