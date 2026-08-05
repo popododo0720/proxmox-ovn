@@ -24,6 +24,8 @@ const (
 	maxWriteAttempts                = 64
 	maxOperationPruneBatch          = 256
 	maxExpiredOperationRecoverBatch = 256
+	expiredOperationError           = "operation lease expired before completion"
+	supersededQueuedOperationError  = "operation target revision was superseded before claim"
 )
 
 // Config defines the secure OVSDB connection. Only unix: and ssl: endpoints
@@ -431,9 +433,10 @@ func operationSuperseded(current *snapshot, operation *model.Operation) bool {
 }
 
 // RecoverExpiredOperations atomically terminalizes a bounded set of stale
-// writer claims. The PVN_Control transaction epoch and per-row revisions make
-// the result race-safe with a heartbeat from the former owner: exactly one
-// transaction wins, and the loser reloads the new state.
+// writer claims and queued reconciles for superseded target revisions. The
+// PVN_Control transaction epoch and per-row revisions make the result race-safe
+// with a heartbeat, claim, or target update: exactly one transaction wins, and
+// the loser reloads the new state.
 func (s *Store) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recoveredAt time.Time, limit int) (int, error) {
 	if err := contextError(ctx); err != nil {
 		return 0, err
@@ -449,21 +452,39 @@ func (s *Store) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recov
 		if err != nil {
 			return 0, err
 		}
-		candidates := make([]*model.Operation, 0)
+		expired := make([]*model.Operation, 0)
+		queued := make([]*model.Operation, 0)
 		for _, entry := range current.resources[model.KindOperation] {
 			operation := entry.resource.(*model.Operation)
-			if !leaseProtectedAction(operation.Action) || operation.OperationStatus != model.OperationRunning || reconcileLeaseIsLive(operation, leaseCutoff) {
-				continue
+			switch {
+			case leaseProtectedAction(operation.Action) && operation.OperationStatus == model.OperationRunning && !reconcileLeaseIsLive(operation, leaseCutoff):
+				expired = append(expired, operation)
+			case operation.Action == "reconcile" && operation.OperationStatus == model.OperationQueued && operationSuperseded(current, operation):
+				queued = append(queued, operation)
 			}
-			candidates = append(candidates, operation)
 		}
-		sort.Slice(candidates, func(i, j int) bool {
-			left, right := candidates[i], candidates[j]
+		sort.Slice(expired, func(i, j int) bool {
+			left, right := expired[i], expired[j]
 			if !left.UpdatedAt.Equal(right.UpdatedAt) {
 				return left.UpdatedAt.Before(right.UpdatedAt)
 			}
 			return left.ID < right.ID
 		})
+		sort.Slice(queued, func(i, j int) bool {
+			left, right := queued[i], queued[j]
+			if !left.UpdatedAt.Equal(right.UpdatedAt) {
+				return left.UpdatedAt.Before(right.UpdatedAt)
+			}
+			return left.ID < right.ID
+		})
+		candidates := expired
+		if len(candidates) < limit {
+			remaining := limit - len(candidates)
+			if len(queued) > remaining {
+				queued = queued[:remaining]
+			}
+			candidates = append(candidates, queued...)
+		}
 		if len(candidates) > limit {
 			candidates = candidates[:limit]
 		}
@@ -479,7 +500,7 @@ func (s *Store) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recov
 			}
 			recovered := copyResource.(*model.Operation)
 			recovered.OperationStatus = model.OperationFailed
-			recovered.Error = "operation lease expired before completion"
+			recovered.Error = operationRecoveryError(operation)
 			recovered.CompletedAt = &completed
 			recovered.Revision++
 			recovered.State = model.ResourcePending
@@ -500,6 +521,13 @@ func (s *Store) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recov
 		return len(candidates), nil
 	}
 	return 0, storeError(controlstore.ErrConflict, "expired operation recovery could not be serialized after concurrent changes")
+}
+
+func operationRecoveryError(operation *model.Operation) string {
+	if operation != nil && operation.OperationStatus == model.OperationQueued {
+		return supersededQueuedOperationError
+	}
+	return expiredOperationError
 }
 
 func (s *Store) Update(ctx context.Context, resource model.Resource, expectedRevision int64, key string) (model.Resource, bool, error) {

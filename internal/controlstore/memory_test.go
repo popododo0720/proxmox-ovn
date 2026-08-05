@@ -546,7 +546,11 @@ func TestMemoryRecoverExpiredOperationsIsBoundedAndIncludesSupersededTargets(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, live := createRunningReconcile("live", base.Add(2*time.Hour))
+	liveProject, live := createRunningReconcile("live", base.Add(2*time.Hour))
+	liveProject.Description = "superseded while lease remains live"
+	if _, _, err := store.Update(context.Background(), liveProject, liveProject.Revision, "supersede-live-project"); err != nil {
+		t.Fatal(err)
+	}
 
 	recoveredAt := base.Add(3 * time.Hour)
 	recovered, err := store.RecoverExpiredOperations(context.Background(), base.Add(time.Hour), recoveredAt, 2)
@@ -583,6 +587,100 @@ func TestMemoryRecoverExpiredOperationsIsBoundedAndIncludesSupersededTargets(t *
 	}
 	if _, err := store.RecoverExpiredOperations(context.Background(), base, recoveredAt, 0); !errors.Is(err, ErrConflict) {
 		t.Fatalf("zero-limit recovery error=%v", err)
+	}
+}
+
+func TestMemoryRecoversSupersededQueuedReconcilesWithReplayAndRetention(t *testing.T) {
+	store := deterministicStore()
+	request := func(project *model.Project, revision int64) *model.Operation {
+		return &model.Operation{
+			Action: "reconcile", TargetKind: model.KindProject, TargetID: project.ID,
+			TargetRevision: revision, OperationStatus: model.OperationQueued,
+		}
+	}
+	createSuperseded := func(name, key string) (*model.Project, *model.Operation) {
+		project := mustCreate(t, store, &model.Project{Name: name, PoolID: "pool-" + name}, "project-"+name).(*model.Project)
+		operation := mustCreate(t, store, request(project, project.Revision), key).(*model.Operation)
+		project.Description = "new desired revision"
+		updated, _, err := store.Update(context.Background(), project, project.Revision, "supersede-"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return updated.(*model.Project), operation
+	}
+
+	firstProject, first := createSuperseded("first", "queued-first")
+	_, second := createSuperseded("second", "queued-second")
+	currentProject := mustCreate(t, store, &model.Project{Name: "current", PoolID: "pool-current"}, "project-current").(*model.Project)
+	current := mustCreate(t, store, request(currentProject, currentProject.Revision), "queued-current").(*model.Operation)
+
+	base := time.Date(2026, 8, 5, 4, 0, 0, 0, time.UTC)
+	recovered, err := store.RecoverExpiredOperations(context.Background(), base.Add(-time.Hour), base, 1)
+	if err != nil || recovered != 1 {
+		t.Fatalf("first recovery count=%d err=%v", recovered, err)
+	}
+	firstResource, err := store.Get(context.Background(), model.KindOperation, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := firstResource.(*model.Operation)
+	if failed.OperationStatus != model.OperationFailed || failed.Error != supersededQueuedOperationError || failed.CompletedAt == nil || !failed.CompletedAt.Equal(base) || failed.Revision != first.Revision+1 {
+		t.Fatalf("recovered queued operation=%#v", failed)
+	}
+	for _, operationID := range []string{second.ID, current.ID} {
+		resource, getErr := store.Get(context.Background(), model.KindOperation, operationID)
+		if getErr != nil || resource.(*model.Operation).OperationStatus != model.OperationQueued {
+			t.Fatalf("bounded recovery changed operation=%#v err=%v", resource, getErr)
+		}
+	}
+
+	replayedResource, replayed, err := store.Create(context.Background(), request(firstProject, first.TargetRevision), "queued-first")
+	if err != nil || !replayed || replayedResource.GetMetadata().ID != first.ID {
+		t.Fatalf("failed operation replay=%#v replayed=%v err=%v", replayedResource, replayed, err)
+	}
+	latest, err := store.Get(context.Background(), model.KindOperation, replayedResource.GetMetadata().ID)
+	if err != nil || latest.(*model.Operation).OperationStatus != model.OperationFailed {
+		t.Fatalf("durable operation after replay=%#v err=%v", latest, err)
+	}
+	recovered, err = store.RecoverExpiredOperations(context.Background(), base.Add(-time.Hour), base.Add(time.Minute), 10)
+	if err != nil || recovered != 1 {
+		t.Fatalf("second recovery count=%d err=%v", recovered, err)
+	}
+	recovered, err = store.RecoverExpiredOperations(context.Background(), base.Add(-time.Hour), base.Add(90*time.Second), 10)
+	if err != nil || recovered != 0 {
+		t.Fatalf("idempotent recovery count=%d err=%v", recovered, err)
+	}
+	firstResource, err = store.Get(context.Background(), model.KindOperation, first.ID)
+	if err != nil || firstResource.GetMetadata().Revision != failed.Revision {
+		t.Fatalf("terminal operation changed on retry: operation=%#v err=%v", firstResource, err)
+	}
+	currentResource, err := store.Get(context.Background(), model.KindOperation, current.ID)
+	if err != nil || currentResource.(*model.Operation).OperationStatus != model.OperationQueued {
+		t.Fatalf("claimable queued operation=%#v err=%v", currentResource, err)
+	}
+	claimed, err := store.ClaimReconcile(context.Background(), current.ID, currentResource.GetMetadata().Revision, "lease-current", base.Add(90*time.Second), base.Add(-time.Hour))
+	if err != nil || claimed.OperationStatus != model.OperationRunning {
+		t.Fatalf("claim current queued operation=%#v err=%v", claimed, err)
+	}
+
+	pruned, err := store.PruneOperations(context.Background(), base, 0)
+	if err != nil || pruned != 0 {
+		t.Fatalf("retention age pruned=%d err=%v", pruned, err)
+	}
+	pruned, err = store.PruneOperations(context.Background(), base.Add(2*time.Minute), 2)
+	if err != nil || pruned != 0 {
+		t.Fatalf("retention keep pruned=%d err=%v", pruned, err)
+	}
+	pruned, err = store.PruneOperations(context.Background(), base.Add(2*time.Minute), 0)
+	if err != nil || pruned != 2 {
+		t.Fatalf("PruneOperations() pruned=%d err=%v", pruned, err)
+	}
+	if _, err := store.Get(context.Background(), model.KindOperation, first.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("pruned operation error=%v", err)
+	}
+	recreated, replayed, err := store.Create(context.Background(), request(firstProject, first.TargetRevision), "queued-first")
+	if err != nil || replayed || recreated.GetMetadata().ID == first.ID {
+		t.Fatalf("pruned replay token remained: resource=%#v replayed=%v err=%v", recreated, replayed, err)
 	}
 }
 

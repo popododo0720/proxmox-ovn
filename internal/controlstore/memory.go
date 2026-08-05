@@ -32,6 +32,8 @@ type Memory struct {
 const (
 	maxOperationPruneBatch          = 256
 	maxExpiredOperationRecoverBatch = 256
+	expiredOperationError           = "operation lease expired before completion"
+	supersededQueuedOperationError  = "operation target revision was superseded before claim"
 )
 
 type MemoryOption func(*Memory)
@@ -289,9 +291,10 @@ func (s *Memory) PruneOperations(ctx context.Context, before time.Time, keep int
 	return pruned, nil
 }
 
-// RecoverExpiredOperations turns abandoned durable writer claims into
-// terminal failures. The store lock makes selection and updates atomic with
-// lease heartbeats, claims, target updates, and purges.
+// RecoverExpiredOperations turns abandoned durable writer claims and queued
+// reconciles for superseded target revisions into terminal failures. The store
+// lock makes selection and updates atomic with lease heartbeats, claims,
+// target updates, and purges.
 func (s *Memory) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recoveredAt time.Time, limit int) (int, error) {
 	if err := contextError(ctx); err != nil {
 		return 0, err
@@ -305,6 +308,14 @@ func (s *Memory) RecoverExpiredOperations(ctx context.Context, leaseCutoff, reco
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidates := expiredRunningOperations(s.resources[model.KindOperation], leaseCutoff)
+	if len(candidates) < limit {
+		queued := s.supersededQueuedReconcilesLocked()
+		remaining := limit - len(candidates)
+		if len(queued) > remaining {
+			queued = queued[:remaining]
+		}
+		candidates = append(candidates, queued...)
+	}
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
@@ -317,7 +328,7 @@ func (s *Memory) RecoverExpiredOperations(ctx context.Context, leaseCutoff, reco
 		}
 		recovered := copyResource.(*model.Operation)
 		recovered.OperationStatus = model.OperationFailed
-		recovered.Error = "operation lease expired before completion"
+		recovered.Error = operationRecoveryError(operation)
 		recovered.CompletedAt = &completed
 		recovered.Revision++
 		recovered.State = model.ResourcePending
@@ -329,6 +340,32 @@ func (s *Memory) RecoverExpiredOperations(ctx context.Context, leaseCutoff, reco
 		s.resources[model.KindOperation][recovered.ID] = recovered
 	}
 	return len(candidates), nil
+}
+
+func (s *Memory) supersededQueuedReconcilesLocked() []*model.Operation {
+	operations := make([]*model.Operation, 0)
+	for _, resource := range s.resources[model.KindOperation] {
+		operation := resource.(*model.Operation)
+		if operation.Action != "reconcile" || operation.OperationStatus != model.OperationQueued || !s.operationSupersededLocked(operation) {
+			continue
+		}
+		operations = append(operations, operation)
+	}
+	sort.Slice(operations, func(i, j int) bool {
+		left, right := operations[i], operations[j]
+		if !left.UpdatedAt.Equal(right.UpdatedAt) {
+			return left.UpdatedAt.Before(right.UpdatedAt)
+		}
+		return left.ID < right.ID
+	})
+	return operations
+}
+
+func operationRecoveryError(operation *model.Operation) string {
+	if operation != nil && operation.OperationStatus == model.OperationQueued {
+		return supersededQueuedOperationError
+	}
+	return expiredOperationError
 }
 
 func expiredRunningOperations(resources map[string]model.Resource, leaseCutoff time.Time) []*model.Operation {

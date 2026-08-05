@@ -563,6 +563,47 @@ func TestControllerFullPassRecoversExpiredOperationsBeforeReconciling(t *testing
 	}
 }
 
+func TestControllerFullPassRecoversSupersededQueuedReconcile(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	staleResource, _, err := store.Create(context.Background(), &model.Operation{
+		Action: "reconcile", TargetKind: model.KindProject, TargetID: project.ID,
+		TargetRevision: project.Revision, OperationStatus: model.OperationQueued,
+	}, "stale-queued-reconcile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := staleResource.(*model.Operation)
+	project.Description = "new desired revision"
+	updatedResource, _, err := store.Update(context.Background(), project, project.Revision, "supersede-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := updatedResource.(*model.Project)
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	controller := NewController(store, NewFakeRenderer(), WithLeaseDuration(5*time.Minute))
+	controller.now = func() time.Time { return now }
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	staleResource, err = store.Get(context.Background(), model.KindOperation, stale.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := staleResource.(*model.Operation)
+	if failed.OperationStatus != model.OperationFailed || failed.CompletedAt == nil || !failed.CompletedAt.Equal(now) || !strings.Contains(failed.Error, "superseded before claim") {
+		t.Fatalf("stale operation=%#v", failed)
+	}
+	ready, err := store.Get(context.Background(), model.KindProject, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.GetMetadata().Revision != updated.Revision || ready.GetMetadata().AppliedRevision != updated.Revision || ready.GetMetadata().State != model.ResourceReady {
+		t.Fatalf("current project was not reconciled: %#v", ready.GetMetadata())
+	}
+}
+
 func TestControllerFullPassReadsOneDependencySnapshot(t *testing.T) {
 	base := controlstore.NewMemory()
 	project := createProject(t, base)

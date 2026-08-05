@@ -64,8 +64,10 @@ type Store interface {
 	// while always retaining at least keep most-recent terminal reconciles.
 	PruneOperations(context.Context, time.Time, int) (int, error)
 	// RecoverExpiredOperations atomically fails a bounded batch of abandoned
-	// running reconcile/delete operations. A concurrent heartbeat either wins
-	// before selection or loses its revision CAS after recovery.
+	// running reconcile/delete operations and queued reconciles whose target
+	// revision was superseded before claim. A concurrent heartbeat or target
+	// update either wins before selection or loses its revision CAS after
+	// recovery.
 	RecoverExpiredOperations(context.Context, time.Time, time.Time, int) (int, error)
 	ClaimReconcile(context.Context, string, int64, string, time.Time, time.Time) (*model.Operation, error)
 	ClaimDelete(context.Context, string, int64, string, time.Time, time.Time) (*model.Operation, error)
