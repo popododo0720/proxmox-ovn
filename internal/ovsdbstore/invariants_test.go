@@ -242,6 +242,14 @@ func TestStoreEnforcesCrossResourceInvariants(t *testing.T) {
 	if _, err := store.Delete(context.Background(), model.KindProviderSegment, topology.segment.ID, topology.segment.Revision, "inv-delete-default-segment"); !errors.Is(err, controlstore.ErrConflict) {
 		t.Fatalf("delete default segment error=%v", err)
 	}
+	if _, err := store.Delete(context.Background(), model.KindProviderSegment, topology.otherSegment.ID, topology.otherSegment.Revision, "inv-delete-implicit-segment"); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("delete sole implicit segment in use error=%v", err)
+	}
+	unusedProvider := mustCreate(t, store, &model.ProviderNetwork{Name: "provider-unused-segment"}, "inv-provider-unused-segment").(*model.ProviderNetwork)
+	unusedSegment := mustCreate(t, store, &model.ProviderSegment{ProviderNetworkID: unusedProvider.ID, Name: "unused", PhysicalNetwork: "phys-unused", NetworkType: model.ProviderFlat}, "inv-unused-segment").(*model.ProviderSegment)
+	if _, err := store.Delete(context.Background(), model.KindProviderSegment, unusedSegment.ID, unusedSegment.Revision, "inv-delete-unused-segment"); err != nil {
+		t.Fatalf("delete unused implicit segment error=%v", err)
+	}
 }
 
 func TestStoreReplacementPreservesCrossResourceInvariants(t *testing.T) {

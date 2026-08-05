@@ -652,6 +652,33 @@ func firstReference(current *snapshot, kind model.Kind, id string) string {
 			}
 		}
 	}
+	if kind == model.KindProviderSegment {
+		segmentEntry, exists := current.resources[kind][id]
+		if exists {
+			segment := segmentEntry.resource.(*model.ProviderSegment)
+			providerEntry, providerExists := current.resources[model.KindProviderNetwork][segment.ProviderNetworkID]
+			if providerExists && providerEntry.resource.(*model.ProviderNetwork).DefaultSegmentID == "" {
+				matching := 0
+				for _, entry := range current.resources[model.KindProviderSegment] {
+					if entry.resource.(*model.ProviderSegment).ProviderNetworkID == segment.ProviderNetworkID {
+						matching++
+					}
+				}
+				if matching == 1 {
+					networkIDs := make([]string, 0, len(current.resources[model.KindNetwork]))
+					for networkID := range current.resources[model.KindNetwork] {
+						networkIDs = append(networkIDs, networkID)
+					}
+					sortStrings(networkIDs)
+					for _, networkID := range networkIDs {
+						if current.resources[model.KindNetwork][networkID].resource.(*model.Network).ProviderNetworkID == segment.ProviderNetworkID {
+							return fmt.Sprintf("%s %q", model.KindNetwork, networkID)
+						}
+					}
+				}
+			}
+		}
+	}
 	if kind == model.KindRouterInterface {
 		routerInterfaceEntry, ok := current.resources[kind][id]
 		if ok {

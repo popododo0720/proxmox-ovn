@@ -1100,6 +1100,27 @@ func (s *Memory) firstReferenceLocked(kind model.Kind, id string) string {
 			}
 		}
 	}
+	if kind == model.KindProviderSegment {
+		segment, exists := s.resources[kind][id].(*model.ProviderSegment)
+		if exists {
+			providerResource, providerExists := s.resources[model.KindProviderNetwork][segment.ProviderNetworkID]
+			if providerExists && providerResource.(*model.ProviderNetwork).DefaultSegmentID == "" {
+				matching := 0
+				for _, resource := range s.resources[model.KindProviderSegment] {
+					if resource.(*model.ProviderSegment).ProviderNetworkID == segment.ProviderNetworkID {
+						matching++
+					}
+				}
+				if matching == 1 {
+					for networkID, resource := range s.resources[model.KindNetwork] {
+						if resource.(*model.Network).ProviderNetworkID == segment.ProviderNetworkID {
+							return fmt.Sprintf("%s %q", model.KindNetwork, networkID)
+						}
+					}
+				}
+			}
+		}
+	}
 	if kind == model.KindRouterInterface {
 		routerInterface, ok := s.resources[kind][id].(*model.RouterInterface)
 		if ok {
