@@ -13,6 +13,7 @@ trap cleanup 0 HUP INT TERM
 
 BIN=$WORK/bin
 MEMBERS=$WORK/members.json
+MEMBERS_GOOD=$WORK/members.good.json
 PVE_NODES=$WORK/nodes
 PVE_IDENTITY=$WORK/id_rsa
 LOCK=$WORK/pvn-topology.lock
@@ -38,6 +39,7 @@ cat > "$MEMBERS" <<'EOF'
   }
 }
 EOF
+cp "$MEMBERS" "$MEMBERS_GOOD"
 
 for node in prox1 prox2 prox3; do
     mkdir "$PVE_NODES/$node"
@@ -55,13 +57,13 @@ use warnings;
 sub cfs_update { return 1; }
 sub cfs_lock_domain {
     my ($domain, $timeout, $code) = @_;
-    die "unexpected topology lease domain\n" if $domain ne 'pvn-lease-topology';
+    die "unexpected topology lease domain\n" if $domain ne 'pvn-lease-mutation';
     return $code->();
 }
 1;
 EOF
 
-GLOBAL_LOCK=$LEASE_DIR/pvn-topology.lease
+GLOBAL_LOCK=$LEASE_DIR/pvn-mutation.lease
 
 cat > "$COROSYNC" <<'EOF'
 logging {
@@ -110,6 +112,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 
 
@@ -119,25 +122,52 @@ def stop(message):
 
 
 args = sys.argv[1:]
-remote_helper = sys.stdin.read()
-Path(os.environ["PVN_TEST_REMOTE_HELPER"]).write_text(remote_helper, encoding="utf-8")
+raw_request = sys.stdin.read()
 try:
     destination_index = next(i for i, value in enumerate(args) if value.startswith("root@"))
-    python_index = args.index("python3", destination_index)
-    if args[python_index + 1] != "-":
-        stop("missing remote stdin program")
-    action = args[python_index + 2]
-    request = json.loads(bytes.fromhex(args[python_index + 3]).decode())
+    if len(args) != destination_index + 2:
+        stop("remote request metadata escaped into SSH argv")
+    remote_command = args[destination_index + 1]
+    remote_argv = shlex.split(remote_command)
+    if len(remote_argv) != 4 or remote_argv[:2] != ["python3", "-c"]:
+        stop("missing quoted remote Python command")
+    remote_helper, action = remote_argv[2:]
+    if "lab-cluster" in remote_command:
+        stop("request sentinel leaked into SSH argv")
+    if len(raw_request.encode()) > 8 * 1024 * 1024:
+        stop("fake SSH received an unbounded request")
+    request = json.loads(raw_request)
+    if request.get("cluster_name") == "lab-cluster" and "lab-cluster" not in raw_request:
+        stop("request sentinel was not transported through stdin")
 except Exception as exc:
     stop("bad fake SSH invocation: %s" % exc)
+Path(os.environ["PVN_TEST_REMOTE_HELPER"]).write_text(remote_helper, encoding="utf-8")
 
 host = args[destination_index][5:]
 node = request.get("node")
 lease_held = Path(os.environ["PVN_TEST_GLOBAL_LOCK"]).is_file()
 with open(os.environ["PVN_TEST_LOG"], "a", encoding="utf-8") as stream:
-    stream.write("host=%s node=%s action=%s lease=%d options=%s\n" % (
+    stream.write("host=%s node=%s action=%s lease=%d transport=stdin argv_request=0 options=%s\n" % (
         host, node, action, lease_held, " ".join(args[:destination_index]),
     ))
+
+cleanup_actions = {
+    "restore-corosync", "rollback-network", "discard-stage", "restore-ledger",
+}
+members_path = Path(os.environ["PVN_TOPOLOGY_MEMBERS_FILE"])
+members = json.loads(members_path.read_text(encoding="utf-8"))
+actual_membership = {
+    "cluster_name": members["cluster"]["name"],
+    "members_version": members["version"],
+    "cluster_version": members["cluster"]["version"],
+    "nodes": sorted((
+        {"name": name, "node_id": entry["id"], "management_ip": entry["ip"]}
+        for name, entry in members["nodelist"].items()
+        if entry.get("online") in (1, True, "1")
+    ), key=lambda item: (item["node_id"], item["name"])),
+}
+if action not in cleanup_actions and request.get("membership_snapshot") != actual_membership:
+    stop("exact PVE membership snapshot changed during topology apply")
 
 if os.environ.get("PVN_TEST_PROBE_FAIL_HOST") == node and action == "probe":
     stop("simulated unsafe topology probe")
@@ -147,6 +177,8 @@ if os.environ.get("PVN_TEST_FAIL_LEDGER_WRITE") == "yes" and action == "write-le
     stop("simulated shared ledger write failure")
 if os.environ.get("PVN_TEST_FAIL_LEDGER_VERIFY_HOST") == node and action == "verify-ledger":
     stop("simulated shared ledger verification failure")
+if os.environ.get("PVN_TEST_FAIL_DISCARD_HOST") == node and action == "discard-stage":
+    stop("simulated pending cleanup failure")
 if (
     os.environ.get("PVN_TEST_FAIL_COMPLETE_PHASE_HOST") == node
     and action == "record-phase"
@@ -164,7 +196,8 @@ if action in mutating:
     if not global_lock.is_file():
         stop("cluster-global lock is not held during mutation")
     owner = json.loads(global_lock.read_text(encoding="utf-8"))
-    if owner.get("cluster") != "lab-cluster" or owner.get("node") != "prox1":
+    if owner.get("cluster") != "lab-cluster" or owner.get("node") != "prox1" or \
+            owner.get("domain") != "mutation":
         stop("cluster-global lock owner record is invalid")
     if not owner.get("token") or not owner.get("transaction"):
         stop("cluster-global lock owner record is incomplete")
@@ -194,6 +227,14 @@ if (
 
 def save():
     state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+
+
+def drift_membership():
+    current = json.loads(members_path.read_text(encoding="utf-8"))
+    current["version"] += 1
+    current["cluster"]["version"] += 1
+    current["nodelist"]["prox3"]["ip"] = "192.168.0.77"
+    members_path.write_text(json.dumps(current, sort_keys=True), encoding="utf-8")
 
 
 def sha(value):
@@ -254,7 +295,14 @@ def emit(**values):
 
 
 if action == "probe":
-    emit(report=report())
+    response = report()
+    if (
+        os.environ.get("PVN_TEST_DRIFT_BEFORE_LEDGER_HOST") == node
+        and len(state["nodes"]) == 3
+        and all(value["network"] == "desired" for value in state["nodes"].values())
+    ):
+        drift_membership()
+    emit(report=response)
 elif action == "prepare":
     node_state["journal"] = True
     node_state["phase"] = node_state["phase"] or "prepared"
@@ -303,6 +351,10 @@ elif action == "stage-network":
         node_state["staged"] = True
         node_state["phase"] = "network-staged"
         save()
+        if os.environ.get("PVN_TEST_DRIFT_AFTER_STAGE_HOST") == node:
+            drift_membership()
+        if os.environ.get("PVN_TEST_FAIL_STAGE_RESPONSE_HOST") == node:
+            stop("simulated lost response after remote network staging")
         emit(noop=False, desired_interfaces_sha256=sha("interfaces-%s-desired" % node))
 elif action == "apply-network":
     if not node_state["staged"]:
@@ -385,6 +437,7 @@ fail() {
 
 reset_state() {
     rm -f "$STATE" "$LOCK" "$GLOBAL_LOCK"
+    cp "$MEMBERS_GOOD" "$MEMBERS"
     : > "$LOG"
 }
 
@@ -402,6 +455,8 @@ reset_state
 [ ! -e "$LOCK" ] || fail "read-only plan created a lock/journal artifact"
 [ ! -e "$GLOBAL_LOCK" ] || fail "read-only plan created a cluster-global lock"
 [ "$(grep -c 'action=probe' "$LOG")" -eq 3 ] || fail "plan did not probe all online members"
+[ "$(grep -c 'transport=stdin argv_request=0' "$LOG")" -eq 3 ] ||
+    fail "remote requests were not carried exclusively through stdin"
 assert_no_mutation
 grep -q 'guest-mtu=1300 ceiling=1342' "$WORK/plan.out" || fail "safe default guest MTU is wrong"
 grep -q 'live-mtu=1442 hardware-max-mtu=65535' "$WORK/plan.out" ||
@@ -414,6 +469,11 @@ grep -Fq 'rename($pending, $interfaces)' "$REMOTE_HELPER" ||
     fail "network apply is not an atomic owned-candidate rename"
 grep -Fq "cfs_lock_file('corosync.conf', 10" "$REMOTE_HELPER" ||
     fail "Corosync CAS does not use its native pmxcfs file lock"
+grep -Fq 'sys.stdin.buffer.read(REMOTE_REQUEST_LIMIT + 1)' "$REMOTE_HELPER" ||
+    fail "remote request stdin is not bounded"
+if grep -Fq 'sys.argv[2]' "$REMOTE_HELPER" || grep -Fq 'bytes.fromhex' "$REMOTE_HELPER"; then
+    fail "remote request metadata is still decoded from process argv"
+fi
 if grep -Fq 'pvesh("delete", "/nodes/%s/network"' "$REMOTE_HELPER"; then
     fail "remote helper still has broad pending-network deletion"
 fi
@@ -479,7 +539,7 @@ fi
 assert_no_mutation
 
 reset_state
-printf '%s\n' '{"cluster":"other","domain":"topology","node":"prox3","pid":123,"started":1,"transaction":"other","token":"abcdef0123456789abcdef0123456789abcdef0123456789"}' \
+printf '%s\n' '{"cluster":"other","domain":"mutation","node":"prox3","pid":123,"started":1,"transaction":"other","token":"abcdef0123456789abcdef0123456789abcdef0123456789"}' \
     > "$GLOBAL_LOCK"
 chmod 0600 "$GLOBAL_LOCK"
 stale_hash=$(sha256sum "$GLOBAL_LOCK" | awk '{print $1}')
@@ -569,6 +629,100 @@ grep -q 'action=restore-corosync' "$LOG" || fail "post-write Corosync failure wa
 if grep -Eq 'action=(stage-network|apply-network|write-ledger)' "$LOG"; then
     fail "network/ledger mutation ran after failed Corosync migration"
 fi
+
+reset_state
+if PVN_TEST_FAIL_STAGE_RESPONSE_HOST=prox2 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/stage-response-loss.out" 2>&1
+then
+    fail "lost stage response unexpectedly succeeded"
+fi
+grep -q 'node=prox2 action=stage-network' "$LOG" ||
+    fail "stage response-loss injection did not run"
+for node in prox1 prox2 prox3; do
+    grep -q "node=$node action=discard-stage" "$LOG" ||
+        fail "prepared node $node was not included in pending cleanup sweep"
+done
+if grep -q 'action=apply-network' "$LOG"; then
+    fail "network apply ran after the lost stage response"
+fi
+grep -q 'all transaction-owned network changes were rolled back' "$WORK/stage-response-loss.out" ||
+    fail "successful response-loss cleanup was not reported"
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert all(not value["staged"] for value in state["nodes"].values())
+assert all(value["network"] == "initial" for value in state["nodes"].values())
+assert state["ledger"] is None
+PY
+
+reset_state
+if PVN_TEST_FAIL_STAGE_RESPONSE_HOST=prox2 PVN_TEST_FAIL_DISCARD_HOST=prox2 \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/stage-cleanup-fail.out" 2>&1
+then
+    fail "lost stage response with failed cleanup unexpectedly succeeded"
+fi
+grep -q 'transaction rollback was incomplete' "$WORK/stage-cleanup-fail.out" ||
+    fail "failed pending cleanup was falsely reported as a complete rollback"
+if grep -q 'all transaction-owned network changes were rolled back' "$WORK/stage-cleanup-fail.out"; then
+    fail "incomplete pending cleanup printed the complete rollback message"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state["nodes"]["prox2"]["staged"] is True
+assert all(value["network"] == "initial" for value in state["nodes"].values())
+PY
+
+reset_state
+if PVN_TEST_DRIFT_AFTER_STAGE_HOST=prox2 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/membership-stage-drift.out" 2>&1
+then
+    fail "membership drift after network staging unexpectedly succeeded"
+fi
+grep -q 'PVE membership changed before network staging' "$WORK/membership-stage-drift.out" ||
+    fail "staging membership drift did not fail closed at the next mutation boundary"
+[ "$(grep -c 'action=stage-network' "$LOG")" -eq 1 ] ||
+    fail "another network candidate was staged after membership drift"
+for node in prox1 prox2 prox3; do
+    grep -q "node=$node action=discard-stage" "$LOG" ||
+        fail "membership drift did not sweep prepared node $node"
+done
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert all(not value["staged"] for value in state["nodes"].values())
+assert all(value["network"] == "initial" for value in state["nodes"].values())
+assert state["ledger"] is None
+PY
+
+reset_state
+if PVN_TEST_DRIFT_BEFORE_LEDGER_HOST=prox3 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/membership-ledger-drift.out" 2>&1
+then
+    fail "membership drift before ledger publication unexpectedly succeeded"
+fi
+grep -q 'PVE membership changed before final ledger publication' \
+    "$WORK/membership-ledger-drift.out" ||
+    fail "final membership drift did not stop ledger publication"
+if grep -q 'action=write-ledger' "$LOG"; then
+    fail "topology ledger was published after final membership drift"
+fi
+[ "$(grep -c 'action=rollback-network' "$LOG")" -eq 3 ] ||
+    fail "final membership drift did not roll back every applied network"
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert all(value["network"] == "initial" for value in state["nodes"].values())
+assert state["ledger"] is None
+PY
 
 reset_state
 if PVN_TEST_FAIL_VERIFY_HOST=prox1 "$TOPOLOGY" apply \

@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import stat
 import subprocess
 import sys
@@ -33,11 +34,12 @@ PVE_IDENTITY_FILE = Path(
 )
 LOCK_FILE = Path(os.environ.get("PVN_TOPOLOGY_LOCK_FILE", "/run/lock/pvn-topology.lock"))
 LEASE_BIN = os.environ.get("PVN_TOPOLOGY_LEASE_BIN", "/usr/lib/pvn/pvn-cluster-lease")
-LEASE_DOMAIN = "topology"
+LEASE_DOMAIN = "mutation"
 SSH_BIN = os.environ.get("PVN_TOPOLOGY_SSH_BIN", "ssh")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 PROVIDER_ACK = "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP"
+REMOTE_REQUEST_LIMIT = 8 * 1024 * 1024
 
 
 class TopologyError(RuntimeError):
@@ -83,7 +85,7 @@ def parse_cidr(value: str, option: str) -> ipaddress.IPv4Network:
     return network
 
 
-def discover_members() -> tuple[str, str, list[dict[str, Any]]]:
+def discover_members() -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
     try:
         data = json.loads(read_limited(MEMBERS_FILE, 1024 * 1024))
     except json.JSONDecodeError as exc:
@@ -100,6 +102,12 @@ def discover_members() -> tuple[str, str, list[dict[str, Any]]]:
         fail("PVE cluster name is empty or unsafe")
     if cluster.get("quorate") not in (1, True, "1"):
         fail("PVE cluster is not quorate")
+    members_version = data.get("version")
+    cluster_version = cluster.get("version")
+    if type(members_version) is not int or members_version < 0:
+        fail("PVE membership version is invalid")
+    if type(cluster_version) is not int or cluster_version < 0:
+        fail("PVE cluster membership version is invalid")
     declared = cluster.get("nodes")
     if not isinstance(declared, int) or declared != len(nodelist):
         fail("PVE cluster node count does not match /etc/pve/.members")
@@ -142,7 +150,22 @@ def discover_members() -> tuple[str, str, list[dict[str, Any]]]:
     if len(nodes) != declared:
         fail("not every declared PVE member is online")
     nodes.sort(key=lambda item: (item["id"], item["name"]))
-    return cluster_name, local_name, nodes
+    membership_snapshot = {
+        "cluster_name": cluster_name,
+        "members_version": members_version,
+        "cluster_version": cluster_version,
+        "nodes": [
+            {"name": node["name"], "node_id": node["id"], "management_ip": node["ip"]}
+            for node in nodes
+        ],
+    }
+    return cluster_name, local_name, nodes, membership_snapshot
+
+
+def assert_membership_unchanged(expected: dict[str, Any], context: str) -> None:
+    _cluster_name, _local_name, _nodes, current = discover_members()
+    if current != expected:
+        fail(f"PVE membership changed {context}; refusing further topology mutation")
 
 
 def validate_ssh_files(nodes: list[dict[str, Any]]) -> None:
@@ -200,6 +223,7 @@ LEDGER_FILE = LEDGER_DIR / "topology.json"
 MARKERS = (Path("/etc/pvn/node-enabled"), Path("/etc/pvn/central/enabled"))
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+REMOTE_REQUEST_LIMIT = 8 * 1024 * 1024
 
 
 class RemoteFailure(RuntimeError):
@@ -504,6 +528,59 @@ def read_regular(path, limit=4 * 1024 * 1024, root_only=True):
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         abort("cannot read %s: %s" % (path, exc))
+
+
+def verify_membership_snapshot(expected):
+    if not isinstance(expected, dict):
+        abort("expected PVE membership snapshot is missing")
+    try:
+        data = json.loads(read_regular(Path("/etc/pve/.members"), 1024 * 1024))
+    except json.JSONDecodeError as exc:
+        abort("invalid /etc/pve/.members: %s" % exc)
+    cluster = data.get("cluster") if isinstance(data, dict) else None
+    nodelist = data.get("nodelist") if isinstance(data, dict) else None
+    if not isinstance(cluster, dict) or not isinstance(nodelist, dict) or not nodelist:
+        abort("/etc/pve/.members does not describe a PVE cluster")
+    if cluster.get("quorate") not in (1, True, "1"):
+        abort("PVE cluster is not quorate")
+    members_version = data.get("version")
+    cluster_version = cluster.get("version")
+    if type(members_version) is not int or members_version < 0:
+        abort("PVE membership version is invalid")
+    if type(cluster_version) is not int or cluster_version < 0:
+        abort("PVE cluster membership version is invalid")
+    declared = cluster.get("nodes")
+    if type(declared) is not int or declared != len(nodelist):
+        abort("PVE cluster node count differs from membership")
+    nodes = []
+    seen_ids = set()
+    seen_ips = set()
+    for name, entry in nodelist.items():
+        if not isinstance(name, str) or not SAFE_NAME.fullmatch(name) or not isinstance(entry, dict):
+            abort("PVE membership contains an unsafe node")
+        if entry.get("online") not in (1, True, "1"):
+            abort("PVE membership contains an offline node")
+        node_id = entry.get("id")
+        if type(node_id) is not int or node_id <= 0 or node_id in seen_ids:
+            abort("PVE membership contains an invalid or duplicate node ID")
+        try:
+            address = ipaddress.ip_address(entry.get("ip"))
+        except ValueError:
+            abort("PVE membership contains an invalid management IP")
+        if not isinstance(address, ipaddress.IPv4Address) or str(address) in seen_ips:
+            abort("PVE membership contains a non-IPv4 or duplicate management IP")
+        seen_ids.add(node_id)
+        seen_ips.add(str(address))
+        nodes.append({"name": name, "node_id": node_id, "management_ip": str(address)})
+    nodes.sort(key=lambda item: (item["node_id"], item["name"]))
+    actual = {
+        "cluster_name": cluster.get("name"),
+        "members_version": members_version,
+        "cluster_version": cluster_version,
+        "nodes": nodes,
+    }
+    if actual != expected:
+        abort("exact PVE membership snapshot changed during topology apply")
 
 
 def sha_text(value):
@@ -1363,15 +1440,23 @@ def restore_ledger(request):
 def main():
     if os.geteuid() != 0:
         abort("remote helper must run as root")
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 2:
         abort("invalid remote helper invocation")
     action = sys.argv[1]
     try:
-        request = json.loads(bytes.fromhex(sys.argv[2]).decode())
+        raw_request = sys.stdin.buffer.read(REMOTE_REQUEST_LIMIT + 1)
+        if len(raw_request) > REMOTE_REQUEST_LIMIT:
+            abort("remote request exceeds the bounded input limit")
+        request = json.loads(raw_request.decode("utf-8"))
     except Exception as exc:
         abort("invalid request: %s" % exc)
     if not isinstance(request, dict):
         abort("request must be an object")
+    cleanup_actions = {
+        "restore-corosync", "rollback-network", "discard-stage", "restore-ledger",
+    }
+    if action not in cleanup_actions:
+        verify_membership_snapshot(request.get("membership_snapshot"))
     handlers = {
         "probe": lambda: emit(report=build_probe(request)),
         "prepare": lambda: prepare(request),
@@ -1404,7 +1489,10 @@ except RemoteFailure as exc:
 
 
 def ssh_request(node: dict[str, Any], action: str, request: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
-    encoded = canonical_json(request).encode().hex()
+    payload = canonical_json(request)
+    if len(payload.encode("utf-8")) > REMOTE_REQUEST_LIMIT:
+        fail(f"{node['name']} {action} request exceeds the bounded input limit")
+    remote_command = "python3 -c %s %s" % (shlex.quote(REMOTE_HELPER), shlex.quote(action))
     argv = [
         SSH_BIN,
         "-F", "/dev/null",
@@ -1426,11 +1514,11 @@ def ssh_request(node: dict[str, Any], action: str, request: dict[str, Any], time
         "-o", f"HostKeyAlias={node['name']}",
         "-o", "ConnectTimeout=10",
         "-o", "ConnectionAttempts=1",
-        "--", f"root@{node['ip']}", "python3", "-", action, encoded,
+        "--", f"root@{node['ip']}", remote_command,
     ]
     try:
         result = subprocess.run(
-            argv, input=REMOTE_HELPER, text=True, stdout=subprocess.PIPE,
+            argv, input=payload, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, timeout=timeout, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1451,7 +1539,12 @@ def ssh_request(node: dict[str, Any], action: str, request: dict[str, Any], time
 
 
 def common_request(
-    node: dict[str, Any], cluster_name: str, nodes: list[dict[str, Any]], spec: dict[str, Any], transaction: str
+    node: dict[str, Any],
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    spec: dict[str, Any],
+    transaction: str,
+    membership_snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "cluster_name": cluster_name,
@@ -1460,6 +1553,7 @@ def common_request(
         "management_ip": node["ip"],
         "spec": spec,
         "transaction": transaction,
+        "membership_snapshot": membership_snapshot,
     }
 
 
@@ -1652,12 +1746,18 @@ def build_plan(
 
 
 def probe_all(
-    cluster_name: str, nodes: list[dict[str, Any]], spec: dict[str, Any], transaction: str
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    spec: dict[str, Any],
+    transaction: str,
+    membership_snapshot: dict[str, Any],
 ) -> list[dict[str, Any]]:
     reports = []
     for node in nodes:
         print(f"[{node['name']}] read-only topology probe")
-        request = common_request(node, cluster_name, nodes, spec, transaction)
+        request = common_request(
+            node, cluster_name, nodes, spec, transaction, membership_snapshot
+        )
         response = ssh_request(node, "probe", request)
         reports.append(validate_report(response.get("report"), node, spec))
     return reports
@@ -1790,12 +1890,16 @@ def apply_topology(
     transaction: str,
     reports: list[dict[str, Any]],
     plan: dict[str, Any],
+    membership_guard: dict[str, Any],
 ) -> None:
     base = {
-        node["name"]: common_request(node, cluster_name, nodes, spec, transaction)
+        node["name"]: common_request(
+            node, cluster_name, nodes, spec, transaction, membership_guard
+        )
         for node in nodes
     }
     for node, report in zip(nodes, reports):
+        assert_membership_unchanged(membership_guard, "before journal preparation")
         request = dict(base[node["name"]])
         request["expected"] = {
             "interfaces_sha256": report["interfaces_sha256"],
@@ -1828,6 +1932,7 @@ def apply_topology(
         request.update(validate_request)
         print(f"[{coordinator['name']}] migrate Corosync ring{migration['ring']} to management")
         try:
+            assert_membership_unchanged(membership_guard, "before Corosync migration")
             ssh_request(coordinator, "apply-corosync", request)
             verify = {
                 "allowed_corosync_sha256": [migration["candidate_sha256"]],
@@ -1896,7 +2001,7 @@ def apply_topology(
             request["phase"] = "corosync-migrated"
             ssh_request(node, "record-phase", request)
 
-    reports = probe_all(cluster_name, nodes, spec, transaction)
+    reports = probe_all(cluster_name, nodes, spec, transaction, membership_guard)
     requests: dict[str, dict[str, Any]] = {}
     for node, report in zip(nodes, reports):
         request = dict(base[node["name"]])
@@ -1907,7 +2012,7 @@ def apply_topology(
         })
         requests[node["name"]] = request
 
-    staged: list[dict[str, Any]] = []
+    prepared_nodes = list(nodes)
     rollback_nodes: list[dict[str, Any]] = [
         node
         for node, report in zip(nodes, reports)
@@ -1928,13 +2033,16 @@ def apply_topology(
                 )
             except TopologyError as rollback_error:
                 rollback_errors.append(f"{changed_node['name']}: {rollback_error}")
-        for staged_node in reversed(staged):
-            if staged_node["name"] in rollback_names:
+        for prepared_node in reversed(prepared_nodes):
+            if prepared_node["name"] in rollback_names:
                 continue
             try:
-                ssh_request(staged_node, "discard-stage", requests[staged_node["name"]])
+                print(f"[{prepared_node['name']}] discard transaction-owned pending network state")
+                ssh_request(
+                    prepared_node, "discard-stage", requests[prepared_node["name"]]
+                )
             except TopologyError as discard_error:
-                rollback_errors.append(f"{staged_node['name']} pending: {discard_error}")
+                rollback_errors.append(f"{prepared_node['name']} pending: {discard_error}")
         if rollback_errors:
             fail(f"{error}; transaction rollback was incomplete: {'; '.join(rollback_errors)}")
         fail(f"{error}; all transaction-owned network changes were rolled back")
@@ -1943,9 +2051,9 @@ def apply_topology(
         for node, report in zip(nodes, reports):
             if report["network_state"] == "desired":
                 continue
+            assert_membership_unchanged(membership_guard, "before network staging")
             print(f"[{node['name']}] stage and validate PVE network API candidate")
             ssh_request(node, "stage-network", requests[node["name"]])
-            staged.append(node)
 
         for index, node in enumerate(nodes):
             report = reports[index]
@@ -1957,6 +2065,7 @@ def apply_topology(
                 # Include the current node before apply: a lost SSH response can
                 # mean the atomic rename happened even though the caller saw a failure.
                 rollback_nodes.append(node)
+            assert_membership_unchanged(membership_guard, "before network apply")
             print(f"[{node['name']}] atomically apply staged network and run ifreload")
             ssh_request(node, "apply-network", request, timeout=150)
             verify_request = dict(request)
@@ -1965,7 +2074,9 @@ def apply_topology(
                 for other in reports if other["node"] != node["name"]
             ]
             ssh_request(node, "verify-network", verify_request, timeout=60)
-        final_reports = probe_all(cluster_name, nodes, spec, transaction)
+        final_reports = probe_all(
+            cluster_name, nodes, spec, transaction, membership_guard
+        )
         incomplete = [report["node"] for report in final_reports if report["network_state"] != "desired"]
         if incomplete:
             fail("final exact-state sweep failed on: " + ", ".join(incomplete))
@@ -1977,7 +2088,7 @@ def apply_topology(
         if len(existing_ledger_states) != 1:
             fail("nodes do not expose one identical shared topology ledger state")
         previous_ledger_sha, previous_ledger_text = next(iter(existing_ledger_states))
-        membership_snapshot = {
+        ledger_membership_snapshot = {
             "cluster_name": cluster_name,
             "nodes": [
                 {"name": node["name"], "node_id": node["id"], "management_ip": node["ip"]}
@@ -1988,8 +2099,8 @@ def apply_topology(
             "schema": 1,
             "phase": "complete",
             "cluster_name": cluster_name,
-            "membership_snapshot": membership_snapshot,
-            "membership_hash": digest_text(canonical_json(membership_snapshot)),
+            "membership_snapshot": ledger_membership_snapshot,
+            "membership_hash": digest_text(canonical_json(ledger_membership_snapshot)),
             "nodes": [
                 {
                     "name": node["name"],
@@ -2029,6 +2140,7 @@ def apply_topology(
             "failed_ledger_sha256": ledger_sha,
         })
         print(f"[{coordinator['name']}] atomically publish root-private shared topology ledger")
+        assert_membership_unchanged(membership_guard, "before final ledger publication")
         ledger_write_attempted = True
         ssh_request(coordinator, "write-ledger", ledger_request)
         for node in nodes:
@@ -2077,7 +2189,7 @@ def main() -> int:
     provider = parse_cidr(args.provider_cidr, "--provider-cidr")
     if geneve.overlaps(provider):
         fail("Geneve and provider CIDRs must not overlap")
-    cluster_name, local_name, nodes = discover_members()
+    cluster_name, local_name, nodes, membership_snapshot = discover_members()
     if args.operation == "apply":
         if args.provider_port_ready != PROVIDER_ACK:
             fail(f"apply requires --provider-port-ready {PROVIDER_ACK}")
@@ -2104,7 +2216,10 @@ def main() -> int:
             lock_fd = None
             raise
     try:
-        reports = probe_all(cluster_name, nodes, spec, transaction)
+        assert_membership_unchanged(membership_snapshot, "before topology probing")
+        reports = probe_all(
+            cluster_name, nodes, spec, transaction, membership_snapshot
+        )
         plan = build_plan(cluster_name, nodes, reports, spec)
         guest_mtu = args.guest_mtu if args.guest_mtu is not None else plan["default_guest_mtu"]
         if guest_mtu < 1280 or guest_mtu > plan["guest_mtu_ceiling"]:
@@ -2124,9 +2239,14 @@ def main() -> int:
             return 0
         # Re-probe with the final transaction/spec so existing journals are
         # accepted only for the exact guest-MTU-aware request.
-        reports = probe_all(cluster_name, nodes, spec, transaction)
+        assert_membership_unchanged(membership_snapshot, "before topology mutation")
+        reports = probe_all(
+            cluster_name, nodes, spec, transaction, membership_snapshot
+        )
         plan = build_plan(cluster_name, nodes, reports, spec)
-        apply_topology(cluster_name, nodes, spec, transaction, reports, plan)
+        apply_topology(
+            cluster_name, nodes, spec, transaction, reports, plan, membership_snapshot
+        )
         return 0
     finally:
         if global_lock_token is not None:
