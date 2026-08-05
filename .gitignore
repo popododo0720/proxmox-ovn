@@ -1,0 +1,12 @@
+/bin/
+/dist/
+/coverage/
+/web/node_modules/
+/web/dist/
+*.deb
+*.buildinfo
+*.changes
+*.dsc
+*.tar.*
+.env
+
