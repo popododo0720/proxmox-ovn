@@ -96,7 +96,7 @@ func TestClientProbeUsesConfiguredClusterAndWaitsForSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(runner.arguments, " ")
-	if !strings.Contains(joined, "--no-syslog --verbose=console:warn") ||
+	if !strings.Contains(joined, "--no-syslog --verbose=syslog:warn --verbose=console:warn") ||
 		!strings.Contains(joined, "--db=unix:/run/ovn/ovnnb_db.sock") ||
 		!strings.Contains(joined, "--wait=sb") || !strings.Contains(joined, "list NB_Global") {
 		t.Fatalf("probe arguments = %v", runner.arguments)
