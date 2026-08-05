@@ -93,6 +93,9 @@ func (s *Memory) Create(ctx context.Context, resource model.Resource, key string
 	if operation, ok := copyResource.(*model.Operation); ok && operation.IdempotencyKey == "" {
 		operation.IdempotencyKey = key
 	}
+	if operation, ok := copyResource.(*model.Operation); ok && operation.Action == "reconcile" && operation.OperationStatus != "" && operation.OperationStatus != model.OperationQueued {
+		return nil, false, storeError(ErrConflict, "reconcile operations must be created in queued state")
+	}
 	meta := copyResource.GetMetadata()
 	if meta.ID == "" {
 		meta.ID = s.newID()
@@ -200,6 +203,9 @@ func (s *Memory) Update(ctx context.Context, resource model.Resource, expectedRe
 		return nil, false, err
 	}
 	model.SetDefaults(copyResource)
+	if operation, ok := copyResource.(*model.Operation); ok && operation.Action == "reconcile" && operation.OperationStatus == model.OperationRunning {
+		return nil, false, storeError(ErrConflict, "reconcile operations must be started with ClaimReconcile")
+	}
 	if err := copyResource.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -237,6 +243,102 @@ func (s *Memory) Update(ctx context.Context, resource model.Resource, expectedRe
 	}
 	s.rememberLocked(scope, fingerprint, result, false)
 	return result, false, nil
+}
+
+// ClaimReconcile is the only supported queued/failed/succeeded-to-running
+// transition for reconcile operations. The operation claim and desired-state
+// revision check share one critical section so a tombstone can never race
+// between them.
+func (s *Memory) ClaimReconcile(ctx context.Context, operationID string, expectedRevision int64, startedAt, leaseCutoff time.Time) (*model.Operation, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	storedResource, exists := s.resources[model.KindOperation][operationID]
+	if !exists {
+		return nil, storeError(ErrNotFound, "operation %q was not found", operationID)
+	}
+	stored := storedResource.(*model.Operation)
+	if expectedRevision < 1 || stored.Revision != expectedRevision {
+		return nil, storeError(ErrPrecondition, "expected operation revision %d but current revision is %d", expectedRevision, stored.Revision)
+	}
+	if stored.Action != "reconcile" {
+		return nil, storeError(ErrConflict, "operation %q is not a reconcile operation", operationID)
+	}
+	if stored.OperationStatus == model.OperationRunning && reconcileLeaseIsLive(stored, leaseCutoff) {
+		return nil, storeError(ErrConflict, "reconcile operation %q still holds a live lease", operationID)
+	}
+	target, exists := s.resources[stored.TargetKind][stored.TargetID]
+	if !exists {
+		return nil, storeError(ErrPrecondition, "%s %q no longer exists", stored.TargetKind, stored.TargetID)
+	}
+	targetMeta := target.GetMetadata()
+	if targetMeta.Revision != stored.TargetRevision || targetMeta.State == model.ResourceDeleting {
+		return nil, storeError(ErrPrecondition, "reconcile target %s %q is not at active revision %d", stored.TargetKind, stored.TargetID, stored.TargetRevision)
+	}
+	claimedResource, err := model.Clone(stored)
+	if err != nil {
+		return nil, err
+	}
+	claimed := claimedResource.(*model.Operation)
+	claimed.OperationStatus = model.OperationRunning
+	started := startedAt.UTC()
+	claimed.StartedAt = &started
+	claimed.CompletedAt = nil
+	claimed.Error = ""
+	claimed.Revision++
+	claimed.State = model.ResourcePending
+	claimed.LastError = ""
+	claimed.UpdatedAt = started
+	s.resources[model.KindOperation][operationID] = claimed
+	result, err := model.Clone(claimed)
+	if err != nil {
+		return nil, err
+	}
+	return result.(*model.Operation), nil
+}
+
+// FenceReconciles expires abandoned reconcile claims for a deleting target and
+// reports whether a live claim still protects it. Both the inspection and all
+// expired-operation updates are atomic with respect to ClaimReconcile/Purge.
+func (s *Memory) FenceReconciles(ctx context.Context, kind model.Kind, id string, leaseCutoff, recoveredAt time.Time) (bool, bool, error) {
+	if err := contextError(ctx); err != nil {
+		return false, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active, recovered := false, false
+	for operationID, resource := range s.resources[model.KindOperation] {
+		operation := resource.(*model.Operation)
+		if operation.Action != "reconcile" || operation.TargetKind != kind || operation.TargetID != id || operation.OperationStatus != model.OperationRunning {
+			continue
+		}
+		if reconcileLeaseIsLive(operation, leaseCutoff) {
+			active = true
+			continue
+		}
+		copyResource, err := model.Clone(operation)
+		if err != nil {
+			return false, false, err
+		}
+		recoveredOperation := copyResource.(*model.Operation)
+		recoveredOperation.OperationStatus = model.OperationFailed
+		recoveredOperation.Error = "reconcile lease expired while target was deleting"
+		completed := recoveredAt.UTC()
+		recoveredOperation.CompletedAt = &completed
+		recoveredOperation.Revision++
+		recoveredOperation.State = model.ResourcePending
+		recoveredOperation.LastError = ""
+		recoveredOperation.UpdatedAt = completed
+		s.resources[model.KindOperation][operationID] = recoveredOperation
+		recovered = true
+	}
+	return active, recovered, nil
+}
+
+func reconcileLeaseIsLive(operation *model.Operation, leaseCutoff time.Time) bool {
+	return operation != nil && operation.StartedAt != nil && operation.StartedAt.UTC().After(leaseCutoff.UTC())
 }
 
 func (s *Memory) Delete(ctx context.Context, kind model.Kind, id string, expectedRevision int64, key string) (bool, error) {
@@ -305,6 +407,12 @@ func (s *Memory) Purge(ctx context.Context, kind model.Kind, id string, deletion
 	}
 	if meta.State != model.ResourceDeleting && meta.State != model.ResourceError {
 		return storeError(ErrConflict, "%s %q is not marked for deletion", kind, id)
+	}
+	for _, resource := range s.resources[model.KindOperation] {
+		operation := resource.(*model.Operation)
+		if operation.Action == "reconcile" && operation.TargetKind == kind && operation.TargetID == id && operation.OperationStatus == model.OperationRunning {
+			return storeError(ErrConflict, "%s %q is protected by running reconcile operation %q", kind, id, operation.ID)
+		}
 	}
 	delete(s.resources[kind], id)
 	return nil

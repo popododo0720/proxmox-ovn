@@ -25,6 +25,11 @@ type Controller struct {
 	locks    map[string]*sync.Mutex
 }
 
+// ErrReconcileLeaseActive means deletion was durably recorded but cleanup must
+// wait for a manager that is still allowed to write the target's realized
+// state. Callers must leave the tombstone in place and retry later.
+var ErrReconcileLeaseActive = errors.New("target has an active reconcile lease")
+
 const (
 	operationLease       = 2 * time.Minute
 	maxConvergencePasses = 8
@@ -58,6 +63,9 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 		// keeps periodic reconciliation from rendering tombstones.
 		lock.Unlock()
 		if err := c.Delete(ctx, resource); err != nil {
+			if errors.Is(err, ErrReconcileLeaseActive) {
+				return nil
+			}
 			return err
 		}
 		if err := c.store.Purge(ctx, kind, id, meta.Revision); err != nil && !errors.Is(err, controlstore.ErrNotFound) {
@@ -94,22 +102,17 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 		_, markErr := c.store.MarkReconciled(ctx, kind, id, meta.Revision, nil)
 		return markErr
 	}
-	if op.OperationStatus == model.OperationRunning && operationIsLeased(op, time.Now().UTC()) {
-		return nil
-	}
-
 	now := time.Now().UTC()
-	op.OperationStatus = model.OperationRunning
-	op.StartedAt = &now
-	updated, _, updateErr := c.store.Update(ctx, op, op.Revision, "")
-	if updateErr != nil {
-		if errors.Is(updateErr, controlstore.ErrPrecondition) {
-			// Another manager won the durable operation claim.
+	claimed, claimErr := c.store.ClaimReconcile(ctx, op.ID, op.Revision, now, now.Add(-operationLease))
+	if claimErr != nil {
+		if errors.Is(claimErr, controlstore.ErrPrecondition) || errors.Is(claimErr, controlstore.ErrConflict) || errors.Is(claimErr, controlstore.ErrNotFound) {
+			// Another manager won the claim, or the exact desired revision
+			// stopped being active before this manager could start writing.
 			return nil
 		}
-		return fmt.Errorf("start reconcile operation: %w", updateErr)
+		return fmt.Errorf("claim reconcile operation: %w", claimErr)
 	}
-	op = updated.(*model.Operation)
+	op = claimed
 
 	renderErr, markErr := c.renderUntilStable(ctx, resource)
 	completed := time.Now().UTC()
@@ -200,13 +203,6 @@ func (c *Controller) renderUntilStable(ctx context.Context, initial model.Resour
 	return err, markErr
 }
 
-func operationIsLeased(operation *model.Operation, now time.Time) bool {
-	if operation == nil || operation.StartedAt == nil {
-		return false
-	}
-	return now.Sub(operation.StartedAt.UTC()) < operationLease
-}
-
 var dependencyOrder = []model.Kind{
 	model.KindProject,
 	model.KindProviderNetwork,
@@ -236,6 +232,14 @@ func (c *Controller) Delete(ctx context.Context, resource model.Resource) error 
 	lock := c.resourceLock(kind, id)
 	lock.Lock()
 	defer lock.Unlock()
+	now := time.Now().UTC()
+	active, recovered, err := c.store.FenceReconciles(ctx, kind, id, now.Add(-operationLease), now)
+	if err != nil {
+		return fmt.Errorf("fence reconcile operations for deleting %s %q: %w", kind, id, err)
+	}
+	if active {
+		return fmt.Errorf("%w for %s %q", ErrReconcileLeaseActive, kind, id)
+	}
 
 	operation := &model.Operation{Action: "delete", TargetKind: kind, TargetID: id, TargetRevision: revision, OperationStatus: model.OperationQueued, IdempotencyKey: deleteOperationKey(kind, id, revision)}
 	created, replayed, err := c.store.Create(ctx, operation, operation.IdempotencyKey)
@@ -249,11 +253,11 @@ func (c *Controller) Delete(ctx context.Context, resource model.Resource) error 
 			return fmt.Errorf("load delete operation: %w", getErr)
 		}
 		op = latest.(*model.Operation)
-		if op.OperationStatus == model.OperationSucceeded {
+		if op.OperationStatus == model.OperationSucceeded && !recovered {
 			return nil
 		}
 	}
-	now := time.Now().UTC()
+	now = time.Now().UTC()
 	op.OperationStatus, op.StartedAt, op.CompletedAt, op.Error = model.OperationRunning, &now, nil, ""
 	updated, _, err := c.store.Update(ctx, op, op.Revision, "")
 	if err != nil {
@@ -265,7 +269,6 @@ func (c *Controller) Delete(ctx context.Context, resource model.Resource) error 
 	op.CompletedAt = &completed
 	if renderErr != nil {
 		op.OperationStatus, op.Error = model.OperationFailed, renderErr.Error()
-		_, _ = c.store.MarkReconciled(ctx, kind, id, revision, renderErr)
 	} else {
 		op.OperationStatus, op.Error = model.OperationSucceeded, ""
 	}

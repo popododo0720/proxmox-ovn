@@ -311,3 +311,121 @@ func TestMemoryDeleteTombstoneMustBePurged(t *testing.T) {
 		t.Fatalf("tombstone replay=%#v replayed=%v err=%v", replayedTombstone, replayed, err)
 	}
 }
+
+func TestMemoryReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
+	store := deterministicStore()
+	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool"}, "create-fenced-project").(*model.Project)
+	operation := mustCreate(t, store, &model.Operation{
+		Action:          "reconcile",
+		TargetKind:      model.KindProject,
+		TargetID:        project.ID,
+		TargetRevision:  project.Revision,
+		OperationStatus: model.OperationQueued,
+	}, "reconcile-fenced-project").(*model.Operation)
+	started := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
+	claimed, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, started, started.Add(-2*time.Minute))
+	if err != nil || claimed.OperationStatus != model.OperationRunning || claimed.StartedAt == nil || !claimed.StartedAt.Equal(started) {
+		t.Fatalf("ClaimReconcile() operation=%#v err=%v", claimed, err)
+	}
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-fenced-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Purge() error=%v, want reconcile fence", err)
+	}
+	active, recovered, err := store.FenceReconciles(context.Background(), model.KindProject, project.ID, started.Add(-time.Minute), started.Add(time.Minute))
+	if err != nil || !active || recovered {
+		t.Fatalf("live FenceReconciles() active=%v recovered=%v err=%v", active, recovered, err)
+	}
+	active, recovered, err = store.FenceReconciles(context.Background(), model.KindProject, project.ID, started.Add(time.Second), started.Add(3*time.Minute))
+	if err != nil || active || !recovered {
+		t.Fatalf("expired FenceReconciles() active=%v recovered=%v err=%v", active, recovered, err)
+	}
+	stored, err := store.Get(context.Background(), model.KindOperation, operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := stored.(*model.Operation)
+	if failed.OperationStatus != model.OperationFailed || failed.CompletedAt == nil || failed.Error == "" {
+		t.Fatalf("expired operation=%#v", failed)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMemoryReconcileCannotStartAfterTombstone(t *testing.T) {
+	store := deterministicStore()
+	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool"}, "create-claim-project").(*model.Project)
+	operation := mustCreate(t, store, &model.Operation{
+		Action:          "reconcile",
+		TargetKind:      model.KindProject,
+		TargetID:        project.ID,
+		TargetRevision:  project.Revision,
+		OperationStatus: model.OperationQueued,
+	}, "reconcile-claim-project").(*model.Operation)
+	if _, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-before-claim"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
+	if _, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, now, now.Add(-2*time.Minute)); !errors.Is(err, ErrPrecondition) {
+		t.Fatalf("ClaimReconcile() error=%v, want inactive target precondition", err)
+	}
+	stored, err := store.Get(context.Background(), model.KindOperation, operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.(*model.Operation).OperationStatus != model.OperationQueued {
+		t.Fatalf("operation changed despite rejected claim: %#v", stored)
+	}
+	queued := stored.(*model.Operation)
+	queued.OperationStatus = model.OperationRunning
+	if _, _, err := store.Update(context.Background(), queued, queued.Revision, ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("generic running transition error=%v", err)
+	}
+}
+
+func TestMemoryClaimAndDeleteAreSerialized(t *testing.T) {
+	for iteration := 0; iteration < 64; iteration++ {
+		store := NewMemory()
+		project := mustCreate(t, store, &model.Project{Name: fmt.Sprintf("tenant-%d", iteration), PoolID: fmt.Sprintf("pool-%d", iteration)}, "project").(*model.Project)
+		operation := mustCreate(t, store, &model.Operation{
+			Action:          "reconcile",
+			TargetKind:      model.KindProject,
+			TargetID:        project.ID,
+			TargetRevision:  project.Revision,
+			OperationStatus: model.OperationQueued,
+		}, "operation").(*model.Operation)
+		start := make(chan struct{})
+		claimResult := make(chan error, 1)
+		deleteResult := make(chan error, 1)
+		now := time.Now().UTC()
+		go func() {
+			<-start
+			_, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, now, now.Add(-2*time.Minute))
+			claimResult <- err
+		}()
+		go func() {
+			<-start
+			_, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete")
+			deleteResult <- err
+		}()
+		close(start)
+		claimErr, deleteErr := <-claimResult, <-deleteResult
+		if deleteErr != nil {
+			t.Fatalf("iteration %d BeginDelete(): %v", iteration, deleteErr)
+		}
+		if claimErr != nil && !errors.Is(claimErr, ErrPrecondition) {
+			t.Fatalf("iteration %d ClaimReconcile(): %v", iteration, claimErr)
+		}
+		stored, err := store.Get(context.Background(), model.KindOperation, operation.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		status := stored.(*model.Operation).OperationStatus
+		if (claimErr == nil) != (status == model.OperationRunning) {
+			t.Fatalf("iteration %d claimErr=%v status=%s", iteration, claimErr, status)
+		}
+	}
+}

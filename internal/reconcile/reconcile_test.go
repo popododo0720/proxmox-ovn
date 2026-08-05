@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pvnstack/proxmox-ovn/internal/controlstore"
 	"github.com/pvnstack/proxmox-ovn/internal/model"
@@ -317,6 +318,38 @@ func TestControllerDeleteCleansRendererBeforePurge(t *testing.T) {
 	}
 }
 
+func TestControllerDeleteFailureKeepsRetryableTombstone(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := NewFakeRenderer()
+	controller := NewController(store, renderer)
+	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-with-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer.SetDeleteFailure(model.KindProject, project.ID, errors.New("OVN unavailable"))
+	if err := controller.Delete(context.Background(), tombstone); err == nil {
+		t.Fatal("Delete() unexpectedly succeeded")
+	}
+	stored, err := store.Get(context.Background(), model.KindProject, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetMetadata().State != model.ResourceDeleting {
+		t.Fatalf("failed delete changed tombstone state to %s", stored.GetMetadata().State)
+	}
+	renderer.SetDeleteFailure(model.KindProject, project.ID, nil)
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("Get() error=%v, want tombstone purged after retry", err)
+	}
+}
+
 func TestControllerReconcileRecoversPersistedTombstone(t *testing.T) {
 	store := controlstore.NewMemory()
 	project := createProject(t, store)
@@ -357,21 +390,78 @@ func TestControllerCleansRenderThatRacesWithDistributedDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deleteController.Delete(context.Background(), tombstone); err != nil {
-		t.Fatal(err)
+	if err := deleteController.Delete(context.Background(), tombstone); !errors.Is(err, ErrReconcileLeaseActive) {
+		t.Fatalf("Delete() error=%v, want active reconcile lease", err)
 	}
-	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
-		t.Fatal(err)
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("Purge() error=%v, want running reconcile conflict", err)
 	}
 	close(renderer.release)
 	if err := <-reconcileDone; err != nil {
 		t.Fatal(err)
+	}
+	if err := deleteController.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("Get() error=%v, want purged tombstone", err)
 	}
 	if _, ok := delegate.Rendered(model.KindProject, project.ID); ok {
 		t.Fatal("stale render survived the distributed delete")
 	}
 	if calls := delegate.DeleteCalls(model.KindProject, project.ID); calls != 2 {
 		t.Fatalf("delete calls=%d, want distributed delete plus stale cleanup", calls)
+	}
+}
+
+func TestReconcileAllRecoversCrashAfterExternalWriteBeforeDeleteCheck(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := NewFakeRenderer()
+	operationResource, _, err := store.Create(context.Background(), &model.Operation{
+		Action:          "reconcile",
+		TargetKind:      model.KindProject,
+		TargetID:        project.ID,
+		TargetRevision:  project.Revision,
+		OperationStatus: model.OperationQueued,
+		IdempotencyKey:  operationKey(model.KindProject, project.ID, project.Revision),
+	}, operationKey(model.KindProject, project.ID, project.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := operationResource.(*model.Operation)
+	started := time.Now().UTC().Add(-operationLease - time.Minute)
+	if _, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, started, started.Add(-operationLease)); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderer.Render(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-after-crash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("Purge() error=%v, want crashed operation fence", err)
+	}
+
+	controller := NewController(store, renderer)
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("Get() error=%v, want recovered tombstone purged", err)
+	}
+	if _, ok := renderer.Rendered(model.KindProject, project.ID); ok {
+		t.Fatal("realized row written immediately before the crash survived recovery")
+	}
+	storedOperation, err := store.Get(context.Background(), model.KindOperation, operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := storedOperation.(*model.Operation)
+	if recovered.OperationStatus != model.OperationFailed || recovered.CompletedAt == nil || recovered.Error == "" {
+		t.Fatalf("recovered operation=%#v", recovered)
 	}
 }
 

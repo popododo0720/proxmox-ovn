@@ -144,6 +144,9 @@ func (s *Store) Create(ctx context.Context, resource model.Resource, key string)
 			return nil, false, storeError(controlstore.ErrConflict, "idempotency_key is required for an operation")
 		}
 	}
+	if operation, ok := candidate.(*model.Operation); ok && operation.Action == "reconcile" && operation.OperationStatus != "" && operation.OperationStatus != model.OperationQueued {
+		return nil, false, storeError(controlstore.ErrConflict, "reconcile operations must be created in queued state")
+	}
 	if operation, ok := candidate.(*model.Operation); ok && (operation.IdempotencyKey == storeLockID || strings.HasPrefix(operation.IdempotencyKey, internalIDPrefix)) {
 		return nil, false, storeError(controlstore.ErrConflict, "operation idempotency_key %q is reserved", operation.IdempotencyKey)
 	}
@@ -279,6 +282,9 @@ func (s *Store) Update(ctx context.Context, resource model.Resource, expectedRev
 		return nil, false, storeError(controlstore.ErrConflict, "operation idempotency_key %q is reserved", operation.IdempotencyKey)
 	}
 	model.SetDefaults(requested)
+	if operation, ok := requested.(*model.Operation); ok && operation.Action == "reconcile" && operation.OperationStatus == model.OperationRunning {
+		return nil, false, storeError(controlstore.ErrConflict, "reconcile operations must be started with ClaimReconcile")
+	}
 	if err := requested.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -347,6 +353,136 @@ func (s *Store) Update(ctx context.Context, resource model.Resource, expectedRev
 		return result, false, err
 	}
 	return nil, false, storeError(controlstore.ErrConflict, "update could not be serialized after concurrent changes")
+}
+
+// ClaimReconcile atomically claims a reconcile operation only if its exact
+// desired-state revision still exists and has not become a tombstone.
+func (s *Store) ClaimReconcile(ctx context.Context, operationID string, expectedRevision int64, startedAt, leaseCutoff time.Time) (*model.Operation, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if isReservedID(operationID) {
+		return nil, storeError(controlstore.ErrNotFound, "operation %q was not found", operationID)
+	}
+	for attempt := 0; attempt < maxWriteAttempts; attempt++ {
+		current, err := s.load(ctx)
+		if err != nil {
+			return nil, err
+		}
+		entry, exists := current.resources[model.KindOperation][operationID]
+		if !exists {
+			return nil, storeError(controlstore.ErrNotFound, "operation %q was not found", operationID)
+		}
+		stored := entry.resource.(*model.Operation)
+		if expectedRevision < 1 || stored.Revision != expectedRevision {
+			return nil, storeError(controlstore.ErrPrecondition, "expected operation revision %d but current revision is %d", expectedRevision, stored.Revision)
+		}
+		if stored.Action != "reconcile" {
+			return nil, storeError(controlstore.ErrConflict, "operation %q is not a reconcile operation", operationID)
+		}
+		if stored.OperationStatus == model.OperationRunning && reconcileLeaseIsLive(stored, leaseCutoff) {
+			return nil, storeError(controlstore.ErrConflict, "reconcile operation %q still holds a live lease", operationID)
+		}
+		targetEntry, exists := current.resources[stored.TargetKind][stored.TargetID]
+		if !exists {
+			return nil, storeError(controlstore.ErrPrecondition, "%s %q no longer exists", stored.TargetKind, stored.TargetID)
+		}
+		targetMeta := targetEntry.resource.GetMetadata()
+		if targetMeta.Revision != stored.TargetRevision || targetMeta.State == model.ResourceDeleting {
+			return nil, storeError(controlstore.ErrPrecondition, "reconcile target %s %q is not at active revision %d", stored.TargetKind, stored.TargetID, stored.TargetRevision)
+		}
+		claimedResource, err := model.Clone(stored)
+		if err != nil {
+			return nil, err
+		}
+		claimed := claimedResource.(*model.Operation)
+		claimed.OperationStatus = model.OperationRunning
+		started := startedAt.UTC()
+		claimed.StartedAt = &started
+		claimed.CompletedAt = nil
+		claimed.Error = ""
+		claimed.Revision++
+		claimed.State = model.ResourcePending
+		claimed.LastError = ""
+		claimed.UpdatedAt = started
+		row, err := encodeResource(claimed, current)
+		if err != nil {
+			return nil, err
+		}
+		changes := []change{{type_: changeUpdate, table: kindTables[model.KindOperation], id: operationID, expectedRevision: expectedRevision, row: row}}
+		if err := s.database.commit(ctx, current.epoch, changes, formatTime(started)); err != nil {
+			if errors.Is(err, errSerialization) {
+				continue
+			}
+			return nil, err
+		}
+		result, err := model.Clone(claimed)
+		if err != nil {
+			return nil, err
+		}
+		return result.(*model.Operation), nil
+	}
+	return nil, storeError(controlstore.ErrConflict, "reconcile claim could not be serialized after concurrent changes")
+}
+
+// FenceReconciles atomically expires abandoned claims for a target and reports
+// whether at least one unexpired reconcile lease still prevents cleanup.
+func (s *Store) FenceReconciles(ctx context.Context, kind model.Kind, id string, leaseCutoff, recoveredAt time.Time) (bool, bool, error) {
+	if err := contextError(ctx); err != nil {
+		return false, false, err
+	}
+	for attempt := 0; attempt < maxWriteAttempts; attempt++ {
+		current, err := s.load(ctx)
+		if err != nil {
+			return false, false, err
+		}
+		active, recovered := false, false
+		changes := make([]change, 0)
+		for operationID, entry := range current.resources[model.KindOperation] {
+			operation := entry.resource.(*model.Operation)
+			if operation.Action != "reconcile" || operation.TargetKind != kind || operation.TargetID != id || operation.OperationStatus != model.OperationRunning {
+				continue
+			}
+			if reconcileLeaseIsLive(operation, leaseCutoff) {
+				active = true
+				continue
+			}
+			copyResource, err := model.Clone(operation)
+			if err != nil {
+				return false, false, err
+			}
+			recoveredOperation := copyResource.(*model.Operation)
+			recoveredOperation.OperationStatus = model.OperationFailed
+			recoveredOperation.Error = "reconcile lease expired while target was deleting"
+			completed := recoveredAt.UTC()
+			recoveredOperation.CompletedAt = &completed
+			recoveredOperation.Revision++
+			recoveredOperation.State = model.ResourcePending
+			recoveredOperation.LastError = ""
+			recoveredOperation.UpdatedAt = completed
+			row, err := encodeResource(recoveredOperation, current)
+			if err != nil {
+				return false, false, err
+			}
+			changes = append(changes, change{type_: changeUpdate, table: kindTables[model.KindOperation], id: operationID, expectedRevision: operation.Revision, row: row})
+			recovered = true
+		}
+		if len(changes) == 0 {
+			return active, false, nil
+		}
+		if err := s.database.commit(ctx, current.epoch, changes, formatTime(recoveredAt.UTC())); err != nil {
+			if errors.Is(err, errSerialization) {
+				continue
+			}
+			return false, false, err
+		}
+		return active, recovered, nil
+	}
+	return false, false, storeError(controlstore.ErrConflict, "reconcile fencing could not be serialized after concurrent changes")
+}
+
+func reconcileLeaseIsLive(operation *model.Operation, leaseCutoff time.Time) bool {
+	return operation != nil && operation.StartedAt != nil && operation.StartedAt.UTC().After(leaseCutoff.UTC())
 }
 
 func (s *Store) Delete(ctx context.Context, kind model.Kind, id string, expectedRevision int64, key string) (bool, error) {
@@ -442,6 +578,12 @@ func (s *Store) Purge(ctx context.Context, kind model.Kind, id string, deletionR
 		}
 		if referrer := firstReference(current, kind, id); referrer != "" {
 			return storeError(controlstore.ErrConflict, "%s %q is still referenced by %s", kind, id, referrer)
+		}
+		for _, entry := range current.resources[model.KindOperation] {
+			operation := entry.resource.(*model.Operation)
+			if operation.Action == "reconcile" && operation.TargetKind == kind && operation.TargetID == id && operation.OperationStatus == model.OperationRunning {
+				return storeError(controlstore.ErrConflict, "%s %q is protected by running reconcile operation %q", kind, id, operation.ID)
+			}
 		}
 		table, err := tableForKind(kind)
 		if err != nil {
