@@ -484,11 +484,13 @@ with tempfile.TemporaryDirectory() as temporary:
 
     node_roots = {}
     ca_dirs = {}
+    stage_roots = {}
     helper_sources = {}
     for node in discovery().nodes:
         node_root = root / "nodes" / node.name
         node_root.mkdir(mode=0o700, parents=True)
         pki_dir = node_root / "pki"
+        stage_root = node_root / "etc-pvn"
         ca_parent = root / "ca-roots" / node.name
         ca_parent.mkdir(mode=0o700, parents=True)
         ca_dir = ca_parent / "pvn-ca"
@@ -499,12 +501,15 @@ with tempfile.TemporaryDirectory() as temporary:
             'PVN_CONFIG = "/etc/pve/pvn/config.json"': f"PVN_CONFIG = {str(config_path)!r}",
             'PVNCTL_BIN = "/usr/sbin/pvnctl"': f"PVNCTL_BIN = {str(pvnctl)!r}",
             'PVN_GROUP = "pvn"': 'PVN_GROUP = "root"',
+            'pathlib.Path("/etc/pvn") not in path.parents':
+                f"pathlib.Path({str(stage_root)!r}) not in path.parents",
         }
         for old, new in replacements.items():
             assert old in source
             source = source.replace(old, new, 1)
         node_roots[node.name] = node_root
         ca_dirs[node.name] = ca_dir
+        stage_roots[node.name] = stage_root
         helper_sources[node.name] = source
 
     def helper_call(node_name, action, request, succeeds=True, source=None):
@@ -525,6 +530,28 @@ with tempfile.TemporaryDirectory() as temporary:
             return (result.stderr or result.stdout).strip()
         assert result.returncode == 0, (action, result.stdout, result.stderr)
         return json.loads(result.stdout)
+
+    # A fresh package install owns one byte-exact inert default. The first
+    # control-plane stage must adopt it without weakening drift rejection for
+    # any operator-modified content.
+    rendered = ControlPlane(None, None)._render_node_files(
+        discovery(), discovery().nodes[0], discovery().nodes[0]
+    )
+    rendered_host = next(item for item in rendered if item["path"] == "/etc/pvn/ovn-host.env")
+    package_default = (script_path.parent.parent / "examples" / "ovn-host.env").read_bytes()
+    assert base64.b64decode(rendered_host["content"]) == package_default
+    staged_host = stage_roots["pve-a"] / "ovn-host.env"
+    staged_host.parent.mkdir(mode=0o750, parents=True)
+    staged_host.write_bytes(package_default)
+    staged_host.chmod(0o640)
+    stage_request = {**rendered_host, "path": str(staged_host)}
+    assert helper_call("pve-a", "stage", {"files": [stage_request]}) == {"staged": True}
+    assert staged_host.read_bytes() == package_default
+    staged_host.write_text("operator-modified\n")
+    stage_error = helper_call(
+        "pve-a", "stage", {"files": [stage_request]}, succeeds=False,
+    )
+    assert "staged file drift" in stage_error
 
     requests = []
     public_keys = {}

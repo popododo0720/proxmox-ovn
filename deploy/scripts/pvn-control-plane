@@ -1609,6 +1609,8 @@ class ControlPlane:
             "PVN_AGENT_HEALTH_URL=http://127.0.0.1:9476/healthz\n"
         )
         host_env = (
+            "# Install as /etc/pvn/ovn-host.env on every PVE node. The Debian 13\n"
+            "# ovn-controller.service expands this single value into ovn-ctl arguments.\n"
             'OVN_CTL_OPTS="--ovn-controller-ssl-key=/etc/pvn/pki/node-key.pem '
             '--ovn-controller-ssl-cert=/etc/pvn/pki/node.pem '
             '--ovn-controller-ssl-ca-cert=/etc/pvn/pki/ca.pem '
