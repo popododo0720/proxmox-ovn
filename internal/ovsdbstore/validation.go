@@ -170,7 +170,8 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 			if prefixErr != nil || addressErr != nil || !address.Is4() || !prefix.Contains(address) {
 				return storeError(controlstore.ErrConflict, "external IP address must belong to the external subnet")
 			}
-			if subnet.GatewayIP != "" && value.ExternalIPAddress == subnet.GatewayIP {
+			gateway, gatewayErr := model.EffectiveIPv4Gateway(subnet)
+			if gatewayErr != nil || value.ExternalIPAddress == gateway.String() {
 				return storeError(controlstore.ErrConflict, "external IP address must differ from the subnet gateway")
 			}
 		}
@@ -442,7 +443,9 @@ func externalAddressClaims(current *snapshot, resource model.Resource) []string 
 	case *model.Subnet:
 		if networkEntry, exists := current.resources[model.KindNetwork][value.NetworkID]; exists {
 			providerID = networkEntry.resource.(*model.Network).ProviderNetworkID
-			address = value.GatewayIP
+			if gateway, err := model.EffectiveIPv4Gateway(value); err == nil {
+				address = gateway.String()
+			}
 		}
 	case *model.Router:
 		if networkEntry, exists := current.resources[model.KindNetwork][value.ExternalNetworkID]; exists {

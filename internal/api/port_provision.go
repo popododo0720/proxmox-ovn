@@ -481,7 +481,8 @@ func usableProvisionAddress(subnet *model.Subnet, address netip.Addr) bool {
 	}
 	network, broadcast := provisionSubnetBounds(prefix.Masked())
 	value := ipv4Uint32(address)
-	if value == network || value == broadcast || address.String() == subnet.GatewayIP {
+	gateway, gatewayErr := model.EffectiveIPv4Gateway(subnet)
+	if value == network || value == broadcast || gatewayErr != nil || address == gateway {
 		return false
 	}
 	return true

@@ -600,7 +600,8 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 			if prefixErr != nil || addressErr != nil || !prefix.Contains(address) {
 				return storeError(ErrConflict, "external_ip_address must be inside the external subnet")
 			}
-			if subnet.GatewayIP != "" && address.String() == subnet.GatewayIP {
+			gateway, gatewayErr := model.EffectiveIPv4Gateway(subnet)
+			if gatewayErr != nil || address == gateway {
 				return storeError(ErrConflict, "external_ip_address must not equal the external subnet gateway")
 			}
 		}
@@ -850,7 +851,9 @@ func (s *Memory) externalAddressClaimsLocked(resource model.Resource) []string {
 	case *model.Subnet:
 		if networkResource, exists := s.resources[model.KindNetwork][value.NetworkID]; exists {
 			providerID = networkResource.(*model.Network).ProviderNetworkID
-			address = value.GatewayIP
+			if gateway, err := model.EffectiveIPv4Gateway(value); err == nil {
+				address = gateway.String()
+			}
 		}
 	case *model.Router:
 		if networkResource, exists := s.resources[model.KindNetwork][value.ExternalNetworkID]; exists {

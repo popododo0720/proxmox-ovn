@@ -1506,20 +1506,9 @@ func deterministicMAC(seed string) string {
 }
 
 func subnetGateway(subnet *model.Subnet) (netip.Addr, error) {
-	prefix, err := netip.ParsePrefix(subnet.CIDR)
-	if err != nil || !prefix.Addr().Is4() {
-		return netip.Addr{}, fmt.Errorf("subnet %q has an invalid IPv4 CIDR", subnet.ID)
-	}
-	if subnet.GatewayIP != "" {
-		gateway, err := netip.ParseAddr(subnet.GatewayIP)
-		if err != nil || !prefix.Contains(gateway) {
-			return netip.Addr{}, fmt.Errorf("subnet %q has an invalid gateway", subnet.ID)
-		}
-		return gateway, nil
-	}
-	gateway := prefix.Masked().Addr().Next()
-	if !prefix.Contains(gateway) {
-		return netip.Addr{}, fmt.Errorf("subnet %q has no usable implicit gateway", subnet.ID)
+	gateway, err := model.EffectiveIPv4Gateway(subnet)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("subnet %q has an invalid gateway: %w", subnet.ID, err)
 	}
 	return gateway, nil
 }

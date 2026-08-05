@@ -365,6 +365,31 @@ func TestPortProvisionReportsSubnetExhaustion(t *testing.T) {
 	}
 }
 
+func TestPortProvisionReservesImplicitGateway(t *testing.T) {
+	store := controlstore.NewMemory()
+	topology := seedProvisionTopology(t, store, "10.0.0.0/29", nil)
+	topology.subnet.GatewayIP = ""
+	updated, _, err := store.Update(context.Background(), topology.subnet, topology.subnet.Revision, "use-implicit-gateway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topology.subnet = updated.(*model.Subnet)
+	provider := &provisionSessionProvider{
+		authenticated: true,
+		csrf:          "csrf",
+		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+	}
+	server := testServer(t, store, provider)
+	response := request(t, server, http.MethodPost, "/api/v1/ports/provision", provisionRequestBody(topology, "implicit-gateway"), provisionHeaders("implicit-gateway", "csrf"))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	port := decodeData[model.Port](t, response)
+	if len(port.FixedIPs) != 1 || port.FixedIPs[0].Address != "10.0.0.2" {
+		t.Fatalf("fixed IPs=%v, implicit gateway .1 must be reserved", port.FixedIPs)
+	}
+}
+
 func TestPortProvisionRollsBackReservationAndCanRetry(t *testing.T) {
 	store := controlstore.NewMemory()
 	topology := seedProvisionTopology(t, store, "10.0.0.0/29", []model.IPRange{{Start: "10.0.0.2", End: "10.0.0.4"}})

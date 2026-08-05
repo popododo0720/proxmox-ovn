@@ -86,11 +86,8 @@ func validateSubnet(s *Subnet) error {
 		return invalid("cidr", "must be a valid IPv4 prefix")
 	}
 	prefix = prefix.Masked()
-	if s.GatewayIP != "" {
-		gateway, parseErr := netip.ParseAddr(s.GatewayIP)
-		if parseErr != nil || !prefix.Contains(gateway) {
-			return invalid("gateway_ip", "must be an IPv4 address inside cidr")
-		}
+	if _, gatewayErr := EffectiveIPv4Gateway(s); gatewayErr != nil {
+		return invalid("gateway_ip", "%s", gatewayErr.Error())
 	}
 	for i, server := range s.DNSNameservers {
 		addr, parseErr := netip.ParseAddr(server)
