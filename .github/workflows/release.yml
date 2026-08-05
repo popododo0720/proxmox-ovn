@@ -66,9 +66,12 @@ jobs:
             echo 'release build produced no assets' >&2
             exit 1
           fi
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          if gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber \
+              --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
-              --verify-tag --generate-notes --title "PVN $GITHUB_REF_NAME"
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              --title "PVN $GITHUB_REF_NAME"
           fi
