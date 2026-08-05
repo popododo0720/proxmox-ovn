@@ -45,6 +45,7 @@ type AgentConfig struct {
 	PollEvery    time.Duration `json:"poll_every"`
 	Bridge       string        `json:"bridge"`
 	ManagerURL   string        `json:"manager_url"`
+	ManagerCA    string        `json:"manager_ca,omitempty"`
 	SystemIDFile string        `json:"system_id_file"`
 }
 
@@ -143,6 +144,9 @@ func applyEnv(cfg *Config) {
 	}
 	if value := os.Getenv("PVN_MANAGER_URL"); value != "" {
 		cfg.Agent.ManagerURL = value
+	}
+	if value := os.Getenv("PVN_MANAGER_CA"); value != "" {
+		cfg.Agent.ManagerCA = value
 	}
 	if value := os.Getenv("PVN_ENCAP_IP"); value != "" {
 		cfg.Networking.EncapIP = value

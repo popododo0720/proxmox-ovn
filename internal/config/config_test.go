@@ -24,6 +24,7 @@ func TestLoadAndEnvironmentOverrides(t *testing.T) {
 	t.Setenv("PVN_GUEST_MTU", "1450")
 	t.Setenv("PVN_TLS_CERT", "/run/credentials/pvn-manager.service/cert")
 	t.Setenv("PVN_TLS_KEY", "/run/credentials/pvn-manager.service/key")
+	t.Setenv("PVN_MANAGER_CA", "/etc/pve/pve-root-ca.pem")
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -33,6 +34,9 @@ func TestLoadAndEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.Manager.TLSCert != "/run/credentials/pvn-manager.service/cert" || cfg.Manager.TLSKey != "/run/credentials/pvn-manager.service/key" {
 		t.Fatalf("credential overrides not applied: %+v", cfg.Manager)
+	}
+	if cfg.Agent.ManagerCA != "/etc/pve/pve-root-ca.pem" {
+		t.Fatalf("agent manager CA override not applied: %+v", cfg.Agent)
 	}
 }
 
