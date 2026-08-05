@@ -116,6 +116,14 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.resolvePort(writer, request)
 		return
 	}
+	if request.URL.Path == "/api/v1/ports/provision" {
+		s.provisionPort(writer, request)
+		return
+	}
+	if portID, ok := parsePortDeprovisionPath(request.URL.Path); ok {
+		s.deprovisionPort(writer, request, portID)
+		return
+	}
 	if portID, action, ok := parsePortActionPath(request.URL.Path); ok {
 		s.portAction(writer, request, portID, action)
 		return
