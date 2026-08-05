@@ -1,0 +1,447 @@
+package ovsdbstore
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ovn-org/libovsdb/ovsdb"
+	"github.com/pvnstack/proxmox-ovn/internal/controlschema"
+	"github.com/pvnstack/proxmox-ovn/internal/controlstore"
+	"github.com/pvnstack/proxmox-ovn/internal/model"
+)
+
+type fakeDatabase struct {
+	mu       sync.Mutex
+	rows     rawDatabase
+	epoch    int64
+	sequence int64
+	closed   bool
+}
+
+func newFakeDatabase() *fakeDatabase {
+	rows := make(rawDatabase)
+	for _, table := range allTables() {
+		rows[table] = nil
+	}
+	return &fakeDatabase{rows: rows}
+}
+
+func (f *fakeDatabase) load(ctx context.Context) (rawDatabase, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return nil, errors.New("database closed")
+	}
+	return cloneRawDatabase(f.rows), nil
+}
+
+func (f *fakeDatabase) initialize(ctx context.Context, row ovsdb.Row) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.epoch != 0 {
+		return errSerialization
+	}
+	copyRow := cloneRow(row)
+	copyRow["_uuid"] = f.nextUUID()
+	f.rows[kindTables[model.KindOperation]] = append(f.rows[kindTables[model.KindOperation]], copyRow)
+	f.epoch = 1
+	return nil
+}
+
+func (f *fakeDatabase) commit(ctx context.Context, epoch int64, changes []change, updatedAt string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if epoch != f.epoch {
+		return errSerialization
+	}
+	if !controlschema.Schema().ValidateOperations(buildOperations(epoch, changes, updatedAt)...) {
+		return errors.New("transaction does not match the generated PVN_Control schema")
+	}
+	next := cloneRawDatabase(f.rows)
+	for _, item := range changes {
+		rows := next[item.table]
+		index := findRow(rows, item.id)
+		switch item.type_ {
+		case changeInsert:
+			if index >= 0 {
+				return &constraintError{cause: errors.New("duplicate id")}
+			}
+			copyRow := cloneRow(item.row)
+			copyRow["_uuid"] = f.nextUUID()
+			next[item.table] = append(rows, copyRow)
+		case changeUpdate:
+			if index < 0 || mustRowRevision(rows[index]) != item.expectedRevision {
+				return errSerialization
+			}
+			copyRow := cloneRow(item.row)
+			copyRow["_uuid"] = rows[index]["_uuid"]
+			next[item.table][index] = copyRow
+		case changeDelete:
+			if index < 0 || mustRowRevision(rows[index]) != item.expectedRevision {
+				return errSerialization
+			}
+			next[item.table] = append(rows[:index:index], rows[index+1:]...)
+		default:
+			return fmt.Errorf("unknown change type %d", item.type_)
+		}
+	}
+	operationTable := kindTables[model.KindOperation]
+	lockIndex := findRow(next[operationTable], storeLockID)
+	if lockIndex < 0 {
+		return errors.New("store lock disappeared")
+	}
+	next[operationTable][lockIndex]["revision"] = epoch + 1
+	next[operationTable][lockIndex]["updated_at"] = updatedAt
+	f.rows = next
+	f.epoch++
+	return nil
+}
+
+func (f *fakeDatabase) close() {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
+}
+
+func (f *fakeDatabase) nextUUID() ovsdb.UUID {
+	f.sequence++
+	return ovsdb.UUID{GoUUID: fmt.Sprintf("00000000-0000-4000-8000-%012d", f.sequence)}
+}
+
+func findRow(rows []ovsdb.Row, id string) int {
+	for index, row := range rows {
+		if row["id"] == id {
+			return index
+		}
+	}
+	return -1
+}
+
+func mustRowRevision(row ovsdb.Row) int64 {
+	value, err := rowInt64(row, "revision")
+	if err != nil {
+		panic(err)
+	}
+	return value
+}
+
+func cloneRawDatabase(source rawDatabase) rawDatabase {
+	result := make(rawDatabase, len(source))
+	for table, rows := range source {
+		result[table] = make([]ovsdb.Row, len(rows))
+		for index, row := range rows {
+			result[table][index] = cloneRow(row)
+		}
+	}
+	return result
+}
+
+func cloneRow(source ovsdb.Row) ovsdb.Row {
+	result := make(ovsdb.Row, len(source))
+	for key, value := range source {
+		switch typed := value.(type) {
+		case ovsdb.OvsSet:
+			result[key] = ovsdb.OvsSet{GoSet: append([]interface{}(nil), typed.GoSet...)}
+		case ovsdb.OvsMap:
+			values := make(map[interface{}]interface{}, len(typed.GoMap))
+			for mapKey, mapValue := range typed.GoMap {
+				values[mapKey] = mapValue
+			}
+			result[key] = ovsdb.OvsMap{GoMap: values}
+		default:
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func deterministicStore(database database) *Store {
+	var sequence atomic.Int64
+	return newStore(database,
+		WithClock(func() time.Time { return time.Date(2026, 8, 5, 1, 2, 3, 456, time.UTC) }),
+		WithIDGenerator(func() string { return fmt.Sprintf("id-%03d", sequence.Add(1)) }),
+	)
+}
+
+func mustCreate(t *testing.T, store controlstore.Store, resource model.Resource, key string) model.Resource {
+	t.Helper()
+	created, replayed, err := store.Create(context.Background(), resource, key)
+	if err != nil || replayed {
+		t.Fatalf("Create(%s) replayed=%v: %v", resource.ResourceKind(), replayed, err)
+	}
+	return created
+}
+
+func TestStorePersistsEveryResourceKindAndFiltersInternalRows(t *testing.T) {
+	database := newFakeDatabase()
+	store := deterministicStore(database)
+	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project").(*model.Project)
+	provider := mustCreate(t, store, &model.ProviderNetwork{Name: "public", Shared: true}, "provider").(*model.ProviderNetwork)
+	segment := mustCreate(t, store, &model.ProviderSegment{ProviderNetworkID: provider.ID, Name: "public-vlan", PhysicalNetwork: "physnet1", NetworkType: model.ProviderVLAN, VLANID: 100}, "segment").(*model.ProviderSegment)
+	provider.DefaultSegmentID = segment.ID
+	providerResource, _, err := store.Update(context.Background(), provider, provider.Revision, "provider-default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider = providerResource.(*model.ProviderNetwork)
+	external := mustCreate(t, store, &model.Network{ProjectID: project.ID, Name: "external", External: true, ProviderNetworkID: provider.ID}, "external-network").(*model.Network)
+	externalSubnet := mustCreate(t, store, &model.Subnet{ProjectID: project.ID, NetworkID: external.ID, Name: "external-v4", CIDR: "198.51.100.0/24", GatewayIP: "198.51.100.1"}, "external-subnet").(*model.Subnet)
+	network := mustCreate(t, store, &model.Network{ProjectID: project.ID, Name: "private"}, "network").(*model.Network)
+	subnet := mustCreate(t, store, &model.Subnet{ProjectID: project.ID, NetworkID: network.ID, Name: "private-v4", CIDR: "10.10.0.0/24", EnableDHCP: true, DNSNameservers: []string{"1.1.1.1"}, AllocationPools: []model.IPRange{{Start: "10.10.0.10", End: "10.10.0.20"}}}, "subnet").(*model.Subnet)
+	node := mustCreate(t, store, &model.Node{Name: "pve-a", ChassisID: "chassis-a", ManagementAddress: "192.0.2.10", Roles: []model.NodeRole{model.NodeRoleCompute, model.NodeRoleGateway}, Enabled: true}, "node").(*model.Node)
+	group := mustCreate(t, store, &model.SecurityGroup{ProjectID: project.ID, Name: "default"}, "group").(*model.SecurityGroup)
+	remoteGroup := mustCreate(t, store, &model.SecurityGroup{ProjectID: project.ID, Name: "web"}, "remote-group").(*model.SecurityGroup)
+	rule := mustCreate(t, store, &model.SecurityGroupRule{ProjectID: project.ID, SecurityGroupID: group.ID, Direction: model.DirectionIngress, Protocol: "tcp", PortRangeMin: 443, PortRangeMax: 443, RemoteGroupID: remoteGroup.ID}, "rule")
+	port := mustCreate(t, store, &model.Port{ProjectID: project.ID, NetworkID: network.ID, Name: "vm-port", MACAddress: "02:00:00:00:00:10", FixedIPs: []model.FixedIP{{SubnetID: subnet.ID, Address: "10.10.0.10"}}, SecurityGroupIDs: []string{group.ID}, AdminStateUp: true, NodeID: node.ID, VMID: 100, NIC: "net0", RequestedChassis: node.ChassisID}, "port").(*model.Port)
+	allocation := mustCreate(t, store, &model.IPAllocation{ProjectID: project.ID, SubnetID: subnet.ID, PortID: port.ID, Address: "10.10.0.10", State: model.IPAllocated}, "allocation")
+	router := mustCreate(t, store, &model.Router{ProjectID: project.ID, Name: "router", ExternalNetworkID: external.ID, ExternalSubnetID: externalSubnet.ID, ExternalIPAddress: "198.51.100.2", EnableSNAT: true}, "router").(*model.Router)
+	interfaceResource := mustCreate(t, store, &model.RouterInterface{ProjectID: project.ID, RouterID: router.ID, SubnetID: subnet.ID, PortID: port.ID}, "router-interface")
+	floating := mustCreate(t, store, &model.FloatingIP{ProjectID: project.ID, ProviderNetworkID: provider.ID, Address: "198.51.100.10", PortID: port.ID, FixedIPAddress: "10.10.0.10", RouterID: router.ID}, "floating")
+	operation := mustCreate(t, store, &model.Operation{Action: "bind", TargetKind: model.KindPort, TargetID: port.ID, TargetRevision: port.Revision}, "operation")
+	if operation.(*model.Operation).IdempotencyKey != "operation" {
+		t.Fatalf("operation idempotency key=%q", operation.(*model.Operation).IdempotencyKey)
+	}
+
+	created := []model.Resource{project, provider, segment, external, externalSubnet, network, subnet, node, group, remoteGroup, rule, port, allocation, router, interfaceResource, floating, operation}
+	seen := make(map[model.Kind]bool)
+	for _, expected := range created {
+		loaded, err := store.Get(context.Background(), expected.ResourceKind(), expected.GetMetadata().ID)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", expected.ResourceKind(), err)
+		}
+		if loaded.GetMetadata().Revision < 1 || loaded.GetMetadata().CreatedAt.IsZero() {
+			t.Fatalf("invalid decoded metadata for %s: %#v", expected.ResourceKind(), loaded.GetMetadata())
+		}
+		seen[expected.ResourceKind()] = true
+	}
+	for _, kind := range model.Kinds() {
+		if !seen[kind] {
+			t.Fatalf("test topology omitted kind %s", kind)
+		}
+	}
+	operations, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 || operations[0].GetMetadata().ID != operation.GetMetadata().ID {
+		t.Fatalf("internal lock/idempotency rows leaked into Operation list: %#v", operations)
+	}
+	ports, err := store.List(context.Background(), model.KindPort, controlstore.ListOptions{ProjectID: project.ID, NetworkID: network.ID, NodeID: node.ID, VMID: 100, NIC: "net0"})
+	if err != nil || len(ports) != 1 || ports[0].GetMetadata().ID != port.ID {
+		t.Fatalf("filtered ports=%#v err=%v", ports, err)
+	}
+}
+
+func TestOperationRequiresAnIdempotencyKey(t *testing.T) {
+	store := deterministicStore(newFakeDatabase())
+	_, _, err := store.Create(context.Background(), &model.Operation{Action: "render", TargetKind: model.KindProject, TargetID: "project-a", TargetRevision: 1}, "")
+	if err == nil {
+		t.Fatal("operation without an idempotency key was accepted")
+	}
+	mustCreate(t, store, &model.Operation{Action: "render", TargetKind: model.KindProject, TargetID: "project-a", TargetRevision: 1, IdempotencyKey: "operation-row-key"}, "request-a")
+	_, _, err = store.Create(context.Background(), &model.Operation{Action: "delete", TargetKind: model.KindProject, TargetID: "project-b", TargetRevision: 1, IdempotencyKey: "operation-row-key"}, "request-b")
+	if !errors.Is(err, controlstore.ErrAlreadyExists) {
+		t.Fatalf("duplicate Operation idempotency key error=%v", err)
+	}
+	_, _, err = store.Create(context.Background(), &model.Operation{Action: "delete", TargetKind: model.KindProject, TargetID: "project-a", TargetRevision: 1, IdempotencyKey: "operation-other-key"}, "request-c")
+	if !errors.Is(err, controlstore.ErrAlreadyExists) {
+		t.Fatalf("duplicate Operation target error=%v", err)
+	}
+}
+
+func TestStoreIdempotencyIsDurableAcrossManagers(t *testing.T) {
+	database := newFakeDatabase()
+	first := deterministicStore(database)
+	second := deterministicStore(database)
+	request := &model.Project{Name: "tenant", PoolID: "pool-a"}
+	created, replayed, err := first.Create(context.Background(), request, "same-request")
+	if err != nil || replayed {
+		t.Fatalf("first Create replayed=%v err=%v", replayed, err)
+	}
+	replayedResource, replayed, err := second.Create(context.Background(), request, "same-request")
+	if err != nil || !replayed || replayedResource.GetMetadata().ID != created.GetMetadata().ID {
+		t.Fatalf("second Create resource=%#v replayed=%v err=%v", replayedResource, replayed, err)
+	}
+	_, _, err = second.Create(context.Background(), &model.Project{Name: "other", PoolID: "pool-b"}, "same-request")
+	if !errors.Is(err, controlstore.ErrIdempotencyConflict) {
+		t.Fatalf("idempotency conflict error=%v", err)
+	}
+}
+
+func TestStoreOptimisticLifecycleAndDeleteReplay(t *testing.T) {
+	database := newFakeDatabase()
+	store := deterministicStore(database)
+	created := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool-a"}, "create").(*model.Project)
+	created.Description = "updated"
+	updatedResource, replayed, err := store.Update(context.Background(), created, 1, "update")
+	if err != nil || replayed {
+		t.Fatalf("Update replayed=%v err=%v", replayed, err)
+	}
+	updated := updatedResource.(*model.Project)
+	if updated.Revision != 2 || updated.Description != "updated" {
+		t.Fatalf("updated=%#v", updated)
+	}
+	if _, _, err := store.Update(context.Background(), created, 1, "stale"); !errors.Is(err, controlstore.ErrPrecondition) {
+		t.Fatalf("stale Update error=%v", err)
+	}
+	failed, err := store.MarkReconciled(context.Background(), model.KindProject, updated.ID, 2, errors.New("OVN unavailable"))
+	if err != nil || failed.GetMetadata().State != model.ResourceError {
+		t.Fatalf("failed reconcile=%#v err=%v", failed, err)
+	}
+	ready, err := store.MarkReconciled(context.Background(), model.KindProject, updated.ID, 2, nil)
+	if err != nil || ready.GetMetadata().State != model.ResourceReady || ready.GetMetadata().AppliedRevision != 2 {
+		t.Fatalf("ready reconcile=%#v err=%v", ready, err)
+	}
+	replayed, err = store.Delete(context.Background(), model.KindProject, updated.ID, 2, "delete")
+	if err != nil || replayed {
+		t.Fatalf("Delete replayed=%v err=%v", replayed, err)
+	}
+	replayed, err = store.Delete(context.Background(), model.KindProject, updated.ID, 2, "delete")
+	if err != nil || !replayed {
+		t.Fatalf("Delete replay replayed=%v err=%v", replayed, err)
+	}
+	if _, err := store.Get(context.Background(), model.KindProject, updated.ID); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("Get after Delete error=%v", err)
+	}
+}
+
+func TestStoreRejectsUpdateThatWouldBreakDependentResources(t *testing.T) {
+	store := deterministicStore(newFakeDatabase())
+	first := mustCreate(t, store, &model.Project{Name: "first", PoolID: "pool-first"}, "first-project").(*model.Project)
+	second := mustCreate(t, store, &model.Project{Name: "second", PoolID: "pool-second"}, "second-project").(*model.Project)
+	network := mustCreate(t, store, &model.Network{ProjectID: first.ID, Name: "private"}, "network").(*model.Network)
+	mustCreate(t, store, &model.Subnet{ProjectID: first.ID, NetworkID: network.ID, Name: "private-v4", CIDR: "10.0.0.0/24"}, "subnet")
+	network.ProjectID = second.ID
+	_, _, err := store.Update(context.Background(), network, network.Revision, "move-network")
+	if !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("dependency-breaking network update error=%v", err)
+	}
+}
+
+func TestStoreSerializesConcurrentUniqueAllocation(t *testing.T) {
+	database := newFakeDatabase()
+	store := deterministicStore(database)
+	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool"}, "project").(*model.Project)
+	network := mustCreate(t, store, &model.Network{ProjectID: project.ID, Name: "private"}, "network").(*model.Network)
+	subnet := mustCreate(t, store, &model.Subnet{ProjectID: project.ID, NetworkID: network.ID, Name: "private-v4", CIDR: "10.0.0.0/24"}, "subnet").(*model.Subnet)
+	const workers = 32
+	var successes atomic.Int64
+	var duplicates atomic.Int64
+	var wait sync.WaitGroup
+	for index := 0; index < workers; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			_, _, err := store.Create(context.Background(), &model.IPAllocation{ProjectID: project.ID, SubnetID: subnet.ID, Address: "10.0.0.10", State: model.IPReserved}, fmt.Sprintf("allocation-%d", index))
+			switch {
+			case err == nil:
+				successes.Add(1)
+			case errors.Is(err, controlstore.ErrAlreadyExists):
+				duplicates.Add(1)
+			default:
+				t.Errorf("Create allocation: %v", err)
+			}
+		}(index)
+	}
+	wait.Wait()
+	if successes.Load() != 1 || duplicates.Load() != workers-1 {
+		t.Fatalf("successes=%d duplicates=%d", successes.Load(), duplicates.Load())
+	}
+}
+
+func TestStoreRejectsMalformedSnapshotAndCancelledContext(t *testing.T) {
+	database := newFakeDatabase()
+	store := deterministicStore(database)
+	if _, err := store.Get(context.Background(), model.KindProject, "missing"); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("missing resource error=%v", err)
+	}
+	database.mu.Lock()
+	database.rows[kindTables[model.KindProject]] = append(database.rows[kindTables[model.KindProject]], ovsdb.Row{"_uuid": database.nextUUID(), "id": "broken"})
+	database.mu.Unlock()
+	if _, err := store.List(context.Background(), model.KindProject, controlstore.ListOptions{}); err == nil {
+		t.Fatal("malformed database row was accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.List(ctx, model.KindProject, controlstore.ListOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled List error=%v", err)
+	}
+}
+
+func TestConnectionConfigFailsClosed(t *testing.T) {
+	ca := x509.NewCertPool()
+	secureTLS := &tls.Config{RootCAs: ca, Certificates: []tls.Certificate{{}}, MinVersion: tls.VersionTLS13}
+	tests := []struct {
+		name    string
+		config  Config
+		wantErr bool
+	}{
+		{name: "unix", config: Config{Endpoints: []string{"unix:/run/pvn/control.sock"}}},
+		{name: "ssl", config: Config{Endpoints: []string{"ssl:192.0.2.10:6645"}, TLSConfig: secureTLS}},
+		{name: "no endpoints", config: Config{}, wantErr: true},
+		{name: "tcp rejected", config: Config{Endpoints: []string{"tcp:192.0.2.10:6645"}}, wantErr: true},
+		{name: "ssl no tls", config: Config{Endpoints: []string{"ssl:192.0.2.10:6645"}}, wantErr: true},
+		{name: "insecure", config: Config{Endpoints: []string{"ssl:192.0.2.10:6645"}, TLSConfig: &tls.Config{InsecureSkipVerify: true}}, wantErr: true}, //nolint:gosec -- verifies rejection
+		{name: "no client cert", config: Config{Endpoints: []string{"ssl:192.0.2.10:6645"}, TLSConfig: &tls.Config{RootCAs: ca}}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateConnectionConfig(test.config)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateConnectionConfig() error=%v wantErr=%v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestBuildOperationsUsesCASAndDurableCommit(t *testing.T) {
+	changes := []change{{type_: changeUpdate, table: kindTables[model.KindProject], id: "project-a", expectedRevision: 7, row: ovsdb.Row{"revision": int64(8)}}}
+	operations := buildOperations(12, changes, "2026-08-05T00:00:00Z")
+	if len(operations) != 4 {
+		t.Fatalf("operation count=%d", len(operations))
+	}
+	if operations[0].Op != ovsdb.OperationWait || operations[0].Timeout == nil || *operations[0].Timeout != 0 || operations[0].Until != string(ovsdb.WaitConditionEqual) {
+		t.Fatalf("CAS wait=%#v", operations[0])
+	}
+	if operations[1].Op != ovsdb.OperationUpdate || operations[1].Row["revision"] != int64(13) {
+		t.Fatalf("lock update=%#v", operations[1])
+	}
+	if operations[2].Op != ovsdb.OperationUpdate || len(operations[2].Where) != 2 {
+		t.Fatalf("resource update=%#v", operations[2])
+	}
+	if operations[3].Op != ovsdb.OperationCommit || operations[3].Durable == nil || !*operations[3].Durable {
+		t.Fatalf("durable commit=%#v", operations[3])
+	}
+}
+
+func TestOperationResultErrorsAreClassifiedByConcreteType(t *testing.T) {
+	operations := []ovsdb.Operation{{Op: ovsdb.OperationWait, Table: kindTables[model.KindOperation]}}
+	operationErrors, transactionError := ovsdb.CheckOperationResults([]ovsdb.OperationResult{{Error: "timed out"}}, operations)
+	if transactionError == nil || !hasWaitError(operationErrors, transactionError) {
+		t.Fatalf("wait error was not classified: ops=%v err=%v", operationErrors, transactionError)
+	}
+	operationErrors, transactionError = ovsdb.CheckOperationResults([]ovsdb.OperationResult{{Error: "constraint violation"}}, operations)
+	if transactionError == nil || !hasConstraintError(operationErrors, transactionError) {
+		t.Fatalf("constraint error was not classified: ops=%v err=%v", operationErrors, transactionError)
+	}
+	operationErrors, transactionError = ovsdb.CheckOperationResults([]ovsdb.OperationResult{{Error: "referential integrity violation"}}, operations)
+	if transactionError == nil || !hasConstraintError(operationErrors, transactionError) || !hasReferentialError(operationErrors, transactionError) {
+		t.Fatalf("referential error was not classified: ops=%v err=%v", operationErrors, transactionError)
+	}
+}
