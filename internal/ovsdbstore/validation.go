@@ -2,7 +2,6 @@ package ovsdbstore
 
 import (
 	"fmt"
-	"net/netip"
 	"strings"
 
 	"github.com/pvnstack/proxmox-ovn/internal/controlstore"
@@ -82,8 +81,10 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 			if subnet.ProjectID != value.ProjectID {
 				return storeError(controlstore.ErrConflict, "fixed IP subnet belongs to a different project")
 			}
-			if fixed.Address != "" && !addressInIPv4Prefix(subnet.CIDR, fixed.Address) {
-				return storeError(controlstore.ErrConflict, "fixed IP address must belong to its subnet")
+			if fixed.Address != "" {
+				if addressErr := model.ValidateIPv4AllocationAddress(subnet, fixed.Address); addressErr != nil {
+					return storeError(controlstore.ErrConflict, "fixed IP address is not allocatable on its subnet: %v", addressErr)
+				}
 			}
 		}
 		for _, groupID := range value.SecurityGroupIDs {
@@ -118,8 +119,8 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 		if subnet.ProjectID != value.ProjectID {
 			return storeError(controlstore.ErrConflict, "subnet belongs to a different project")
 		}
-		if !addressInIPv4Prefix(subnet.CIDR, value.Address) {
-			return storeError(controlstore.ErrConflict, "allocated address must belong to its subnet")
+		if addressErr := model.ValidateIPv4AllocationAddress(subnet, value.Address); addressErr != nil {
+			return storeError(controlstore.ErrConflict, "allocated address is not allocatable on its subnet: %v", addressErr)
 		}
 		if value.PortID != "" {
 			portResource, err := require(current, model.KindPort, value.PortID, "port_id")
@@ -165,14 +166,8 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 			if subnet.NetworkID != value.ExternalNetworkID || subnet.ProjectID != external.ProjectID {
 				return storeError(controlstore.ErrConflict, "external subnet belongs to a different network")
 			}
-			prefix, prefixErr := netip.ParsePrefix(subnet.CIDR)
-			address, addressErr := netip.ParseAddr(value.ExternalIPAddress)
-			if prefixErr != nil || addressErr != nil || !address.Is4() || !prefix.Contains(address) {
-				return storeError(controlstore.ErrConflict, "external IP address must belong to the external subnet")
-			}
-			gateway, gatewayErr := model.EffectiveIPv4Gateway(subnet)
-			if gatewayErr != nil || value.ExternalIPAddress == gateway.String() {
-				return storeError(controlstore.ErrConflict, "external IP address must differ from the subnet gateway")
+			if addressErr := model.ValidateIPv4AllocationAddress(subnet, value.ExternalIPAddress); addressErr != nil {
+				return storeError(controlstore.ErrConflict, "external IP address is not allocatable on the external subnet: %v", addressErr)
 			}
 		}
 	case *model.RouterInterface:
@@ -226,6 +221,9 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 		if err != nil {
 			return err
 		}
+		if !providerHasAllocatableAddress(current, value.ProviderNetworkID, value.Address, "") {
+			return storeError(controlstore.ErrConflict, "floating IP address is not allocatable on an external subnet for its provider network")
+		}
 		if (value.PortID == "") != (value.FixedIPAddress == "") {
 			return storeError(controlstore.ErrConflict, "port and fixed IP address must be configured together")
 		}
@@ -263,8 +261,8 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 			if externalSubnet.NetworkID != externalNetwork.ID || externalSubnet.ProjectID != externalNetwork.ProjectID {
 				return storeError(controlstore.ErrConflict, "router external subnet does not belong to its external network")
 			}
-			if !addressInIPv4Prefix(externalSubnet.CIDR, value.Address) {
-				return storeError(controlstore.ErrConflict, "floating IP address must belong to the router external subnet")
+			if addressErr := model.ValidateIPv4AllocationAddress(externalSubnet, value.Address); addressErr != nil {
+				return storeError(controlstore.ErrConflict, "floating IP address is not allocatable on the router external subnet: %v", addressErr)
 			}
 		}
 		if value.PortID != "" {
@@ -313,13 +311,23 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 	return nil
 }
 
-func addressInIPv4Prefix(cidr, address string) bool {
-	prefix, err := netip.ParsePrefix(cidr)
-	if err != nil || !prefix.Addr().Is4() {
-		return false
+func providerHasAllocatableAddress(current *snapshot, providerID, address, ignoredSubnetID string) bool {
+	for _, networkEntry := range current.resources[model.KindNetwork] {
+		network := networkEntry.resource.(*model.Network)
+		if network.State == model.ResourceDeleting || !network.External || network.ProviderNetworkID != providerID {
+			continue
+		}
+		for subnetID, subnetEntry := range current.resources[model.KindSubnet] {
+			if subnetID == ignoredSubnetID {
+				continue
+			}
+			subnet := subnetEntry.resource.(*model.Subnet)
+			if subnet.State != model.ResourceDeleting && subnet.NetworkID == network.ID && model.ValidateIPv4AllocationAddress(subnet, address) == nil {
+				return true
+			}
+		}
 	}
-	parsed, err := netip.ParseAddr(address)
-	return err == nil && parsed.Is4() && prefix.Contains(parsed)
+	return false
 }
 
 func portHasFixedIP(port *model.Port, subnetID, address string) bool {
@@ -434,6 +442,20 @@ func validateSnapshotUnique(current *snapshot) error {
 			}
 		}
 	}
+	subnetIDs := make([]string, 0, len(current.resources[model.KindSubnet]))
+	for id := range current.resources[model.KindSubnet] {
+		subnetIDs = append(subnetIDs, id)
+	}
+	sortStrings(subnetIDs)
+	for leftIndex, leftID := range subnetIDs {
+		left := current.resources[model.KindSubnet][leftID].resource.(*model.Subnet)
+		for _, rightID := range subnetIDs[leftIndex+1:] {
+			right := current.resources[model.KindSubnet][rightID].resource.(*model.Subnet)
+			if left.NetworkID == right.NetworkID && model.IPv4PrefixesOverlap(left.CIDR, right.CIDR) {
+				return fmt.Errorf("stored subnet %q overlaps %q on network_id,cidr", leftID, rightID)
+			}
+		}
+	}
 	return nil
 }
 
@@ -529,8 +551,8 @@ func conflictField(candidate, existing model.Resource) string {
 		}
 	case *model.Subnet:
 		right := existing.(*model.Subnet)
-		if left.NetworkID == right.NetworkID && left.CIDR == right.CIDR {
-			return "network_id,cidr"
+		if left.NetworkID == right.NetworkID && model.IPv4PrefixesOverlap(left.CIDR, right.CIDR) {
+			return "network_id,cidr-overlap"
 		}
 		if left.NetworkID == right.NetworkID && left.Name == right.Name {
 			return "network_id,name"
@@ -647,6 +669,29 @@ func firstReference(current *snapshot, kind model.Kind, id string) string {
 				portEntry, exists := current.resources[model.KindPort][floating.PortID]
 				if exists && portHasFixedIP(portEntry.resource.(*model.Port), routerInterface.SubnetID, floating.FixedIPAddress) {
 					return fmt.Sprintf("%s %q", model.KindFloatingIP, floatingID)
+				}
+			}
+		}
+	}
+	if kind == model.KindSubnet {
+		subnetEntry, exists := current.resources[kind][id]
+		if exists {
+			subnet := subnetEntry.resource.(*model.Subnet)
+			networkEntry, networkExists := current.resources[model.KindNetwork][subnet.NetworkID]
+			if networkExists {
+				network := networkEntry.resource.(*model.Network)
+				if network.External && network.ProviderNetworkID != "" {
+					ids := make([]string, 0, len(current.resources[model.KindFloatingIP]))
+					for floatingID := range current.resources[model.KindFloatingIP] {
+						ids = append(ids, floatingID)
+					}
+					sortStrings(ids)
+					for _, floatingID := range ids {
+						floating := current.resources[model.KindFloatingIP][floatingID].resource.(*model.FloatingIP)
+						if floating.ProviderNetworkID == network.ProviderNetworkID && model.ValidateIPv4AllocationAddress(subnet, floating.Address) == nil && !providerHasAllocatableAddress(current, network.ProviderNetworkID, floating.Address, id) {
+							return fmt.Sprintf("%s %q", model.KindFloatingIP, floatingID)
+						}
+					}
 				}
 			}
 		}

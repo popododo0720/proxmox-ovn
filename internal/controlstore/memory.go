@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -512,8 +511,10 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 			if subnet.ProjectID != value.ProjectID {
 				return storeError(ErrConflict, "fixed IP subnet belongs to a different project")
 			}
-			if fixed.Address != "" && !addressInIPv4Prefix(subnet.CIDR, fixed.Address) {
-				return storeError(ErrConflict, "fixed IP address must belong to its subnet")
+			if fixed.Address != "" {
+				if addressErr := model.ValidateIPv4AllocationAddress(subnet, fixed.Address); addressErr != nil {
+					return storeError(ErrConflict, "fixed IP address is not allocatable on its subnet: %v", addressErr)
+				}
 			}
 		}
 		for _, groupID := range value.SecurityGroupIDs {
@@ -548,8 +549,8 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 		if subnet.ProjectID != value.ProjectID {
 			return storeError(ErrConflict, "subnet belongs to a different project")
 		}
-		if !addressInIPv4Prefix(subnet.CIDR, value.Address) {
-			return storeError(ErrConflict, "allocated address must belong to its subnet")
+		if addressErr := model.ValidateIPv4AllocationAddress(subnet, value.Address); addressErr != nil {
+			return storeError(ErrConflict, "allocated address is not allocatable on its subnet: %v", addressErr)
 		}
 		if value.PortID != "" {
 			portResource, err := s.requireLocked(model.KindPort, value.PortID, "port_id")
@@ -595,14 +596,8 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 			if subnet.NetworkID != network.ID || subnet.ProjectID != network.ProjectID {
 				return storeError(ErrConflict, "external subnet belongs to a different network")
 			}
-			prefix, prefixErr := netip.ParsePrefix(subnet.CIDR)
-			address, addressErr := netip.ParseAddr(value.ExternalIPAddress)
-			if prefixErr != nil || addressErr != nil || !prefix.Contains(address) {
-				return storeError(ErrConflict, "external_ip_address must be inside the external subnet")
-			}
-			gateway, gatewayErr := model.EffectiveIPv4Gateway(subnet)
-			if gatewayErr != nil || address == gateway {
-				return storeError(ErrConflict, "external_ip_address must not equal the external subnet gateway")
+			if addressErr := model.ValidateIPv4AllocationAddress(subnet, value.ExternalIPAddress); addressErr != nil {
+				return storeError(ErrConflict, "external_ip_address is not allocatable on the external subnet: %v", addressErr)
 			}
 		}
 	case *model.RouterInterface:
@@ -656,6 +651,9 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 		if err != nil {
 			return err
 		}
+		if !s.providerHasAllocatableAddressLocked(value.ProviderNetworkID, value.Address, "") {
+			return storeError(ErrConflict, "floating IP address is not allocatable on an external subnet for its provider network")
+		}
 		if (value.PortID == "") != (value.FixedIPAddress == "") {
 			return storeError(ErrConflict, "port and fixed IP address must be configured together")
 		}
@@ -693,8 +691,8 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 			if externalSubnet.NetworkID != externalNetwork.ID || externalSubnet.ProjectID != externalNetwork.ProjectID {
 				return storeError(ErrConflict, "router external subnet does not belong to its external network")
 			}
-			if !addressInIPv4Prefix(externalSubnet.CIDR, value.Address) {
-				return storeError(ErrConflict, "floating IP address must belong to the router external subnet")
+			if addressErr := model.ValidateIPv4AllocationAddress(externalSubnet, value.Address); addressErr != nil {
+				return storeError(ErrConflict, "floating IP address is not allocatable on the router external subnet: %v", addressErr)
 			}
 		}
 		if value.PortID != "" {
@@ -743,13 +741,23 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 	return nil
 }
 
-func addressInIPv4Prefix(cidr, address string) bool {
-	prefix, err := netip.ParsePrefix(cidr)
-	if err != nil || !prefix.Addr().Is4() {
-		return false
+func (s *Memory) providerHasAllocatableAddressLocked(providerID, address, ignoredSubnetID string) bool {
+	for _, networkResource := range s.resources[model.KindNetwork] {
+		network := networkResource.(*model.Network)
+		if network.State == model.ResourceDeleting || !network.External || network.ProviderNetworkID != providerID {
+			continue
+		}
+		for subnetID, subnetResource := range s.resources[model.KindSubnet] {
+			if subnetID == ignoredSubnetID {
+				continue
+			}
+			subnet := subnetResource.(*model.Subnet)
+			if subnet.State != model.ResourceDeleting && subnet.NetworkID == network.ID && model.ValidateIPv4AllocationAddress(subnet, address) == nil {
+				return true
+			}
+		}
 	}
-	parsed, err := netip.ParseAddr(address)
-	return err == nil && parsed.Is4() && prefix.Contains(parsed)
+	return false
 }
 
 func portHasFixedIP(port *model.Port, subnetID, address string) bool {
@@ -886,8 +894,8 @@ func conflictField(candidate, existing model.Resource) string {
 		}
 	case *model.Subnet:
 		right := existing.(*model.Subnet)
-		if left.NetworkID == right.NetworkID && left.CIDR == right.CIDR {
-			return "network_id,cidr"
+		if left.NetworkID == right.NetworkID && model.IPv4PrefixesOverlap(left.CIDR, right.CIDR) {
+			return "network_id,cidr-overlap"
 		}
 		if left.NetworkID == right.NetworkID && left.Name == right.Name {
 			return "network_id,name"
@@ -995,6 +1003,23 @@ func (s *Memory) firstReferenceLocked(kind model.Kind, id string) string {
 				portResource, exists := s.resources[model.KindPort][floating.PortID]
 				if exists && portHasFixedIP(portResource.(*model.Port), routerInterface.SubnetID, floating.FixedIPAddress) {
 					return fmt.Sprintf("%s %q", model.KindFloatingIP, floatingID)
+				}
+			}
+		}
+	}
+	if kind == model.KindSubnet {
+		subnet, exists := s.resources[kind][id].(*model.Subnet)
+		if exists {
+			networkResource, networkExists := s.resources[model.KindNetwork][subnet.NetworkID]
+			if networkExists {
+				network := networkResource.(*model.Network)
+				if network.External && network.ProviderNetworkID != "" {
+					for floatingID, resource := range s.resources[model.KindFloatingIP] {
+						floating := resource.(*model.FloatingIP)
+						if floating.ProviderNetworkID == network.ProviderNetworkID && model.ValidateIPv4AllocationAddress(subnet, floating.Address) == nil && !s.providerHasAllocatableAddressLocked(network.ProviderNetworkID, floating.Address, id) {
+							return fmt.Sprintf("%s %q", model.KindFloatingIP, floatingID)
+						}
+					}
 				}
 			}
 		}
