@@ -210,6 +210,15 @@ func (s *Memory) Update(ctx context.Context, resource model.Resource, expectedRe
 	if err := s.validateUniqueLocked(copyResource, id); err != nil {
 		return nil, false, err
 	}
+	// Parent fields can invalidate resources that already point at this row.
+	// Validate the whole prospective graph before making the replacement
+	// visible, matching the transactional PVN_Control store behavior.
+	s.resources[copyResource.ResourceKind()][id] = copyResource
+	graphErr := s.validateAllReferencesLocked()
+	s.resources[copyResource.ResourceKind()][id] = current
+	if graphErr != nil {
+		return nil, false, graphErr
+	}
 	meta := copyResource.GetMetadata()
 	currentMeta := current.GetMetadata()
 	meta.ID = id
@@ -577,6 +586,22 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 		if value.RemoteGroupID != "" {
 			if _, err := s.requireLocked(model.KindSecurityGroup, value.RemoteGroupID, "remote_group_id"); err != nil {
 				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Memory) validateAllReferencesLocked() error {
+	for _, kind := range model.Kinds() {
+		ids := make([]string, 0, len(s.resources[kind]))
+		for id := range s.resources[kind] {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			if err := s.validateReferencesLocked(s.resources[kind][id]); err != nil {
+				return storeError(ErrConflict, "%s %q would become invalid: %v", kind, id, err)
 			}
 		}
 	}

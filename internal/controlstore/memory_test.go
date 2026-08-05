@@ -213,6 +213,23 @@ func TestMemoryConcurrentUniqueAllocation(t *testing.T) {
 	}
 }
 
+func TestMemoryUpdateRejectsBrokenExistingReferences(t *testing.T) {
+	store := deterministicStore()
+	project, network, _ := baseTopology(t, store)
+	otherProject := mustCreate(t, store, &model.Project{Name: "other", PoolID: "pool-other"}, "other-project").(*model.Project)
+	network.ProjectID = otherProject.ID
+	if _, _, err := store.Update(context.Background(), network, network.Revision, "move-network"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("network move error = %v", err)
+	}
+	stored, err := store.Get(context.Background(), model.KindNetwork, network.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.(*model.Network).ProjectID != project.ID {
+		t.Fatalf("failed update changed stored network: %#v", stored)
+	}
+}
+
 func TestMemoryMarkReconciledHonorsDesiredRevision(t *testing.T) {
 	store := deterministicStore()
 	created := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool"}, "create").(*model.Project)
