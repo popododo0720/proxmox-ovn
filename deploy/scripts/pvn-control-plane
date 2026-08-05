@@ -1880,7 +1880,8 @@ class ControlPlane:
             raise ControlPlaneError(f"--confirm must exactly match {initial.confirmation!r}")
         with self.store.lock(initial.local_node):
             discovery = self.backend.discover()
-            if discovery.snapshot() != initial.snapshot():
+            if not self._durable_snapshot_matches(
+                    initial.snapshot(), discovery.snapshot()):
                 raise ControlPlaneError("PVE membership/topology changed while acquiring the lock")
             ledger = self.store.load()
             if ledger is None:
@@ -2022,7 +2023,8 @@ class ControlPlane:
         self, expected: Discovery, ledger: dict[str, Any], boundary: str
     ) -> None:
         live = self.backend.discover()
-        if live.snapshot() != expected.snapshot():
+        if not self._durable_snapshot_matches(
+                expected.snapshot(), live.snapshot()):
             raise ControlPlaneError(
                 f"membership/topology/package drift before {boundary}; activation refused"
             )
@@ -2112,9 +2114,9 @@ class ControlPlane:
     def _package_snapshot_repin_allowed(
         cls, discovery: Discovery, ledger: dict[str, Any]
     ) -> bool:
-        pinned = ledger.get("snapshot")
-        live = discovery.snapshot()
-        if not isinstance(pinned, dict):
+        pinned = cls._normalized_durable_snapshot(ledger.get("snapshot"))
+        live = cls._normalized_durable_snapshot(discovery.snapshot())
+        if pinned is None or live is None:
             return False
         pinned_nodes = pinned.get("nodes")
         live_nodes = live.get("nodes")
@@ -2141,6 +2143,27 @@ class ControlPlane:
             for node in snapshot["nodes"]:
                 node["package_version"] = None
         return pinned_without_versions == live_without_versions
+
+    @staticmethod
+    def _normalized_durable_snapshot(snapshot: Any) -> dict[str, Any] | None:
+        if not isinstance(snapshot, dict):
+            return None
+        epoch = snapshot.get("members_version")
+        if type(epoch) is not int or epoch < 0:
+            return None
+        # /etc/pve/.members "version" is a volatile membership-view
+        # generation. Every boundary re-runs full discovery, but this counter
+        # is not durable topology identity: the exact nodelist, node IDs/IPs,
+        # corosync config version, and topology digest remain pinned.
+        normalized = copy.deepcopy(snapshot)
+        normalized.pop("members_version")
+        return normalized
+
+    @classmethod
+    def _durable_snapshot_matches(cls, pinned: Any, live: dict[str, Any]) -> bool:
+        pinned_durable = cls._normalized_durable_snapshot(pinned)
+        live_durable = cls._normalized_durable_snapshot(live)
+        return pinned_durable is not None and pinned_durable == live_durable
 
     @staticmethod
     def _cert_fingerprint_set_valid(
@@ -2241,14 +2264,18 @@ class ControlPlane:
     ) -> bool:
         if ledger.get("version") != LEDGER_VERSION:
             raise ControlPlaneError("unsupported control-plane ledger version")
-        package_repin = ledger.get("snapshot") != discovery.snapshot() and \
+        live_snapshot = discovery.snapshot()
+        durable_match = cls._durable_snapshot_matches(
+            ledger.get("snapshot"), live_snapshot
+        )
+        package_repin = not durable_match and \
             allow_package_repin and (
                 cls._planned_package_repin_allowed(discovery, ledger) or
                 cls._staged_seed_package_repin_allowed(discovery, ledger) or
                 cls._partial_central_package_repin_allowed(discovery, ledger) or
                 cls._complete_package_repin_allowed(discovery, ledger)
             )
-        if ledger.get("snapshot") != discovery.snapshot() and not package_repin:
+        if not durable_match and not package_repin:
             raise ControlPlaneError("live membership/topology/package drift from the ledger")
         try:
             uuid.UUID(ledger["cluster_uuid"])

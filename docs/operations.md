@@ -352,6 +352,15 @@ failed node stops the sequence. Nodes already completed remain upgraded, and a
 later run safely verifies/skips them while continuing the one remaining older
 version.
 
+Proxmox also exposes a volatile membership-view generation as the top-level
+`version` in `/etc/pve/.members`. It can advance while the durable cluster is
+unchanged, so PVN records it for diagnostics but does not treat it as topology
+identity. Every discovery still requires quorum and all members online and
+strictly pins the cluster name, corosync configuration version, exact sorted
+node name/ID/management-IP set, topology digest, interfaces, addresses, MTU,
+and package versions. Drift in any of those durable fields remains a hard
+failure before an activation boundary.
+
 The control-plane ledger also pins the package version on every node. Package
 drift normally stops `pvn-control-plane plan`. There are only four automatic
 forward-recovery exceptions:

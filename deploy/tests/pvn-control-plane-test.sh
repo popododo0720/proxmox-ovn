@@ -1735,6 +1735,20 @@ with tempfile.TemporaryDirectory() as temporary:
     control.apply("test-cluster")
     assert backend.log == before
 
+    # pmxcfs increments /etc/pve/.members "version" for a new membership
+    # view even when the exact durable nodelist/config/topology is unchanged.
+    # That epoch is ignored across runs, is not rewritten into the ledger, and
+    # does not masquerade as a package repin.
+    old_epoch = store.load()["snapshot"]["members_version"]
+    backend.found = Discovery(**{
+        **backend.found.__dict__, "members_version": old_epoch + 2,
+    })
+    epoch_plan = control.plan()
+    assert epoch_plan["read_only"] and not epoch_plan["package_repin_required"]
+    control.apply("test-cluster")
+    assert store.load()["snapshot"]["members_version"] == old_epoch
+    assert backend.log == before
+
     # Frozen package/membership/topology drift fails before mutation.
     original = backend.found
     changed_nodes = list(original.nodes)
@@ -1792,7 +1806,9 @@ with tempfile.TemporaryDirectory() as temporary:
     store = LedgerStore(pathlib.Path(temporary) / "private")
     pinned = discovery(package="0.1.1")
     store.create(planned_ledger(pinned))
-    backend = FakeBackend(discovery(package="0.1.2"))
+    live = discovery(package="0.1.2")
+    live = Discovery(**{**live.__dict__, "members_version": live.members_version + 4})
+    backend = FakeBackend(live)
     control = ControlPlane(backend, store, timeout=0.01, interval=0)
     before = copy.deepcopy(store.load())
     plan = control.plan()
@@ -1812,7 +1828,9 @@ with tempfile.TemporaryDirectory() as temporary:
 with tempfile.TemporaryDirectory() as temporary:
     store = LedgerStore(pathlib.Path(temporary) / "private")
     pinned = discovery(package="0.1.1")
-    backend = FakeBackend(discovery(package="0.1.2"))
+    live = discovery(package="0.1.2")
+    live = Discovery(**{**live.__dict__, "members_version": live.members_version + 4})
+    backend = FakeBackend(live)
     enter_seed_activation_crash(backend)
     store.create(staged_seed_ledger(pinned, backend.cids["PVN_Control"]))
     control = ControlPlane(backend, store, timeout=0.01, interval=0)
@@ -1851,7 +1869,9 @@ for cid_known in (False, True):
     with tempfile.TemporaryDirectory() as temporary:
         store = LedgerStore(pathlib.Path(temporary) / "private")
         pinned = discovery(package="0.1.1")
-        backend = FakeBackend(discovery(package="0.1.2"))
+        live = discovery(package="0.1.2")
+        live = Discovery(**{**live.__dict__, "members_version": live.members_version + 4})
+        backend = FakeBackend(live)
         enter_partial_join_crash(backend, cid_known=cid_known)
         store.create(partial_central_ledger(pinned, backend.cids))
         control = ControlPlane(backend, store, timeout=0.01, interval=0)
@@ -1897,6 +1917,36 @@ with tempfile.TemporaryDirectory() as temporary:
     assert "init:pve-d" not in backend.log and backend.log.count("init:pve-e") == 1
 
 
+# The exact live crash state exercised in the lab is also resumable without a
+# package repin: central-1 is durable, the second voter is already active and
+# healthy but its ledger write was missed, and only the volatile PVE membership
+# epoch advanced. Apply adopts no foreign state; init verifies the pinned CID,
+# the 2/2 health gate records voter two, and convergence continues forward.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    pinned = discovery(package="0.1.1")
+    live = Discovery(**{**pinned.__dict__, "members_version": 11})
+    backend = FakeBackend(live)
+    first, second, _third = live.nodes
+    backend.control_dbs = {
+        first.name: backend.cids["PVN_Control"],
+        second.name: backend.cids["PVN_Control"],
+    }
+    backend.central = [first.name, second.name]
+    backend.central_markers = [first.name, second.name]
+    store.create(partial_central_ledger(pinned, backend.cids))
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    before = copy.deepcopy(store.load())
+    plan = control.plan()
+    assert plan["read_only"] and not plan["package_repin_required"]
+    assert store.load() == before
+    result = control.apply("test-cluster")
+    assert result["complete"] and backend.central == [
+        "pve-a", "pve-b", "pve-c"
+    ]
+    assert "init:pve-b" not in backend.log and "central:pve-b" not in backend.log
+
+
 # A fully converged cluster may adopt one uniform forward package rollout only
 # while every active voter has an unconsumed restart marker for that exact
 # package, all three databases remain exact N/N, and a fresh node doctor passes.
@@ -1904,7 +1954,9 @@ for count in (1, 3, 5):
     with tempfile.TemporaryDirectory() as temporary:
         store = LedgerStore(pathlib.Path(temporary) / "private")
         pinned = discovery(count, package="0.1.1")
-        backend = FakeBackend(discovery(count, package="0.1.2"))
+        live = discovery(count, package="0.1.2")
+        live = Discovery(**{**live.__dict__, "members_version": live.members_version + 4})
+        backend = FakeBackend(live)
         enter_complete_update(backend)
         store.create(complete_ledger(pinned, backend.cids))
         control = ControlPlane(backend, store, timeout=0.01, interval=0)
@@ -2128,6 +2180,60 @@ topology_drift = Discovery(**{
 })
 expect_package_repin_rejected(pinned, topology_drift)
 
+durable_snapshot = pinned.snapshot()
+epoch_only = copy.deepcopy(durable_snapshot)
+epoch_only["members_version"] += 100
+assert ControlPlane._durable_snapshot_matches(durable_snapshot, epoch_only)
+
+durable_mutations = (
+    lambda value: value.update(cluster_version=value["cluster_version"] + 1),
+    lambda value: value.update(topology_sha256="b" * 64),
+    lambda value: value["nodes"][0].update(
+        node_id=value["nodes"][0]["node_id"] + 10
+    ),
+    lambda value: value["nodes"][0].update(control_ip="192.0.2.200"),
+    lambda value: value["nodes"][0].update(package_version="0.1.2"),
+)
+for durable_mutation in durable_mutations:
+    changed = copy.deepcopy(epoch_only)
+    durable_mutation(changed)
+    assert not ControlPlane._durable_snapshot_matches(durable_snapshot, changed)
+
+epoch_package_live = discovery(package="0.1.2")
+epoch_package_live = Discovery(**{
+    **epoch_package_live.__dict__,
+    "members_version": epoch_package_live.members_version + 100,
+})
+changed_node_id = list(epoch_package_live.nodes)
+changed_node_id[0] = Node(**{
+    **changed_node_id[0].__dict__, "node_id": changed_node_id[0].node_id + 10,
+})
+changed_control_ip = list(epoch_package_live.nodes)
+changed_control_ip[1] = Node(**{
+    **changed_control_ip[1].__dict__, "control_ip": "192.0.2.200",
+})
+renamed_node = list(epoch_package_live.nodes)
+renamed_node[2] = Node(**{**renamed_node[2].__dict__, "name": "foreign-node"})
+for durable_package_drift in (
+    Discovery(**{
+        **epoch_package_live.__dict__,
+        "cluster_version": epoch_package_live.cluster_version + 1,
+    }),
+    Discovery(**{**epoch_package_live.__dict__, "nodes": tuple(changed_node_id)}),
+    Discovery(**{**epoch_package_live.__dict__, "nodes": tuple(changed_control_ip)}),
+    Discovery(**{**epoch_package_live.__dict__, "nodes": tuple(renamed_node)}),
+    Discovery(**{**epoch_package_live.__dict__, "nodes": epoch_package_live.nodes[:-1]}),
+):
+    expect_package_repin_rejected(pinned, durable_package_drift)
+
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    malformed = planned_ledger(pinned)
+    malformed["snapshot"]["members_version"] = "7"
+    store.create(malformed)
+    control = ControlPlane(FakeBackend(pinned), store, timeout=0.01, interval=0)
+    expect_error(control.plan, "drift")
+
 
 def expect_staged_snapshot_repin_rejected(pinned, live, **ledger_overrides):
     with tempfile.TemporaryDirectory() as temporary:
@@ -2221,6 +2327,25 @@ with tempfile.TemporaryDirectory() as temporary:
 
 
 # Topology/membership is re-read before every destructive or activation boundary.
+# A changing pmxcfs membership-view epoch alone does not interrupt those
+# boundaries because every read still proves the exact online nodelist,
+# corosync config version, and durable topology hash.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(discovery())
+
+    def advance_membership_epoch(current):
+        current.found = Discovery(**{
+            **current.found.__dict__,
+            "members_version": current.found.members_version + 1,
+        })
+
+    backend.discover_hook = advance_membership_epoch
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    result = control.apply("test-cluster")
+    assert result["complete"] and backend.found.members_version > 7
+
+
 with tempfile.TemporaryDirectory() as temporary:
     store = LedgerStore(pathlib.Path(temporary) / "private")
     backend = FakeBackend(discovery())
