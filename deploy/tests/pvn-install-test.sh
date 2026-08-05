@@ -85,11 +85,11 @@ printf 'control %s\n' "$*" >> "$PVN_TEST_SETUP_LOG"
 EOF
 chmod 0755 "$BIN/pvn-control-plane"
 
-printf 'test deb payload\n' > "$ASSETS/pvn-node_0.2.3_amd64.deb"
+printf 'test deb payload\n' > "$ASSETS/pvn-node_0.2.4_amd64.deb"
 make_manifest() {
     (
         cd "$ASSETS"
-        sha256sum pvn-node_0.2.3_amd64.deb pvn-cluster-install \
+        sha256sum pvn-node_0.2.4_amd64.deb pvn-cluster-install \
             pvn-cluster-lease > SHA256SUMS
     )
 }
@@ -147,12 +147,12 @@ reset_logs() {
 }
 
 run_bootstrap() {
-    PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 \
+    PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 \
     PVN_INVENTORY=$INVENTORY PVN_IDENTITY=$IDENTITY "$BOOTSTRAP" "$@"
 }
 
 run_local_bootstrap() {
-    PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 \
+    PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 \
     PVN_CP_MEMBERS=$MEMBERS \
     "$BOOTSTRAP" "$@"
 }
@@ -263,7 +263,7 @@ fi
 [ ! -s "$SETUP_LOG" ] || fail "invalid full install ran setup tools"
 
 reset_logs
-if PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 \
+if PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 \
     PVN_INVENTORY=$INVENTORY PVN_IDENTITY=$IDENTITY \
     "$BOOTSTRAP" --local-pve preflight > "$WORK/mixed-mode.out" 2>&1
 then
@@ -274,7 +274,7 @@ fi
 reset_logs
 PVN_PHASE=preflight run_bootstrap > "$WORK/preflight.out"
 [ "$(wc -l < "$CURL_LOG")" -eq 4 ] || fail "bootstrap did not download exactly four files"
-grep -q '/pvn-node_0.2.3_amd64.deb ' "$CURL_LOG" || fail "versioned DEB was not downloaded"
+grep -q '/pvn-node_0.2.4_amd64.deb ' "$CURL_LOG" || fail "versioned DEB was not downloaded"
 grep -q '/pvn-cluster-install ' "$CURL_LOG" || fail "cluster installer was not downloaded"
 grep -q '/pvn-cluster-lease ' "$CURL_LOG" || fail "cluster lease helper was not downloaded"
 grep -q '/SHA256SUMS ' "$CURL_LOG" || fail "SHA256SUMS was not downloaded"
@@ -314,7 +314,7 @@ fi
 [ ! -s "$CURL_LOG" ] || fail "missing confirmation downloaded artifacts"
 
 reset_logs
-if PVN_RELEASE_BASE_URL=http://releases.example.invalid/v0.2.3 \
+if PVN_RELEASE_BASE_URL=http://releases.example.invalid/v0.2.4 \
     PVN_INVENTORY=$INVENTORY PVN_IDENTITY=$IDENTITY PVN_PHASE=preflight \
     "$BOOTSTRAP" > "$WORK/http.out" 2>&1
 then
@@ -322,15 +322,15 @@ then
 fi
 [ ! -s "$CURL_LOG" ] || fail "non-HTTPS base reached curl"
 
-cp "$ASSETS/pvn-node_0.2.3_amd64.deb" "$WORK/deb.good"
-printf 'tampered payload\n' > "$ASSETS/pvn-node_0.2.3_amd64.deb"
+cp "$ASSETS/pvn-node_0.2.4_amd64.deb" "$WORK/deb.good"
+printf 'tampered payload\n' > "$ASSETS/pvn-node_0.2.4_amd64.deb"
 reset_logs
 if PVN_PHASE=preflight run_bootstrap > "$WORK/bad-checksum.out" 2>&1; then
     fail "a bad DEB checksum unexpectedly succeeded"
 fi
 [ ! -s "$INSTALLER_LOG" ] || fail "installer ran after checksum failure"
 assert_temp_cleaned
-cp "$WORK/deb.good" "$ASSETS/pvn-node_0.2.3_amd64.deb"
+cp "$WORK/deb.good" "$ASSETS/pvn-node_0.2.4_amd64.deb"
 make_manifest
 
 reset_logs
@@ -343,7 +343,7 @@ assert_temp_cleaned
 # for an inventory or identity. Empty confirmation stops safely.
 reset_logs
 printf '\n' | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 bash -c \"\$(cat '$BOOTSTRAP')\"" \
     /dev/null > "$WORK/local-interactive-stop.out"
 [ "$(wc -l < "$INSTALLER_LOG")" -eq 1 ] ||
     fail "default local interactive flow ran more than preflight"
@@ -359,7 +359,7 @@ assert_temp_cleaned
 # Supplying one advanced setting explicitly prompts only for its missing pair.
 reset_logs
 printf '%s\n' "$IDENTITY" | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 PVN_INVENTORY='$INVENTORY' PVN_PHASE=preflight bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_PHASE=preflight bash -c \"\$(cat '$BOOTSTRAP')\"" \
     /dev/null > "$WORK/advanced-prompt.out"
 grep -q 'SSH private-key path' "$WORK/advanced-prompt.out" ||
     fail "explicit advanced flow did not prompt for the missing identity"
@@ -371,7 +371,7 @@ assert_temp_cleaned
 # performs preflight and safely stops without invoking install.
 reset_logs
 printf '\n' | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 PVN_INVENTORY='$INVENTORY' PVN_IDENTITY='$IDENTITY' bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_IDENTITY='$IDENTITY' bash -c \"\$(cat '$BOOTSTRAP')\"" \
     /dev/null > "$WORK/interactive-stop.out"
 [ "$(wc -l < "$INSTALLER_LOG")" -eq 1 ] ||
     fail "implicit interactive blank confirmation ran more than preflight"
@@ -381,7 +381,7 @@ grep -q 'installation was not requested' "$WORK/interactive-stop.out" ||
 
 reset_logs
 printf 'lab-cluster\n' | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 PVN_INVENTORY='$INVENTORY' PVN_IDENTITY='$IDENTITY' bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_IDENTITY='$IDENTITY' bash -c \"\$(cat '$BOOTSTRAP')\"" \
     /dev/null > "$WORK/interactive-apply.out"
 [ "$(wc -l < "$INSTALLER_LOG")" -eq 2 ] ||
     fail "implicit interactive apply did not run exactly preflight then install"
@@ -396,7 +396,7 @@ assert_temp_cleaned
 write_members 2
 reset_logs
 if printf 'lab-cluster\ny\n' | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.3 PVN_CP_MEMBERS='$MEMBERS' PVN_TOPOLOGY_BIN='$BIN/pvn-topology' PVN_CONTROL_PLANE_BIN='$BIN/pvn-control-plane' bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_CP_MEMBERS='$MEMBERS' PVN_TOPOLOGY_BIN='$BIN/pvn-topology' PVN_CONTROL_PLANE_BIN='$BIN/pvn-control-plane' bash -c \"\$(cat '$BOOTSTRAP')\"" \
     /dev/null > "$WORK/interactive-unsupported-full.out" 2>&1
 then
     fail "interactive unsupported cluster reached full setup"
