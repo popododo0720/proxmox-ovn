@@ -367,12 +367,21 @@ elif action == "stage":
 elif action == "init-control":
     database = "/var/lib/pvn/control-db/pvn_control.db"
     expected_local = payload.get("local")
+    expected_cluster_id = payload.get("expected_cluster_id")
+    if expected_cluster_id is not None and (
+            not isinstance(expected_cluster_id, str) or not expected_cluster_id):
+        fail("expected Control DB cluster ID is invalid")
     current = db_info(database)
+    created = not current["exists"]
     if current["exists"]:
         if current.get("name") != "PVN_Control": fail("existing Control DB has wrong schema name")
         if payload["mode"] == "raft":
             if not current.get("clustered") or current.get("local_address") != expected_local:
                 fail("existing Control DB mode/local address drift")
+            if expected_cluster_id is None:
+                fail("existing Control DB cluster ID is not pinned by the ledger")
+            if current.get("cluster_id") != expected_cluster_id:
+                fail("existing Control DB cluster ID differs from the ledger")
         elif current.get("clustered"):
             fail("existing standalone Control DB is clustered")
     else:
@@ -382,6 +391,18 @@ elif action == "init-control":
         if payload.get("join"): command += ["--join", payload["join"]]
         run(command)
         current = db_info(database)
+        if not current.get("exists") or current.get("name") != "PVN_Control":
+            fail("Control DB initialization did not create the expected schema")
+        if payload["mode"] == "raft":
+            if not current.get("clustered") or current.get("local_address") != expected_local:
+                fail("new Control DB mode/local address drift")
+            if not current.get("cluster_id"):
+                fail("new Control DB has no cluster ID")
+            if expected_cluster_id is not None and current.get("cluster_id") != expected_cluster_id:
+                fail("new Control DB joined a different cluster ID")
+        elif current.get("clustered"):
+            fail("new standalone Control DB is clustered")
+    current["created"] = created
     print(json.dumps(current, sort_keys=True))
 
 elif action == "activate-central":
@@ -717,10 +738,12 @@ class SystemBackend:
     def stage(self, node: Node, files: list[dict[str, str]]) -> None:
         self._remote(node.name, "stage", {"files": files})
 
-    def init_control(self, node: Node, mode: str, cluster_id: str, seed: Node) -> None:
-        self._remote(node.name, "init-control", {
+    def init_control(self, node: Node, mode: str, cluster_id: str, seed: Node,
+                     expected_cluster_id: str | None) -> dict[str, Any]:
+        return self._remote(node.name, "init-control", {
             "mode": mode,
             "cluster_id": cluster_id,
+            "expected_cluster_id": expected_cluster_id,
             "local": f"ssl:{node.control_ip}:6646" if mode == "raft" else None,
             "join": f"ssl:{seed.control_ip}:6646" if mode == "raft" and node != seed else None,
         })
@@ -785,6 +808,7 @@ class ControlPlane:
                     "central_complete": 0,
                     "nodes_complete": 0,
                     "cert_fingerprints": {},
+                    "control_db_cluster_id": None,
                     "db_cluster_ids": {},
                 }
                 self.store.create(ledger)
@@ -811,10 +835,29 @@ class ControlPlane:
             for index, node in enumerate(discovery.nodes, 1):
                 if ledger["central_complete"] >= index:
                     continue
-                # init-control may already have joined before a previous process
-                # crashed. The backend validates and adopts the exact file; it
-                # never deletes or recreates an existing clustered database.
-                self.backend.init_control(node, discovery.mode, ledger["cluster_uuid"], seed)
+                # Existing files are adopted only after their Raft cluster ID
+                # matches the durable pin. A newly created seed is pinned before
+                # activation; a crash before that ledger write fails closed.
+                expected_control_cid = ledger["control_db_cluster_id"]
+                control_info = self.backend.init_control(
+                    node, discovery.mode, ledger["cluster_uuid"], seed,
+                    expected_control_cid,
+                )
+                if discovery.mode == "raft":
+                    control_cid = control_info.get("cluster_id")
+                    if not isinstance(control_cid, str) or not control_cid:
+                        raise ControlPlaneError(f"node {node.name} Control DB lacks a cluster ID")
+                    if expected_control_cid is None:
+                        if control_info.get("created") is not True:
+                            raise ControlPlaneError(
+                                "existing seed Control DB is not pinned by the ledger"
+                            )
+                        ledger["control_db_cluster_id"] = control_cid
+                        self.store.update(ledger)
+                    elif control_cid != expected_control_cid:
+                        raise ControlPlaneError(
+                            f"node {node.name} Control DB cluster ID drift from the ledger"
+                        )
                 self.backend.activate_central(node)
                 cids = self._wait_central(discovery, index, ledger["db_cluster_ids"])
                 if not ledger["db_cluster_ids"]:
@@ -863,6 +906,26 @@ class ControlPlane:
             raise ControlPlaneError("ledger node progress is invalid")
         if ledger.get("nodes_complete", 0) and ledger.get("central_complete") != count:
             raise ControlPlaneError("ledger activates nodes before all central voters")
+        if "control_db_cluster_id" not in ledger:
+            raise ControlPlaneError("ledger lacks the Control DB cluster ID pin field")
+        control_cid = ledger.get("control_db_cluster_id")
+        if control_cid is not None and (not isinstance(control_cid, str) or not control_cid):
+            raise ControlPlaneError("ledger Control DB cluster ID pin is invalid")
+        db_cids = ledger.get("db_cluster_ids")
+        if not isinstance(db_cids, dict):
+            raise ControlPlaneError("ledger database cluster IDs are invalid")
+        if discovery.mode == "standalone":
+            if control_cid is not None or db_cids:
+                raise ControlPlaneError("standalone ledger unexpectedly pins Raft cluster IDs")
+        else:
+            if ledger.get("central_complete", 0) and control_cid is None:
+                raise ControlPlaneError("ledger lacks the Control DB cluster ID pin")
+            if db_cids:
+                if set(db_cids) != set(DATABASES) or not all(
+                        isinstance(value, str) and value for value in db_cids.values()):
+                    raise ControlPlaneError("ledger database cluster ID set is invalid")
+                if db_cids["PVN_Control"] != control_cid:
+                    raise ControlPlaneError("ledger Control DB cluster ID pins disagree")
 
     @staticmethod
     def _render_config(discovery: Discovery, cluster_id: str) -> dict[str, Any]:

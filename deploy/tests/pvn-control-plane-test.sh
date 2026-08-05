@@ -56,13 +56,14 @@ class FakeBackend:
         self.log = []
         self.shared = None
         self.staged = {}
-        self.control_dbs = set()
+        self.control_dbs = {}
         self.central = []
         self.nodes = []
         self.cids = {name: f"cid-{index}" for index, name in enumerate(DATABASES, 1)}
         self.block_at = None
         self.pki_variant = "one"
         self.pristine = True
+        self.crash_after_init = None
 
     def discover(self):
         return self.found
@@ -105,10 +106,24 @@ class FakeBackend:
         elif self.staged[node.name] != snapshot:
             raise ControlPlaneError("stage drift")
 
-    def init_control(self, node, mode, cluster_id, seed):
+    def init_control(self, node, mode, cluster_id, seed, expected_cluster_id):
+        actual = self.control_dbs.get(node.name)
+        if actual is not None:
+            if mode == "raft" and expected_cluster_id is None:
+                raise ControlPlaneError("existing Control DB cluster ID is not pinned")
+            if mode == "raft" and actual != expected_cluster_id:
+                raise ControlPlaneError("existing Control DB cluster ID differs from the ledger")
+            return {"cluster_id": actual if mode == "raft" else None, "created": False}
+        actual = self.cids["PVN_Control"] if mode == "raft" else "standalone"
+        if mode == "raft" and expected_cluster_id is not None and actual != expected_cluster_id:
+            raise ControlPlaneError("new Control DB joined a different cluster ID")
         if node.name not in self.control_dbs:
-            self.control_dbs.add(node.name)
+            self.control_dbs[node.name] = actual
             self.log.append("init:" + node.name)
+        if self.crash_after_init == node.name:
+            self.crash_after_init = None
+            raise ControlPlaneError("simulated crash after Control DB initialization")
+        return {"cluster_id": actual if mode == "raft" else None, "created": True}
 
     def activate_central(self, node):
         if node.name not in self.central:
@@ -337,6 +352,7 @@ with tempfile.TemporaryDirectory() as temporary:
     ledger = store.load()
     assert ledger["phase"] == "complete"
     assert ledger["db_cluster_ids"] == backend.cids
+    assert ledger["control_db_cluster_id"] == backend.cids["PVN_Control"]
     assert ledger["snapshot"]["nodes"][0]["geneve_ip"] == "198.51.100.11"
 
     # Exact rerun verifies live state and performs no new mutation.
@@ -371,6 +387,20 @@ with tempfile.TemporaryDirectory() as temporary:
     assert result["complete"]
     assert backend.central == ["pve-a", "pve-b", "pve-c"]
     assert backend.log.count("init:pve-b") == 1
+
+
+# A previously created foreign Control DB is rejected before central activation.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(discovery())
+    backend.crash_after_init = "pve-b"
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    expect_error(lambda: control.apply("test-cluster"), "simulated crash")
+    assert backend.central == ["pve-a"]
+    assert store.load()["control_db_cluster_id"] == backend.cids["PVN_Control"]
+    backend.control_dbs["pve-b"] = "foreign-control-cid"
+    expect_error(lambda: control.apply("test-cluster"), "differs from the ledger")
+    assert backend.central == ["pve-a"]
 
 
 # Standalone uses the same durable workflow without Raft CIDs.
