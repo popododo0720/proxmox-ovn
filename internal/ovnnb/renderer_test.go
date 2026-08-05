@@ -142,6 +142,10 @@ func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
 		DNSNameservers: []string{"1.1.1.1"},
 	}).(*model.Subnet)
 	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "web"}).(*model.SecurityGroup)
+	mustCreate(t, store, &model.Node{
+		Metadata: model.Metadata{ID: "pve-a"}, Name: "pve-a", ChassisID: "chassis-a",
+		Roles: []model.NodeRole{model.NodeRoleCompute}, Enabled: true,
+	})
 	port := mustCreate(t, store, &model.Port{
 		Metadata: model.Metadata{ID: "port-1"}, ProjectID: project.ID, NetworkID: network.ID, Name: "vm100-net0",
 		MACAddress: "02:00:00:00:00:10", FixedIPs: []model.FixedIP{{SubnetID: subnet.ID, Address: "10.42.0.10"}},
