@@ -85,6 +85,12 @@ class FakeBackend:
         if not self.pristine:
             raise ControlPlaneError("unledgered state")
 
+    def assert_planned_package_repin_safe(self, found):
+        if self.central or self.nodes or self.control_dbs:
+            raise ControlPlaneError(
+                "planned ledger package repin refused: activation or central database state"
+            )
+
     def ensure_shared_config(self, config):
         encoded = json.dumps(config, sort_keys=True)
         if self.shared is None:
@@ -204,6 +210,22 @@ def drift_topology(found_backend):
         "topology_sha256": "b" * 64,
     })
     found_backend.discover_hook = None
+
+
+def planned_ledger(found, **overrides):
+    ledger = {
+        "version": module["LEDGER_VERSION"],
+        "cluster_uuid": str(uuid.uuid4()),
+        "snapshot": found.snapshot(),
+        "phase": "planned",
+        "central_complete": 0,
+        "nodes_complete": 0,
+        "cert_fingerprints": {},
+        "control_db_cluster_id": None,
+        "db_cluster_ids": {},
+    }
+    ledger.update(overrides)
+    return ledger
 
 
 lease_temporary = tempfile.TemporaryDirectory()
@@ -791,6 +813,61 @@ with tempfile.TemporaryDirectory() as temporary:
     backend.found = original
     backend.pki_variant = "two"
     expect_error(lambda: control.apply("test-cluster"), "PKI fingerprint drift")
+
+
+# A wholly unactivated planned ledger may follow one uniform forward package
+# upgrade. Plan remains read-only; apply performs the atomic snapshot repin
+# under the cluster-global mutation lease before any staging or activation.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    pinned = discovery(package="0.1.1")
+    store.create(planned_ledger(pinned))
+    backend = FakeBackend(discovery(package="0.1.2"))
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    before = copy.deepcopy(store.load())
+    plan = control.plan()
+    assert plan["read_only"] and plan["package_repin_required"] is True
+    assert store.load() == before
+    result = control.apply("test-cluster")
+    assert result["complete"]
+    assert {node["package_version"] for node in store.load()["snapshot"]["nodes"]} == {
+        "0.1.2"
+    }
+
+
+def expect_package_repin_rejected(pinned, live, **ledger_overrides):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        store.create(planned_ledger(pinned, **ledger_overrides))
+        backend = FakeBackend(live)
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        expect_error(control.plan, "drift")
+
+
+# Mixed versions, a downgrade, any non-planned progress, and topology drift
+# can never be disguised as a package-only repin.
+pinned = discovery(package="0.1.1")
+mixed_nodes = list(discovery(package="0.1.2").nodes)
+mixed_nodes[1] = Node(**{**mixed_nodes[1].__dict__, "package_version": "0.1.3"})
+mixed = Discovery(**{**discovery(package="0.1.2").__dict__, "nodes": tuple(mixed_nodes)})
+expect_package_repin_rejected(pinned, mixed)
+expect_package_repin_rejected(discovery(package="0.1.2"), discovery(package="0.1.1"))
+expect_package_repin_rejected(pinned, discovery(package="0.1.2"), phase="staged")
+topology_drift = Discovery(**{
+    **discovery(package="0.1.2").__dict__, "topology_sha256": "b" * 64,
+})
+expect_package_repin_rejected(pinned, topology_drift)
+
+
+# Even an otherwise eligible planned snapshot is refused if a marker/service
+# or database appeared outside the zero-progress ledger.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    store.create(planned_ledger(discovery(package="0.1.1")))
+    backend = FakeBackend(discovery(package="0.1.2"))
+    backend.control_dbs["pve-a"] = "unexpected-cid"
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    expect_error(control.plan, "repin refused")
 
 
 # Topology/membership is re-read before every destructive or activation boundary.

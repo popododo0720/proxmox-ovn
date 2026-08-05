@@ -1102,6 +1102,17 @@ class SystemBackend:
             if any(info.get("exists") for info in probe.get("databases", {}).values()):
                 raise ControlPlaneError(f"node {node.name} has unledgered central database state")
 
+    def assert_planned_package_repin_safe(self, discovery: Discovery) -> None:
+        for node in discovery.nodes:
+            probe = self.probes[node.name]
+            if probe.get("central_marker") or probe.get("node_marker") or \
+                    probe.get("central_active") or probe.get("node_ready") or \
+                    any(info.get("exists") for info in probe.get("databases", {}).values()):
+                raise ControlPlaneError(
+                    f"planned ledger package repin refused: node {node.name} has "
+                    "activation or central database state"
+                )
+
     def _validate_ssh(
         self, records: list[tuple[int, str, str, str, str, str, str]]
     ) -> None:
@@ -1367,21 +1378,33 @@ class ControlPlane:
     def plan(self) -> dict[str, Any]:
         discovery = self.backend.discover()
         ledger = self.store.load()
+        package_repin = False
         if ledger is not None:
-            self._verify_ledger(discovery, ledger)
+            package_repin = self._verify_ledger(
+                discovery, ledger, allow_planned_package_repin=True
+            )
+            if package_repin:
+                self.backend.assert_planned_package_repin_safe(discovery)
+        actions = [
+            "freeze membership/topology/package in the private pmxcfs ledger",
+            "render shared config and preserve a seed-local private cluster CA",
+            "generate node-local keys, sign CSRs, then stage exact local/central environment",
+            "bootstrap central voters one at a time with exact three-DB health gates",
+            "activate transport nodes one at a time after central convergence",
+        ]
+        if package_repin:
+            actions.insert(
+                0,
+                "atomically repin the untouched planned ledger to the uniform newer package",
+            )
         return {
             "read_only": True,
             "confirmation": discovery.confirmation,
             "mode": discovery.mode,
             "nodes": [node.frozen() for node in discovery.nodes],
             "existing_phase": ledger.get("phase") if ledger else None,
-            "actions": [
-                "freeze membership/topology/package in the private pmxcfs ledger",
-                "render shared config and preserve a seed-local private cluster CA",
-                "generate node-local keys, sign CSRs, then stage exact local/central environment",
-                "bootstrap central voters one at a time with exact three-DB health gates",
-                "activate transport nodes one at a time after central convergence",
-            ],
+            "package_repin_required": package_repin,
+            "actions": actions,
         }
 
     def apply(self, confirmation: str) -> dict[str, Any]:
@@ -1408,7 +1431,15 @@ class ControlPlane:
                 }
                 self.store.create(ledger)
             else:
-                self._verify_ledger(discovery, ledger)
+                package_repin = self._verify_ledger(
+                    discovery, ledger, allow_planned_package_repin=True
+                )
+                if package_repin:
+                    self.backend.assert_planned_package_repin_safe(discovery)
+                    ledger = copy.deepcopy(ledger)
+                    ledger["snapshot"] = discovery.snapshot()
+                    self.store.update(ledger)
+                    self._verify_ledger(discovery, ledger)
 
             config = self._render_config(discovery, ledger["cluster_uuid"])
             self.backend.ensure_shared_config(config)
@@ -1513,10 +1544,74 @@ class ControlPlane:
         self._verify_ledger(live, persisted)
 
     @staticmethod
-    def _verify_ledger(discovery: Discovery, ledger: dict[str, Any]) -> None:
+    def _package_version_is_newer(candidate: str, pinned: str) -> bool:
+        try:
+            compared = subprocess.run(
+                ["/usr/bin/dpkg", "--compare-versions", candidate, "gt", pinned],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ControlPlaneError(f"cannot compare pvn-node package versions: {error}") from error
+        if compared.returncode not in {0, 1}:
+            detail = compared.stderr.strip().replace("\n", "; ")
+            raise ControlPlaneError(
+                f"cannot compare pvn-node package versions: {detail[:800]}"
+            )
+        return compared.returncode == 0
+
+    @classmethod
+    def _planned_package_repin_allowed(
+        cls, discovery: Discovery, ledger: dict[str, Any]
+    ) -> bool:
+        if ledger.get("phase") != "planned" or ledger.get("central_complete") != 0 or \
+                ledger.get("nodes_complete") != 0 or \
+                ledger.get("control_db_cluster_id") is not None or \
+                ledger.get("db_cluster_ids") != {}:
+            return False
+        pinned = ledger.get("snapshot")
+        live = discovery.snapshot()
+        if not isinstance(pinned, dict):
+            return False
+        pinned_nodes = pinned.get("nodes")
+        live_nodes = live.get("nodes")
+        if not isinstance(pinned_nodes, list) or not isinstance(live_nodes, list) or \
+                len(pinned_nodes) != len(live_nodes) or not pinned_nodes or \
+                not all(isinstance(node, dict) for node in pinned_nodes + live_nodes):
+            return False
+        pinned_version_values = [node.get("package_version") for node in pinned_nodes]
+        live_version_values = [node.get("package_version") for node in live_nodes]
+        if any(not isinstance(version, str) or not version
+               for version in pinned_version_values + live_version_values):
+            return False
+        pinned_versions = set(pinned_version_values)
+        live_versions = set(live_version_values)
+        if len(pinned_versions) != 1 or len(live_versions) != 1:
+            return False
+        pinned_version = next(iter(pinned_versions))
+        live_version = next(iter(live_versions))
+        if not cls._package_version_is_newer(live_version, pinned_version):
+            return False
+        pinned_without_versions = copy.deepcopy(pinned)
+        live_without_versions = copy.deepcopy(live)
+        for snapshot in (pinned_without_versions, live_without_versions):
+            for node in snapshot["nodes"]:
+                node["package_version"] = None
+        return pinned_without_versions == live_without_versions
+
+    @classmethod
+    def _verify_ledger(
+        cls, discovery: Discovery, ledger: dict[str, Any],
+        allow_planned_package_repin: bool = False,
+    ) -> bool:
         if ledger.get("version") != LEDGER_VERSION:
             raise ControlPlaneError("unsupported control-plane ledger version")
-        if ledger.get("snapshot") != discovery.snapshot():
+        package_repin = ledger.get("snapshot") != discovery.snapshot() and \
+            allow_planned_package_repin and cls._planned_package_repin_allowed(discovery, ledger)
+        if ledger.get("snapshot") != discovery.snapshot() and not package_repin:
             raise ControlPlaneError("live membership/topology/package drift from the ledger")
         try:
             uuid.UUID(ledger["cluster_uuid"])
@@ -1566,6 +1661,7 @@ class ControlPlane:
                     raise ControlPlaneError("ledger database cluster ID set is invalid")
                 if db_cids["PVN_Control"] != control_cid:
                     raise ControlPlaneError("ledger Control DB cluster ID pins disagree")
+        return package_repin
 
     @staticmethod
     def _render_config(discovery: Discovery, cluster_id: str) -> dict[str, Any]:
