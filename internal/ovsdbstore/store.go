@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	maxWriteAttempts       = 64
-	maxOperationPruneBatch = 256
+	maxWriteAttempts                = 64
+	maxOperationPruneBatch          = 256
+	maxExpiredOperationRecoverBatch = 256
 )
 
 // Config defines the secure OVSDB connection. Only unix: and ssl: endpoints
@@ -403,6 +404,78 @@ func (s *Store) PruneOperations(ctx context.Context, before time.Time, keep int)
 func operationSuperseded(current *snapshot, operation *model.Operation) bool {
 	target, exists := current.resources[operation.TargetKind][operation.TargetID]
 	return !exists || target.resource.GetMetadata().Revision > operation.TargetRevision
+}
+
+// RecoverExpiredOperations atomically terminalizes a bounded set of stale
+// writer claims. The PVN_Control transaction epoch and per-row revisions make
+// the result race-safe with a heartbeat from the former owner: exactly one
+// transaction wins, and the loser reloads the new state.
+func (s *Store) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recoveredAt time.Time, limit int) (int, error) {
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
+	if leaseCutoff.IsZero() || recoveredAt.IsZero() || limit < 1 {
+		return 0, storeError(controlstore.ErrConflict, "lease cutoff, recovery time, and positive limit are required")
+	}
+	if limit > maxExpiredOperationRecoverBatch {
+		limit = maxExpiredOperationRecoverBatch
+	}
+	for attempt := 0; attempt < maxWriteAttempts; attempt++ {
+		current, err := s.load(ctx)
+		if err != nil {
+			return 0, err
+		}
+		candidates := make([]*model.Operation, 0)
+		for _, entry := range current.resources[model.KindOperation] {
+			operation := entry.resource.(*model.Operation)
+			if !leaseProtectedAction(operation.Action) || operation.OperationStatus != model.OperationRunning || reconcileLeaseIsLive(operation, leaseCutoff) {
+				continue
+			}
+			candidates = append(candidates, operation)
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			left, right := candidates[i], candidates[j]
+			if !left.UpdatedAt.Equal(right.UpdatedAt) {
+				return left.UpdatedAt.Before(right.UpdatedAt)
+			}
+			return left.ID < right.ID
+		})
+		if len(candidates) > limit {
+			candidates = candidates[:limit]
+		}
+		if len(candidates) == 0 {
+			return 0, nil
+		}
+		completed := recoveredAt.UTC()
+		changes := make([]change, 0, len(candidates))
+		for _, operation := range candidates {
+			copyResource, err := model.Clone(operation)
+			if err != nil {
+				return 0, err
+			}
+			recovered := copyResource.(*model.Operation)
+			recovered.OperationStatus = model.OperationFailed
+			recovered.Error = "operation lease expired before completion"
+			recovered.CompletedAt = &completed
+			recovered.Revision++
+			recovered.State = model.ResourcePending
+			recovered.LastError = ""
+			recovered.UpdatedAt = completed
+			row, err := encodeResource(recovered, current)
+			if err != nil {
+				return 0, err
+			}
+			changes = append(changes, change{type_: changeUpdate, table: kindTables[model.KindOperation], id: recovered.ID, expectedRevision: operation.Revision, row: row})
+		}
+		if err := s.database.commit(ctx, current.epoch, changes, formatTime(completed)); err != nil {
+			if errors.Is(err, errSerialization) {
+				continue
+			}
+			return 0, err
+		}
+		return len(candidates), nil
+	}
+	return 0, storeError(controlstore.ErrConflict, "expired operation recovery could not be serialized after concurrent changes")
 }
 
 func (s *Store) Update(ctx context.Context, resource model.Resource, expectedRevision int64, key string) (model.Resource, bool, error) {

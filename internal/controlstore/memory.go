@@ -29,7 +29,10 @@ type Memory struct {
 	newID       func() string
 }
 
-const maxOperationPruneBatch = 256
+const (
+	maxOperationPruneBatch          = 256
+	maxExpiredOperationRecoverBatch = 256
+)
 
 type MemoryOption func(*Memory)
 
@@ -263,6 +266,67 @@ func (s *Memory) PruneOperations(ctx context.Context, before time.Time, keep int
 		pruned++
 	}
 	return pruned, nil
+}
+
+// RecoverExpiredOperations turns abandoned durable writer claims into
+// terminal failures. The store lock makes selection and updates atomic with
+// lease heartbeats, claims, target updates, and purges.
+func (s *Memory) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recoveredAt time.Time, limit int) (int, error) {
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
+	if leaseCutoff.IsZero() || recoveredAt.IsZero() || limit < 1 {
+		return 0, storeError(ErrConflict, "lease cutoff, recovery time, and positive limit are required")
+	}
+	if limit > maxExpiredOperationRecoverBatch {
+		limit = maxExpiredOperationRecoverBatch
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidates := expiredRunningOperations(s.resources[model.KindOperation], leaseCutoff)
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	completed := recoveredAt.UTC()
+	recoveredOperations := make([]*model.Operation, 0, len(candidates))
+	for _, operation := range candidates {
+		copyResource, err := model.Clone(operation)
+		if err != nil {
+			return 0, err
+		}
+		recovered := copyResource.(*model.Operation)
+		recovered.OperationStatus = model.OperationFailed
+		recovered.Error = "operation lease expired before completion"
+		recovered.CompletedAt = &completed
+		recovered.Revision++
+		recovered.State = model.ResourcePending
+		recovered.LastError = ""
+		recovered.UpdatedAt = completed
+		recoveredOperations = append(recoveredOperations, recovered)
+	}
+	for _, recovered := range recoveredOperations {
+		s.resources[model.KindOperation][recovered.ID] = recovered
+	}
+	return len(candidates), nil
+}
+
+func expiredRunningOperations(resources map[string]model.Resource, leaseCutoff time.Time) []*model.Operation {
+	operations := make([]*model.Operation, 0)
+	for _, resource := range resources {
+		operation := resource.(*model.Operation)
+		if !leaseProtectedAction(operation.Action) || operation.OperationStatus != model.OperationRunning || reconcileLeaseIsLive(operation, leaseCutoff) {
+			continue
+		}
+		operations = append(operations, operation)
+	}
+	sort.Slice(operations, func(i, j int) bool {
+		left, right := operations[i], operations[j]
+		if !left.UpdatedAt.Equal(right.UpdatedAt) {
+			return left.UpdatedAt.Before(right.UpdatedAt)
+		}
+		return left.ID < right.ID
+	})
+	return operations
 }
 
 func terminalReconcileOperations(resources map[string]model.Resource) []*model.Operation {

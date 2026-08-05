@@ -39,11 +39,12 @@ type Controller struct {
 var ErrReconcileLeaseActive = errors.New("target has an active reconcile lease")
 
 const (
-	operationLease       = 5 * time.Minute
-	maxConvergencePasses = 8
-	maxHeartbeatInterval = 30 * time.Second
-	defaultOperationKeep = 1000
-	defaultOperationAge  = 24 * time.Hour
+	operationLease         = 5 * time.Minute
+	maxConvergencePasses   = 8
+	maxHeartbeatInterval   = 30 * time.Second
+	defaultOperationKeep   = 1000
+	defaultOperationAge    = 24 * time.Hour
+	operationRecoveryBatch = 256
 )
 
 type operationRetention struct {
@@ -87,10 +88,10 @@ func NewController(store controlstore.Store, renderer Renderer, options ...Optio
 }
 
 func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) error {
-	return c.reconcile(ctx, kind, id, false)
+	return c.reconcile(ctx, kind, id, false, time.Time{})
 }
 
-func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, force bool) error {
+func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, force bool, freshSince time.Time) error {
 	if c == nil || c.store == nil || c.renderer == nil {
 		return errors.New("reconciler is not configured")
 	}
@@ -145,6 +146,12 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 		}
 		op = latest.(*model.Operation)
 	}
+	// Recheck durable freshness immediately before the claim. Two managers may
+	// both decide that an audit is due from an older snapshot; after either one
+	// completes, the other must not replay the same audit sequentially.
+	if !freshSince.IsZero() && meta.State == model.ResourceReady && meta.AppliedRevision >= meta.Revision && op.OperationStatus == model.OperationSucceeded && op.CompletedAt != nil && !op.CompletedAt.Before(freshSince) {
+		return nil
+	}
 	if op.OperationStatus == model.OperationSucceeded && !force {
 		_, markErr := c.store.MarkReconciled(ctx, kind, id, meta.Revision, nil)
 		return markErr
@@ -195,8 +202,49 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 	return nil
 }
 
+// ReconcileAll is a forced drift audit. It is intentionally used at manager
+// startup even when the exact desired revision was recently confirmed.
 func (c *Controller) ReconcileAll(ctx context.Context) error {
+	return c.reconcileAll(ctx, 0)
+}
+
+// ReconcilePeriodic performs a forced drift audit only when an exact desired
+// revision has not completed successfully within freshness. Pending, failed,
+// deleting, and superseded resources are always processed. This gives every
+// manager the same durable decision and prevents clustered periodic loops from
+// continuously replaying an already-healthy full audit.
+func (c *Controller) ReconcilePeriodic(ctx context.Context, freshness time.Duration) error {
+	if freshness <= 0 {
+		return errors.New("periodic reconciliation freshness must be positive")
+	}
+	return c.reconcileAll(ctx, freshness)
+}
+
+func (c *Controller) reconcileAll(ctx context.Context, freshness time.Duration) error {
+	if c == nil || c.store == nil || c.renderer == nil {
+		return errors.New("reconciler is not configured")
+	}
 	var failures []error
+	now := c.now().UTC()
+	if _, err := c.store.RecoverExpiredOperations(ctx, now.Add(-c.lease), now, operationRecoveryBatch); err != nil {
+		failures = append(failures, fmt.Errorf("recover expired operation leases: %w", err))
+	}
+	recent := make(map[string]struct{})
+	if freshness > 0 {
+		operations, err := c.store.List(ctx, model.KindOperation, controlstore.ListOptions{})
+		if err != nil {
+			failures = append(failures, fmt.Errorf("list operation audit records: %w", err))
+		} else {
+			cutoff := now.Add(-freshness)
+			for _, resource := range operations {
+				operation := resource.(*model.Operation)
+				if operation.Action != "reconcile" || operation.OperationStatus != model.OperationSucceeded || operation.CompletedAt == nil || operation.CompletedAt.Before(cutoff) {
+					continue
+				}
+				recent[operationKey(operation.TargetKind, operation.TargetID, operation.TargetRevision)] = struct{}{}
+			}
+		}
+	}
 	for _, kind := range dependencyOrder {
 		resources, err := c.store.List(ctx, kind, controlstore.ListOptions{})
 		if err != nil {
@@ -204,14 +252,24 @@ func (c *Controller) ReconcileAll(ctx context.Context) error {
 			continue
 		}
 		for _, resource := range resources {
+			meta := resource.GetMetadata()
+			if freshness > 0 && meta.State == model.ResourceReady && meta.AppliedRevision >= meta.Revision {
+				if _, ok := recent[operationKey(kind, meta.ID, meta.Revision)]; ok {
+					continue
+				}
+			}
 			// A forced pass repairs OVN drift left by a manager that died
 			// between an external write and desired-state confirmation.
-			if err := c.reconcile(ctx, kind, resource.GetMetadata().ID, true); err != nil {
+			freshSince := time.Time{}
+			if freshness > 0 {
+				freshSince = now.Add(-freshness)
+			}
+			if err := c.reconcile(ctx, kind, meta.ID, true, freshSince); err != nil {
 				failures = append(failures, err)
 			}
 		}
 	}
-	if _, err := c.store.PruneOperations(ctx, c.now().UTC().Add(-c.retention.age), c.retention.keep); err != nil {
+	if _, err := c.store.PruneOperations(ctx, now.Add(-c.retention.age), c.retention.keep); err != nil {
 		failures = append(failures, fmt.Errorf("prune operation audit records: %w", err))
 	}
 	return errors.Join(failures...)

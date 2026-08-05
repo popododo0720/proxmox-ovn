@@ -470,6 +470,139 @@ func TestMemoryReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 	}
 }
 
+func TestMemoryRecoverExpiredOperationsIsBoundedAndIncludesSupersededTargets(t *testing.T) {
+	store := deterministicStore()
+	base := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
+	createRunningReconcile := func(name string, started time.Time) (*model.Project, *model.Operation) {
+		project := mustCreate(t, store, &model.Project{Name: name, PoolID: "pool-" + name}, "project-"+name).(*model.Project)
+		operation := mustCreate(t, store, &model.Operation{
+			Action: "reconcile", TargetKind: model.KindProject, TargetID: project.ID,
+			TargetRevision: project.Revision, OperationStatus: model.OperationQueued,
+		}, "operation-"+name).(*model.Operation)
+		claimed, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-"+name, started, started.Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return project, claimed
+	}
+
+	supersededProject, superseded := createRunningReconcile("superseded", base)
+	supersededProject.Description = "new desired revision"
+	if _, _, err := store.Update(context.Background(), supersededProject, supersededProject.Revision, "supersede-project"); err != nil {
+		t.Fatal(err)
+	}
+	_, current := createRunningReconcile("current", base.Add(time.Minute))
+
+	deleteProject := mustCreate(t, store, &model.Project{Name: "deleting", PoolID: "pool-deleting"}, "project-deleting").(*model.Project)
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, deleteProject.ID, deleteProject.Revision, "begin-delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteOperation := mustCreate(t, store, &model.Operation{
+		Action: "delete", TargetKind: model.KindProject, TargetID: deleteProject.ID,
+		TargetRevision: tombstone.GetMetadata().Revision, OperationStatus: model.OperationQueued,
+	}, "operation-delete").(*model.Operation)
+	deleting, err := store.ClaimDelete(context.Background(), deleteOperation.ID, deleteOperation.Revision, "lease-delete", base.Add(2*time.Minute), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, live := createRunningReconcile("live", base.Add(2*time.Hour))
+
+	recoveredAt := base.Add(3 * time.Hour)
+	recovered, err := store.RecoverExpiredOperations(context.Background(), base.Add(time.Hour), recoveredAt, 2)
+	if err != nil || recovered != 2 {
+		t.Fatalf("first recovery count=%d err=%v", recovered, err)
+	}
+	for _, operationID := range []string{superseded.ID, current.ID} {
+		resource, getErr := store.Get(context.Background(), model.KindOperation, operationID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		operation := resource.(*model.Operation)
+		if operation.OperationStatus != model.OperationFailed || operation.CompletedAt == nil || !operation.CompletedAt.Equal(recoveredAt) || operation.Error == "" {
+			t.Fatalf("recovered operation=%#v", operation)
+		}
+	}
+	for _, operationID := range []string{deleting.ID, live.ID} {
+		resource, getErr := store.Get(context.Background(), model.KindOperation, operationID)
+		if getErr != nil || resource.(*model.Operation).OperationStatus != model.OperationRunning {
+			t.Fatalf("unrecovered operation=%#v err=%v", resource, getErr)
+		}
+	}
+	recovered, err = store.RecoverExpiredOperations(context.Background(), base.Add(time.Hour), recoveredAt.Add(time.Minute), 10)
+	if err != nil || recovered != 1 {
+		t.Fatalf("second recovery count=%d err=%v", recovered, err)
+	}
+	resource, err := store.Get(context.Background(), model.KindOperation, deleting.ID)
+	if err != nil || resource.(*model.Operation).OperationStatus != model.OperationFailed {
+		t.Fatalf("delete recovery operation=%#v err=%v", resource, err)
+	}
+	resource, err = store.Get(context.Background(), model.KindOperation, live.ID)
+	if err != nil || resource.(*model.Operation).OperationStatus != model.OperationRunning {
+		t.Fatalf("live operation=%#v err=%v", resource, err)
+	}
+	if _, err := store.RecoverExpiredOperations(context.Background(), base, recoveredAt, 0); !errors.Is(err, ErrConflict) {
+		t.Fatalf("zero-limit recovery error=%v", err)
+	}
+}
+
+func TestMemoryExpiredRecoveryAndHeartbeatAreSerialized(t *testing.T) {
+	for iteration := 0; iteration < 64; iteration++ {
+		store := NewMemory()
+		project := mustCreate(t, store, &model.Project{Name: fmt.Sprintf("tenant-%d", iteration), PoolID: fmt.Sprintf("pool-%d", iteration)}, "project").(*model.Project)
+		operation := mustCreate(t, store, &model.Operation{
+			Action: "reconcile", TargetKind: model.KindProject, TargetID: project.ID,
+			TargetRevision: project.Revision, OperationStatus: model.OperationQueued,
+		}, "operation").(*model.Operation)
+		started := time.Now().UTC()
+		claimed, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-race", started, started.Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		renewResult := make(chan error, 1)
+		recoverResult := make(chan struct {
+			count int
+			err   error
+		}, 1)
+		go func() {
+			<-start
+			_, renewErr := store.RenewOperationLease(context.Background(), claimed.ID, claimed.Revision, claimed.LeaseOwner, started.Add(time.Second))
+			renewResult <- renewErr
+		}()
+		go func() {
+			<-start
+			count, recoverErr := store.RecoverExpiredOperations(context.Background(), started, started.Add(2*time.Second), 1)
+			recoverResult <- struct {
+				count int
+				err   error
+			}{count, recoverErr}
+		}()
+		close(start)
+		renewErr, recovery := <-renewResult, <-recoverResult
+		if recovery.err != nil {
+			t.Fatalf("iteration %d recovery error=%v", iteration, recovery.err)
+		}
+		stored, getErr := store.Get(context.Background(), model.KindOperation, claimed.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		status := stored.(*model.Operation).OperationStatus
+		switch recovery.count {
+		case 0:
+			if renewErr != nil || status != model.OperationRunning {
+				t.Fatalf("iteration %d renewal winner err=%v status=%s", iteration, renewErr, status)
+			}
+		case 1:
+			if renewErr == nil || status != model.OperationFailed {
+				t.Fatalf("iteration %d recovery winner renewErr=%v status=%s", iteration, renewErr, status)
+			}
+		default:
+			t.Fatalf("iteration %d recovery count=%d", iteration, recovery.count)
+		}
+	}
+}
+
 func TestMemoryReconcileCannotStartAfterTombstone(t *testing.T) {
 	store := deterministicStore()
 	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool"}, "create-claim-project").(*model.Project)

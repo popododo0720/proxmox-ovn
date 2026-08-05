@@ -54,6 +54,10 @@ type Store interface {
 	// records whose target revision has been superseded (or target was purged),
 	// while always retaining at least keep most-recent terminal reconciles.
 	PruneOperations(context.Context, time.Time, int) (int, error)
+	// RecoverExpiredOperations atomically fails a bounded batch of abandoned
+	// running reconcile/delete operations. A concurrent heartbeat either wins
+	// before selection or loses its revision CAS after recovery.
+	RecoverExpiredOperations(context.Context, time.Time, time.Time, int) (int, error)
 	ClaimReconcile(context.Context, string, int64, string, time.Time, time.Time) (*model.Operation, error)
 	ClaimDelete(context.Context, string, int64, string, time.Time, time.Time) (*model.Operation, error)
 	RenewOperationLease(context.Context, string, int64, string, time.Time) (*model.Operation, error)

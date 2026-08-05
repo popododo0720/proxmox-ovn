@@ -68,6 +68,25 @@ type retentionObservingStore struct {
 	keep   int
 }
 
+type recoveryObservingStore struct {
+	controlstore.Store
+	mu          sync.Mutex
+	calls       int
+	leaseCutoff time.Time
+	recoveredAt time.Time
+	limit       int
+}
+
+func (store *recoveryObservingStore) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recoveredAt time.Time, limit int) (int, error) {
+	store.mu.Lock()
+	store.calls++
+	store.leaseCutoff = leaseCutoff
+	store.recoveredAt = recoveredAt
+	store.limit = limit
+	store.mu.Unlock()
+	return store.Store.RecoverExpiredOperations(ctx, leaseCutoff, recoveredAt, limit)
+}
+
 func (store *retentionObservingStore) PruneOperations(ctx context.Context, before time.Time, keep int) (int, error) {
 	store.mu.Lock()
 	store.calls++
@@ -499,6 +518,95 @@ func TestControllerReconcileAllRunsConservativeOperationRetention(t *testing.T) 
 	defer store.mu.Unlock()
 	if store.calls != 1 || store.keep != 25 || !store.before.Equal(now.Add(-6*time.Hour)) {
 		t.Fatalf("retention calls=%d keep=%d before=%v", store.calls, store.keep, store.before)
+	}
+}
+
+func TestControllerFullPassRecoversExpiredOperationsBeforeReconciling(t *testing.T) {
+	base := controlstore.NewMemory()
+	store := &recoveryObservingStore{Store: base}
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	controller := NewController(store, NewFakeRenderer(), WithLeaseDuration(5*time.Minute))
+	controller.now = func() time.Time { return now }
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.ReconcilePeriodic(context.Background(), 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.calls != 2 || !store.leaseCutoff.Equal(now.Add(-5*time.Minute)) || !store.recoveredAt.Equal(now) || store.limit != operationRecoveryBatch {
+		t.Fatalf("recovery calls=%d cutoff=%v recovered=%v limit=%d", store.calls, store.leaseCutoff, store.recoveredAt, store.limit)
+	}
+}
+
+func TestControllerReconcilePeriodicUsesDurableFreshnessAcrossManagers(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := &unfencedRevisionRenderer{blockRevision: -1}
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	first := NewController(store, renderer)
+	second := NewController(store, renderer)
+	first.now = func() time.Time { return now }
+	second.now = func() time.Time { return now }
+	if err := first.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	const freshness = 10 * time.Minute
+	for pass := 0; pass < 5; pass++ {
+		if err := second.ReconcilePeriodic(context.Background(), freshness); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, calls := renderer.state(); calls != 1 {
+		t.Fatalf("fresh clustered periodic passes rendered %d times, want 1", calls)
+	}
+
+	now = now.Add(freshness + time.Second)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, controller := range []*Controller{first, second} {
+		go func(controller *Controller) {
+			<-start
+			results <- controller.ReconcilePeriodic(context.Background(), freshness)
+		}(controller)
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if revision, calls := renderer.state(); revision != project.Revision || calls != 2 {
+		t.Fatalf("due clustered audit revision=%d calls=%d, want revision=%d calls=2", revision, calls, project.Revision)
+	}
+}
+
+func TestControllerReconcilePeriodicDoesNotHideUnreadyExactRevision(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := &unfencedRevisionRenderer{blockRevision: -1}
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	controller := NewController(store, renderer)
+	controller.now = func() time.Time { return now }
+	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkReconciled(context.Background(), model.KindProject, project.ID, project.Revision, errors.New("realized state lost")); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.ReconcilePeriodic(context.Background(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, calls := renderer.state(); calls != 2 {
+		t.Fatalf("unready exact revision renderer calls=%d, want 2", calls)
+	}
+}
+
+func TestControllerReconcilePeriodicRejectsNonPositiveFreshness(t *testing.T) {
+	controller := NewController(controlstore.NewMemory(), NewFakeRenderer())
+	if err := controller.ReconcilePeriodic(context.Background(), 0); err == nil {
+		t.Fatal("zero periodic freshness was accepted")
 	}
 }
 

@@ -379,6 +379,7 @@ func (health *reconcilerHealth) Probe(ctx context.Context) error {
 }
 
 func reconcilePeriodically(ctx context.Context, controller *reconcile.Controller, interval time.Duration, health *reconcilerHealth, logger *slog.Logger) {
+	freshness := 10 * interval
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -387,7 +388,7 @@ func reconcilePeriodically(ctx context.Context, controller *reconcile.Controller
 			return
 		case <-ticker.C:
 			reconcileContext, cancel := context.WithTimeout(ctx, interval)
-			err := controller.ReconcileAll(reconcileContext)
+			err := controller.ReconcilePeriodic(reconcileContext, freshness)
 			cancel()
 			health.record(err)
 			if err != nil && !errors.Is(err, context.Canceled) {
