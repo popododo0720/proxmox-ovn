@@ -120,6 +120,11 @@ EOF
 {"nodename":"node-a","version":7,"cluster":{"name":"lab-cluster","version":9,"nodes":3,"quorate":1},"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"},"node-b":{"id":2,"online":1,"ip":"192.0.2.12"},"node-c":{"id":3,"online":1,"ip":"192.0.2.13"}}}
 EOF
             ;;
+        5)
+            cat > "$MEMBERS" <<'EOF'
+{"nodename":"node-a","version":7,"cluster":{"name":"lab-cluster","version":9,"nodes":5,"quorate":1},"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"},"node-b":{"id":2,"online":1,"ip":"192.0.2.12"},"node-c":{"id":3,"online":1,"ip":"192.0.2.13"},"node-d":{"id":4,"online":1,"ip":"192.0.2.14"},"node-e":{"id":5,"online":1,"ip":"192.0.2.15"}}}
+EOF
+            ;;
         *) fail "unsupported test membership count: $pvn_member_count" ;;
     esac
     chmod 0600 "$MEMBERS"
@@ -229,9 +234,23 @@ cmp "$WORK/expected-standalone-setup.log" "$SETUP_LOG" ||
     fail "standalone full install did not preserve the setup sequence"
 assert_temp_cleaned
 
+# Every member of a supported odd-sized cluster becomes a central voter.
+write_members 5
+reset_logs
+PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
+    PVN_GENEVE_CIDR=192.168.100.0/24 \
+    PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+    PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+    PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+    PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+    run_local_bootstrap > "$WORK/five-node-full-apply.out"
+cmp "$WORK/expected-setup.log" "$SETUP_LOG" ||
+    fail "five-node full install did not run the topology/control-plane sequence"
+assert_temp_cleaned
+
 # The package stage may support other cluster sizes, but automated control-plane
-# activation currently supports only one or three nodes. Reject an unsupported
-# cluster before even the read-only topology plan, and especially before apply.
+# activation requires an odd voter count. Reject an even cluster before even the
+# read-only topology plan, and especially before topology/control-plane apply.
 write_members 2
 reset_logs
 if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
@@ -244,7 +263,7 @@ if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
 then
     fail "unsupported cluster reached full setup"
 fi
-grep -q 'supports exactly one or three nodes, found 2' \
+grep -q 'requires a positive odd node count with every node as a central voter, found 2' \
     "$WORK/unsupported-full.out" || fail "unsupported cluster error was unclear"
 [ ! -s "$SETUP_LOG" ] ||
     fail "unsupported cluster invoked topology/control-plane tooling"
@@ -401,7 +420,7 @@ if printf 'lab-cluster\ny\n' | script -qefc \
 then
     fail "interactive unsupported cluster reached full setup"
 fi
-grep -q 'supports exactly one or three nodes, found 2' \
+grep -q 'requires a positive odd node count with every node as a central voter, found 2' \
     "$WORK/interactive-unsupported-full.out" ||
     fail "interactive unsupported cluster error was unclear"
 [ ! -s "$SETUP_LOG" ] ||

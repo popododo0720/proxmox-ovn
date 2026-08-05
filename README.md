@@ -7,8 +7,9 @@ as the compute control plane.
 The installer puts the same PVN package on every online Proxmox node. Each
 node runs the manager API/UI, a local TAP binding agent, Open vSwitch, and
 `ovn-controller`. The current bootstrap supports either one standalone PVE
-node or a quorate three-node PVE cluster; in a three-node cluster all three
-nodes are database voters and transport nodes.
+node or any quorate, odd-sized PVE cluster. In clustered mode every PVE node
+is a database voter and transport node; even-sized clusters are rejected
+before topology changes.
 
 ## Initial feature set
 

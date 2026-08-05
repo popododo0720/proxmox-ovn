@@ -11,20 +11,21 @@ package. There is no container runtime and no separate appliance VM.
 - `pvn-agent`: observes local QEMU TAP interfaces and binds only ports for
   which the manager returns an exact `(node, vmid, netN)` assignment.
 - Open vSwitch and `ovn-controller`: implement the local datapath.
-- `pvn-control-db`, OVN NB/SB, and `ovn-northd`: installed everywhere but
-  enabled only on selected central voters.
+- `pvn-control-db`, OVN NB/SB, and `ovn-northd`: installed everywhere and
+  enabled on every member by the supported automated bootstrap.
 
-The current automated bootstrap has two deterministic placements:
+The current automated bootstrap has one deterministic placement policy:
 
 | Online PVE nodes | Central voters | Mode |
 | --- | ---: | --- |
 | 1 | 1 | standalone |
-| 3 | 3 | Raft |
+| 3, 5, 7, ... | every node | Raft |
 
-Two-, four-, and five-or-more-node clusters are rejected by the full-setup
-compatibility preflight before topology changes. Supporting those sizes needs
-an explicit voter-placement and membership-change workflow; the package-only
-installer remains usable without activating PVN.
+Even-sized clusters are rejected by the full-setup compatibility preflight
+before topology changes. All listed members of a supported odd-sized cluster
+become central voters and transport nodes. Changing membership after bootstrap
+remains an explicit operator workflow; the package-only installer remains
+usable without activating PVN.
 
 ## Source of truth
 

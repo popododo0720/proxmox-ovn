@@ -948,8 +948,12 @@ class SystemBackend:
             cluster_name = f"standalone-{local_name}"
             confirmation = cluster_name
             cluster_version = 0
-        if len(nodelist) not in {1, 3}:
-            raise ControlPlaneError("control-plane bootstrap supports exactly one or three nodes")
+        node_count = len(nodelist)
+        if node_count < 1 or node_count % 2 == 0:
+            raise ControlPlaneError(
+                "control-plane bootstrap requires a positive odd node count "
+                "with every node as a central voter"
+            )
         if any(not isinstance(name, str) or not isinstance(member, dict)
                for name, member in nodelist.items()):
             raise ControlPlaneError(".members nodelist contains a malformed node")
@@ -1389,7 +1393,8 @@ class ControlPlane:
             "freeze membership/topology/package in the private pmxcfs ledger",
             "render shared config and preserve a seed-local private cluster CA",
             "generate node-local keys, sign CSRs, then stage exact local/central environment",
-            "bootstrap central voters one at a time with exact three-DB health gates",
+            "bootstrap every PVE node as a central voter, one at a time, "
+            "with exact three-DB health gates",
             "activate transport nodes one at a time after central convergence",
         ]
         if package_repin:

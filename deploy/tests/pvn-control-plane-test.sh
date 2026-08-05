@@ -41,17 +41,21 @@ MAX_KNOWN_HOSTS_BYTES = module["MAX_KNOWN_HOSTS_BYTES"]
 
 
 def discovery(count=3, package="0.1.1"):
-    records = (
-        ("pve-a", 1, "192.0.2.11", "198.51.100.11"),
-        ("pve-b", 2, "192.0.2.12", "198.51.100.12"),
-        ("pve-c", 3, "192.0.2.13", "198.51.100.13"),
-    )[:count]
+    records = tuple(
+        (
+            f"pve-{chr(ord('a') + index)}",
+            index + 1,
+            f"192.0.2.{11 + index}",
+            f"198.51.100.{11 + index}",
+        )
+        for index in range(count)
+    )
     nodes = tuple(Node(name, node_id, control, geneve, "ens4", "ens5", "br-provider",
                        package, 1450, index == 0)
                   for index, (name, node_id, control, geneve) in enumerate(records))
     mode = "standalone" if count == 1 else "raft"
     confirm = "standalone-pve-a" if count == 1 else "test-cluster"
-    return Discovery(mode, confirm, confirm, "pve-a", 7, 3 if count == 3 else 0,
+    return Discovery(mode, confirm, confirm, "pve-a", 7, 3 if count > 1 else 0,
                      "a" * 64, 1380, "provider", nodes)
 
 
@@ -268,16 +272,22 @@ os.environ["PVN_CP_LEASE_BIN"] = str(lease_helper)
 os.environ["PVN_TEST_CP_LEASE"] = str(lease_state)
 
 
-def canonical_topology_fixture(root):
-    records = (
-        ("pve-a", 1, "192.0.2.11", "198.51.100.11"),
-        ("pve-b", 2, "192.0.2.12", "198.51.100.12"),
-        ("pve-c", 3, "192.0.2.13", "198.51.100.13"),
+def canonical_topology_fixture(root, count=3):
+    records = tuple(
+        (
+            f"pve-{chr(ord('a') + index)}",
+            index + 1,
+            f"192.0.2.{11 + index}",
+            f"198.51.100.{11 + index}",
+        )
+        for index in range(count)
     )
     members = {
         "nodename": "pve-a",
         "version": 7,
-        "cluster": {"name": "test-cluster", "version": 3, "nodes": 3, "quorate": 1},
+        "cluster": {
+            "name": "test-cluster", "version": 3, "nodes": count, "quorate": 1,
+        },
         "nodelist": {
             name: {"id": node_id, "online": 1, "ip": management}
             for name, node_id, management, _ in records
@@ -379,6 +389,18 @@ with tempfile.TemporaryDirectory() as temporary:
     invalid["guest_mtu"] = 1400
     topology_path.write_text(json.dumps(invalid))
     expect_error(backend.discover, "exceeds effective Geneve MTU")
+
+
+# Discovery accepts every positive odd clustered size and rejects even voter
+# counts before configuration, database, or service mutation can begin.
+with tempfile.TemporaryDirectory() as temporary:
+    backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary), count=5)
+    found = backend.discover()
+    assert len(found.nodes) == 5 and found.mode == "raft"
+
+with tempfile.TemporaryDirectory() as temporary:
+    backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary), count=2)
+    expect_error(backend.discover, "positive odd node count")
 
 
 # Legacy pmxcfs key material is never adopted or copied automatically.
@@ -813,6 +835,45 @@ with tempfile.TemporaryDirectory() as temporary:
     backend.found = original
     backend.pki_variant = "two"
     expect_error(lambda: control.apply("test-cluster"), "PKI fingerprint drift")
+
+
+# A five-node cluster bootstraps every PVE member as a voter in deterministic
+# order. Each join points at the seed, every intermediate N/N membership gate
+# passes, and transport activation waits for all five central voters.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(discovery(5))
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    result = control.apply("test-cluster")
+    assert result["complete"] and result["nodes"] == 5
+    ordered = [entry for entry in backend.log if entry.startswith(("init:", "central:", "node:"))]
+    assert ordered == [
+        "init:pve-a", "central:pve-a",
+        "init:pve-b", "central:pve-b",
+        "init:pve-c", "central:pve-c",
+        "init:pve-d", "central:pve-d",
+        "init:pve-e", "central:pve-e",
+        "node:pve-a", "node:pve-b", "node:pve-c", "node:pve-d", "node:pve-e",
+    ], ordered
+    for index, node in enumerate(backend.found.nodes):
+        decoded = json.loads(backend.staged[node.name])
+        node_env = base64.b64decode(next(
+            item["content"] for item in decoded if item["path"].endswith("node.env")
+        )).decode()
+        central_env = base64.b64decode(next(
+            item["content"] for item in decoded
+            if item["path"].endswith("ovn-central.env")
+        )).decode()
+        assert "PVN_NODE_ROLES=compute,gateway,central\n" in node_env
+        if index == 0:
+            assert "PVN_OVN_BOOTSTRAP=seed\n" in central_env
+        else:
+            assert "PVN_OVN_BOOTSTRAP=join\n" in central_env
+            assert "--db-nb-cluster-remote-addr=192.0.2.11 " in central_env
+            assert "--db-sb-cluster-remote-addr=192.0.2.11 " in central_env
+    ledger = store.load()
+    assert ledger["phase"] == "complete"
+    assert ledger["central_complete"] == 5 and ledger["nodes_complete"] == 5
 
 
 # A wholly unactivated planned ledger may follow one uniform forward package

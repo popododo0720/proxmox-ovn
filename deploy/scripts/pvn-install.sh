@@ -424,9 +424,10 @@ else:
         fail("standalone PVE membership contains multiple nodes")
     deployment = f"standalone-{local_name}"
 
-if node_count not in {1, 3}:
+if node_count < 1 or node_count % 2 == 0:
     fail(
-        f"automated activation supports exactly one or three nodes, found {node_count}; "
+        f"automated activation requires a positive odd node count with every node "
+        f"as a central voter, found {node_count}; "
         "topology was not changed"
     )
 if confirmation != deployment:

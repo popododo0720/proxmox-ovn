@@ -4,9 +4,9 @@ PVN targets Proxmox VE 9 on Debian 13 with OVN 25.03. Install the same
 `pvn-node` package on every online PVE node. Its network services remain
 inactive after installation: a root-owned local activation marker plus
 `pvn-node.target` starts the per-node manager/controller/agent stack, and
-`pvn-central.target` starts a selected central voter only after its separate
-activation marker exists. The shared pmxcfs configuration does not activate a
-node.
+`pvn-central.target` starts that node's central voter only after its separate
+activation marker exists. The supported automated bootstrap makes every PVE
+member a voter. The shared pmxcfs configuration does not activate a node.
 
 The package owns the local OVN deployment. Its maintainer script masks the
 Debian `ovn-host.service` and `ovn-central.service` aggregate units; PVN starts
@@ -20,7 +20,8 @@ Run the public installer on any target PVE node. The default mode reads native
 PVE membership, requires quorum and every declared member online, and uses
 Proxmox's root cluster key plus each node's own `ssh_known_hosts` pin. It never
 asks for or uses a password. The current automated control-plane bootstrap
-supports one standalone PVE node or exactly three clustered PVE nodes.
+supports one standalone PVE node or any odd-sized, fully online and quorate
+PVE cluster. Every clustered PVE node becomes a central voter.
 
 Before writing configuration, the topology preflight discovers on every node:
 
@@ -231,12 +232,12 @@ Apply only after reviewing the plan, using the exact PVE cluster name:
 /usr/lib/pvn/pvn-control-plane apply --confirm CLUSTER_NAME
 ```
 
-One PVE node uses standalone databases. Exactly three PVE nodes use all three
-as Raft voters. The apply process initializes the deterministic seed, joins
-one voter at a time, verifies exact membership and cluster IDs after every
-step, then activates transport nodes one at a time. A durable phase ledger
-makes a safe rerun converge forward without deleting or regenerating existing
-database or key material.
+One PVE node uses standalone databases. Any supported cluster has a positive
+odd node count and uses every PVE node as a Raft voter. The apply process
+initializes the deterministic seed, joins one voter at a time, verifies exact
+membership and cluster IDs after every step, then activates transport nodes
+one at a time. A durable phase ledger makes a safe rerun converge forward
+without deleting or regenerating existing database or key material.
 
 The OVN units use clustered NB/SB database ports 6643/6644 and publish
 mutual-TLS client listeners on 6641/6642. PVN Control uses client port 6645 and
@@ -251,8 +252,8 @@ restarting a central database therefore cannot remove the live manager socket.
 
 The preflight unit refuses missing configuration, a mode mismatch, an existing
 standalone OVN database, insecure OVN listeners, or a join configuration with
-no remote seed. Nodes that are not voters never get the activation marker and
-keep all central services inactive.
+no remote seed. Each voter gets its activation marker only at its serialized
+bootstrap step and keeps all central services inactive before then.
 
 ### One-node installations
 
@@ -262,7 +263,7 @@ is intentionally rejected because it cannot provide majority availability.
 
 ## 6. Activate every transport node
 
-The control-plane apply activates PVE nodes only after all selected central
+The control-plane apply activates PVE transport nodes only after all central
 voters have quorum. Verify each local stack after it completes:
 
 ```sh
