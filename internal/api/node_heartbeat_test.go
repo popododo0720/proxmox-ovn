@@ -56,9 +56,43 @@ func TestRuntimeNodeHeartbeatRegistersAndPreservesAdminState(t *testing.T) {
 		t.Fatalf("explicit roles status=%d body=%s", explicitResponse.Code, explicitResponse.Body.String())
 	}
 	explicit := decodeData[model.Node](t, explicitResponse)
-	wantRoles := []model.NodeRole{model.NodeRoleCompute, model.NodeRoleGateway, model.NodeRoleCentral}
+	wantRoles := []model.NodeRole{model.NodeRoleCentral, model.NodeRoleCompute, model.NodeRoleGateway}
 	if explicit.Enabled || !reflect.DeepEqual(explicit.Roles, wantRoles) {
 		t.Fatalf("explicit node=%#v", explicit)
+	}
+}
+
+func TestRuntimeNodeHeartbeatDoesNotRewriteLexicallyDecodedRoles(t *testing.T) {
+	store := controlstore.NewMemory()
+	createdResource, _, err := store.Create(context.Background(), &model.Node{
+		Name:      "pve01",
+		ChassisID: "chassis-01",
+		Roles: []model.NodeRole{
+			model.NodeRoleCentral,
+			model.NodeRoleCompute,
+			model.NodeRoleGateway,
+		},
+		Enabled: true,
+	}, "lexically-ordered-node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := createdResource.(*model.Node)
+	server := testServer(t, store, nil)
+
+	response := request(t, server.RuntimeHandler(), http.MethodPost, "/api/v1/runtime/nodes/heartbeat", map[string]any{
+		"name": "pve01", "chassis_id": "chassis-01", "roles": []string{"gateway", "compute", "central"},
+	}, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("heartbeat status=%d body=%s", response.Code, response.Body.String())
+	}
+	observed := decodeData[model.Node](t, response)
+	if observed.Revision != created.Revision {
+		t.Fatalf("unchanged lexical roles advanced revision: got %d want %d", observed.Revision, created.Revision)
+	}
+	wantRoles := []model.NodeRole{model.NodeRoleCentral, model.NodeRoleCompute, model.NodeRoleGateway}
+	if !reflect.DeepEqual(observed.Roles, wantRoles) {
+		t.Fatalf("roles=%#v want %#v", observed.Roles, wantRoles)
 	}
 }
 

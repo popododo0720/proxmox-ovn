@@ -173,7 +173,9 @@ func canonicalHeartbeatRoles(input *[]model.NodeRole) ([]model.NodeRole, error) 
 		seen[role] = true
 	}
 	ordered := make([]model.NodeRole, 0, len(seen))
-	for _, role := range []model.NodeRole{model.NodeRoleCompute, model.NodeRoleGateway, model.NodeRoleCentral} {
+	// OVSDB sets are decoded in lexical order. Use the same order here so an
+	// unchanged heartbeat does not appear to change roles after a store read.
+	for _, role := range []model.NodeRole{model.NodeRoleCentral, model.NodeRoleCompute, model.NodeRoleGateway} {
 		if seen[role] {
 			ordered = append(ordered, role)
 		}
