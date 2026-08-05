@@ -1,0 +1,134 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+use Fcntl qw(:DEFAULT);
+use JSON::PP qw(decode_json encode_json);
+
+my $program = 'pvn-cluster-lease';
+my $lease_dir = $ENV{PVN_CLUSTER_LEASE_DIR} // '/etc/pve/priv/lock';
+
+sub fail {
+    my ($message) = @_;
+    die "$program: $message\n";
+}
+
+sub usage {
+    fail('usage: pvn-cluster-lease acquire|release|show DOMAIN [TOKEN]');
+}
+
+@ARGV >= 2 && @ARGV <= 3 or usage();
+my ($action, $domain, $token) = @ARGV;
+$action =~ /\A(?:acquire|release|show)\z/ or usage();
+$domain =~ /\A[A-Za-z0-9][A-Za-z0-9._-]*\z/ or fail('unsafe lease domain');
+length($domain) <= 80 or fail('lease domain is too long');
+if ($action eq 'show') {
+    defined($token) and usage();
+} else {
+    defined($token) or usage();
+    $token =~ /\A[0-9a-f]{32,128}\z/ or fail('unsafe lease token');
+}
+
+$lease_dir =~ m!\A/! or fail('lease directory must be absolute');
+-d $lease_dir && !-l $lease_dir or fail("lease directory is unavailable: $lease_dir");
+my @directory_stat = stat($lease_dir);
+@directory_stat && $directory_stat[4] == 0 or fail('lease directory must be owned by root');
+($directory_stat[2] & 0022) == 0 or fail('lease directory must not be group/world writable');
+
+my $lease_path = "$lease_dir/pvn-$domain.lease";
+my $lock_domain = "pvn-lease-$domain";
+
+sub read_limited {
+    my ($path) = @_;
+    open(my $handle, '<', $path) or fail("cannot read lease: $!");
+    my $content = '';
+    my $buffer;
+    while (1) {
+        my $read = read($handle, $buffer, 8192);
+        defined($read) or fail("cannot read lease: $!");
+        last if $read == 0;
+        $content .= $buffer;
+        length($content) <= 65536 or fail('lease owner record is too large');
+    }
+    close($handle) or fail("cannot close lease: $!");
+    return $content;
+}
+
+sub parse_owner {
+    my ($raw) = @_;
+    my $owner = eval { decode_json($raw) };
+    ref($owner) eq 'HASH' or fail('lease owner record is invalid');
+    my $owner_token = $owner->{token};
+    defined($owner_token) && !ref($owner_token)
+        && $owner_token =~ /\A[0-9a-f]{32,128}\z/
+        or fail('lease owner token is invalid');
+    return $owner;
+}
+
+sub with_cluster_lock {
+    my ($code) = @_;
+    eval { require PVE::Cluster; 1 }
+        or fail('PVE::Cluster is unavailable; run this on a Proxmox VE node');
+    my $result = PVE::Cluster::cfs_lock_domain($lock_domain, 10, $code);
+    my $error = $@;
+    defined($error) && length($error) and fail("cluster lock failed: $error");
+    return $result;
+}
+
+if ($action eq 'show') {
+    eval { require PVE::Cluster; 1 }
+        or fail('PVE::Cluster is unavailable; run this on a Proxmox VE node');
+    PVE::Cluster::cfs_update(1);
+    -f $lease_path && !-l $lease_path or fail("no active lease for $domain");
+    my $owner = parse_owner(read_limited($lease_path));
+    print encode_json($owner), "\n";
+    exit 0;
+}
+
+if ($action eq 'acquire') {
+    my $payload = '';
+    my $buffer;
+    while (1) {
+        my $read = read(STDIN, $buffer, 8192);
+        defined($read) or fail("cannot read owner record: $!");
+        last if $read == 0;
+        $payload .= $buffer;
+        length($payload) <= 65536 or fail('owner record is too large');
+    }
+    my $owner = parse_owner($payload);
+    $owner->{token} eq $token or fail('owner record token does not match argument');
+    defined($owner->{domain}) && !ref($owner->{domain}) && $owner->{domain} eq $domain
+        or fail('owner record domain does not match argument');
+    my $canonical = encode_json($owner) . "\n";
+
+    with_cluster_lock(sub {
+        -e $lease_path and fail("an active $domain lease already exists at $lease_path");
+        my $flags = O_WRONLY | O_CREAT | O_EXCL;
+        $flags |= O_NOFOLLOW if defined(&O_NOFOLLOW);
+        sysopen(my $handle, $lease_path, $flags, 0600)
+            or fail("cannot create lease: $!");
+        my $ok = eval {
+            print {$handle} $canonical or die "write failed: $!";
+            close($handle) or die "close failed: $!";
+            1;
+        };
+        if (!$ok) {
+            my $error = $@ || 'unknown write failure';
+            unlink($lease_path);
+            fail("cannot persist lease: $error");
+        }
+        chmod(0600, $lease_path) or fail("cannot protect lease: $!");
+        return 1;
+    });
+    print "$lease_path\n";
+    exit 0;
+}
+
+with_cluster_lock(sub {
+    -f $lease_path && !-l $lease_path or fail("no active lease for $domain");
+    my $owner = parse_owner(read_limited($lease_path));
+    $owner->{token} eq $token or fail('refusing to release a lease owned by another token');
+    unlink($lease_path) or fail("cannot remove lease: $!");
+    return 1;
+});
+exit 0;
