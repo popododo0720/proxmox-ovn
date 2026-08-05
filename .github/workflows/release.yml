@@ -1,0 +1,74 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: debian:13
+    steps:
+      - name: Install Debian 13 prerequisites
+        run: >-
+          apt-get update &&
+          apt-get install -y --no-install-recommends
+          ca-certificates file gh git make systemd
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version=${GITHUB_REF_NAME#v}
+          if [[ ! $release_version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+~-][A-Za-z0-9.+~-]+)?$ ]]; then
+            echo "unsupported release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          grep -Fx "DEFAULT_VERSION=$release_version" deploy/scripts/pvn-install.sh
+          grep -Fx "DEB_VERSION ?= $release_version" Makefile
+          printf 'PVN_RELEASE_VERSION=%s\n' "$release_version" >> "$GITHUB_ENV"
+
+      - name: Build and verify release
+        run: make release DEB_VERSION="$PVN_RELEASE_VERSION"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*)
+          if (( ${#assets[@]} == 0 )); then
+            echo 'release build produced no assets' >&2
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag --generate-notes --title "PVN $GITHUB_REF_NAME"
+          fi
