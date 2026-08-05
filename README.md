@@ -23,11 +23,20 @@ also hosts the clustered PVN, OVN Northbound, and OVN Southbound databases.
 PVE built-in SDN, BGP, IPv6, LXC, load balancing, metadata service, and live
 migration coordination are intentionally outside the first release.
 
+Package installation does not activate PVN networking. After staging shared
+config, node-local config, PKI, and operator-created OVS bridges, create the
+root-owned `/etc/pvn/node-enabled` marker and enable `pvn-node.target` on every
+online node. Central services use a separate marker and
+`pvn-central.target`; in a three-node cluster, all three nodes normally become
+Raft voters. Shared pmxcfs configuration alone never opts a node in.
+
 ## Development
 
 ```sh
 make test
 make build
+make package-check
+make deb
 ```
 
 See [architecture](docs/architecture.md), [operations](docs/operations.md),
