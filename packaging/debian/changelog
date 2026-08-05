@@ -1,3 +1,9 @@
+proxmox-ovn (0.2.1) unstable; urgency=medium
+
+  * Accept node-local pmxcfs membership generation counters.
+
+ -- PVN Project <root@localhost>  Wed, 05 Aug 2026 07:26:56 +0000
+
 proxmox-ovn (0.2.0) unstable; urgency=medium
 
   * Add native one-line PVE cluster deployment and hardened OVN bootstrap.
