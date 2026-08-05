@@ -15,7 +15,7 @@ import (
 
 const (
 	DefaultDatabase = "/var/lib/pvn/control-db/pvn_control.db"
-	DefaultSchema   = "/usr/share/pvn/schema/pvn-control.ovsschema"
+	DefaultSchema   = "/usr/share/pvn/schema/PVN_Control.ovsschema"
 	SchemaName      = "PVN_Control"
 )
 
