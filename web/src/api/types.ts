@@ -40,6 +40,14 @@ export interface HealthStatus {
   ovn_northbound?: string;
   ovn_southbound?: string;
   reconciler?: string;
+  capacity?: {
+    ready: boolean;
+    reason?: string;
+    reporter?: string;
+    online_nodes?: string[];
+    missing_nodes?: string[];
+    stale_nodes?: string[];
+  };
   [key: string]: unknown;
 }
 

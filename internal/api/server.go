@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pvnstack/proxmox-ovn/internal/buildinfo"
 	"github.com/pvnstack/proxmox-ovn/internal/controlstore"
 	"github.com/pvnstack/proxmox-ovn/internal/model"
 )
@@ -63,6 +64,7 @@ type Options struct {
 	Clock            func() time.Time
 	GuestMTU         int
 	Physnet          string
+	ClusterName      string
 }
 
 type Server struct {
@@ -73,6 +75,7 @@ type Server struct {
 	clusterGate     *clusterCapacityGate
 	guestMTU        int
 	physnet         string
+	clusterName     string
 }
 
 type sessionContextKey struct{}
@@ -99,7 +102,7 @@ func New(options Options) (*Server, error) {
 	return &Server{
 		store: options.Store, reconciler: options.Reconciler, sessionProvider: options.SessionProvider,
 		logger: options.Logger, clusterGate: newClusterCapacityGate(options.RequireAllNodes, options.NodeHeartbeatTTL, options.Clock),
-		guestMTU: options.GuestMTU, physnet: strings.TrimSpace(options.Physnet),
+		guestMTU: options.GuestMTU, physnet: strings.TrimSpace(options.Physnet), clusterName: strings.TrimSpace(options.ClusterName),
 	}, nil
 }
 
@@ -181,11 +184,10 @@ func (s *Server) health(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	status := s.clusterGate.status(request.Context(), s.store)
-	code := http.StatusOK
-	if !status.Ready {
-		code = http.StatusServiceUnavailable
-	}
-	writeJSON(writer, code, map[string]any{"data": map[string]any{"status": status.Label(), "time": s.clusterGate.now().UTC(), "cluster": status}})
+	writeJSON(writer, http.StatusOK, map[string]any{"data": map[string]any{
+		"status": status.Label(), "time": s.clusterGate.now().UTC(), "cluster": s.clusterName,
+		"version": buildinfo.Version, "capacity": status,
+	}})
 }
 
 func (s *Server) session(writer http.ResponseWriter, request *http.Request) {

@@ -169,6 +169,7 @@ func run(arguments []string) error {
 		Store: store, Reconciler: controller, SessionProvider: sessionProvider, Logger: logger,
 		RequireAllNodes: defaults.requireAllNodes, NodeHeartbeatTTL: 2 * time.Minute,
 		GuestMTU: defaults.guestMTU, Physnet: defaults.physnet,
+		ClusterName: defaults.clusterName,
 	})
 	if err != nil {
 		return err

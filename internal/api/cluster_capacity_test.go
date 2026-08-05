@@ -24,7 +24,7 @@ func TestRequireAllNodesGatesNewPortCapacity(t *testing.T) {
 	}
 
 	health := request(t, server, http.MethodGet, "/api/v1/health", nil, nil)
-	if health.Code != http.StatusServiceUnavailable {
+	if health.Code != http.StatusOK || !responseHealthStatus(t, health, "degraded") {
 		t.Fatalf("initial health=%d body=%s", health.Code, health.Body.String())
 	}
 
@@ -40,7 +40,7 @@ func TestRequireAllNodesGatesNewPortCapacity(t *testing.T) {
 		t.Fatalf("first heartbeat=%d body=%s", first.Code, first.Body.String())
 	}
 	health = request(t, server, http.MethodGet, "/api/v1/health", nil, nil)
-	if health.Code != http.StatusServiceUnavailable || !responseDetailsContain(t, health, "missing_nodes", "pve-b") {
+	if health.Code != http.StatusOK || !responseDetailsContain(t, health, "missing_nodes", "pve-b") {
 		t.Fatalf("partial health=%d body=%s", health.Code, health.Body.String())
 	}
 	second := heartbeat("pve-b", "chassis-b")
@@ -95,14 +95,14 @@ func responseDetailsContain(t *testing.T, response *httptest.ResponseRecorder, f
 	t.Helper()
 	var envelope struct {
 		Data struct {
-			Cluster map[string]json.RawMessage `json:"cluster"`
+			Capacity map[string]json.RawMessage `json:"capacity"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
 		t.Fatal(err)
 	}
 	var values []string
-	if err := json.Unmarshal(envelope.Data.Cluster[field], &values); err != nil {
+	if err := json.Unmarshal(envelope.Data.Capacity[field], &values); err != nil {
 		return false
 	}
 	for _, candidate := range values {
@@ -111,4 +111,17 @@ func responseDetailsContain(t *testing.T, response *httptest.ResponseRecorder, f
 		}
 	}
 	return false
+}
+
+func responseHealthStatus(t *testing.T, response *httptest.ResponseRecorder, expected string) bool {
+	t.Helper()
+	var envelope struct {
+		Data struct {
+			Status string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	return envelope.Data.Status == expected
 }
