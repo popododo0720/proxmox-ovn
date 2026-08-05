@@ -158,19 +158,20 @@ func Promote(ctx context.Context, runner Runner, options PromoteOptions) (string
 
 func validateClusterAddress(address string) error {
 	parts := strings.SplitN(address, ":", 2)
-	if len(parts) != 2 || (parts[0] != "ssl" && parts[0] != "tcp") {
-		return errors.New("must use ssl:IP:PORT or tcp:IP:PORT syntax")
+	if len(parts) != 2 || parts[0] != "ssl" {
+		return errors.New("must use ssl:IPv4:6646 syntax")
 	}
 	host, port, err := net.SplitHostPort(parts[1])
 	if err != nil {
 		return err
 	}
-	if net.ParseIP(host) == nil {
-		return errors.New("host must be an IP address")
+	addressIP := net.ParseIP(host)
+	if addressIP == nil || addressIP.To4() == nil {
+		return errors.New("host must be an IPv4 address")
 	}
 	numericPort, err := strconv.Atoi(port)
-	if err != nil || numericPort < 1 || numericPort > 65535 {
-		return errors.New("port must be between 1 and 65535")
+	if err != nil || numericPort != 6646 {
+		return errors.New("port must be 6646")
 	}
 	return nil
 }

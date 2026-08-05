@@ -178,7 +178,7 @@ func centralInit(args []string) error {
 	database := flags.String("database", centraldb.DefaultDatabase, "control database path")
 	schema := flags.String("schema", centraldb.DefaultSchema, "control schema path")
 	mode := flags.String("mode", "standalone", "standalone or raft")
-	local := flags.String("local", "", "local Raft address, normally ssl:IP:6646")
+	local := flags.String("local", "", "local Raft address (required format: ssl:IPv4:6646)")
 	join := flags.String("join", "", "comma-separated existing Raft members")
 	confirmation := flags.String("confirm", "", "exact PVN cluster ID")
 	if err := flags.Parse(args); err != nil {
@@ -205,7 +205,7 @@ func centralPromote(args []string) error {
 	flags := flag.NewFlagSet("central promote-control", flag.ContinueOnError)
 	configPath := flags.String("config", config.DefaultPath, "PVN config path")
 	database := flags.String("database", centraldb.DefaultDatabase, "control database path")
-	local := flags.String("local", "", "local Raft address, normally ssl:IP:6646")
+	local := flags.String("local", "", "local Raft address (required format: ssl:IPv4:6646)")
 	confirmation := flags.String("confirm", "", "exact PVN cluster ID")
 	apply := flags.Bool("apply", false, "perform the promotion")
 	if err := flags.Parse(args); err != nil {

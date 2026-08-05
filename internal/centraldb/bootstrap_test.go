@@ -64,6 +64,22 @@ func TestInitStandaloneAndRaftJoin(t *testing.T) {
 	}
 }
 
+func TestClusterAddressRequiresMutualTLSIPv4Port(t *testing.T) {
+	for _, address := range []string{
+		"tcp:192.0.2.1:6646",
+		"ssl:db.example.test:6646",
+		"ssl:[2001:db8::1]:6646",
+		"ssl:192.0.2.1:16646",
+	} {
+		if err := validateClusterAddress(address); err == nil {
+			t.Fatalf("cluster address %q unexpectedly accepted", address)
+		}
+	}
+	if err := validateClusterAddress("ssl:192.0.2.1:6646"); err != nil {
+		t.Fatalf("secure v1 cluster address rejected: %v", err)
+	}
+}
+
 func TestPromoteRequiresStoppedDatabaseAndKeepsBackup(t *testing.T) {
 	dir := t.TempDir()
 	database := filepath.Join(dir, "control.db")
