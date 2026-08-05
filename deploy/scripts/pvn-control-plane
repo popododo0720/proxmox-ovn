@@ -1143,6 +1143,15 @@ class SystemBackend:
                         raise ControlPlaneError(
                             f"native known_hosts for {name} changed while opening"
                         )
+                    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or \
+                            opened.st_uid != 0 or stat.S_IMODE(opened.st_mode) & 0o022:
+                        raise ControlPlaneError(
+                            f"opened native known_hosts for {name} owner/link/mode is unsafe"
+                        )
+                    if opened.st_size > MAX_KNOWN_HOSTS_BYTES:
+                        raise ControlPlaneError(
+                            f"opened native known_hosts for {name} exceeds 1 MiB"
+                        )
                     chunks: list[bytes] = []
                     total = 0
                     while True:

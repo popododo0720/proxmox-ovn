@@ -387,6 +387,24 @@ with tempfile.TemporaryDirectory() as temporary:
     write_known("pve-c")
     SystemBackend._validate_ssh(backend, records)
 
+    real_fstat = module["os"].fstat
+
+    def writable_fstat(descriptor):
+        opened = real_fstat(descriptor)
+        return types.SimpleNamespace(
+            st_dev=opened.st_dev, st_ino=opened.st_ino, st_mode=opened.st_mode | 0o022,
+            st_nlink=opened.st_nlink, st_uid=opened.st_uid, st_size=opened.st_size,
+        )
+
+    module["os"].fstat = writable_fstat
+    try:
+        expect_error(
+            lambda: SystemBackend._validate_ssh(backend, records),
+            "opened native known_hosts",
+        )
+    finally:
+        module["os"].fstat = real_fstat
+
     pve_b_known.chmod(0o662)
     expect_error(lambda: SystemBackend._validate_ssh(backend, records), "owner/link/mode")
     pve_b_known.chmod(0o640)
