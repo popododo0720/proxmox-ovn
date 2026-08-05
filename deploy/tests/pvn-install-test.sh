@@ -100,6 +100,11 @@ run_bootstrap() {
     PVN_INVENTORY=$INVENTORY PVN_IDENTITY=$IDENTITY "$BOOTSTRAP" "$@"
 }
 
+run_local_bootstrap() {
+    PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.1.1 \
+    "$BOOTSTRAP" "$@"
+}
+
 assert_temp_cleaned() {
     while IFS= read -r line; do
         output=${line#* output=}
@@ -108,6 +113,40 @@ assert_temp_cleaned() {
 }
 
 sh -n "$BOOTSTRAP"
+
+# With no inventory/key settings the one-line bootstrap selects local PVE
+# discovery and never asks for deployment-host paths.
+reset_logs
+PVN_PHASE=preflight run_local_bootstrap > "$WORK/local-preflight.out"
+[ "$(cat "$INSTALLER_LOG")" = "preflight --local-pve" ] ||
+    fail "default bootstrap did not select --local-pve"
+assert_temp_cleaned
+
+reset_logs
+PVN_PHASE=install run_local_bootstrap > "$WORK/local-install-dry-run.out"
+local_install_args=$(cat "$INSTALLER_LOG")
+case "$local_install_args" in
+    "install --local-pve --deb "*) ;;
+    *) fail "local PVE install dry-run arguments were incorrect" ;;
+esac
+case "$local_install_args" in *' --apply '*) fail "local install default applied" ;; esac
+assert_temp_cleaned
+
+reset_logs
+PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster \
+    run_local_bootstrap > "$WORK/local-install-apply.out"
+grep -q -- '^install --local-pve .*--apply --confirm lab-cluster$' \
+    "$INSTALLER_LOG" || fail "local PVE apply confirmation was not forwarded"
+assert_temp_cleaned
+
+reset_logs
+if PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.1.1 \
+    PVN_INVENTORY=$INVENTORY PVN_IDENTITY=$IDENTITY \
+    "$BOOTSTRAP" --local-pve preflight > "$WORK/mixed-mode.out" 2>&1
+then
+    fail "bootstrap mixed local PVE and advanced settings"
+fi
+[ ! -s "$CURL_LOG" ] || fail "mixed bootstrap mode downloaded artifacts"
 
 reset_logs
 PVN_PHASE=preflight run_bootstrap > "$WORK/preflight.out"
@@ -174,6 +213,34 @@ reset_logs
 PVN_PHASE=preflight PVN_TEST_INSTALLER_STATUS=17 run_bootstrap \
     > "$WORK/installer-failure.out" 2>&1 &&
     fail "bootstrap did not propagate installer failure"
+assert_temp_cleaned
+
+# The exact no-argument curl shape performs local-PVE preflight without asking
+# for an inventory or identity. Empty confirmation stops safely.
+reset_logs
+printf '\n' | script -qefc \
+    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.1.1 bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    /dev/null > "$WORK/local-interactive-stop.out"
+[ "$(wc -l < "$INSTALLER_LOG")" -eq 1 ] ||
+    fail "default local interactive flow ran more than preflight"
+grep -q '^preflight --local-pve$' "$INSTALLER_LOG" ||
+    fail "default interactive flow did not use local PVE discovery"
+if grep -q 'PVN inventory path\|SSH private-key path' "$WORK/local-interactive-stop.out"; then
+    fail "default local interactive flow prompted for advanced paths"
+fi
+grep -q 'installation was not requested' "$WORK/local-interactive-stop.out" ||
+    fail "default local interactive blank confirmation did not stop safely"
+assert_temp_cleaned
+
+# Supplying one advanced setting explicitly prompts only for its missing pair.
+reset_logs
+printf '%s\n' "$IDENTITY" | script -qefc \
+    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.1.1 PVN_INVENTORY='$INVENTORY' PVN_PHASE=preflight bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    /dev/null > "$WORK/advanced-prompt.out"
+grep -q 'SSH private-key path' "$WORK/advanced-prompt.out" ||
+    fail "explicit advanced flow did not prompt for the missing identity"
+[ "$(cat "$INSTALLER_LOG")" = "preflight --inventory $INVENTORY --identity $IDENTITY" ] ||
+    fail "advanced prompt did not forward both paths"
 assert_temp_cleaned
 
 # This exercises the exact command-substitution shape. A blank terminal reply

@@ -22,15 +22,22 @@ cat > "$BIN/ssh" <<'EOF'
 set -eu
 
 host=
+alias=
 action=
+previous=
 for arg in "$@"; do
     case "$arg" in root@*) host=${arg#root@} ;; esac
     case "$arg" in probe|prepare|verify|apply|cleanup) action=$arg ;; esac
+    if [ "$previous" = -o ]; then
+        case "$arg" in HostKeyAlias=*) alias=${arg#HostKeyAlias=} ;; esac
+    fi
+    previous=$arg
 done
 cat > "$PVN_TEST_REMOTE_SCRIPT"
-printf 'ssh host=%s action=%s args=%s\n' "$host" "$action" "$*" >> "$PVN_TEST_LOG"
+node=${alias:-$host}
+printf 'ssh host=%s action=%s node=%s args=%s\n' "$host" "$action" "$node" "$*" >> "$PVN_TEST_LOG"
 
-if [ "${PVN_TEST_FAIL_HOST:-}" = "$host" ] && [ "$action" = probe ]; then
+if [ "${PVN_TEST_FAIL_HOST:-}" = "$node" ] && [ "$action" = probe ]; then
     echo "simulated preflight failure" >&2
     exit 1
 fi
@@ -38,32 +45,40 @@ fi
 case "$action" in
     probe)
         cluster=${PVN_TEST_CLUSTER:-lab-cluster}
-        if [ "${PVN_TEST_OTHER_CLUSTER_HOST:-}" = "$host" ]; then
+        if [ "${PVN_TEST_OTHER_CLUSTER_HOST:-}" = "$node" ]; then
             cluster=other-cluster
         fi
         package=absent
         version=absent
-        if [ -e "$PVN_TEST_STATE/$host" ] || [ "${PVN_TEST_PREINSTALLED:-no}" = yes ]; then
+        if [ -e "$PVN_TEST_STATE/$node" ] || [ "${PVN_TEST_PREINSTALLED:-no}" = yes ]; then
             package=installed
             version=${PVN_TEST_INSTALLED_VERSION:-0.1.0}
         fi
-        case "$host" in
-            node-a) hostname=pve-a; nodeid=0x00000001 ;;
-            node-b) hostname=pve-b; nodeid=0x00000002 ;;
-            *) hostname=$host; nodeid=0x00000009 ;;
+        mode=${PVN_TEST_MODE:-cluster}
+        case "$node" in
+            node-a) hostname=pve-a; nodeid=1 ;;
+            node-b) hostname=pve-b; nodeid=2 ;;
+            pve-a) hostname=pve-a; nodeid=1 ;;
+            pve-b) hostname=pve-b; nodeid=2 ;;
+            pve-solo) hostname=pve-solo; nodeid=0 ;;
+            *) hostname=$node; nodeid=9 ;;
         esac
-        printf 'PVN_PREFLIGHT cluster=%s nodes=%s pve=9.2.2 arch=amd64 package=%s version=%s hostname=%s nodeid=%s\n' \
-            "$cluster" "${PVN_TEST_NODE_COUNT:-2}" "$package" "$version" \
+        if [ "$mode" = standalone ]; then
+            cluster=standalone-$hostname
+        fi
+        if [ "${PVN_TEST_WRONG_NODE_ID:-}" = "$node" ]; then nodeid=99; fi
+        printf 'PVN_PREFLIGHT mode=%s cluster=%s nodes=%s pve=9.2.2 arch=amd64 package=%s version=%s hostname=%s nodeid=%s\n' \
+            "$mode" "$cluster" "${PVN_TEST_NODE_COUNT:-2}" "$package" "$version" \
             "$hostname" "$nodeid"
         ;;
     prepare)
-        printf '/var/tmp/pvn-node.%s.deb\n' "$host"
+        printf '/var/tmp/pvn-node.%s.deb\n' "$node"
         ;;
     verify)
         [ "${PVN_TEST_VERIFY_FAIL:-no}" != yes ]
         ;;
     apply)
-        : > "$PVN_TEST_STATE/$host"
+        : > "$PVN_TEST_STATE/$node"
         ;;
     cleanup)
         ;;
@@ -75,6 +90,64 @@ esac
 EOF
 chmod 0755 "$BIN/ssh"
 
+cat > "$BIN/local-sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+node=${PVN_NODE_NAME:?}
+action=
+for arg in "$@"; do
+    case "$arg" in probe|prepare|verify|apply|cleanup) action=$arg ;; esac
+done
+cat > "$PVN_TEST_REMOTE_SCRIPT"
+printf 'local host=%s action=%s node=%s args=%s\n' "$node" "$action" "$node" "$*" >> "$PVN_TEST_LOG"
+
+if [ "${PVN_TEST_FAIL_HOST:-}" = "$node" ] && [ "$action" = probe ]; then
+    echo "simulated preflight failure" >&2
+    exit 1
+fi
+
+case "$action" in
+    probe)
+        mode=${PVN_TEST_MODE:-cluster}
+        cluster=${PVN_TEST_CLUSTER:-lab-cluster}
+        package=absent
+        version=absent
+        if [ -e "$PVN_TEST_STATE/$node" ] || [ "${PVN_TEST_PREINSTALLED:-no}" = yes ]; then
+            package=installed
+            version=${PVN_TEST_INSTALLED_VERSION:-0.1.0}
+        fi
+        case "$node" in
+            pve-a) nodeid=1 ;;
+            pve-b) nodeid=2 ;;
+            pve-solo) nodeid=0 ;;
+            *) nodeid=9 ;;
+        esac
+        if [ "$mode" = standalone ]; then cluster=standalone-$node; fi
+        if [ "${PVN_TEST_WRONG_NODE_ID:-}" = "$node" ]; then nodeid=99; fi
+        printf 'PVN_PREFLIGHT mode=%s cluster=%s nodes=%s pve=9.2.2 arch=amd64 package=%s version=%s hostname=%s nodeid=%s\n' \
+            "$mode" "$cluster" "${PVN_TEST_NODE_COUNT:-2}" "$package" \
+            "$version" "$node" "$nodeid"
+        ;;
+    prepare)
+        printf '/var/tmp/pvn-node.%s.deb\n' "$node"
+        ;;
+    verify)
+        [ "${PVN_TEST_VERIFY_FAIL:-no}" != yes ]
+        ;;
+    apply)
+        : > "$PVN_TEST_STATE/$node"
+        ;;
+    cleanup)
+        ;;
+    *)
+        echo "fake local sh could not identify action" >&2
+        exit 1
+        ;;
+esac
+EOF
+chmod 0755 "$BIN/local-sh"
+
 cat > "$BIN/scp" <<'EOF'
 #!/bin/sh
 set -eu
@@ -82,6 +155,56 @@ printf 'scp args=%s\n' "$*" >> "$PVN_TEST_LOG"
 exit 0
 EOF
 chmod 0755 "$BIN/scp"
+
+cat > "$BIN/cp" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'cp args=%s\n' "$*" >> "$PVN_TEST_LOG"
+exit 0
+EOF
+chmod 0755 "$BIN/cp"
+
+cat > "$BIN/pvecm" <<'EOF'
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+    status)
+        if [ "${PVN_TEST_PVECM_STANDALONE:-no}" = yes ]; then exit 1; fi
+        cat <<OUT
+Cluster information
+-------------------
+Name:             ${PVN_TEST_CLUSTER:-lab-cluster}
+
+Quorum information
+------------------
+Nodes:            ${PVN_TEST_PVECM_NODE_COUNT:-2}
+Node ID:          0x00000001
+Quorate:          ${PVN_TEST_PVECM_QUORATE:-Yes}
+OUT
+        ;;
+    nodes)
+        count=0
+        if [ -n "${PVN_TEST_PVECM_COUNTER:-}" ]; then
+            count=$(cat "$PVN_TEST_PVECM_COUNTER" 2>/dev/null || printf '0')
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$PVN_TEST_PVECM_COUNTER"
+        fi
+        cat <<OUT
+
+Membership information
+----------------------
+    Nodeid      Votes Name
+         1          1 pve-a (local)
+OUT
+        if [ -z "${PVN_TEST_PVECM_MUTATE_AT:-}" ] || [ "$count" -lt "$PVN_TEST_PVECM_MUTATE_AT" ]; then
+            printf '         2          1 pve-b\n'
+        fi
+        ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod 0755 "$BIN/pvecm"
 
 cat > "$BIN/dpkg-deb" <<'EOF'
 #!/bin/sh
@@ -123,6 +246,57 @@ EOF
 : > "$DEB"
 chmod 0600 "$IDENTITY"
 
+PVE_FIXTURE=$WORK/pve
+PVE_MEMBERS=$PVE_FIXTURE/.members
+PVE_COROSYNC=$PVE_FIXTURE/corosync.conf
+PVE_NODES=$PVE_FIXTURE/nodes
+PVE_IDENTITY=$PVE_FIXTURE/id_rsa
+PVE_GLOBAL_LOCK=$PVE_FIXTURE/pvn-install.lock
+PVECM_COUNTER=$PVE_FIXTURE/pvecm-counter
+mkdir -p "$PVE_NODES/pve-a" "$PVE_NODES/pve-b"
+: > "$PVE_COROSYNC"
+: > "$PVE_IDENTITY"
+chmod 0600 "$PVE_IDENTITY"
+printf '%s\n' 'pve-b ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCtest pve-b' \
+    > "$PVE_NODES/pve-b/ssh_known_hosts"
+chmod 0640 "$PVE_NODES/pve-b/ssh_known_hosts"
+
+write_cluster_members() {
+    pvn_online=${1:-1}
+    pvn_nodes=${2:-2}
+    cat > "$PVE_MEMBERS" <<EOF
+{
+  "nodename": "pve-a",
+  "version": 9,
+  "cluster": {"name":"lab-cluster","version":3,"nodes":$pvn_nodes,"quorate":1},
+  "nodelist": {
+    "pve-a": {"id":1,"online":1,"ip":"192.0.2.10"},
+    "pve-b": {"id":2,"online":$pvn_online,"ip":"192.0.2.11"}
+  }
+}
+EOF
+    chmod 0440 "$PVE_MEMBERS"
+}
+
+write_standalone_members() {
+    cat > "$PVE_MEMBERS" <<'EOF'
+{"nodename":"pve-solo","version":0}
+EOF
+    chmod 0440 "$PVE_MEMBERS"
+}
+
+run_local_pve() {
+    PVN_PVE_MEMBERS_FILE=$PVE_MEMBERS \
+    PVN_PVE_COROSYNC_CONF=$PVE_COROSYNC \
+    PVN_PVE_NODES_DIR=$PVE_NODES \
+    PVN_PVE_IDENTITY=$PVE_IDENTITY \
+    PVN_PVE_GLOBAL_LOCK_FILE=$PVE_GLOBAL_LOCK \
+    PVN_PVECM_BIN=$BIN/pvecm \
+    PVN_LOCAL_SH_BIN=$BIN/local-sh \
+    PVN_CP_BIN=$BIN/cp \
+    "$INSTALLER" "$@"
+}
+
 fail() {
     echo "pvn-cluster-install test failed: $*" >&2
     exit 1
@@ -135,7 +309,9 @@ assert_no_mutation_calls() {
 }
 
 reset_state() {
-    rm -f "$PVN_TEST_STATE/node-a" "$PVN_TEST_STATE/node-b"
+    rm -f "$PVN_TEST_STATE/node-a" "$PVN_TEST_STATE/node-b" \
+        "$PVN_TEST_STATE/pve-a" "$PVN_TEST_STATE/pve-b" \
+        "$PVN_TEST_STATE/pve-solo" "$PVE_GLOBAL_LOCK" "$PVECM_COUNTER"
 }
 
 sh -n "$INSTALLER"
@@ -300,5 +476,146 @@ then
     fail "duplicate inventory node unexpectedly succeeded"
 fi
 [ ! -s "$LOG" ] || fail "invalid inventory contacted a node"
+
+# Local-PVE cluster mode discovers the PVE management IPs, executes the local
+# member without SSH, and pins each peer to its PVE-owned host-key alias.
+: > "$LOG"
+reset_state
+write_cluster_members
+run_local_pve preflight --local-pve > "$WORK/local-preflight.out"
+grep -q 'Preflight passed for all 2 nodes in cluster lab-cluster' \
+    "$WORK/local-preflight.out" || fail "local PVE preflight summary is missing"
+[ "$(grep -c '^local .*action=probe' "$LOG")" -eq 1 ] ||
+    fail "local PVE preflight did not execute the local node directly"
+[ "$(grep -c '^ssh .*action=probe' "$LOG")" -eq 1 ] ||
+    fail "local PVE preflight did not execute exactly one peer over SSH"
+grep -q 'host=192.0.2.11 action=probe node=pve-b' "$LOG" ||
+    fail "local PVE peer did not use its discovered management IP"
+for option in \
+    HostKeyAlias=pve-b \
+    "UserKnownHostsFile=$PVE_NODES/pve-b/ssh_known_hosts" \
+    GlobalKnownHostsFile=none StrictHostKeyChecking=yes UpdateHostKeys=no \
+    CheckHostIP=no IdentitiesOnly=yes
+do
+    grep -q "$option" "$LOG" || fail "local PVE SSH did not enforce $option"
+done
+grep -q -- "-i $PVE_IDENTITY" "$LOG" ||
+    fail "local PVE SSH did not use the PVE root cluster identity"
+assert_no_mutation_calls
+
+: > "$LOG"
+reset_state
+write_cluster_members
+run_local_pve install --local-pve --deb "$DEB" \
+    --apply --confirm lab-cluster > "$WORK/local-apply.out"
+[ "$(grep -c 'action=apply' "$LOG")" -eq 2 ] ||
+    fail "local PVE apply did not install every discovered node"
+[ "$(grep -c '^cp ' "$LOG")" -eq 1 ] ||
+    fail "local PVE apply did not copy the local DEB directly"
+[ "$(grep -c '^scp ' "$LOG")" -eq 1 ] ||
+    fail "local PVE apply did not copy the peer DEB over pinned SCP"
+grep -q 'HostKeyAlias=pve-b' "$LOG" ||
+    fail "local PVE SCP did not pin the peer alias"
+[ ! -e "$PVE_GLOBAL_LOCK" ] ||
+    fail "successful cluster apply left the cluster-global lock behind"
+grep -q 'Installed pvn-node 0.1.0 on all 2 nodes in cluster lab-cluster.' \
+    "$WORK/local-apply.out" || fail "local PVE install summary is missing"
+
+# A remote probe must bind back to the exact name/id discovered in .members.
+: > "$LOG"
+reset_state
+write_cluster_members
+PVN_TEST_WRONG_NODE_ID=pve-b run_local_pve preflight --local-pve \
+    > "$WORK/local-wrong-id.out" 2>&1 &&
+    fail "local PVE preflight accepted the wrong peer node ID"
+assert_no_mutation_calls
+
+# JSON/quorum/membership failures stop before any node transport is attempted.
+: > "$LOG"
+reset_state
+write_cluster_members 0 2
+run_local_pve preflight --local-pve > "$WORK/local-offline.out" 2>&1 &&
+    fail "local PVE discovery accepted an offline member"
+[ ! -s "$LOG" ] || fail "offline discovery contacted a node"
+
+: > "$LOG"
+reset_state
+write_cluster_members 1 3
+run_local_pve preflight --local-pve > "$WORK/local-count.out" 2>&1 &&
+    fail "local PVE discovery accepted a cluster node-count mismatch"
+[ ! -s "$LOG" ] || fail "count-mismatch discovery contacted a node"
+
+: > "$LOG"
+reset_state
+printf '%s\n' '{malformed' > "$PVE_MEMBERS"
+chmod 0440 "$PVE_MEMBERS"
+run_local_pve preflight --local-pve > "$WORK/local-json.out" 2>&1 &&
+    fail "local PVE discovery accepted malformed JSON"
+[ ! -s "$LOG" ] || fail "malformed discovery contacted a node"
+
+# A pre-existing pmxcfs owner record is never removed or ignored as stale.
+: > "$LOG"
+reset_state
+write_cluster_members
+printf '%s\n' '{"node":"other","token":"stale"}' > "$PVE_GLOBAL_LOCK"
+chmod 0600 "$PVE_GLOBAL_LOCK"
+run_local_pve install --local-pve --deb "$DEB" \
+    --apply --confirm lab-cluster > "$WORK/local-locked.out" 2>&1 &&
+    fail "local PVE apply ignored a cluster-global owner lock"
+[ -e "$PVE_GLOBAL_LOCK" ] || fail "stale cluster-global lock was auto-deleted"
+[ ! -s "$LOG" ] || fail "locked local PVE apply contacted a node"
+rm -f "$PVE_GLOBAL_LOCK"
+
+# Membership is re-read after staging and before the first apt mutation.
+: > "$LOG"
+reset_state
+write_cluster_members
+: > "$PVECM_COUNTER"
+PVN_TEST_PVECM_COUNTER=$PVECM_COUNTER PVN_TEST_PVECM_MUTATE_AT=3 \
+    run_local_pve install --local-pve --deb "$DEB" \
+    --apply --confirm lab-cluster > "$WORK/local-membership-change.out" 2>&1 &&
+    fail "local PVE apply ignored a changed membership snapshot"
+if grep -q 'action=apply' "$LOG"; then
+    fail "apt mutation ran after membership changed"
+fi
+[ "$(grep -c 'action=cleanup' "$LOG")" -eq 2 ] ||
+    fail "membership-change abort did not clean every staged DEB"
+[ ! -e "$PVE_GLOBAL_LOCK" ] ||
+    fail "membership-change abort left the owned global lock behind"
+
+# Standalone mode has one explicit confirmation token and never uses SSH/SCP.
+: > "$LOG"
+reset_state
+write_standalone_members
+rm -f "$PVE_COROSYNC"
+PVN_TEST_PVECM_STANDALONE=yes PVN_TEST_MODE=standalone \
+    PVN_TEST_NODE_COUNT=1 run_local_pve install --local-pve --deb "$DEB" \
+    --apply --confirm standalone-pve-solo > "$WORK/local-standalone.out"
+[ "$(grep -c '^local .*action=apply' "$LOG")" -eq 1 ] ||
+    fail "standalone apply did not execute exactly one local install"
+if grep -Eq '^ssh |^scp ' "$LOG"; then
+    fail "standalone local PVE mode attempted cluster SSH"
+fi
+[ ! -e "$PVE_GLOBAL_LOCK" ] ||
+    fail "standalone apply created a cluster-global lock"
+grep -q 'standalone-pve-solo' "$WORK/local-standalone.out" ||
+    fail "standalone confirmation ID is missing from output"
+
+# A standalone-shaped .members file is not accepted on a configured cluster.
+: > "$LOG"
+reset_state
+: > "$PVE_COROSYNC"
+PVN_TEST_PVECM_STANDALONE=yes PVN_TEST_MODE=standalone \
+    run_local_pve preflight --local-pve > "$WORK/local-false-standalone.out" 2>&1 &&
+    fail "corosync cluster state was misclassified as standalone"
+[ ! -s "$LOG" ] || fail "false standalone discovery contacted a node"
+
+# Target modes are deliberately mutually exclusive.
+: > "$LOG"
+write_cluster_members
+run_local_pve preflight --local-pve --inventory "$INVENTORY" \
+    --identity "$IDENTITY" > "$WORK/local-mixed-mode.out" 2>&1 &&
+    fail "--local-pve accepted advanced inventory/key arguments"
+[ ! -s "$LOG" ] || fail "mixed target modes contacted a node"
 
 echo "pvn-cluster-install tests passed"

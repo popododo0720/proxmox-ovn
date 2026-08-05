@@ -1,8 +1,9 @@
 #!/bin/sh
 # Thin, checksum-verifying bootstrap intended for:
 #   bash -c "$(curl -fsSL https://PUBLIC_URL/pvn-install.sh)"
-# Missing inventory/key paths are prompted for on a terminal. With no phase or
-# apply settings this can only run the cluster installer's read-only preflight.
+# On a PVE node the default discovers local standalone/cluster membership and
+# runs read-only preflight. Inventory/key prompts exist only for an explicitly
+# selected advanced deployment-host flow.
 set -eu
 
 PROGRAM=${0##*/}
@@ -19,6 +20,7 @@ else
 fi
 INVENTORY=${PVN_INVENTORY:-}
 IDENTITY=${PVN_IDENTITY:-}
+LOCAL_PVE_EXPLICIT=0
 APPLY=${PVN_APPLY:-0}
 CONFIRM=${PVN_CONFIRM:-}
 CURL_BIN=${PVN_CURL_BIN:-curl}
@@ -29,17 +31,19 @@ usage() {
 usage: $PROGRAM [preflight|install] [options]
 
 options:
-  --inventory FILE          deployment inventory
-  --identity PRIVATE_KEY    SSH private key
+  --local-pve               discover from this PVE node (default)
+  --inventory FILE          advanced deployment inventory
+  --identity PRIVATE_KEY    advanced deployment SSH private key
   --version VERSION         release version (default: $DEFAULT_VERSION)
   --arch ARCH               Debian architecture (default: amd64)
   --release-base-url URL    HTTPS release directory
   --apply                   permit the install phase to write remotely
-  --confirm CLUSTER_ID      exact PVE cluster name required with --apply
+  --confirm DEPLOYMENT_ID   exact discovered ID required with --apply
 
-The curl one-liner may instead set PVN_INVENTORY, PVN_IDENTITY, PVN_PHASE,
-PVN_APPLY, PVN_CONFIRM, PVN_VERSION, and PVN_RELEASE_BASE_URL. The default
-phase is the read-only preflight.
+The default curl one-liner uses --local-pve and read-only preflight. Supplying
+PVN_INVENTORY or PVN_IDENTITY explicitly selects advanced mode and prompts for
+the missing counterpart. Other settings may use PVN_PHASE, PVN_APPLY,
+PVN_CONFIRM, PVN_VERSION, and PVN_RELEASE_BASE_URL.
 EOF
     exit 2
 }
@@ -69,6 +73,10 @@ while [ "$#" -gt 0 ]; do
             need_value "$@"
             IDENTITY=$2
             shift 2
+            ;;
+        --local-pve)
+            LOCAL_PVE_EXPLICIT=1
+            shift
             ;;
         --version)
             need_value "$@"
@@ -115,7 +123,7 @@ esac
 [ "$PHASE" = install ] || [ "$APPLY" = 0 ] ||
     fail "--apply is valid only with the install phase"
 if [ "$APPLY" -eq 1 ]; then
-    [ -n "$CONFIRM" ] || fail "install --apply requires --confirm CLUSTER_ID"
+    [ -n "$CONFIRM" ] || fail "install --apply requires --confirm DEPLOYMENT_ID"
 fi
 
 case "$VERSION" in
@@ -154,17 +162,25 @@ prompt_path() {
     fi
 }
 
-if [ -z "$INVENTORY" ]; then
-    INVENTORY=$(prompt_path PVN_INVENTORY "PVN inventory path")
+ADVANCED=0
+if [ -n "$INVENTORY" ] || [ -n "$IDENTITY" ]; then
+    ADVANCED=1
 fi
-if [ -z "$IDENTITY" ]; then
-    IDENTITY=$(prompt_path PVN_IDENTITY "SSH private-key path")
-fi
+[ "$LOCAL_PVE_EXPLICIT" -eq 0 ] || [ "$ADVANCED" -eq 0 ] ||
+    fail "--local-pve cannot be combined with inventory or identity settings"
 
-[ -r "$INVENTORY" ] && [ -f "$INVENTORY" ] ||
-    fail "inventory is not a readable regular file: $INVENTORY"
-[ -r "$IDENTITY" ] && [ -f "$IDENTITY" ] ||
-    fail "SSH identity is not a readable regular file: $IDENTITY"
+if [ "$ADVANCED" -eq 1 ]; then
+    if [ -z "$INVENTORY" ]; then
+        INVENTORY=$(prompt_path PVN_INVENTORY "PVN inventory path")
+    fi
+    if [ -z "$IDENTITY" ]; then
+        IDENTITY=$(prompt_path PVN_IDENTITY "SSH private-key path")
+    fi
+    [ -r "$INVENTORY" ] && [ -f "$INVENTORY" ] ||
+        fail "inventory is not a readable regular file: $INVENTORY"
+    [ -r "$IDENTITY" ] && [ -f "$IDENTITY" ] ||
+        fail "SSH identity is not a readable regular file: $IDENTITY"
+fi
 
 for command_name in "$CURL_BIN" sha256sum awk mktemp chmod rm; do
     command -v "$command_name" >/dev/null 2>&1 ||
@@ -235,7 +251,12 @@ run_cluster_installer() {
     pvn_run_phase=$1
     pvn_run_apply=$2
     pvn_run_confirm=$3
-    set -- "$pvn_run_phase" --inventory "$INVENTORY" --identity "$IDENTITY"
+    set -- "$pvn_run_phase"
+    if [ "$ADVANCED" -eq 1 ]; then
+        set -- "$@" --inventory "$INVENTORY" --identity "$IDENTITY"
+    else
+        set -- "$@" --local-pve
+    fi
     if [ "$pvn_run_phase" = install ]; then
         set -- "$@" --deb "$DEB_PATH"
     fi
@@ -249,7 +270,7 @@ echo "Verified downloads; running PVN $PHASE."
 if [ "$PHASE_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ -r /dev/tty ]; then
     if run_cluster_installer preflight 0 ''; then
         printf '%s' \
-            'Type the exact cluster name to install pvn-node, or press Enter to stop: ' \
+            'Type the exact deployment ID shown above to install pvn-node, or press Enter to stop: ' \
             >/dev/tty
         if IFS= read -r pvn_typed_cluster </dev/tty; then
             if [ -z "$pvn_typed_cluster" ]; then

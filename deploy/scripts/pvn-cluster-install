@@ -22,6 +22,7 @@ PVE_MEMBERS_FILE=${PVN_PVE_MEMBERS_FILE:-/etc/pve/.members}
 PVE_COROSYNC_CONF=${PVN_PVE_COROSYNC_CONF:-/etc/pve/corosync.conf}
 PVE_NODES_DIR=${PVN_PVE_NODES_DIR:-/etc/pve/nodes}
 PVE_CLUSTER_IDENTITY=${PVN_PVE_IDENTITY:-/root/.ssh/id_rsa}
+PVE_GLOBAL_LOCK_FILE=${PVN_PVE_GLOBAL_LOCK_FILE:-/etc/pve/priv/lock/pvn-install.lock}
 CURRENT_HOST=
 CURRENT_REMOTE_DEB=
 STAGED_RECORDS=
@@ -30,6 +31,8 @@ PVE_LOCAL_NODE=
 PVE_NODE_RECORDS=
 PVE_DISCOVERY_SNAPSHOT=
 PVE_CONFIRM_ID=
+PVE_GLOBAL_LOCK_TOKEN=
+PVE_GLOBAL_LOCK_HELD=false
 
 usage() {
     cat >&2 <<EOF
@@ -151,7 +154,7 @@ case "$PHASE" in
         DEB=$pvn_deb_dir/$pvn_deb_name
         if [ "$APPLY" = true ]; then
             [ -n "$CONFIRM" ] ||
-                fail "--apply requires --confirm CLUSTER_ID"
+                fail "--apply requires --confirm DEPLOYMENT_ID"
         fi
         ;;
 esac
@@ -198,21 +201,421 @@ if [ "$LOCAL_PVE" = false ]; then
     [ "$NODE_COUNT" -gt 0 ] || fail "inventory contains no target nodes"
 fi
 
-ssh_run() {
-    pvn_ssh_host=$1
+discover_local_pve_snapshot() {
+    command -v "$PYTHON_BIN" >/dev/null 2>&1 ||
+        fail "required command is unavailable: $PYTHON_BIN"
+    command -v "$PVECM_BIN" >/dev/null 2>&1 ||
+        fail "required command is unavailable: $PVECM_BIN"
+
+    "$PYTHON_BIN" - "$PVE_MEMBERS_FILE" "$PVE_COROSYNC_CONF" \
+        "$PVECM_BIN" "$PVE_NODES_DIR" <<'PVN_DISCOVER'
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+
+
+def fail(message):
+    print(f"PVN local PVE discovery failed: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def safe_name(value, label):
+    pattern = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?"
+    if not isinstance(value, str) or not re.fullmatch(pattern, value) or value in {".", ".."}:
+        fail(f"{label} is unsafe or empty")
+    return value
+
+
+def safe_int(value, label, minimum=0):
+    if type(value) is not int or value < minimum:
+        fail(f"{label} is not a valid integer")
+    return value
+
+
+def secure_regular(path, label):
+    try:
+        metadata = os.lstat(path)
+    except OSError as error:
+        fail(f"cannot inspect {label}: {error}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fail(f"{label} is not a regular non-symlink file")
+    if metadata.st_uid != 0:
+        fail(f"{label} is not owned by root")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        fail(f"{label} is group- or world-writable")
+
+
+members_path, corosync_path, pvecm, nodes_dir = sys.argv[1:]
+secure_regular(members_path, members_path)
+try:
+    with open(members_path, "r", encoding="utf-8") as members_file:
+        data = json.load(members_file)
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    fail(f"cannot parse {members_path}: {error}")
+
+if not isinstance(data, dict):
+    fail(".members root must be an object")
+local_name = safe_name(data.get("nodename"), ".members nodename")
+members_version = safe_int(data.get("version", 0), ".members version")
+nodelist = data.get("nodelist")
+cluster = data.get("cluster")
+has_corosync = os.path.exists(corosync_path)
+records = []
+
+if isinstance(cluster, dict) and cluster.get("name"):
+    if not has_corosync:
+        fail(".members reports a cluster but corosync.conf is absent")
+    cluster_name = safe_name(cluster.get("name"), "cluster name")
+    cluster_version = safe_int(cluster.get("version"), "cluster version")
+    cluster_nodes = safe_int(cluster.get("nodes"), "cluster node count", 1)
+    quorate = safe_int(cluster.get("quorate"), "cluster quorum state")
+    if quorate != 1:
+        fail("PVE cluster is not quorate")
+    if not isinstance(nodelist, dict) or len(nodelist) != cluster_nodes:
+        fail(".members nodelist count does not match cluster.nodes")
+    if local_name not in nodelist:
+        fail("local nodename is missing from .members nodelist")
+
+    seen_ids = set()
+    for name, member in nodelist.items():
+        safe_name(name, "node name")
+        if not isinstance(member, dict):
+            fail(f"node {name} record is not an object")
+        node_id = safe_int(member.get("id"), f"node {name} id", 1)
+        if node_id in seen_ids:
+            fail(f"duplicate PVE node id {node_id}")
+        seen_ids.add(node_id)
+        if safe_int(member.get("online"), f"node {name} online state") != 1:
+            fail(f"PVE node {name} is offline")
+        address = member.get("ip")
+        if not isinstance(address, str):
+            fail(f"node {name} has no management IP")
+        try:
+            address = str(ipaddress.ip_address(address))
+        except ValueError:
+            fail(f"node {name} has an invalid management IP")
+        records.append((node_id, name, address, name == local_name))
+
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    status_result = subprocess.run(
+        [pvecm, "status"], text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=environment, check=False,
+    )
+    if status_result.returncode != 0:
+        fail("pvecm status failed for a configured cluster")
+
+    def status_field(label, pattern):
+        values = re.findall(pattern, status_result.stdout, re.MULTILINE)
+        if len(values) != 1:
+            fail(f"pvecm status has an invalid {label} field")
+        return values[0]
+
+    if status_field("name", r"^Name:\s+(\S+)\s*$") != cluster_name:
+        fail("pvecm cluster name differs from .members")
+    if int(status_field("node count", r"^Nodes:\s+(\d+)\s*$")) != cluster_nodes:
+        fail("pvecm node count differs from .members")
+    if status_field("quorum", r"^Quorate:\s+(Yes|No)\s*$") != "Yes":
+        fail("pvecm reports a non-quorate cluster")
+
+    nodes_result = subprocess.run(
+        [pvecm, "nodes"], text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=environment, check=False,
+    )
+    if nodes_result.returncode != 0:
+        fail("pvecm nodes failed for a configured cluster")
+    live_members = {}
+    local_markers = []
+    for line in nodes_result.stdout.splitlines():
+        match = re.fullmatch(
+            r"\s*(\d+)\s+\d+\s+([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?)(\s+\(local\))?\s*",
+            line,
+        )
+        if not match:
+            continue
+        node_id = int(match.group(1))
+        name = match.group(2)
+        if name in live_members:
+            fail(f"pvecm nodes repeats node {name}")
+        live_members[name] = node_id
+        if match.group(3):
+            local_markers.append(name)
+    expected_members = {name: node_id for node_id, name, _, _ in records}
+    if live_members != expected_members:
+        fail("pvecm live membership differs from .members nodelist")
+    if local_markers != [local_name]:
+        fail("pvecm local node marker differs from .members nodename")
+
+    for _, name, _, is_local in records:
+        if is_local:
+            continue
+        known_hosts = os.path.join(nodes_dir, name, "ssh_known_hosts")
+        secure_regular(known_hosts, known_hosts)
+        try:
+            with open(known_hosts, "r", encoding="ascii") as known_hosts_file:
+                host_lines = [
+                    line.strip() for line in known_hosts_file
+                    if line.strip() and not line.lstrip().startswith("#")
+                ]
+        except (OSError, UnicodeError) as error:
+            fail(f"cannot read {known_hosts}: {error}")
+        if not host_lines:
+            fail(f"{known_hosts} contains no pinned host key")
+        for host_line in host_lines:
+            fields = host_line.split()
+            if len(fields) < 3 or fields[0] != name:
+                fail(f"{known_hosts} does not exclusively pin alias {name}")
+
+    mode = "cluster"
+    confirm_id = cluster_name
+else:
+    if has_corosync:
+        fail("corosync.conf exists but .members has no cluster")
+    cluster_version = 0
+    if nodelist is None:
+        records = [(0, local_name, "local", True)]
+    else:
+        if not isinstance(nodelist, dict) or set(nodelist) != {local_name}:
+            fail("standalone .members must contain only the local node")
+        member = nodelist[local_name]
+        if not isinstance(member, dict):
+            fail("standalone local node record is not an object")
+        node_id = safe_int(member.get("id", 0), "standalone node id")
+        if safe_int(member.get("online", 1), "standalone online state") != 1:
+            fail("standalone local node is offline")
+        address = member.get("ip", "local")
+        if address != "local":
+            if not isinstance(address, str):
+                fail("standalone node IP is invalid")
+            try:
+                address = str(ipaddress.ip_address(address))
+            except ValueError:
+                fail("standalone node IP is invalid")
+        records = [(node_id, local_name, address, True)]
+
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    status_result = subprocess.run(
+        [pvecm, "status"], text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=environment, check=False,
+    )
+    if status_result.returncode == 0:
+        fail("pvecm status succeeded although .members reports standalone mode")
+    mode = "standalone"
+    confirm_id = f"standalone-{local_name}"
+
+records.sort(key=lambda record: (record[0], record[1]))
+tokens = [
+    "|".join(
+        ["PVN_LOCAL", mode, confirm_id, str(cluster_version), local_name,
+         str(len(records)), str(members_version)]
+    )
+]
+for node_id, name, address, is_local in records:
+    tokens.append(
+        "|".join(
+            ["PVN_NODE", name, address, str(node_id), "1" if is_local else "0"]
+        )
+    )
+print(" ".join(tokens))
+PVN_DISCOVER
+}
+
+load_local_pve_snapshot() {
+    pvn_snapshot=$1
+    set -- $pvn_snapshot
+    [ "$#" -ge 2 ] || fail "local PVE discovery returned no node records"
+    pvn_header=$1
     shift
-    "$SSH_BIN" \
-        -i "$IDENTITY" \
-        -o BatchMode=yes \
-        -o PasswordAuthentication=no \
-        -o KbdInteractiveAuthentication=no \
-        -o PubkeyAuthentication=yes \
-        -o PreferredAuthentications=publickey \
-        -o IdentitiesOnly=yes \
-        -o NumberOfPasswordPrompts=0 \
-        -o StrictHostKeyChecking=yes \
-        -o ConnectTimeout=10 \
-        -- "root@$pvn_ssh_host" sh -s -- "$@" <<'PVN_REMOTE'
+    pvn_old_ifs=$IFS
+    IFS='|'
+    read -r pvn_tag pvn_mode pvn_confirm pvn_config_version \
+        pvn_local pvn_count pvn_members_version <<EOF
+$pvn_header
+EOF
+    IFS=$pvn_old_ifs
+    [ "$pvn_tag" = PVN_LOCAL ] || fail "local PVE discovery returned a malformed header"
+    case "$pvn_mode" in cluster|standalone) ;; *) fail "invalid local PVE mode" ;; esac
+    case "$pvn_confirm" in
+        ''|*[!A-Za-z0-9._-]*) fail "unsafe local PVE confirmation value" ;;
+    esac
+    case "$pvn_count" in ''|*[!0-9]*) fail "invalid local PVE node count" ;; esac
+    [ "$pvn_count" -eq "$#" ] || fail "local PVE discovery node count mismatch"
+
+    NODES=
+    NODE_COUNT=0
+    PVE_NODE_RECORDS=
+    for pvn_record in "$@"; do
+        IFS='|'
+        read -r pvn_record_tag pvn_name pvn_ip pvn_id pvn_is_local <<EOF
+$pvn_record
+EOF
+        IFS=$pvn_old_ifs
+        [ "$pvn_record_tag" = PVN_NODE ] || fail "malformed local PVE node record"
+        case "$pvn_name" in
+            ''|*[!A-Za-z0-9._-]*|-*) fail "unsafe discovered PVE node name" ;;
+        esac
+        case "$pvn_id" in ''|*[!0-9]*) fail "invalid discovered PVE node id" ;; esac
+        case "$pvn_is_local" in 0|1) ;; *) fail "invalid discovered local-node flag" ;; esac
+        case " $NODES " in *" $pvn_name "*) fail "duplicate discovered PVE node" ;; esac
+        NODES=${NODES:+$NODES }$pvn_name
+        PVE_NODE_RECORDS=${PVE_NODE_RECORDS:+$PVE_NODE_RECORDS }$pvn_name,$pvn_ip,$pvn_id,$pvn_is_local
+        NODE_COUNT=$((NODE_COUNT + 1))
+    done
+
+    PVE_MODE=$pvn_mode
+    PVE_CONFIRM_ID=$pvn_confirm
+    PVE_LOCAL_NODE=$pvn_local
+}
+
+verify_local_pve_snapshot() {
+    [ "$LOCAL_PVE" = true ] || return 0
+    pvn_fresh_snapshot=$(discover_local_pve_snapshot) ||
+        fail "could not revalidate local PVE membership"
+    [ "$pvn_fresh_snapshot" = "$PVE_DISCOVERY_SNAPSHOT" ] ||
+        fail "PVE membership changed after the initial preflight"
+}
+
+local_pve_record() {
+    pvn_wanted_node=$1
+    for pvn_record in $PVE_NODE_RECORDS; do
+        pvn_record_name=${pvn_record%%,*}
+        if [ "$pvn_record_name" = "$pvn_wanted_node" ]; then
+            printf '%s\n' "$pvn_record"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ "$LOCAL_PVE" = true ]; then
+    PVE_DISCOVERY_SNAPSHOT=$(discover_local_pve_snapshot) ||
+        fail "local PVE discovery did not pass"
+    load_local_pve_snapshot "$PVE_DISCOVERY_SNAPSHOT"
+    command -v "$LOCAL_SH_BIN" >/dev/null 2>&1 ||
+        fail "required command is unavailable: $LOCAL_SH_BIN"
+    if [ "$PVE_MODE" = cluster ]; then
+        command -v "$SSH_BIN" >/dev/null 2>&1 ||
+            fail "required command is unavailable: $SSH_BIN"
+        validate_identity "$PVE_CLUSTER_IDENTITY"
+    fi
+fi
+
+acquire_pve_global_lock() {
+    [ "$LOCAL_PVE" = true ] && [ "$PVE_MODE" = cluster ] || return 0
+    case "$PVE_GLOBAL_LOCK_FILE" in
+        /*) ;;
+        *) fail "PVN_PVE_GLOBAL_LOCK_FILE must be an absolute path" ;;
+    esac
+    PVE_GLOBAL_LOCK_TOKEN=$("$PYTHON_BIN" - "$PVE_GLOBAL_LOCK_FILE" \
+        "$PVE_LOCAL_NODE" "$PVE_CONFIRM_ID" "$$" <<'PVN_LOCK_ACQUIRE'
+import json
+import os
+import secrets
+import stat
+import sys
+import time
+
+path, node, deployment, installer_pid = sys.argv[1:]
+parent = os.path.dirname(path)
+try:
+    parent_stat = os.lstat(parent)
+except OSError as error:
+    print(f"PVN cluster-global lock directory is unavailable: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(parent_stat.st_mode):
+    print("PVN cluster-global lock parent is not a directory", file=sys.stderr)
+    raise SystemExit(1)
+if parent_stat.st_uid != 0 or stat.S_IMODE(parent_stat.st_mode) & 0o022:
+    print("PVN cluster-global lock parent has unsafe ownership or mode", file=sys.stderr)
+    raise SystemExit(1)
+
+token = secrets.token_hex(24)
+record = {
+    "deployment": deployment,
+    "node": node,
+    "pid": int(installer_pid),
+    "started": int(time.time()),
+    "token": token,
+}
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+try:
+    descriptor = os.open(path, flags, 0o600)
+except FileExistsError:
+    try:
+        with open(path, "r", encoding="utf-8") as existing_file:
+            existing_record = json.load(existing_file)
+        existing = json.dumps(
+            {
+                key: existing_record.get(key)
+                for key in ("deployment", "node", "pid", "started")
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        existing = "unreadable-owner-record"
+    print(
+        f"PVN cluster-global install lock already exists at {path}: {existing}; "
+        "verify its owner and remove it manually only if stale",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+except OSError as error:
+    print(f"cannot create PVN cluster-global install lock: {error}", file=sys.stderr)
+    raise SystemExit(1)
+try:
+    payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    os.write(descriptor, payload)
+finally:
+    os.close(descriptor)
+print(token)
+PVN_LOCK_ACQUIRE
+    ) || fail "could not acquire the PVE cluster-global install lock"
+    case "$PVE_GLOBAL_LOCK_TOKEN" in
+        ''|*[!0-9a-f]*) fail "cluster-global lock returned an invalid owner token" ;;
+    esac
+    PVE_GLOBAL_LOCK_HELD=true
+}
+
+release_pve_global_lock() {
+    [ "$PVE_GLOBAL_LOCK_HELD" = true ] || return 0
+    if ! "$PYTHON_BIN" - "$PVE_GLOBAL_LOCK_FILE" "$PVE_GLOBAL_LOCK_TOKEN" <<'PVN_LOCK_RELEASE'
+import json
+import os
+import stat
+import sys
+
+path, token = sys.argv[1:]
+try:
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("lock path is not a regular file")
+    with open(path, "r", encoding="utf-8") as lock_file:
+        record = json.load(lock_file)
+    if not isinstance(record, dict) or record.get("token") != token:
+        raise RuntimeError("owner token no longer matches")
+    os.unlink(path)
+except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as error:
+    print(f"refusing to remove PVN cluster-global lock {path}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PVN_LOCK_RELEASE
+    then
+        echo "$PROGRAM: warning: cluster-global lock was not removed; inspect $PVE_GLOBAL_LOCK_FILE manually" >&2
+        return 1
+    fi
+    PVE_GLOBAL_LOCK_HELD=false
+    PVE_GLOBAL_LOCK_TOKEN=
+}
+
+emit_node_script() {
+    cat <<'PVN_REMOTE'
 set -eu
 
 remote_fail() {
@@ -330,24 +733,73 @@ check_pve_and_quorum() {
         *) remote_fail "PVE 9 is required; found ${pvn_pve_version:-unknown}" ;;
     esac
 
-    pvn_cluster_status=$(pvecm status 2>/dev/null) ||
-        remote_fail "pvecm status failed"
-    pvn_cluster_id=$(printf '%s\n' "$pvn_cluster_status" |
-        awk '$1 == "Name:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
-        remote_fail "cannot determine the PVE cluster name"
-    case "$pvn_cluster_id" in
-        ''|*[!A-Za-z0-9._-]*) remote_fail "unsafe PVE cluster name" ;;
+    pvn_hostname=$(perl -MPVE::INotify -e 'print PVE::INotify::nodename()' 2>/dev/null) ||
+        remote_fail "cannot determine the local PVE nodename"
+    case "$pvn_hostname" in
+        ''|*[!A-Za-z0-9._-]*|.|..) remote_fail "unsafe or empty PVE nodename" ;;
     esac
-    pvn_quorate=$(printf '%s\n' "$pvn_cluster_status" |
-        awk '$1 == "Quorate:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
-        remote_fail "cannot determine quorum state"
-    [ "$pvn_quorate" = Yes ] || remote_fail "PVE cluster is not quorate"
-    pvn_cluster_nodes=$(printf '%s\n' "$pvn_cluster_status" |
-        awk '$1 == "Nodes:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
-        remote_fail "cannot determine cluster node count"
-    case "$pvn_cluster_nodes" in
-        ''|*[!0-9]*) remote_fail "invalid cluster node count" ;;
-    esac
+
+    if [ -e /etc/pve/corosync.conf ]; then
+        pvn_mode=cluster
+        pvn_cluster_status=$(LC_ALL=C pvecm status 2>/dev/null) ||
+            remote_fail "pvecm status failed"
+        pvn_cluster_id=$(printf '%s\n' "$pvn_cluster_status" |
+            awk '$1 == "Name:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
+            remote_fail "cannot determine the PVE cluster name"
+        case "$pvn_cluster_id" in
+            ''|*[!A-Za-z0-9._-]*) remote_fail "unsafe PVE cluster name" ;;
+        esac
+        pvn_quorate=$(printf '%s\n' "$pvn_cluster_status" |
+            awk '$1 == "Quorate:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
+            remote_fail "cannot determine quorum state"
+        [ "$pvn_quorate" = Yes ] || remote_fail "PVE cluster is not quorate"
+        pvn_cluster_nodes=$(printf '%s\n' "$pvn_cluster_status" |
+            awk '$1 == "Nodes:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
+            remote_fail "cannot determine cluster node count"
+        case "$pvn_cluster_nodes" in
+            ''|*[!0-9]*) remote_fail "invalid cluster node count" ;;
+        esac
+        pvn_node_id_raw=$(printf '%s\n' "$pvn_cluster_status" |
+            awk '$1 == "Node" && $2 == "ID:" { print $3; found++ } END { if (found != 1) exit 1 }') ||
+            remote_fail "cannot determine local PVE node ID"
+        case "$pvn_node_id_raw" in
+            ''|*[!A-Fa-f0-9x]*) remote_fail "invalid local PVE node ID" ;;
+        esac
+        pvn_node_id=$(printf '%d\n' "$pvn_node_id_raw" 2>/dev/null) ||
+            remote_fail "invalid local PVE node ID"
+    else
+        pvn_mode=standalone
+        if LC_ALL=C pvecm status >/dev/null 2>&1; then
+            remote_fail "pvecm status succeeded without corosync.conf"
+        fi
+        require_command python3
+        pvn_standalone_record=$(python3 -c '
+import json, sys
+with open("/etc/pve/.members", encoding="utf-8") as source:
+    data = json.load(source)
+name = data.get("nodename")
+nodes = data.get("nodelist")
+if data.get("cluster") or (nodes is not None and set(nodes) != {name}):
+    raise SystemExit(1)
+node_id = 0 if nodes is None else nodes[name].get("id", 0)
+if type(node_id) is not int or node_id < 0:
+    raise SystemExit(1)
+print(f"{name}|{node_id}")
+' 2>/dev/null) || remote_fail "cannot validate standalone .members"
+        pvn_old_ifs=$IFS
+        IFS='|'
+        read -r pvn_standalone_name pvn_node_id <<EOF
+$pvn_standalone_record
+EOF
+        IFS=$pvn_old_ifs
+        [ "$pvn_standalone_name" = "$pvn_hostname" ] ||
+            remote_fail "standalone .members nodename differs from local PVE nodename"
+        case "$pvn_node_id" in
+            ''|*[!0-9]*) remote_fail "invalid standalone PVE node ID" ;;
+        esac
+        pvn_cluster_id=standalone-$pvn_hostname
+        pvn_cluster_nodes=1
+    fi
 }
 
 check_clean_ui_template() {
@@ -392,7 +844,8 @@ run_preflight() {
     require_command apt-get
     require_command find
     require_command grep
-    [ "$(id -u)" -eq 0 ] || remote_fail "SSH user is not root"
+    require_command perl
+    [ "$(id -u)" -eq 0 ] || remote_fail "execution user is not root"
 
     pvn_package_state=$(package_state)
     check_pve_and_quorum
@@ -418,18 +871,8 @@ case "$pvn_action" in
     probe)
         [ "$#" -eq 0 ] || remote_fail "invalid probe arguments"
         run_preflight
-        pvn_hostname=$(hostname --fqdn 2>/dev/null || hostname)
-        case "$pvn_hostname" in
-            ''|*[!A-Za-z0-9._-]*) remote_fail "unsafe or empty node hostname" ;;
-        esac
-        pvn_node_id=$(printf '%s\n' "$pvn_cluster_status" |
-            awk '$1 == "Node" && $2 == "ID:" { print $3; found++ } END { if (found != 1) exit 1 }') ||
-            remote_fail "cannot determine local PVE node ID"
-        case "$pvn_node_id" in
-            ''|*[!A-Fa-f0-9x]*) remote_fail "invalid local PVE node ID" ;;
-        esac
-        printf 'PVN_PREFLIGHT cluster=%s nodes=%s pve=%s arch=%s package=%s version=%s hostname=%s nodeid=%s\n' \
-            "$pvn_cluster_id" "$pvn_cluster_nodes" "$pvn_pve_version" \
+        printf 'PVN_PREFLIGHT mode=%s cluster=%s nodes=%s pve=%s arch=%s package=%s version=%s hostname=%s nodeid=%s\n' \
+            "$pvn_mode" "$pvn_cluster_id" "$pvn_cluster_nodes" "$pvn_pve_version" \
             "$pvn_arch" "$pvn_package_state" "$pvn_package_version" \
             "$pvn_hostname" "$pvn_node_id"
         ;;
@@ -515,9 +958,99 @@ esac
 PVN_REMOTE
 }
 
-scp_deb() {
-    pvn_scp_host=$1
-    pvn_scp_path=$2
+node_run() {
+    pvn_run_host=$1
+    shift
+    if [ "$LOCAL_PVE" = true ]; then
+        pvn_run_record=$(local_pve_record "$pvn_run_host") ||
+            fail "no local PVE transport record for $pvn_run_host"
+        pvn_old_ifs=$IFS
+        IFS=','
+        read -r pvn_run_name pvn_run_ip pvn_run_id pvn_run_local <<EOF
+$pvn_run_record
+EOF
+        IFS=$pvn_old_ifs
+        if [ "$pvn_run_local" = 1 ]; then
+            emit_node_script | PVN_NODE_NAME="$pvn_run_name" \
+                "$LOCAL_SH_BIN" -s -- "$@"
+            return
+        fi
+        pvn_known_hosts=$PVE_NODES_DIR/$pvn_run_name/ssh_known_hosts
+        emit_node_script | "$SSH_BIN" -F /dev/null -e none \
+            -i "$PVE_CLUSTER_IDENTITY" \
+            -o BatchMode=yes \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o PubkeyAuthentication=yes \
+            -o PreferredAuthentications=publickey \
+            -o IdentitiesOnly=yes \
+            -o NumberOfPasswordPrompts=0 \
+            -o StrictHostKeyChecking=yes \
+            -o UpdateHostKeys=no \
+            -o CheckHostIP=no \
+            -o "HostKeyAlias=$pvn_run_name" \
+            -o "UserKnownHostsFile=$pvn_known_hosts" \
+            -o GlobalKnownHostsFile=none \
+            -o ConnectTimeout=10 \
+            -- "root@$pvn_run_ip" sh -s -- "$@"
+        return
+    fi
+
+    emit_node_script | "$SSH_BIN" \
+        -i "$IDENTITY" \
+        -o BatchMode=yes \
+        -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o PubkeyAuthentication=yes \
+        -o PreferredAuthentications=publickey \
+        -o IdentitiesOnly=yes \
+        -o NumberOfPasswordPrompts=0 \
+        -o StrictHostKeyChecking=yes \
+        -o ConnectTimeout=10 \
+        -- "root@$pvn_run_host" sh -s -- "$@"
+}
+
+node_copy_deb() {
+    pvn_copy_host=$1
+    pvn_copy_path=$2
+    if [ "$LOCAL_PVE" = true ]; then
+        pvn_copy_record=$(local_pve_record "$pvn_copy_host") ||
+            fail "no local PVE transport record for $pvn_copy_host"
+        pvn_old_ifs=$IFS
+        IFS=','
+        read -r pvn_copy_name pvn_copy_ip pvn_copy_id pvn_copy_local <<EOF
+$pvn_copy_record
+EOF
+        IFS=$pvn_old_ifs
+        if [ "$pvn_copy_local" = 1 ]; then
+            "$CP_BIN" -- "$DEB" "$pvn_copy_path"
+            return
+        fi
+        pvn_known_hosts=$PVE_NODES_DIR/$pvn_copy_name/ssh_known_hosts
+        case "$pvn_copy_ip" in
+            *:*) pvn_copy_target="root@[$pvn_copy_ip]:$pvn_copy_path" ;;
+            *) pvn_copy_target="root@$pvn_copy_ip:$pvn_copy_path" ;;
+        esac
+        "$SCP_BIN" -q -F /dev/null \
+            -i "$PVE_CLUSTER_IDENTITY" \
+            -o BatchMode=yes \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o PubkeyAuthentication=yes \
+            -o PreferredAuthentications=publickey \
+            -o IdentitiesOnly=yes \
+            -o NumberOfPasswordPrompts=0 \
+            -o StrictHostKeyChecking=yes \
+            -o UpdateHostKeys=no \
+            -o CheckHostIP=no \
+            -o "HostKeyAlias=$pvn_copy_name" \
+            -o "UserKnownHostsFile=$pvn_known_hosts" \
+            -o GlobalKnownHostsFile=none \
+            -o ConnectTimeout=10 \
+            -- "$DEB" "$pvn_copy_target"
+        return
+    fi
+
     "$SCP_BIN" -q \
         -i "$IDENTITY" \
         -o BatchMode=yes \
@@ -529,7 +1062,7 @@ scp_deb() {
         -o NumberOfPasswordPrompts=0 \
         -o StrictHostKeyChecking=yes \
         -o ConnectTimeout=10 \
-        -- "$DEB" "root@$pvn_scp_host:$pvn_scp_path"
+        -- "$DEB" "root@$pvn_copy_host:$pvn_copy_path"
 }
 
 DISCOVERED_CLUSTER_ID=
@@ -537,6 +1070,7 @@ DISCOVERED_ARCH=
 DISCOVERED_PACKAGE_VERSIONS=
 
 preflight_all() {
+    pvn_expected_mode=
     pvn_expected_cluster=
     pvn_expected_arch=
     pvn_seen_hostnames=
@@ -544,34 +1078,41 @@ preflight_all() {
     pvn_versions=
     for pvn_host in $NODES; do
         echo "[$pvn_host] read-only preflight"
-        pvn_probe=$(ssh_run "$pvn_host" probe) ||
+        pvn_probe=$(node_run "$pvn_host" probe) ||
             fail "preflight failed on $pvn_host"
         set -- $pvn_probe
-        [ "$#" -eq 9 ] && [ "$1" = PVN_PREFLIGHT ] ||
+        [ "$#" -eq 10 ] && [ "$1" = PVN_PREFLIGHT ] ||
             fail "unexpected preflight response from $pvn_host"
-        pvn_cluster=${2#cluster=}
-        pvn_reported_nodes=${3#nodes=}
-        pvn_pve=${4#pve=}
-        pvn_arch=${5#arch=}
-        pvn_package=${6#package=}
-        pvn_package_version=${7#version=}
-        pvn_hostname=${8#hostname=}
-        pvn_node_id=${9#nodeid=}
-        [ "$2" = "cluster=$pvn_cluster" ] &&
-            [ "$3" = "nodes=$pvn_reported_nodes" ] &&
-            [ "$4" = "pve=$pvn_pve" ] &&
-            [ "$5" = "arch=$pvn_arch" ] &&
-            [ "$6" = "package=$pvn_package" ] &&
-            [ "$7" = "version=$pvn_package_version" ] &&
-            [ "$8" = "hostname=$pvn_hostname" ] &&
-            [ "$9" = "nodeid=$pvn_node_id" ] ||
+        pvn_mode=${2#mode=}
+        pvn_cluster=${3#cluster=}
+        pvn_reported_nodes=${4#nodes=}
+        pvn_pve=${5#pve=}
+        pvn_arch=${6#arch=}
+        pvn_package=${7#package=}
+        pvn_package_version=${8#version=}
+        pvn_hostname=${9#hostname=}
+        pvn_node_id=${10#nodeid=}
+        [ "$2" = "mode=$pvn_mode" ] &&
+            [ "$3" = "cluster=$pvn_cluster" ] &&
+            [ "$4" = "nodes=$pvn_reported_nodes" ] &&
+            [ "$5" = "pve=$pvn_pve" ] &&
+            [ "$6" = "arch=$pvn_arch" ] &&
+            [ "$7" = "package=$pvn_package" ] &&
+            [ "$8" = "version=$pvn_package_version" ] &&
+            [ "$9" = "hostname=$pvn_hostname" ] &&
+            [ "${10}" = "nodeid=$pvn_node_id" ] ||
             fail "malformed preflight response from $pvn_host"
+        case "$pvn_mode" in cluster|standalone) ;; *) fail "invalid PVE mode from $pvn_host" ;; esac
+        case "$pvn_node_id" in ''|*[!0-9]*) fail "invalid PVE node ID from $pvn_host" ;; esac
         [ "$pvn_reported_nodes" = "$NODE_COUNT" ] ||
-            fail "$pvn_host reports $pvn_reported_nodes cluster nodes, but inventory has $NODE_COUNT"
+            fail "$pvn_host reports $pvn_reported_nodes nodes, but the target set has $NODE_COUNT"
         if [ -z "$pvn_expected_cluster" ]; then
+            pvn_expected_mode=$pvn_mode
             pvn_expected_cluster=$pvn_cluster
             pvn_expected_arch=$pvn_arch
         else
+            [ "$pvn_mode" = "$pvn_expected_mode" ] ||
+                fail "$pvn_host reports PVE mode $pvn_mode, expected $pvn_expected_mode"
             [ "$pvn_cluster" = "$pvn_expected_cluster" ] ||
                 fail "$pvn_host belongs to cluster $pvn_cluster, expected $pvn_expected_cluster"
             [ "$pvn_arch" = "$pvn_expected_arch" ] ||
@@ -582,6 +1123,25 @@ preflight_all() {
                 fail "$pvn_host duplicates PVE hostname $pvn_hostname"
                 ;;
         esac
+        if [ "$LOCAL_PVE" = true ]; then
+            pvn_expected_record=$(local_pve_record "$pvn_host") ||
+                fail "missing discovery record for $pvn_host"
+            pvn_old_ifs=$IFS
+            IFS=','
+            read -r pvn_expected_name pvn_expected_ip pvn_expected_id \
+                pvn_expected_local <<EOF
+$pvn_expected_record
+EOF
+            IFS=$pvn_old_ifs
+            [ "$pvn_mode" = "$PVE_MODE" ] ||
+                fail "$pvn_host PVE mode differs from the discovery snapshot"
+            [ "$pvn_cluster" = "$PVE_CONFIRM_ID" ] ||
+                fail "$pvn_host deployment ID differs from the discovery snapshot"
+            [ "$pvn_hostname" = "$pvn_expected_name" ] ||
+                fail "$pvn_host reached PVE node $pvn_hostname, expected $pvn_expected_name"
+            [ "$pvn_node_id" = "$pvn_expected_id" ] ||
+                fail "$pvn_host reports node ID $pvn_node_id, expected $pvn_expected_id"
+        fi
         case " $pvn_seen_node_ids " in
             *" $pvn_node_id "*)
                 fail "$pvn_host duplicates PVE node ID $pvn_node_id"
@@ -590,7 +1150,7 @@ preflight_all() {
         pvn_seen_hostnames=${pvn_seen_hostnames:+$pvn_seen_hostnames }$pvn_hostname
         pvn_seen_node_ids=${pvn_seen_node_ids:+$pvn_seen_node_ids }$pvn_node_id
         pvn_versions=${pvn_versions:+$pvn_versions }$pvn_package_version
-        echo "[$pvn_host] ok: node=$pvn_hostname/$pvn_node_id cluster=$pvn_cluster pve=$pvn_pve arch=$pvn_arch package=$pvn_package:$pvn_package_version inactive"
+        echo "[$pvn_host] ok: mode=$pvn_mode node=$pvn_hostname/$pvn_node_id cluster=$pvn_cluster pve=$pvn_pve arch=$pvn_arch package=$pvn_package:$pvn_package_version inactive"
     done
     DISCOVERED_CLUSTER_ID=$pvn_expected_cluster
     DISCOVERED_ARCH=$pvn_expected_arch
@@ -599,21 +1159,26 @@ preflight_all() {
 
 cleanup_staged() {
     if [ -n "$CURRENT_HOST" ] && [ -n "$CURRENT_REMOTE_DEB" ]; then
-        ssh_run "$CURRENT_HOST" cleanup "$CURRENT_REMOTE_DEB" >/dev/null 2>&1 ||
+        node_run "$CURRENT_HOST" cleanup "$CURRENT_REMOTE_DEB" >/dev/null 2>&1 ||
             echo "$PROGRAM: warning: could not remove $CURRENT_REMOTE_DEB from $CURRENT_HOST" >&2
         CURRENT_HOST=
         CURRENT_REMOTE_DEB=
     fi
     for pvn_staged_record in $STAGED_RECORDS; do
-        pvn_staged_host=${pvn_staged_record%%:*}
-        pvn_staged_path=${pvn_staged_record#*:}
-        ssh_run "$pvn_staged_host" cleanup "$pvn_staged_path" >/dev/null 2>&1 ||
+        pvn_staged_host=${pvn_staged_record%%|*}
+        pvn_staged_path=${pvn_staged_record#*|}
+        node_run "$pvn_staged_host" cleanup "$pvn_staged_path" >/dev/null 2>&1 ||
             echo "$PROGRAM: warning: could not remove $pvn_staged_path from $pvn_staged_host" >&2
     done
     STAGED_RECORDS=
 }
 
-trap cleanup_staged 0
+cleanup_all() {
+    cleanup_staged
+    release_pve_global_lock || true
+}
+
+trap cleanup_all 0
 trap 'exit 130' HUP INT TERM
 
 if [ "$PHASE" = preflight ]; then
@@ -624,10 +1189,21 @@ if [ "$PHASE" = preflight ]; then
     exit 0
 fi
 
-for command_name in "$SCP_BIN" dpkg dpkg-deb sha256sum; do
+for command_name in dpkg dpkg-deb sha256sum; do
     command -v "$command_name" >/dev/null 2>&1 ||
         fail "required command is unavailable: $command_name"
 done
+if [ "$LOCAL_PVE" = true ]; then
+    command -v "$CP_BIN" >/dev/null 2>&1 ||
+        fail "required command is unavailable: $CP_BIN"
+    if [ "$PVE_MODE" = cluster ]; then
+        command -v "$SCP_BIN" >/dev/null 2>&1 ||
+            fail "required command is unavailable: $SCP_BIN"
+    fi
+else
+    command -v "$SCP_BIN" >/dev/null 2>&1 ||
+        fail "required command is unavailable: $SCP_BIN"
+fi
 
 DEB_PACKAGE=$(dpkg-deb -f "$DEB" Package 2>/dev/null || true)
 [ "$DEB_PACKAGE" = pvn-node ] || fail "DEB package must be pvn-node"
@@ -654,9 +1230,13 @@ if [ "$APPLY" = true ]; then
     esac
     exec 9>"$pvn_lock_file" || fail "cannot open local install lock: $pvn_lock_file"
     flock -n 9 || fail "another PVN cluster install is already running"
+    acquire_pve_global_lock
 fi
 
 preflight_all
+if [ "$APPLY" = true ]; then
+    verify_local_pve_snapshot
+fi
 
 [ "$DEB_ARCH" = all ] || [ "$DEB_ARCH" = "$DISCOVERED_ARCH" ] ||
     fail "DEB architecture $DEB_ARCH does not match cluster architecture $DISCOVERED_ARCH"
@@ -685,7 +1265,7 @@ fi
 for pvn_host in $NODES; do
     echo "[$pvn_host] staging verified pvn-node $DEB_VERSION"
     CURRENT_HOST=$pvn_host
-    CURRENT_REMOTE_DEB=$(ssh_run "$pvn_host" prepare) ||
+    CURRENT_REMOTE_DEB=$(node_run "$pvn_host" prepare) ||
         fail "could not create a staging file on $pvn_host"
     case "$CURRENT_REMOTE_DEB" in
         /var/tmp/pvn-node.*.deb) ;;
@@ -694,21 +1274,24 @@ for pvn_host in $NODES; do
     case "$CURRENT_REMOTE_DEB" in
         *[!A-Za-z0-9._/-]*) fail "unsafe staging path returned by $pvn_host" ;;
     esac
-    scp_deb "$pvn_host" "$CURRENT_REMOTE_DEB" ||
+    node_copy_deb "$pvn_host" "$CURRENT_REMOTE_DEB" ||
         fail "could not copy the DEB to $pvn_host"
-    ssh_run "$pvn_host" verify "$CURRENT_REMOTE_DEB" "$DEB_SHA" ||
+    node_run "$pvn_host" verify "$CURRENT_REMOTE_DEB" "$DEB_SHA" ||
         fail "DEB verification failed on $pvn_host"
 
-    STAGED_RECORDS=${STAGED_RECORDS:+$STAGED_RECORDS }$pvn_host:$CURRENT_REMOTE_DEB
+    STAGED_RECORDS=${STAGED_RECORDS:+$STAGED_RECORDS }$pvn_host\|$CURRENT_REMOTE_DEB
     CURRENT_HOST=
     CURRENT_REMOTE_DEB=
 done
 
+verify_local_pve_snapshot
+
 for pvn_staged_record in $STAGED_RECORDS; do
-    pvn_host=${pvn_staged_record%%:*}
-    pvn_remote_deb=${pvn_staged_record#*:}
+    pvn_host=${pvn_staged_record%%|*}
+    pvn_remote_deb=${pvn_staged_record#*|}
     echo "[$pvn_host] masking OVN aggregate units and installing"
-    ssh_run "$pvn_host" apply "$pvn_remote_deb" "$DEB_SHA" \
+    verify_local_pve_snapshot
+    node_run "$pvn_host" apply "$pvn_remote_deb" "$DEB_SHA" \
         "$DEB_VERSION" "$DEB_ARCH" ||
         fail "package installation failed on $pvn_host"
     echo "[$pvn_host] installed and verified inactive"
@@ -717,6 +1300,7 @@ done
 # Remove all staged artifacts, then prove the final state on every node rather
 # than trusting only the per-node apt command.
 cleanup_staged
+verify_local_pve_snapshot
 preflight_all
 for pvn_seen_version in $DISCOVERED_PACKAGE_VERSIONS; do
     [ "$pvn_seen_version" = "$DEB_VERSION" ] ||
