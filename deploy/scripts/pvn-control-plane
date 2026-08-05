@@ -1,0 +1,952 @@
+#!/bin/sh
+exec /usr/bin/python3 - "$@" <<'__PVN_CONTROL_PLANE_PYTHON__'
+"""Guarded PVN control-plane bootstrap from a PVE node.
+
+The network topology and an identical pvn-node package must already exist on
+every member.  With no arguments this command is a read-only plan.  `apply`
+uses a pmxcfs-private lock and durable ledger, then converges forward; it never
+deletes a database, activation marker, certificate, or configuration file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import copy
+import dataclasses
+import datetime as dt
+import grp
+import hashlib
+import ipaddress
+import json
+import os
+import pathlib
+import pwd
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from typing import Any, Iterator
+
+
+LEDGER_VERSION = 1
+DEFAULT_MEMBERS = "/etc/pve/.members"
+DEFAULT_TOPOLOGY = "/etc/pve/priv/pvn/topology.json"
+DEFAULT_PRIVATE = "/etc/pve/priv/pvn"
+DEFAULT_CONFIG = "/etc/pve/pvn/config.json"
+DEFAULT_SSH_KEY = "/root/.ssh/id_rsa"
+DEFAULT_NODES_DIR = "/etc/pve/nodes"
+SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
+DATABASES = {
+    "PVN_Control": 6646,
+    "OVN_Northbound": 6643,
+    "OVN_Southbound": 6644,
+}
+
+
+class ControlPlaneError(RuntimeError):
+    pass
+
+
+def canonical_json(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def safe_name(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not SAFE_NAME.fullmatch(value) or value in {".", ".."}:
+        raise ControlPlaneError(f"{label} is unsafe or empty")
+    return value
+
+
+def ipv4(value: Any, label: str) -> str:
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError as error:
+        raise ControlPlaneError(f"{label} is not an IP address") from error
+    if parsed.version != 4 or parsed.is_unspecified or parsed.is_multicast:
+        raise ControlPlaneError(f"{label} must be a usable IPv4 address")
+    return str(parsed)
+
+
+def secure_json(path: pathlib.Path, label: str) -> tuple[dict[str, Any], bytes]:
+    try:
+        metadata = path.lstat()
+        data = path.read_bytes()
+    except OSError as error:
+        raise ControlPlaneError(f"cannot read {label}: {error}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ControlPlaneError(f"{label} is not a regular non-symlink file")
+    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ControlPlaneError(f"{label} must be root-owned and not group/world writable")
+    try:
+        value = json.loads(data)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ControlPlaneError(f"cannot parse {label}: {error}") from error
+    if not isinstance(value, dict):
+        raise ControlPlaneError(f"{label} root must be an object")
+    return value, data
+
+
+@dataclasses.dataclass(frozen=True)
+class Node:
+    name: str
+    node_id: int
+    control_ip: str
+    geneve_ip: str
+    provider_bridge: str
+    package_version: str
+    geneve_mtu: int
+    local: bool = False
+
+    def frozen(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "node_id": self.node_id,
+            "control_ip": self.control_ip,
+            "geneve_ip": self.geneve_ip,
+            "provider_bridge": self.provider_bridge,
+            "package_version": self.package_version,
+            "geneve_mtu": self.geneve_mtu,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class Discovery:
+    mode: str
+    confirmation: str
+    cluster_name: str
+    local_node: str
+    members_version: int
+    cluster_version: int
+    topology_sha256: str
+    guest_mtu: int
+    physnet: str
+    nodes: tuple[Node, ...]
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "confirmation": self.confirmation,
+            "cluster_name": self.cluster_name,
+            "members_version": self.members_version,
+            "cluster_version": self.cluster_version,
+            "topology_sha256": self.topology_sha256,
+            "guest_mtu": self.guest_mtu,
+            "physnet": self.physnet,
+            "nodes": [node.frozen() for node in self.nodes],
+        }
+
+
+class LedgerStore:
+    def __init__(self, private_dir: pathlib.Path):
+        self.private_dir = private_dir
+        self.ledger_path = private_dir / "control-plane.json"
+        self.lock_path = private_dir / "control-plane.lock"
+
+    def load(self) -> dict[str, Any] | None:
+        try:
+            raw = self.ledger_path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise ControlPlaneError(f"cannot read control-plane ledger: {error}") from error
+        try:
+            value = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ControlPlaneError(f"control-plane ledger is invalid: {error}") from error
+        if not isinstance(value, dict) or value.get("version") != LEDGER_VERSION:
+            raise ControlPlaneError("control-plane ledger has an unsupported format")
+        return value
+
+    def create(self, ledger: dict[str, Any]) -> None:
+        self.private_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(self.ledger_path, flags, 0o600)
+        except FileExistsError as error:
+            raise ControlPlaneError("control-plane ledger appeared concurrently") from error
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(canonical_json(ledger))
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                self.ledger_path.unlink()
+            raise
+
+    def update(self, ledger: dict[str, Any]) -> None:
+        temporary = self.private_dir / f".control-plane.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(canonical_json(ledger))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.ledger_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    @contextlib.contextmanager
+    def lock(self, owner: str) -> Iterator[None]:
+        self.private_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(self.lock_path, flags, 0o600)
+        except FileExistsError as error:
+            raise ControlPlaneError(
+                f"cluster-wide control-plane lock already exists: {self.lock_path}"
+            ) from error
+        try:
+            payload = canonical_json({
+                "owner": owner,
+                "pid": os.getpid(),
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            })
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+            yield
+        finally:
+            os.close(descriptor)
+            # A stale lock is never broken automatically, but the process that
+            # successfully created this inode owns its normal cleanup.
+            with contextlib.suppress(FileNotFoundError):
+                self.lock_path.unlink()
+
+
+REMOTE_HELPER = r'''
+import base64, grp, hashlib, json, os, pathlib, pwd, stat, subprocess, sys
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+def run(arguments, check=True):
+    result = subprocess.run(arguments, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, check=False,
+                            env={**os.environ, "LC_ALL": "C"})
+    if check and result.returncode != 0:
+        fail(f"{' '.join(arguments)}: {result.stderr.strip() or result.stdout.strip()}")
+    return result
+
+def digest(path):
+    try:
+        return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+def db_info(path):
+    result = {"exists": os.path.exists(path)}
+    if not result["exists"]:
+        return result
+    result["name"] = run(["/usr/bin/ovsdb-tool", "db-name", path]).stdout.strip()
+    clustered = run(["/usr/bin/ovsdb-tool", "db-is-clustered", path], check=False)
+    result["clustered"] = clustered.returncode == 0
+    if result["clustered"]:
+        result["local_address"] = run(["/usr/bin/ovsdb-tool", "db-local-address", path]).stdout.strip()
+        result["cluster_id"] = run(["/usr/bin/ovsdb-tool", "db-cid", path]).stdout.strip()
+        result["server_id"] = run(["/usr/bin/ovsdb-tool", "db-sid", path]).stdout.strip()
+    return result
+
+def marker(path):
+    if os.path.exists(path):
+        return
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    os.close(descriptor)
+
+action = sys.argv[1]
+payload = json.load(sys.stdin)
+
+if action == "probe":
+    version = run(["dpkg-query", "-W", "-f=${Version}", "pvn-node"]).stdout.strip()
+    pve = run(["dpkg-query", "-W", "-f=${Version}", "pve-manager"]).stdout.strip().split(":")[-1]
+    addresses = []
+    for link in json.loads(run(["ip", "-j", "address", "show"]).stdout):
+        for address in link.get("addr_info", []):
+            if address.get("family") == "inet" and address.get("scope") == "global":
+                addresses.append({"ip": address["local"], "mtu": int(link["mtu"])})
+    bridges = {}
+    for bridge in payload["bridges"]:
+        bridges[bridge] = run(["ovs-vsctl", "--timeout=10", "br-exists", bridge], check=False).returncode == 0
+    print(json.dumps({
+        "hostname": run(["hostname", "--fqdn"], check=False).stdout.strip() or run(["hostname"]).stdout.strip(),
+        "package_version": version,
+        "pve_version": pve,
+        "addresses": addresses,
+        "bridges": bridges,
+        "cert_hashes": {name: digest(path) for name, path in {
+            "ca": "/etc/pvn/pki/ca.pem", "cert": "/etc/pvn/pki/node.pem",
+            "key": "/etc/pvn/pki/node-key.pem"}.items()},
+        "central_marker": os.path.exists("/etc/pvn/central/enabled"),
+        "node_marker": os.path.exists("/etc/pvn/node-enabled"),
+        "central_active": run(["systemctl", "is-active", "pvn-central.target"], check=False).stdout.strip() == "active",
+        "node_ready": run(["systemctl", "is-active", "pvn-node-ready.service"], check=False).stdout.strip() == "active",
+        "databases": {
+            "PVN_Control": db_info("/var/lib/pvn/control-db/pvn_control.db"),
+            "OVN_Northbound": db_info("/var/lib/ovn/ovnnb_db.db"),
+            "OVN_Southbound": db_info("/var/lib/ovn/ovnsb_db.db"),
+        },
+    }, sort_keys=True))
+
+elif action == "stage":
+    pvn_gid = grp.getgrnam("pvn").gr_gid
+    for item in payload["files"]:
+        path = pathlib.Path(item["path"])
+        if not str(path).startswith("/etc/pvn/") or ".." in path.parts:
+            fail(f"unsafe staged path: {path}")
+        data = base64.b64decode(item["content"])
+        mode = int(item["mode"], 8)
+        gid = pvn_gid if item["group"] == "pvn" else 0
+        path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        os.chown(path.parent, 0, pvn_gid)
+        if path.exists():
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or path.read_bytes() != data:
+                fail(f"staged file drift: {path}")
+            if stat.S_IMODE(metadata.st_mode) != mode or metadata.st_uid != 0 or metadata.st_gid != gid:
+                fail(f"staged file metadata drift: {path}")
+            continue
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            os.write(descriptor, data)
+            os.fsync(descriptor)
+            os.fchmod(descriptor, mode)
+            os.fchown(descriptor, 0, gid)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+    print(json.dumps({"staged": True}))
+
+elif action == "init-control":
+    database = "/var/lib/pvn/control-db/pvn_control.db"
+    expected_local = payload.get("local")
+    current = db_info(database)
+    if current["exists"]:
+        if current.get("name") != "PVN_Control": fail("existing Control DB has wrong schema name")
+        if payload["mode"] == "raft":
+            if not current.get("clustered") or current.get("local_address") != expected_local:
+                fail("existing Control DB mode/local address drift")
+        elif current.get("clustered"):
+            fail("existing standalone Control DB is clustered")
+    else:
+        command = ["/usr/sbin/pvnctl", "central", "init-control", "--mode", payload["mode"],
+                   "--confirm", payload["cluster_id"]]
+        if expected_local: command += ["--local", expected_local]
+        if payload.get("join"): command += ["--join", payload["join"]]
+        run(command)
+        current = db_info(database)
+    print(json.dumps(current, sort_keys=True))
+
+elif action == "activate-central":
+    marker("/etc/pvn/central/enabled")
+    result = run(["systemctl", "enable", "--now", "pvn-central.target"], check=False)
+    if result.returncode != 0:
+        fail(result.stderr.strip() or result.stdout.strip() or "central target failed")
+    print(json.dumps({"active": True}))
+
+elif action == "central-status":
+    mode = payload["mode"]
+    active = run(["systemctl", "is-active", "pvn-central.target"], check=False).stdout.strip() == "active"
+    offline = {
+        "PVN_Control": db_info("/var/lib/pvn/control-db/pvn_control.db"),
+        "OVN_Northbound": db_info("/var/lib/ovn/ovnnb_db.db"),
+        "OVN_Southbound": db_info("/var/lib/ovn/ovnsb_db.db"),
+    }
+    if mode == "raft":
+        status = run(["/usr/sbin/pvnctl", "central", "status"], check=False)
+        try: report = json.loads(status.stdout)
+        except Exception: report = {"healthy": False, "databases": [], "error": status.stderr.strip()}
+    else:
+        databases = []
+        for name, info in offline.items():
+            healthy = info.get("exists") and not info.get("clustered", False)
+            databases.append({"database": name, "healthy": healthy, "member_count": 1,
+                              "connected_members": 1, "cluster_id": None,
+                              "server_id": name + "-standalone", "address": None,
+                              "membership_change": False})
+        report = {"healthy": all(item["healthy"] for item in databases), "databases": databases}
+    report["target_active"] = active
+    report["offline"] = offline
+    print(json.dumps(report, sort_keys=True))
+
+elif action == "activate-node":
+    marker("/etc/pvn/node-enabled")
+    result = run(["systemctl", "enable", "--now", "pvn-node.target"], check=False)
+    if result.returncode != 0:
+        fail(result.stderr.strip() or result.stdout.strip() or "node target failed")
+    ready = run(["systemctl", "is-active", "pvn-node-ready.service"], check=False).stdout.strip() == "active"
+    if not ready: fail("pvn-node-ready.service is not active")
+    print(json.dumps({"ready": True}))
+
+elif action == "node-status":
+    ready = run(["systemctl", "is-active", "pvn-node-ready.service"], check=False).stdout.strip() == "active"
+    print(json.dumps({"ready": ready, "marker": os.path.exists("/etc/pvn/node-enabled")}))
+else:
+    fail("unknown remote action")
+'''
+
+
+class SystemBackend:
+    def __init__(self, args: argparse.Namespace):
+        self.members_path = pathlib.Path(args.members)
+        self.topology_path = pathlib.Path(args.topology_ledger)
+        self.config_path = pathlib.Path(args.config)
+        self.private_dir = pathlib.Path(args.private_dir)
+        self.ssh_key = pathlib.Path(args.ssh_key)
+        self.nodes_dir = pathlib.Path(args.nodes_dir)
+        self.python = args.python
+        self.local_name = ""
+        self.node_addresses: dict[str, str] = {}
+        self.probes: dict[str, dict[str, Any]] = {}
+
+    def discover(self) -> Discovery:
+        members, members_raw = secure_json(self.members_path, ".members")
+        topology, topology_raw = secure_json(self.topology_path, "topology ledger")
+        local_name = safe_name(members.get("nodename"), ".members nodename")
+        nodelist = members.get("nodelist")
+        if not isinstance(nodelist, dict) or local_name not in nodelist:
+            raise ControlPlaneError(".members nodelist is missing the local node")
+        cluster = members.get("cluster")
+        if isinstance(cluster, dict) and cluster.get("name"):
+            mode = "raft"
+            cluster_name = safe_name(cluster.get("name"), "PVE cluster name")
+            if cluster.get("quorate") != 1 or cluster.get("nodes") != len(nodelist):
+                raise ControlPlaneError("PVE membership is not fully online and quorate")
+            confirmation = cluster_name
+            cluster_version = int(cluster.get("version", 0))
+        else:
+            if len(nodelist) != 1:
+                raise ControlPlaneError("standalone .members contains multiple nodes")
+            mode = "standalone"
+            cluster_name = f"standalone-{local_name}"
+            confirmation = cluster_name
+            cluster_version = 0
+        if len(nodelist) not in {1, 3}:
+            raise ControlPlaneError("control-plane bootstrap supports exactly one or three nodes")
+
+        if topology.get("version") != 1 or topology.get("cluster") != confirmation:
+            raise ControlPlaneError("topology ledger version/cluster does not match PVE membership")
+        topology_nodes = topology.get("nodes")
+        if not isinstance(topology_nodes, dict) or set(topology_nodes) != set(nodelist):
+            raise ControlPlaneError("topology ledger node set differs from PVE membership")
+        guest_mtu = topology.get("guest_mtu")
+        if type(guest_mtu) is not int or not 576 <= guest_mtu <= 9000:
+            raise ControlPlaneError("topology guest_mtu is invalid")
+        physnet = safe_name(topology.get("physnet", "provider"), "topology physnet")
+        provider_default = safe_name(topology.get("provider_bridge", "br-provider"), "provider bridge")
+
+        records: list[tuple[int, str, str, str, str]] = []
+        seen_ids: set[int] = set()
+        seen_addresses: set[str] = set()
+        providers: set[str] = set()
+        for name, member in nodelist.items():
+            name = safe_name(name, "PVE node name")
+            if not isinstance(member, dict) or member.get("online") != 1:
+                raise ControlPlaneError(f"PVE node {name} is offline or malformed")
+            node_id = member.get("id")
+            if type(node_id) is not int or node_id < 0 or node_id in seen_ids:
+                raise ControlPlaneError(f"PVE node {name} has an invalid/duplicate node id")
+            seen_ids.add(node_id)
+            management = ipv4(member.get("ip"), f"PVE node {name} management IP")
+            item = topology_nodes[name]
+            if not isinstance(item, dict):
+                raise ControlPlaneError(f"topology node {name} is malformed")
+            control = ipv4(item.get("control_ip"), f"node {name} control_ip")
+            geneve = ipv4(item.get("geneve_ip"), f"node {name} geneve_ip")
+            if control != management:
+                raise ControlPlaneError(f"node {name} control_ip differs from .members management IP")
+            if control == geneve or control in seen_addresses or geneve in seen_addresses:
+                raise ControlPlaneError(f"node {name} topology addresses are not unique")
+            seen_addresses.update({control, geneve})
+            provider = safe_name(item.get("provider_bridge", provider_default), f"node {name} provider bridge")
+            providers.add(provider)
+            records.append((node_id, name, control, geneve, provider))
+        if len(providers) != 1:
+            raise ControlPlaneError("all nodes must use the same provider bridge name")
+
+        self.local_name = local_name
+        self.node_addresses = {name: control for _, name, control, _, _ in records}
+        self._validate_ssh(records)
+        nodes: list[Node] = []
+        versions: set[str] = set()
+        for node_id, name, control, geneve, provider in sorted(records):
+            probe = self._remote(name, "probe", {"bridges": ["br-int", provider]})
+            self.probes[name] = probe
+            if not str(probe.get("pve_version", "")).startswith("9."):
+                raise ControlPlaneError(f"node {name} is not PVE 9")
+            version = str(probe.get("package_version", ""))
+            if not version:
+                raise ControlPlaneError(f"node {name} has no installed pvn-node package")
+            versions.add(version)
+            addresses = {entry.get("ip"): entry.get("mtu") for entry in probe.get("addresses", [])}
+            if control not in addresses or geneve not in addresses:
+                raise ControlPlaneError(f"node {name} does not own its ledger control/geneve IP")
+            if not all(probe.get("bridges", {}).get(bridge) for bridge in ["br-int", provider]):
+                raise ControlPlaneError(f"node {name} is missing the topology OVS bridges")
+            hostname = str(probe.get("hostname", "")).split(".", 1)[0]
+            if hostname != name:
+                raise ControlPlaneError(f"SSH target {name} reports hostname {probe.get('hostname')!r}")
+            nodes.append(Node(name, node_id, control, geneve, provider, version,
+                              int(addresses[geneve]), name == local_name))
+        if len(versions) != 1:
+            raise ControlPlaneError("pvn-node package versions differ across PVE nodes")
+        return Discovery(mode, confirmation, cluster_name, local_name,
+                         int(members.get("version", 0)), cluster_version,
+                         sha256(canonical_json(topology)), guest_mtu, physnet,
+                         tuple(nodes))
+
+    def assert_pristine(self, discovery: Discovery) -> None:
+        for node in discovery.nodes:
+            probe = self.probes[node.name]
+            if probe.get("central_marker") or probe.get("node_marker") or \
+                    probe.get("central_active") or probe.get("node_ready"):
+                raise ControlPlaneError(
+                    f"node {node.name} has active/marked PVN state without a cluster ledger"
+                )
+            if any(probe.get("cert_hashes", {}).values()):
+                raise ControlPlaneError(f"node {node.name} has unledgered PVN PKI state")
+            if any(info.get("exists") for info in probe.get("databases", {}).values()):
+                raise ControlPlaneError(f"node {node.name} has unledgered central database state")
+
+    def _validate_ssh(self, records: list[tuple[int, str, str, str, str]]) -> None:
+        if len(records) == 1:
+            return
+        metadata = self.ssh_key.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ControlPlaneError("native PVE SSH identity is not a regular file")
+        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
+            raise ControlPlaneError("native PVE SSH identity owner/mode is unsafe")
+        for _, name, _, _, _ in records:
+            if name == self.local_name:
+                continue
+            known = self.nodes_dir / name / "ssh_known_hosts"
+            data = known.read_text(encoding="ascii")
+            lines = [line for line in data.splitlines() if line and not line.startswith("#")]
+            if not lines or any(line.split()[0] != name for line in lines):
+                raise ControlPlaneError(f"native known_hosts does not exclusively pin {name}")
+
+    def _remote(self, name: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if name == self.local_name:
+            command = [self.python, "-c", REMOTE_HELPER, action]
+        else:
+            known = str(self.nodes_dir / name / "ssh_known_hosts")
+            remote_command = f"python3 -c {shlex.quote(REMOTE_HELPER)} {shlex.quote(action)}"
+            command = [
+                "ssh", "-i", str(self.ssh_key), "-o", "BatchMode=yes",
+                "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
+                "-o", "PubkeyAuthentication=yes", "-o", "PreferredAuthentications=publickey",
+                "-o", "IdentitiesOnly=yes", "-o", "NumberOfPasswordPrompts=0",
+                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known}",
+                "-o", f"HostKeyAlias={name}", "-o", "ConnectTimeout=10", "--",
+                f"root@{self.node_addresses[name]}", remote_command,
+            ]
+        result = subprocess.run(command, input=canonical_json(payload).decode(), text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if result.returncode != 0:
+            raise ControlPlaneError(f"{name} {action} failed: {result.stderr.strip() or result.stdout.strip()}")
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ControlPlaneError(f"{name} {action} returned invalid JSON") from error
+        if not isinstance(value, dict):
+            raise ControlPlaneError(f"{name} {action} returned a non-object")
+        return value
+
+    def ensure_shared_config(self, config: dict[str, Any]) -> None:
+        data = canonical_json(config)
+        if self.config_path.exists():
+            if self.config_path.is_symlink() or self.config_path.read_bytes() != data:
+                raise ControlPlaneError("shared PVN config drift; refusing to overwrite")
+            return
+        self.config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.config_path.with_name(f".{self.config_path.name}.{os.getpid()}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, data)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, self.config_path)
+
+    def ensure_pki(self, cluster_id: str, nodes: tuple[Node, ...]) -> tuple[dict[str, str], dict[str, list[dict[str, str]]]]:
+        root = self.private_dir / "pki"
+        ca_dir = root / "ca"
+        ca_cert, ca_key = ca_dir / "ca.pem", ca_dir / "ca-key.pem"
+        if ca_cert.exists() != ca_key.exists():
+            raise ControlPlaneError("partial private CA state; refusing automatic cleanup")
+        if not ca_cert.exists():
+            subprocess.run(["/usr/sbin/pvnctl", "pki", "init-ca", "--config", str(self.config_path),
+                            "--directory", str(ca_dir), "--confirm", cluster_id], check=True)
+        fingerprints: dict[str, str] = {"ca": sha256(ca_cert.read_bytes())}
+        bundles: dict[str, list[dict[str, str]]] = {}
+        for node in nodes:
+            directory = root / "nodes" / node.name
+            cert, key = directory / "node.pem", directory / "node-key.pem"
+            if cert.exists() != key.exists():
+                raise ControlPlaneError(f"partial certificate state for {node.name}")
+            if not cert.exists():
+                subprocess.run([
+                    "/usr/sbin/pvnctl", "pki", "issue-node", "--config", str(self.config_path),
+                    "--ca-cert", str(ca_cert), "--ca-key", str(ca_key),
+                    "--directory", str(directory), "--name", node.name, "--dns", node.name,
+                    "--ips", f"{node.control_ip},{node.geneve_ip}", "--confirm", cluster_id,
+                ], check=True)
+            verify = subprocess.run(["openssl", "verify", "-CAfile", str(ca_cert), str(cert)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if verify.returncode != 0:
+                raise ControlPlaneError(f"certificate verification failed for {node.name}")
+            fingerprints[node.name] = sha256(cert.read_bytes())
+            bundles[node.name] = [
+                self._file("/etc/pvn/pki/ca.pem", ca_cert.read_bytes(), "0644"),
+                self._file("/etc/pvn/pki/node.pem", cert.read_bytes(), "0644"),
+                self._file("/etc/pvn/pki/node-key.pem", key.read_bytes(), "0640"),
+            ]
+        return fingerprints, bundles
+
+    @staticmethod
+    def _file(path: str, data: bytes, mode: str) -> dict[str, str]:
+        return {"path": path, "content": base64.b64encode(data).decode(), "mode": mode, "group": "pvn"}
+
+    def stage(self, node: Node, files: list[dict[str, str]]) -> None:
+        self._remote(node.name, "stage", {"files": files})
+
+    def init_control(self, node: Node, mode: str, cluster_id: str, seed: Node) -> None:
+        self._remote(node.name, "init-control", {
+            "mode": mode,
+            "cluster_id": cluster_id,
+            "local": f"ssl:{node.control_ip}:6646" if mode == "raft" else None,
+            "join": f"ssl:{seed.control_ip}:6646" if mode == "raft" and node != seed else None,
+        })
+
+    def activate_central(self, node: Node) -> None:
+        self._remote(node.name, "activate-central", {})
+
+    def central_status(self, node: Node, mode: str) -> dict[str, Any]:
+        return self._remote(node.name, "central-status", {"mode": mode})
+
+    def activate_node(self, node: Node) -> None:
+        self._remote(node.name, "activate-node", {})
+
+    def node_status(self, node: Node) -> dict[str, Any]:
+        return self._remote(node.name, "node-status", {})
+
+
+class ControlPlane:
+    def __init__(self, backend: Any, store: LedgerStore, timeout: float = 120.0,
+                 interval: float = 2.0):
+        self.backend = backend
+        self.store = store
+        self.timeout = timeout
+        self.interval = interval
+
+    def plan(self) -> dict[str, Any]:
+        discovery = self.backend.discover()
+        ledger = self.store.load()
+        if ledger is not None:
+            self._verify_ledger(discovery, ledger)
+        return {
+            "read_only": True,
+            "confirmation": discovery.confirmation,
+            "mode": discovery.mode,
+            "nodes": [node.frozen() for node in discovery.nodes],
+            "existing_phase": ledger.get("phase") if ledger else None,
+            "actions": [
+                "freeze membership/topology/package in the private pmxcfs ledger",
+                "render shared config and preserve a private cluster CA",
+                "stage unique node PKI and exact local/central environment",
+                "bootstrap central voters one at a time with exact three-DB health gates",
+                "activate transport nodes one at a time after central convergence",
+            ],
+        }
+
+    def apply(self, confirmation: str) -> dict[str, Any]:
+        initial = self.backend.discover()
+        if not confirmation or confirmation != initial.confirmation:
+            raise ControlPlaneError(f"--confirm must exactly match {initial.confirmation!r}")
+        with self.store.lock(initial.local_node):
+            discovery = self.backend.discover()
+            if discovery.snapshot() != initial.snapshot():
+                raise ControlPlaneError("PVE membership/topology changed while acquiring the lock")
+            ledger = self.store.load()
+            if ledger is None:
+                self.backend.assert_pristine(discovery)
+                ledger = {
+                    "version": LEDGER_VERSION,
+                    "cluster_uuid": str(uuid.uuid4()),
+                    "snapshot": discovery.snapshot(),
+                    "phase": "planned",
+                    "central_complete": 0,
+                    "nodes_complete": 0,
+                    "cert_fingerprints": {},
+                    "db_cluster_ids": {},
+                }
+                self.store.create(ledger)
+            else:
+                self._verify_ledger(discovery, ledger)
+
+            config = self._render_config(discovery, ledger["cluster_uuid"])
+            self.backend.ensure_shared_config(config)
+            fingerprints, bundles = self.backend.ensure_pki(ledger["cluster_uuid"], discovery.nodes)
+            if ledger["cert_fingerprints"] and ledger["cert_fingerprints"] != fingerprints:
+                raise ControlPlaneError("PKI fingerprint drift from the control-plane ledger")
+            if not ledger["cert_fingerprints"]:
+                ledger["cert_fingerprints"] = fingerprints
+                self.store.update(ledger)
+
+            seed = discovery.nodes[0]
+            for index, node in enumerate(discovery.nodes):
+                files = bundles[node.name] + self._render_node_files(discovery, node, seed)
+                self.backend.stage(node, files)
+            if ledger["phase"] == "planned":
+                ledger["phase"] = "staged"
+                self.store.update(ledger)
+
+            for index, node in enumerate(discovery.nodes, 1):
+                if ledger["central_complete"] >= index:
+                    continue
+                # init-control may already have joined before a previous process
+                # crashed. The backend validates and adopts the exact file; it
+                # never deletes or recreates an existing clustered database.
+                self.backend.init_control(node, discovery.mode, ledger["cluster_uuid"], seed)
+                self.backend.activate_central(node)
+                cids = self._wait_central(discovery, index, ledger["db_cluster_ids"])
+                if not ledger["db_cluster_ids"]:
+                    ledger["db_cluster_ids"] = cids
+                elif cids != ledger["db_cluster_ids"]:
+                    raise ControlPlaneError("Raft cluster ID drift during join")
+                ledger["central_complete"] = index
+                ledger["phase"] = f"central-{index}"
+                self.store.update(ledger)
+
+            self._wait_central(discovery, len(discovery.nodes), ledger["db_cluster_ids"])
+            for index, node in enumerate(discovery.nodes, 1):
+                if ledger["nodes_complete"] >= index:
+                    continue
+                self.backend.activate_node(node)
+                status = self.backend.node_status(node)
+                if not status.get("ready") or not status.get("marker", True):
+                    raise ControlPlaneError(f"node {node.name} did not become PVN-ready")
+                ledger["nodes_complete"] = index
+                ledger["phase"] = f"nodes-{index}"
+                self.store.update(ledger)
+
+            for node in discovery.nodes:
+                status = self.backend.node_status(node)
+                if not status.get("ready"):
+                    raise ControlPlaneError(f"final readiness drift on {node.name}")
+            ledger["phase"] = "complete"
+            self.store.update(ledger)
+            return {"complete": True, "cluster_uuid": ledger["cluster_uuid"],
+                    "phase": ledger["phase"], "nodes": len(discovery.nodes)}
+
+    @staticmethod
+    def _verify_ledger(discovery: Discovery, ledger: dict[str, Any]) -> None:
+        if ledger.get("version") != LEDGER_VERSION:
+            raise ControlPlaneError("unsupported control-plane ledger version")
+        if ledger.get("snapshot") != discovery.snapshot():
+            raise ControlPlaneError("live membership/topology/package drift from the ledger")
+        try:
+            uuid.UUID(ledger["cluster_uuid"])
+        except (KeyError, ValueError, TypeError) as error:
+            raise ControlPlaneError("ledger cluster UUID is invalid") from error
+        count = len(discovery.nodes)
+        if not 0 <= ledger.get("central_complete", -1) <= count:
+            raise ControlPlaneError("ledger central progress is invalid")
+        if not 0 <= ledger.get("nodes_complete", -1) <= count:
+            raise ControlPlaneError("ledger node progress is invalid")
+        if ledger.get("nodes_complete", 0) and ledger.get("central_complete") != count:
+            raise ControlPlaneError("ledger activates nodes before all central voters")
+
+    @staticmethod
+    def _render_config(discovery: Discovery, cluster_id: str) -> dict[str, Any]:
+        controls = [node.control_ip for node in discovery.nodes]
+        return {
+            "cluster": {"id": cluster_id, "reconcile_every": 30000000000,
+                        "orphan_grace": 300000000000, "require_all_nodes": True,
+                        "supported_pve_major": 9},
+            "manager": {"listen_address": ":8443", "public_port": 8443,
+                        "pve_url": "https://127.0.0.1:8006",
+                        "unix_socket": "/run/pvn/manager.sock",
+                        "web_root": "/usr/share/pvn/web",
+                        "tls_cert": "/etc/pve/local/pve-ssl.pem",
+                        "tls_key": "/etc/pve/local/pve-ssl.key"},
+            "agent": {"poll_every": 2000000000, "bridge": "br-int",
+                      "manager_url": "unix:///run/pvn/manager.sock",
+                      "system_id_file": "/etc/openvswitch/system-id.conf"},
+            "ovn": {
+                "control_db": [f"ssl:{ip}:6645" for ip in controls],
+                "northbound": [f"ssl:{ip}:6641" for ip in controls],
+                "southbound": [f"ssl:{ip}:6642" for ip in controls],
+                "tls_ca": "/etc/pvn/pki/ca.pem", "tls_cert": "/etc/pvn/pki/node.pem",
+                "tls_key": "/etc/pvn/pki/node-key.pem"},
+            "networking": {"encap_type": "geneve", "encap_ip": "",
+                           "guest_mtu": discovery.guest_mtu,
+                           "physnet": discovery.physnet,
+                           "provider_bridge": discovery.nodes[0].provider_bridge},
+            "security": {"session_ttl": 900000000000},
+        }
+
+    @staticmethod
+    def _encoded_file(path: str, text: str, mode: str = "0640") -> dict[str, str]:
+        return {"path": path, "content": base64.b64encode(text.encode()).decode(),
+                "mode": mode, "group": "pvn"}
+
+    def _render_node_files(self, discovery: Discovery, node: Node, seed: Node) -> list[dict[str, str]]:
+        node_env = (
+            f"PVN_NODE_NAME={node.name}\nPVN_ENCAP_IP={node.geneve_ip}\n"
+            "PVN_PVE_URL=https://127.0.0.1:8006\nPVN_NODE_ROLES=compute,gateway,central\n"
+            "PVN_HEALTH_LISTEN=127.0.0.1:9476\n"
+            "PVN_AGENT_HEALTH_URL=http://127.0.0.1:9476/healthz\n"
+        )
+        host_env = (
+            'OVN_CTL_OPTS="--ovn-controller-ssl-key=/etc/pvn/pki/node-key.pem '
+            '--ovn-controller-ssl-cert=/etc/pvn/pki/node.pem '
+            '--ovn-controller-ssl-ca-cert=/etc/pvn/pki/ca.pem '
+            '--ovn-controller-ssl-protocols=TLSv1.2,TLSv1.3"\n'
+        )
+        control_mode = "raft" if discovery.mode == "raft" else "standalone"
+        control_env = (
+            f"PVN_CONTROL_MODE={control_mode}\nPVN_CONTROL_LISTEN={node.control_ip}\n"
+            "PVN_CONTROL_PORT=6645\nPVN_CONTROL_DB_FILE=/var/lib/pvn/control-db/pvn_control.db\n"
+            "PVN_CONTROL_TLS_CA=/etc/pvn/pki/ca.pem\n"
+            "PVN_CONTROL_TLS_CERT=/etc/pvn/pki/node.pem\n"
+            "PVN_CONTROL_TLS_KEY=/etc/pvn/pki/node-key.pem\n"
+        )
+        tls = (
+            "--db-nb-create-insecure-remote=no --db-sb-create-insecure-remote=no "
+            "--ovn-nb-db-ssl-key=/etc/pvn/pki/node-key.pem "
+            "--ovn-nb-db-ssl-cert=/etc/pvn/pki/node.pem "
+            "--ovn-nb-db-ssl-ca-cert=/etc/pvn/pki/ca.pem "
+            "--ovn-nb-db-ssl-protocols=TLSv1.2,TLSv1.3 "
+            "--ovn-sb-db-ssl-key=/etc/pvn/pki/node-key.pem "
+            "--ovn-sb-db-ssl-cert=/etc/pvn/pki/node.pem "
+            "--ovn-sb-db-ssl-ca-cert=/etc/pvn/pki/ca.pem "
+            "--ovn-sb-db-ssl-protocols=TLSv1.2,TLSv1.3"
+        )
+        if discovery.mode == "standalone":
+            ovn_env = f'PVN_OVN_BOOTSTRAP=standalone\nOVN_CTL_OPTS="{tls}"\n'
+        else:
+            nb_local = (f"--db-nb-cluster-local-addr={node.control_ip} "
+                        "--db-nb-cluster-local-port=6643 --db-nb-cluster-local-proto=ssl")
+            sb_local = (f"--db-sb-cluster-local-addr={node.control_ip} "
+                        "--db-sb-cluster-local-port=6644 --db-sb-cluster-local-proto=ssl")
+            if node == seed:
+                ovn_env = f'PVN_OVN_BOOTSTRAP=seed\nOVN_CTL_OPTS="{nb_local} {sb_local} {tls}"\n'
+            else:
+                remote = (f"--db-nb-cluster-remote-addr={seed.control_ip} "
+                          "--db-nb-cluster-remote-port=6643 --db-nb-cluster-remote-proto=ssl "
+                          f"--db-sb-cluster-remote-addr={seed.control_ip} "
+                          "--db-sb-cluster-remote-port=6644 --db-sb-cluster-remote-proto=ssl")
+                ovn_env = f'PVN_OVN_BOOTSTRAP=join\nOVN_CTL_OPTS="{nb_local} {remote} {sb_local} {tls}"\n'
+        listener_env = (f"PVN_OVN_LISTEN={node.control_ip}\nPVN_OVN_NB_PORT=6641\n"
+                        "PVN_OVN_SB_PORT=6642\n")
+        return [
+            self._encoded_file("/etc/pvn/node.env", node_env),
+            self._encoded_file("/etc/pvn/ovn-host.env", host_env),
+            self._encoded_file("/etc/pvn/central/control-db.env", control_env),
+            self._encoded_file("/etc/pvn/central/ovn-central.env", ovn_env),
+            self._encoded_file("/etc/pvn/central/ovn-listeners.env", listener_env),
+        ]
+
+    def _wait_central(self, discovery: Discovery, count: int,
+                      expected_cids: dict[str, str]) -> dict[str, str]:
+        deadline = time.monotonic() + self.timeout
+        last_error = "central status not yet checked"
+        while True:
+            try:
+                reports = [(node, self.backend.central_status(node, discovery.mode))
+                           for node in discovery.nodes[:count]]
+                return self._verify_reports(discovery, reports, count, expected_cids)
+            except ControlPlaneError as error:
+                last_error = str(error)
+            if time.monotonic() >= deadline:
+                raise ControlPlaneError(f"central convergence timed out: {last_error}")
+            time.sleep(self.interval)
+
+    @staticmethod
+    def _verify_reports(discovery: Discovery, reports: list[tuple[Node, dict[str, Any]]],
+                        count: int, expected_cids: dict[str, str]) -> dict[str, str]:
+        found_cids: dict[str, str] = {}
+        server_ids: dict[str, set[str]] = {name: set() for name in DATABASES}
+        for node, report in reports:
+            if not report.get("healthy") or not report.get("target_active"):
+                raise ControlPlaneError(f"central target/databases are unhealthy on {node.name}")
+            rows = report.get("databases")
+            if not isinstance(rows, list) or len(rows) != 3:
+                raise ControlPlaneError(f"incomplete three-database status on {node.name}")
+            by_name = {row.get("database"): row for row in rows}
+            if set(by_name) != set(DATABASES):
+                raise ControlPlaneError(f"database name mismatch on {node.name}")
+            for name, port in DATABASES.items():
+                row = by_name[name]
+                if not row.get("healthy") or row.get("membership_change"):
+                    raise ControlPlaneError(f"{name} is unhealthy or changing on {node.name}")
+                if row.get("member_count") != count or row.get("connected_members") != count:
+                    raise ControlPlaneError(f"{name} does not have exact {count}/{count} membership")
+                if discovery.mode == "raft":
+                    expected_address = f"ssl:{node.control_ip}:{port}"
+                    if row.get("address") != expected_address:
+                        raise ControlPlaneError(f"{name} local address drift on {node.name}")
+                    cid = row.get("cluster_id")
+                    sid = row.get("server_id")
+                    if not cid or not sid:
+                        raise ControlPlaneError(f"{name} lacks cluster/server ID on {node.name}")
+                    if name in found_cids and found_cids[name] != cid:
+                        raise ControlPlaneError(f"{name} cluster ID differs among voters")
+                    found_cids[name] = cid
+                    if sid in server_ids[name]:
+                        raise ControlPlaneError(f"{name} repeats a server ID")
+                    server_ids[name].add(sid)
+        if discovery.mode == "standalone":
+            return {}
+        if expected_cids and found_cids != expected_cids:
+            raise ControlPlaneError("live database cluster IDs drift from the ledger")
+        return found_cids
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="plan or apply the PVN control plane")
+    result.add_argument("command", nargs="?", default="plan", choices=["plan", "apply"])
+    result.add_argument("--confirm", default="")
+    result.add_argument("--members", default=os.environ.get("PVN_CP_MEMBERS", DEFAULT_MEMBERS))
+    result.add_argument("--topology-ledger", default=os.environ.get("PVN_CP_TOPOLOGY", DEFAULT_TOPOLOGY))
+    result.add_argument("--private-dir", default=os.environ.get("PVN_CP_PRIVATE", DEFAULT_PRIVATE))
+    result.add_argument("--config", default=os.environ.get("PVN_CP_CONFIG", DEFAULT_CONFIG))
+    result.add_argument("--ssh-key", default=os.environ.get("PVN_CP_SSH_KEY", DEFAULT_SSH_KEY))
+    result.add_argument("--nodes-dir", default=os.environ.get("PVN_CP_NODES_DIR", DEFAULT_NODES_DIR))
+    result.add_argument("--python", default=os.environ.get("PVN_CP_PYTHON", "python3"))
+    result.add_argument("--timeout", type=float, default=120.0)
+    result.add_argument("--interval", type=float, default=2.0)
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    if os.geteuid() != 0:
+        raise ControlPlaneError("pvn-control-plane must run as root on a PVE node")
+    backend = SystemBackend(args)
+    control = ControlPlane(backend, LedgerStore(pathlib.Path(args.private_dir)),
+                           args.timeout, args.interval)
+    result = control.plan() if args.command == "plan" else control.apply(args.confirm)
+    print(json.dumps(result, sort_keys=True, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ControlPlaneError as error:
+        print(f"pvn-control-plane: {error}", file=sys.stderr)
+        raise SystemExit(1)
+__PVN_CONTROL_PLANE_PYTHON__
