@@ -15,6 +15,7 @@ import (
 	"github.com/pvnstack/proxmox-ovn/internal/centraldb"
 	"github.com/pvnstack/proxmox-ovn/internal/config"
 	"github.com/pvnstack/proxmox-ovn/internal/diagnostic"
+	"github.com/pvnstack/proxmox-ovn/internal/hostconfig"
 	"github.com/pvnstack/proxmox-ovn/internal/nodestate"
 	"github.com/pvnstack/proxmox-ovn/internal/pki"
 )
@@ -239,14 +240,49 @@ func confirmedConfig(path, confirmation string) (config.Config, error) {
 }
 
 func nodeCommand(args []string) error {
-	if len(args) == 0 || args[0] != "can-remove" {
-		return errors.New("usage: pvnctl node can-remove [--local] [--state path]")
+	if len(args) == 0 {
+		return errors.New("usage: pvnctl node <configure-ovn|can-remove>")
 	}
+	switch args[0] {
+	case "configure-ovn":
+		return nodeConfigureOVN(args[1:])
+	case "can-remove":
+		return nodeCanRemove(args[1:])
+	default:
+		return fmt.Errorf("unknown node command %q", args[0])
+	}
+}
+
+func nodeConfigureOVN(args []string) error {
+	flags := flag.NewFlagSet("node configure-ovn", flag.ContinueOnError)
+	configPath := flags.String("config", config.DefaultPath, "PVN config path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	if err := hostconfig.ApplyOVN(context.Background(), centraldb.ExecRunner{}, hostconfig.Config{
+		IntegrationBridge: cfg.Agent.Bridge,
+		ProviderBridge:    cfg.Networking.ProviderBridge,
+		PhysicalNetwork:   cfg.Networking.Physnet,
+		EncapType:         cfg.Networking.EncapType,
+		EncapIP:           cfg.Networking.EncapIP,
+		Southbound:        cfg.OVN.Southbound,
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("configured local ovn-controller for %s\n", cfg.Cluster.NodeName)
+	return nil
+}
+
+func nodeCanRemove(args []string) error {
 	flags := flag.NewFlagSet("node can-remove", flag.ContinueOnError)
 	_ = flags.Bool("local", false, "check the local node")
 	path := flags.String("state", nodestate.DefaultPath, "node state path")
 	configPath := flags.String("config", config.DefaultPath, "PVN config path")
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	state, err := nodestate.Load(*path)
