@@ -418,18 +418,19 @@ if isinstance(cluster, dict) and cluster.get("name"):
         fail("PVE cluster name is unsafe or empty")
     if cluster.get("quorate") != 1 or cluster.get("nodes") != node_count:
         fail("PVE membership is not fully online and quorate")
+    if node_count < 3 or node_count % 2 == 0:
+        fail(
+            f"automated activation requires one standalone node or an odd clustered "
+            f"node count of at least three, with every clustered node as a central "
+            f"voter; found {node_count} clustered node(s); "
+            "topology was not changed"
+        )
     deployment = cluster_name
 else:
     if node_count != 1:
         fail("standalone PVE membership contains multiple nodes")
     deployment = f"standalone-{local_name}"
 
-if node_count < 1 or node_count % 2 == 0:
-    fail(
-        f"automated activation requires a positive odd node count with every node "
-        f"as a central voter, found {node_count}; "
-        "topology was not changed"
-    )
 if confirmation != deployment:
     fail(f"confirmation must exactly match {deployment!r}")
 

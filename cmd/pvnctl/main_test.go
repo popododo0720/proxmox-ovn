@@ -39,9 +39,23 @@ Servers:
 `, database)), nil
 }
 
-func TestCentralPlan(t *testing.T) {
-	if err := run([]string{"central", "plan", "--nodes", "pve-a,pve-b,pve-c"}); err != nil {
-		t.Fatal(err)
+func TestCentralPlanVoterCountPolicy(t *testing.T) {
+	nodes := func(count int) string {
+		values := make([]string, count)
+		for index := range values {
+			values[index] = fmt.Sprintf("pve-%d", index+1)
+		}
+		return strings.Join(values, ",")
+	}
+	for _, count := range []int{1, 3, 5, 7} {
+		if err := run([]string{"central", "plan", "--nodes", nodes(count)}); err != nil {
+			t.Fatalf("count %d: %v", count, err)
+		}
+	}
+	for _, count := range []int{0, 2, 4, 6} {
+		if err := run([]string{"central", "plan", "--nodes", nodes(count)}); err == nil {
+			t.Fatalf("count %d: invalid central plan succeeded", count)
+		}
 	}
 }
 

@@ -46,9 +46,6 @@ func Select(nodes []Node, existing []string) (Plan, error) {
 		eligible[node.Name] = node
 		ordered = append(ordered, node)
 	}
-	if len(ordered) == 0 {
-		return Plan{}, fmt.Errorf("no online eligible PVN node")
-	}
 	sort.Slice(ordered, func(i, j int) bool {
 		if ordered[i].Order == ordered[j].Order {
 			return ordered[i].Name < ordered[j].Name
@@ -56,7 +53,10 @@ func Select(nodes []Node, existing []string) (Plan, error) {
 		return ordered[i].Order < ordered[j].Order
 	})
 
-	target := targetCount(len(ordered))
+	target := len(ordered)
+	if err := validateVoterCount(target); err != nil {
+		return Plan{}, err
+	}
 	mode := ModeRaft
 	if target == 1 {
 		mode = ModeStandalone
@@ -90,21 +90,17 @@ func Select(nodes []Node, existing []string) (Plan, error) {
 		TargetVoterCount:  target,
 		RequiresPromotion: !sameSet(voters, existing),
 	}
-	if len(ordered) == 2 {
-		plan.Warning = "two-node deployments use one standalone central and have no central HA"
-	}
 	return plan, nil
 }
 
-func targetCount(count int) int {
-	switch {
-	case count >= 5:
-		return 5
-	case count >= 3:
-		return 3
-	default:
-		return 1
+func validateVoterCount(count int) error {
+	if count < 1 || count%2 == 0 {
+		return fmt.Errorf(
+			"central voter count must be one standalone voter or an odd clustered count of at least three, got %d",
+			count,
+		)
 	}
+	return nil
 }
 
 func sameSet(a, b []string) bool {

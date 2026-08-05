@@ -21,7 +21,8 @@ PVE membership, requires quorum and every declared member online, and uses
 Proxmox's root cluster key plus each node's own `ssh_known_hosts` pin. It never
 asks for or uses a password. The current automated control-plane bootstrap
 supports one standalone PVE node or any odd-sized, fully online and quorate
-PVE cluster. Every clustered PVE node becomes a central voter.
+PVE cluster with at least three nodes. Every clustered PVE node becomes a
+central voter.
 
 Before writing configuration, the topology preflight discovers on every node:
 
@@ -236,8 +237,8 @@ Apply only after reviewing the plan, using the exact PVE cluster name:
 /usr/lib/pvn/pvn-control-plane apply --confirm CLUSTER_NAME
 ```
 
-One PVE node uses standalone databases. Any supported cluster has a positive
-odd node count and uses every PVE node as a Raft voter. The apply process
+One PVE node uses standalone databases. Any supported cluster has an odd node
+count of at least three and uses every PVE node as a Raft voter. The apply process
 initializes the deterministic seed, joins one voter at a time, verifies exact
 membership and cluster IDs after every step, then activates transport nodes
 one at a time. A durable phase ledger makes a safe rerun converge forward

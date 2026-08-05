@@ -1076,10 +1076,11 @@ class SystemBackend:
             confirmation = cluster_name
             cluster_version = 0
         node_count = len(nodelist)
-        if node_count < 1 or node_count % 2 == 0:
+        if mode == "raft" and (node_count < 3 or node_count % 2 == 0):
             raise ControlPlaneError(
-                "control-plane bootstrap requires a positive odd node count "
-                "with every node as a central voter"
+                "control-plane bootstrap requires one standalone node or an odd "
+                "clustered node count of at least three, with every clustered "
+                "node as a central voter"
             )
         if any(not isinstance(name, str) or not isinstance(member, dict)
                for name, member in nodelist.items()):

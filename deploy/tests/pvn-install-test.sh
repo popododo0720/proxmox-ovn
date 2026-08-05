@@ -124,20 +124,26 @@ write_members() {
 {"nodename":"node-a","version":7,"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"}}}
 EOF
             ;;
-        2)
-            cat > "$MEMBERS" <<'EOF'
-{"nodename":"node-a","version":7,"cluster":{"name":"lab-cluster","version":9,"nodes":2,"quorate":1},"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"},"node-b":{"id":2,"online":1,"ip":"192.0.2.12"}}}
-EOF
-            ;;
-        3)
-            cat > "$MEMBERS" <<'EOF'
-{"nodename":"node-a","version":7,"cluster":{"name":"lab-cluster","version":9,"nodes":3,"quorate":1},"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"},"node-b":{"id":2,"online":1,"ip":"192.0.2.12"},"node-c":{"id":3,"online":1,"ip":"192.0.2.13"}}}
-EOF
-            ;;
-        5)
-            cat > "$MEMBERS" <<'EOF'
-{"nodename":"node-a","version":7,"cluster":{"name":"lab-cluster","version":9,"nodes":5,"quorate":1},"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"},"node-b":{"id":2,"online":1,"ip":"192.0.2.12"},"node-c":{"id":3,"online":1,"ip":"192.0.2.13"},"node-d":{"id":4,"online":1,"ip":"192.0.2.14"},"node-e":{"id":5,"online":1,"ip":"192.0.2.15"}}}
-EOF
+        2|3|4|5|6|7)
+            pvn_member_nodes=
+            pvn_member_index=1
+            while [ "$pvn_member_index" -le "$pvn_member_count" ]; do
+                case "$pvn_member_index" in
+                    1) pvn_member_name=node-a ;;
+                    2) pvn_member_name=node-b ;;
+                    3) pvn_member_name=node-c ;;
+                    4) pvn_member_name=node-d ;;
+                    5) pvn_member_name=node-e ;;
+                    6) pvn_member_name=node-f ;;
+                    7) pvn_member_name=node-g ;;
+                esac
+                [ -z "$pvn_member_nodes" ] || pvn_member_nodes=$pvn_member_nodes,
+                pvn_member_nodes=$pvn_member_nodes\"$pvn_member_name\":{\"id\":$pvn_member_index,\"online\":1,\"ip\":\"192.0.2.$((10 + pvn_member_index))\"}
+                pvn_member_index=$((pvn_member_index + 1))
+            done
+            printf '%s\n' \
+                "{\"nodename\":\"node-a\",\"version\":7,\"cluster\":{\"name\":\"lab-cluster\",\"version\":9,\"nodes\":$pvn_member_count,\"quorate\":1},\"nodelist\":{$pvn_member_nodes}}" \
+                > "$MEMBERS"
             ;;
         *) fail "unsupported test membership count: $pvn_member_count" ;;
     esac
@@ -261,40 +267,45 @@ cmp "$WORK/expected-standalone-setup.log" "$SETUP_LOG" ||
     fail "standalone full install did not preserve the setup sequence"
 assert_temp_cleaned
 
-# Every member of a supported odd-sized cluster becomes a central voter.
-write_members 5
-reset_logs
-PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
-    PVN_GENEVE_CIDR=192.168.100.0/24 \
-    PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
-    PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
-    PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
-    PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
-    run_local_bootstrap > "$WORK/five-node-full-apply.out"
-cmp "$WORK/expected-setup.log" "$SETUP_LOG" ||
-    fail "five-node full install did not run the topology/control-plane sequence"
-assert_temp_cleaned
+# Every member of every supported odd-sized cluster becomes a central voter.
+for pvn_supported_count in 3 5 7; do
+    write_members "$pvn_supported_count"
+    reset_logs
+    PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
+        PVN_GENEVE_CIDR=192.168.100.0/24 \
+        PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+        PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+        PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+        PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+        run_local_bootstrap > "$WORK/$pvn_supported_count-node-full-apply.out"
+    cmp "$WORK/expected-setup.log" "$SETUP_LOG" ||
+        fail "$pvn_supported_count-node full install did not run the setup sequence"
+    assert_temp_cleaned
+done
 
 # The package stage may support other cluster sizes, but automated control-plane
 # activation requires an odd voter count. Reject an even cluster before even the
 # read-only topology plan, and especially before topology/control-plane apply.
-write_members 2
-reset_logs
-if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
-    PVN_GENEVE_CIDR=192.168.100.0/24 \
-    PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
-    PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
-    PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
-    PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
-    run_local_bootstrap > "$WORK/unsupported-full.out" 2>&1
-then
-    fail "unsupported cluster reached full setup"
-fi
-grep -q 'requires a positive odd node count with every node as a central voter, found 2' \
-    "$WORK/unsupported-full.out" || fail "unsupported cluster error was unclear"
-[ ! -s "$SETUP_LOG" ] ||
-    fail "unsupported cluster invoked topology/control-plane tooling"
-assert_temp_cleaned
+for pvn_unsupported_count in 2 4 6; do
+    write_members "$pvn_unsupported_count"
+    reset_logs
+    if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
+        PVN_GENEVE_CIDR=192.168.100.0/24 \
+        PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+        PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+        PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+        PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+        run_local_bootstrap > "$WORK/$pvn_unsupported_count-node-unsupported.out" 2>&1
+    then
+        fail "$pvn_unsupported_count-node cluster reached full setup"
+    fi
+    grep -q "odd clustered node count of at least three.*found $pvn_unsupported_count clustered node" \
+        "$WORK/$pvn_unsupported_count-node-unsupported.out" ||
+        fail "$pvn_unsupported_count-node cluster error was unclear"
+    [ ! -s "$SETUP_LOG" ] ||
+        fail "$pvn_unsupported_count-node cluster invoked setup tooling"
+    assert_temp_cleaned
+done
 write_members 3
 
 reset_logs
@@ -447,7 +458,7 @@ if printf 'lab-cluster\ny\n' | script -qefc \
 then
     fail "interactive unsupported cluster reached full setup"
 fi
-grep -q 'requires a positive odd node count with every node as a central voter, found 2' \
+grep -q 'odd clustered node count of at least three.*found 2 clustered node' \
     "$WORK/interactive-unsupported-full.out" ||
     fail "interactive unsupported cluster error was unclear"
 [ ! -s "$SETUP_LOG" ] ||

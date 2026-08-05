@@ -768,7 +768,9 @@ os.environ["PVN_CP_LEASE_BIN"] = str(lease_helper)
 os.environ["PVN_TEST_CP_LEASE"] = str(lease_state)
 
 
-def canonical_topology_fixture(root, count=3):
+def canonical_topology_fixture(root, count=3, standalone=False):
+    if standalone and count != 1:
+        raise AssertionError("standalone fixture must contain exactly one node")
     records = tuple(
         (
             f"pve-{chr(ord('a') + index)}",
@@ -778,19 +780,21 @@ def canonical_topology_fixture(root, count=3):
         )
         for index in range(count)
     )
+    cluster_name = "standalone-pve-a" if standalone else "test-cluster"
     members = {
         "nodename": "pve-a",
         "version": 7,
-        "cluster": {
-            "name": "test-cluster", "version": 3, "nodes": count, "quorate": 1,
-        },
         "nodelist": {
             name: {"id": node_id, "online": 1, "ip": management}
             for name, node_id, management, _ in records
         },
     }
+    if not standalone:
+        members["cluster"] = {
+            "name": "test-cluster", "version": 3, "nodes": count, "quorate": 1,
+        }
     membership = {
-        "cluster_name": "test-cluster",
+        "cluster_name": cluster_name,
         "nodes": [
             {"name": name, "node_id": node_id, "management_ip": management}
             for name, node_id, management, _ in records
@@ -799,7 +803,7 @@ def canonical_topology_fixture(root, count=3):
     topology = {
         "schema": 1,
         "phase": "complete",
-        "cluster_name": "test-cluster",
+        "cluster_name": cluster_name,
         "membership_snapshot": membership,
         "membership_hash": module["sha256"](
             json.dumps(membership, sort_keys=True, separators=(",", ":")).encode()
@@ -887,16 +891,30 @@ with tempfile.TemporaryDirectory() as temporary:
     expect_error(backend.discover, "exceeds effective Geneve MTU")
 
 
-# Discovery accepts every positive odd clustered size and rejects even voter
-# counts before configuration, database, or service mutation can begin.
+# Discovery accepts exactly one standalone node and every clustered odd size
+# from three upward. Clustered one-node and even-sized layouts stop before any
+# configuration, database, or service mutation can begin.
 with tempfile.TemporaryDirectory() as temporary:
-    backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary), count=5)
+    backend, _, _ = canonical_topology_fixture(
+        pathlib.Path(temporary), count=1, standalone=True
+    )
     found = backend.discover()
-    assert len(found.nodes) == 5 and found.mode == "raft"
+    assert len(found.nodes) == 1 and found.mode == "standalone"
 
-with tempfile.TemporaryDirectory() as temporary:
-    backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary), count=2)
-    expect_error(backend.discover, "positive odd node count")
+for supported_count in (3, 5, 7):
+    with tempfile.TemporaryDirectory() as temporary:
+        backend, _, _ = canonical_topology_fixture(
+            pathlib.Path(temporary), count=supported_count
+        )
+        found = backend.discover()
+        assert len(found.nodes) == supported_count and found.mode == "raft"
+
+for unsupported_count in (1, 2, 4, 6):
+    with tempfile.TemporaryDirectory() as temporary:
+        backend, _, _ = canonical_topology_fixture(
+            pathlib.Path(temporary), count=unsupported_count
+        )
+        expect_error(backend.discover, "odd clustered node count of at least three")
 
 
 def complete_system_backend_state(root):
