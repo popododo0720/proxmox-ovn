@@ -1,3 +1,11 @@
+proxmox-ovn (0.2.8) unstable; urgency=medium
+
+  * Keep OVN client listeners process-local on every central voter.
+  * Safely repin fully converged clusters after uniform package upgrades.
+  * Revalidate live transport health with a bounded doctor probe.
+
+ -- PVN Project <root@localhost>  Wed, 05 Aug 2026 11:20:00 +0000
+
 proxmox-ovn (0.2.7) unstable; urgency=medium
 
   * Pin PVN Control DB joins to the ledger Raft cluster ID.
