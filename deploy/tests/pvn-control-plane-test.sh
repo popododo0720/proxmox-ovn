@@ -153,6 +153,44 @@ def expect_error(action, text):
         raise AssertionError("expected ControlPlaneError")
 
 
+lease_temporary = tempfile.TemporaryDirectory()
+lease_root = pathlib.Path(lease_temporary.name)
+lease_helper = lease_root / "pvn-cluster-lease"
+lease_state = lease_root / "control-plane.lease"
+lease_helper.write_text(r'''#!/usr/bin/python3
+import json
+import os
+import pathlib
+import sys
+
+state = pathlib.Path(os.environ["PVN_TEST_CP_LEASE"])
+action, domain, token = sys.argv[1:]
+if action == "acquire":
+    owner = json.load(sys.stdin)
+    if owner.get("domain") != domain or owner.get("token") != token:
+        raise SystemExit("owner mismatch")
+    try:
+        descriptor = os.open(state, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise SystemExit("active lease exists")
+    with os.fdopen(descriptor, "w") as stream:
+        json.dump(owner, stream)
+elif action == "release":
+    try:
+        owner = json.loads(state.read_text())
+    except FileNotFoundError:
+        raise SystemExit("no active lease")
+    if owner.get("domain") != domain or owner.get("token") != token:
+        raise SystemExit("wrong lease owner")
+    state.unlink()
+else:
+    raise SystemExit("unsupported fake lease action")
+''')
+lease_helper.chmod(0o755)
+os.environ["PVN_CP_LEASE_BIN"] = str(lease_helper)
+os.environ["PVN_TEST_CP_LEASE"] = str(lease_state)
+
+
 def canonical_topology_fixture(root):
     records = (
         ("pve-a", 1, "192.0.2.11", "198.51.100.11"),
@@ -346,17 +384,20 @@ with tempfile.TemporaryDirectory() as temporary:
     assert backend.log[-1] == "node:pve-a"
 
 
-# Existing pmxcfs lock blocks all apply mutations and is never auto-broken.
+# An existing cluster lease blocks apply and is never removed by a non-owner.
 with tempfile.TemporaryDirectory() as temporary:
     private = pathlib.Path(temporary) / "private"
-    private.mkdir()
-    (private / "control-plane.lock").write_text("held")
+    owner = {"domain": "control-plane", "token": "b" * 32}
+    lease_state.write_text(json.dumps(owner))
     store = LedgerStore(private)
     backend = FakeBackend(discovery())
     control = ControlPlane(backend, store, timeout=0.01, interval=0)
-    expect_error(lambda: control.apply("test-cluster"), "lock already exists")
+    expect_error(lambda: control.apply("test-cluster"), "could not acquire cluster-global")
     assert backend.log == []
+    assert json.loads(lease_state.read_text()) == owner
+    lease_state.unlink()
 
+lease_temporary.cleanup()
 print("pvn-control-plane mock tests passed")
 PY
 

@@ -15,7 +15,6 @@ import base64
 import contextlib
 import copy
 import dataclasses
-import datetime as dt
 import grp
 import hashlib
 import ipaddress
@@ -40,6 +39,8 @@ DEFAULT_PRIVATE = "/etc/pve/priv/pvn"
 DEFAULT_CONFIG = "/etc/pve/pvn/config.json"
 DEFAULT_SSH_KEY = "/root/.ssh/id_rsa"
 DEFAULT_NODES_DIR = "/etc/pve/nodes"
+DEFAULT_LEASE_BIN = "/usr/lib/pvn/pvn-cluster-lease"
+LEASE_DOMAIN = "control-plane"
 SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
 PROVIDER_ACK = "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP"
 DATABASES = {
@@ -151,10 +152,10 @@ class Discovery:
 
 
 class LedgerStore:
-    def __init__(self, private_dir: pathlib.Path):
+    def __init__(self, private_dir: pathlib.Path, lease_bin: str | None = None):
         self.private_dir = private_dir
         self.ledger_path = private_dir / "control-plane.json"
-        self.lock_path = private_dir / "control-plane.lock"
+        self.lease_bin = lease_bin or os.environ.get("PVN_CP_LEASE_BIN", DEFAULT_LEASE_BIN)
 
     def load(self) -> dict[str, Any] | None:
         try:
@@ -204,29 +205,58 @@ class LedgerStore:
 
     @contextlib.contextmanager
     def lock(self, owner: str) -> Iterator[None]:
-        self.private_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if not pathlib.Path(self.lease_bin).is_absolute():
+            raise ControlPlaneError("PVN_CP_LEASE_BIN must be an absolute path")
+        token = uuid.uuid4().hex
+        payload = canonical_json({
+            "domain": LEASE_DOMAIN,
+            "node": owner,
+            "pid": os.getpid(),
+            "started": int(time.time()),
+            "token": token,
+        }).decode()
         try:
-            descriptor = os.open(self.lock_path, flags, 0o600)
-        except FileExistsError as error:
+            acquired = subprocess.run(
+                [self.lease_bin, "acquire", LEASE_DOMAIN, token],
+                input=payload,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
             raise ControlPlaneError(
-                f"cluster-wide control-plane lock already exists: {self.lock_path}"
+                f"cluster-global control-plane lease helper failed: {error}"
             ) from error
+        if acquired.returncode != 0:
+            detail = (acquired.stderr or acquired.stdout).strip().replace("\n", "; ")
+            raise ControlPlaneError(
+                f"could not acquire cluster-global control-plane lease: {detail[:800]}; "
+                f"inspect it with '{self.lease_bin} show {LEASE_DOMAIN}' and release it "
+                "only if stale"
+            )
         try:
-            payload = canonical_json({
-                "owner": owner,
-                "pid": os.getpid(),
-                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            })
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
             yield
         finally:
-            os.close(descriptor)
-            # A stale lock is never broken automatically, but the process that
-            # successfully created this inode owns its normal cleanup.
-            with contextlib.suppress(FileNotFoundError):
-                self.lock_path.unlink()
+            try:
+                released = subprocess.run(
+                    [self.lease_bin, "release", LEASE_DOMAIN, token],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=20,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise ControlPlaneError(
+                    f"cluster-global control-plane lease helper failed during release: {error}"
+                ) from error
+            if released.returncode != 0:
+                detail = (released.stderr or released.stdout).strip().replace("\n", "; ")
+                raise ControlPlaneError(
+                    f"refusing to release cluster-global control-plane lease: {detail[:800]}"
+                )
 
 
 REMOTE_HELPER = r'''
