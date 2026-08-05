@@ -16,10 +16,12 @@ ASSETS=$WORK/assets
 CURL_LOG=$WORK/curl.log
 INSTALLER_LOG=$WORK/installer.log
 DEB_LOG=$WORK/deb-path.log
+SETUP_LOG=$WORK/setup.log
 mkdir "$BIN" "$ASSETS"
 : > "$CURL_LOG"
 : > "$INSTALLER_LOG"
 : > "$DEB_LOG"
+: > "$SETUP_LOG"
 
 cat > "$BIN/curl" <<'EOF'
 #!/bin/sh
@@ -63,6 +65,20 @@ exit "${PVN_TEST_INSTALLER_STATUS:-0}"
 EOF
 chmod 0755 "$ASSETS/pvn-cluster-install"
 
+cat > "$BIN/pvn-topology" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'topology %s\n' "$*" >> "$PVN_TEST_SETUP_LOG"
+EOF
+chmod 0755 "$BIN/pvn-topology"
+
+cat > "$BIN/pvn-control-plane" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'control %s\n' "$*" >> "$PVN_TEST_SETUP_LOG"
+EOF
+chmod 0755 "$BIN/pvn-control-plane"
+
 printf 'test deb payload\n' > "$ASSETS/pvn-node_0.1.1_amd64.deb"
 make_manifest() {
     (
@@ -83,6 +99,7 @@ export PVN_TEST_ASSETS=$ASSETS
 export PVN_TEST_CURL_LOG=$CURL_LOG
 export PVN_TEST_INSTALLER_LOG=$INSTALLER_LOG
 export PVN_TEST_DEB_LOG=$DEB_LOG
+export PVN_TEST_SETUP_LOG=$SETUP_LOG
 
 fail() {
     echo "pvn-install test failed: $*" >&2
@@ -93,6 +110,7 @@ reset_logs() {
     : > "$CURL_LOG"
     : > "$INSTALLER_LOG"
     : > "$DEB_LOG"
+    : > "$SETUP_LOG"
 }
 
 run_bootstrap() {
@@ -138,6 +156,35 @@ PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster \
 grep -q -- '^install --local-pve .*--apply --confirm lab-cluster$' \
     "$INSTALLER_LOG" || fail "local PVE apply confirmation was not forwarded"
 assert_temp_cleaned
+
+reset_logs
+PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
+    PVN_GENEVE_CIDR=192.168.100.0/24 \
+    PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+    PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+    PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+    PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+    run_local_bootstrap > "$WORK/local-full-apply.out"
+cat > "$WORK/expected-setup.log" <<'EOF'
+topology plan --geneve-cidr 192.168.100.0/24 --provider-cidr 192.168.200.0/24 --guest-mtu 1300
+topology apply --geneve-cidr 192.168.100.0/24 --provider-cidr 192.168.200.0/24 --guest-mtu 1300 --provider-port-ready OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP --confirm lab-cluster
+control plan
+control apply --confirm lab-cluster
+EOF
+cmp "$WORK/expected-setup.log" "$SETUP_LOG" ||
+    fail "full install did not run the topology/control-plane sequence"
+assert_temp_cleaned
+
+reset_logs
+if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=lab-cluster PVN_FULL=1 \
+    PVN_GENEVE_CIDR=192.168.100.0/24 \
+    PVN_PROVIDER_CIDR=192.168.200.0/24 \
+    run_local_bootstrap > "$WORK/full-no-provider-ack.out" 2>&1
+then
+    fail "full install without provider-port acknowledgement succeeded"
+fi
+[ ! -s "$CURL_LOG" ] || fail "invalid full install downloaded artifacts"
+[ ! -s "$SETUP_LOG" ] || fail "invalid full install ran setup tools"
 
 reset_logs
 if PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.1.1 \

@@ -23,7 +23,14 @@ IDENTITY=${PVN_IDENTITY:-}
 LOCAL_PVE_EXPLICIT=0
 APPLY=${PVN_APPLY:-0}
 CONFIRM=${PVN_CONFIRM:-}
+FULL=${PVN_FULL:-0}
+GENEVE_CIDR=${PVN_GENEVE_CIDR:-}
+PROVIDER_CIDR=${PVN_PROVIDER_CIDR:-}
+GUEST_MTU=${PVN_GUEST_MTU:-}
+PROVIDER_PORT_READY=${PVN_PROVIDER_PORT_READY:-}
 CURL_BIN=${PVN_CURL_BIN:-curl}
+TOPOLOGY_BIN=${PVN_TOPOLOGY_BIN:-/usr/lib/pvn/pvn-topology}
+CONTROL_PLANE_BIN=${PVN_CONTROL_PLANE_BIN:-/usr/lib/pvn/pvn-control-plane}
 WORK=
 
 usage() {
@@ -39,11 +46,18 @@ options:
   --release-base-url URL    HTTPS release directory
   --apply                   permit the install phase to write remotely
   --confirm DEPLOYMENT_ID   exact discovered ID required with --apply
+  --full                    configure topology and activate OVN after install
+  --geneve-cidr CIDR        dedicated Geneve IPv4 network for --full
+  --provider-cidr CIDR      provider-uplink IPv4 network for --full
+  --guest-mtu MTU           optional guest MTU for --full
+  --provider-port-ready P   required provider-port acknowledgement for --full
 
 The default curl one-liner uses --local-pve and read-only preflight. Supplying
 PVN_INVENTORY or PVN_IDENTITY explicitly selects advanced mode and prompts for
 the missing counterpart. Other settings may use PVN_PHASE, PVN_APPLY,
-PVN_CONFIRM, PVN_VERSION, and PVN_RELEASE_BASE_URL.
+PVN_CONFIRM, PVN_VERSION, PVN_RELEASE_BASE_URL, PVN_FULL,
+PVN_GENEVE_CIDR, PVN_PROVIDER_CIDR, PVN_GUEST_MTU, and
+PVN_PROVIDER_PORT_READY.
 EOF
     exit 2
 }
@@ -102,6 +116,30 @@ while [ "$#" -gt 0 ]; do
             CONFIRM=$2
             shift 2
             ;;
+        --full)
+            FULL=1
+            shift
+            ;;
+        --geneve-cidr)
+            need_value "$@"
+            GENEVE_CIDR=$2
+            shift 2
+            ;;
+        --provider-cidr)
+            need_value "$@"
+            PROVIDER_CIDR=$2
+            shift 2
+            ;;
+        --guest-mtu)
+            need_value "$@"
+            GUEST_MTU=$2
+            shift 2
+            ;;
+        --provider-port-ready)
+            need_value "$@"
+            PROVIDER_PORT_READY=$2
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -120,10 +158,23 @@ case "$APPLY" in
     1|yes|true) APPLY=1 ;;
     *) fail "PVN_APPLY must be 0/1, no/yes, or false/true" ;;
 esac
+case "$FULL" in
+    0|no|false) FULL=0 ;;
+    1|yes|true) FULL=1 ;;
+    *) fail "PVN_FULL must be 0/1, no/yes, or false/true" ;;
+esac
 [ "$PHASE" = install ] || [ "$APPLY" = 0 ] ||
     fail "--apply is valid only with the install phase"
 if [ "$APPLY" -eq 1 ]; then
     [ -n "$CONFIRM" ] || fail "install --apply requires --confirm DEPLOYMENT_ID"
+fi
+if [ "$FULL" -eq 1 ]; then
+    [ "$PHASE" = install ] && [ "$APPLY" -eq 1 ] ||
+        fail "--full requires install --apply"
+    [ -n "$GENEVE_CIDR" ] || fail "--full requires --geneve-cidr"
+    [ -n "$PROVIDER_CIDR" ] || fail "--full requires --provider-cidr"
+    [ "$PROVIDER_PORT_READY" = OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP ] ||
+        fail "--full requires the exact provider-port acknowledgement"
 fi
 
 case "$VERSION" in
@@ -181,6 +232,8 @@ if [ "$ADVANCED" -eq 1 ]; then
     [ -r "$IDENTITY" ] && [ -f "$IDENTITY" ] ||
         fail "SSH identity is not a readable regular file: $IDENTITY"
 fi
+[ "$FULL" -eq 0 ] || [ "$ADVANCED" -eq 0 ] ||
+    fail "--full must run directly on a PVE node"
 
 for command_name in "$CURL_BIN" sha256sum awk mktemp chmod rm; do
     command -v "$command_name" >/dev/null 2>&1 ||
@@ -266,7 +319,82 @@ run_cluster_installer() {
     "$INSTALLER_PATH" "$@"
 }
 
+run_topology() {
+    pvn_topology_phase=$1
+    pvn_topology_confirm=$2
+    pvn_topology_ack=$3
+    [ -x "$TOPOLOGY_BIN" ] || fail "installed topology tool is unavailable: $TOPOLOGY_BIN"
+    set -- "$pvn_topology_phase" \
+        --geneve-cidr "$GENEVE_CIDR" \
+        --provider-cidr "$PROVIDER_CIDR"
+    if [ -n "$GUEST_MTU" ]; then
+        set -- "$@" --guest-mtu "$GUEST_MTU"
+    fi
+    if [ -n "$pvn_topology_ack" ]; then
+        set -- "$@" --provider-port-ready "$pvn_topology_ack"
+    fi
+    if [ -n "$pvn_topology_confirm" ]; then
+        set -- "$@" --confirm "$pvn_topology_confirm"
+    fi
+    "$TOPOLOGY_BIN" "$@"
+}
+
+run_full_setup() {
+    pvn_setup_cluster=$1
+    [ -x "$CONTROL_PLANE_BIN" ] ||
+        fail "installed control-plane tool is unavailable: $CONTROL_PLANE_BIN"
+
+    echo "Planning the three-NIC PVN topology; no changes are made by this step."
+    run_topology plan '' ''
+    echo "Applying the approved topology on every online PVE node."
+    run_topology apply "$pvn_setup_cluster" "$PROVIDER_PORT_READY"
+    echo "Planning and activating the OVN/PVN control plane."
+    "$CONTROL_PLANE_BIN" plan
+    "$CONTROL_PLANE_BIN" apply --confirm "$pvn_setup_cluster"
+    echo "PVN topology and control-plane activation completed for $pvn_setup_cluster."
+}
+
+prompt_full_setup() {
+    pvn_setup_cluster=$1
+    printf '%s' \
+        'Configure the three-NIC topology and activate OVN now? [y/N]: ' \
+        >/dev/tty
+    if ! IFS= read -r pvn_setup_answer </dev/tty; then
+        echo "No topology confirmation read; package installation is complete." >&2
+        return 0
+    fi
+    case "$pvn_setup_answer" in
+        y|Y|yes|YES) ;;
+        *)
+            echo "Package installation complete; topology was not changed."
+            return 0
+            ;;
+    esac
+
+    [ -x "$TOPOLOGY_BIN" ] || fail "installed topology tool is unavailable: $TOPOLOGY_BIN"
+    [ -x "$CONTROL_PLANE_BIN" ] ||
+        fail "installed control-plane tool is unavailable: $CONTROL_PLANE_BIN"
+    GENEVE_CIDR=$(prompt_path PVN_GENEVE_CIDR "Dedicated Geneve IPv4 CIDR")
+    PROVIDER_CIDR=$(prompt_path PVN_PROVIDER_CIDR "Provider-uplink IPv4 CIDR")
+    run_topology plan '' ''
+    cat >/dev/tty <<'EOF'
+Before continuing, every outer OpenStack provider port for these PVE VMs must
+allow arbitrary guest/router MAC and IP addresses. The provider NIC will lose
+its host IP and become an OVS provider port.
+EOF
+    PROVIDER_PORT_READY=$(prompt_path PVN_PROVIDER_PORT_READY \
+        "Type OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP")
+    [ "$PROVIDER_PORT_READY" = OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP ] ||
+        fail "provider-port acknowledgement did not match; topology was not changed"
+    run_topology apply "$pvn_setup_cluster" "$PROVIDER_PORT_READY"
+    "$CONTROL_PLANE_BIN" plan
+    "$CONTROL_PLANE_BIN" apply --confirm "$pvn_setup_cluster"
+    echo "PVN topology and control-plane activation completed for $pvn_setup_cluster."
+}
+
 echo "Verified downloads; running PVN $PHASE."
+PVN_PACKAGE_INSTALLED=0
+PVN_SETUP_CLUSTER=$CONFIRM
 if [ "$PHASE_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ -r /dev/tty ]; then
     if run_cluster_installer preflight 0 ''; then
         printf '%s' \
@@ -278,6 +406,8 @@ if [ "$PHASE_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ -r /dev/tty ]; then
                 pvn_status=0
             elif run_cluster_installer install 1 "$pvn_typed_cluster"; then
                 pvn_status=0
+                PVN_PACKAGE_INSTALLED=1
+                PVN_SETUP_CLUSTER=$pvn_typed_cluster
             else
                 pvn_status=$?
             fi
@@ -290,8 +420,18 @@ if [ "$PHASE_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ -r /dev/tty ]; then
     fi
 elif run_cluster_installer "$PHASE" "$APPLY" "$CONFIRM"; then
     pvn_status=0
+    if [ "$PHASE" = install ] && [ "$APPLY" -eq 1 ]; then
+        PVN_PACKAGE_INSTALLED=1
+    fi
 else
     pvn_status=$?
+fi
+if [ "$pvn_status" -eq 0 ] && [ "$PVN_PACKAGE_INSTALLED" -eq 1 ]; then
+    if [ "$FULL" -eq 1 ]; then
+        run_full_setup "$PVN_SETUP_CLUSTER"
+    elif [ "$PHASE_EXPLICIT" -eq 0 ] && [ -r /dev/tty ]; then
+        prompt_full_setup "$PVN_SETUP_CLUSTER"
+    fi
 fi
 cleanup
 trap - 0 HUP INT TERM
