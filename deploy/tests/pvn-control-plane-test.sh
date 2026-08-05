@@ -9,8 +9,12 @@ SCRIPT=$REPO/deploy/scripts/pvn-control-plane
 
 PVN_CONTROL_PLANE_SCRIPT=$SCRIPT python3 <<'PY'
 import base64
+import ast
 import copy
+import contextlib
 import hashlib
+import io
+import ipaddress
 import json
 import os
 import pathlib
@@ -66,6 +70,10 @@ class FakeBackend:
         self.shared = None
         self.staged = {}
         self.control_dbs = {}
+        self.pending_control_dbs = set()
+        self.pending_control_cids = {}
+        self.pending_control_remotes = {}
+        self.pending_control_server_ids = {}
         self.central = []
         self.central_markers = []
         self.nodes = []
@@ -96,7 +104,9 @@ class FakeBackend:
 
     def assert_planned_package_repin_safe(self, found):
         if self.central or self.central_markers or self.nodes or self.node_markers or \
-                self.node_targets or self.restart_pending or self.control_dbs:
+                self.node_targets or self.restart_pending or self.control_dbs or \
+                self.pending_control_dbs or self.pending_control_remotes or \
+                self.pending_control_server_ids or self.pending_control_cids:
             raise ControlPlaneError(
                 "planned ledger package repin refused: activation or central database state"
             )
@@ -106,7 +116,9 @@ class FakeBackend:
         if self.central != [seed.name] or self.central_markers != [seed.name] or \
                 self.nodes or self.node_markers or self.node_targets or \
                 self.restart_pending != {seed.name: seed.package_version} or \
-                set(self.control_dbs) != {seed.name}:
+                set(self.control_dbs) != {seed.name} or self.pending_control_dbs or \
+                self.pending_control_remotes or self.pending_control_server_ids or \
+                self.pending_control_cids:
             raise ControlPlaneError("staged ledger package repin refused: runtime shape")
         if self.control_dbs[seed.name] != ledger["control_db_cluster_id"]:
             raise ControlPlaneError("staged ledger package repin refused: wrong Control CID")
@@ -125,6 +137,37 @@ class FakeBackend:
         if self.staged_report_hook is not None:
             self.staged_report_hook(report)
         return report
+
+    def assert_partial_central_package_repin_safe(self, found, ledger):
+        complete = ledger["central_complete"]
+        active = [node.name for node in found.nodes[:complete]]
+        next_node = found.nodes[complete].name
+        expected_remote = [f"ssl:{found.nodes[0].control_ip}:6646"]
+        active_server_ids = {f"sid-PVN_Control-{name}" for name in active}
+        if self.central != active or self.central_markers != active or \
+                self.nodes or self.node_markers or self.node_targets or \
+                set(self.control_dbs) != set(active) or \
+                self.pending_control_dbs != {next_node} or \
+                set(self.pending_control_cids) != {next_node} or \
+                self.pending_control_cids[next_node] not in {
+                    None, ledger["control_db_cluster_id"]
+                } or \
+                self.pending_control_remotes != {next_node: expected_remote} or \
+                set(self.pending_control_server_ids) != {next_node} or \
+                not self.pending_control_server_ids[next_node] or \
+                self.pending_control_server_ids[next_node] in active_server_ids or \
+                self.restart_pending != {
+                    node.name: node.package_version for node in found.nodes[:complete]
+                }:
+            raise ControlPlaneError(
+                f"central-{complete} ledger package repin refused: runtime shape"
+            )
+        if any(self.control_dbs[name] != ledger["control_db_cluster_id"] for name in active):
+            raise ControlPlaneError(
+                f"central-{complete} ledger package repin refused: wrong Control CID"
+            )
+        return [(node, self.central_status(node, found.mode))
+                for node in found.nodes[:complete]]
 
     def ensure_shared_config(self, config):
         encoded = json.dumps(config, sort_keys=True)
@@ -178,6 +221,18 @@ class FakeBackend:
             raise ControlPlaneError("stage drift")
 
     def init_control(self, node, mode, cluster_id, seed, expected_cluster_id):
+        if node.name in self.pending_control_dbs:
+            if node == seed or mode != "raft" or expected_cluster_id is None:
+                raise ControlPlaneError("pending Control DB is not pinned")
+            control_cid = self.pending_control_cids[node.name]
+            return {
+                "cluster_id": control_cid,
+                "cluster_id_pending": control_cid is None,
+                "preactivation_join": True,
+                "remote_addresses": self.pending_control_remotes[node.name],
+                "server_id": self.pending_control_server_ids[node.name],
+                "created": False,
+            }
         actual = self.control_dbs.get(node.name)
         if actual is not None:
             if mode == "raft" and expected_cluster_id is None:
@@ -197,6 +252,12 @@ class FakeBackend:
         return {"cluster_id": actual if mode == "raft" else None, "created": True}
 
     def activate_central(self, node):
+        if node.name in self.pending_control_dbs:
+            self.pending_control_dbs.remove(node.name)
+            self.pending_control_cids.pop(node.name, None)
+            self.pending_control_remotes.pop(node.name, None)
+            self.pending_control_server_ids.pop(node.name, None)
+            self.control_dbs[node.name] = self.cids["PVN_Control"]
         if node.name not in self.central_markers:
             self.central_markers.append(node.name)
         if node.name not in self.central:
@@ -241,6 +302,264 @@ def expect_error(action, text):
         assert text in str(error), (text, str(error))
     else:
         raise AssertionError("expected ControlPlaneError")
+
+
+def remote_db_info_runner(cluster_id_result, show_log=None):
+    if show_log is None:
+        show_log = (
+            'record 0:\n name: "PVN_Control\'\n'
+            ' local address: "ssl:192.0.2.12:6646"\n'
+            ' server_id: serv\n'
+            ' remote_addresses: ssl:192.0.2.11:6646\n\n'
+        )
+    def fake_run(arguments, check=True):
+        operation = arguments[2] if arguments[1] == "--more" else arguments[1]
+        values = {
+            "db-name": types.SimpleNamespace(returncode=0, stdout="PVN_Control\n", stderr=""),
+            "db-is-clustered": types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+            "db-local-address": types.SimpleNamespace(
+                returncode=0, stdout="ssl:192.0.2.12:6646\n", stderr=""
+            ),
+            "db-sid": types.SimpleNamespace(returncode=0, stdout="server-id\n", stderr=""),
+            "db-cid": cluster_id_result,
+            "show-log": types.SimpleNamespace(
+                returncode=0,
+                stdout=show_log,
+                stderr="",
+            ),
+        }
+        result = values[operation]
+        if check and result.returncode != 0:
+            raise AssertionError(f"unexpected checked failure: {operation}")
+        return result
+    return fake_run
+
+
+def load_remote_db_info(run_function):
+    tree = ast.parse(module["REMOTE_HELPER"])
+    selected = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {
+            "fail", "ipv4", "join_stub_remote", "db_info"
+        }
+    ]
+    namespace = {
+        "ipaddress": ipaddress, "os": os, "re": re, "sys": sys,
+        "run": run_function,
+    }
+    exec(compile(ast.Module(body=selected, type_ignores=[]), "remote-db-info", "exec"),
+         namespace)
+    return namespace["db_info"]
+
+
+# Only ovsdb-tool's exact pre-activation join sentinel is represented as a
+# pending CID. A known CID remains strict, and any lookalike command failure
+# still aborts the remote probe.
+with tempfile.TemporaryDirectory() as temporary:
+    database = pathlib.Path(temporary) / "control.db"
+    database.touch()
+    pending = types.SimpleNamespace(
+        returncode=2, stdout="", stderr=f"{database}: cluster ID not yet known\n"
+    )
+    info = load_remote_db_info(remote_db_info_runner(pending))(str(database))
+    assert info["cluster_id"] is None and info["cluster_id_pending"] is True
+    assert info["server_id"] == "server-id"
+    assert info["remote_addresses"] == ["ssl:192.0.2.11:6646"]
+
+    known = types.SimpleNamespace(returncode=0, stdout="expected-cid\n", stderr="")
+    info = load_remote_db_info(remote_db_info_runner(known))(str(database), True)
+    assert info["cluster_id"] == "expected-cid"
+    assert info["cluster_id_pending"] is False
+    assert info["preactivation_join"] is True
+    assert info["remote_addresses"] == ["ssl:192.0.2.11:6646"]
+
+    for rejected in (
+        types.SimpleNamespace(
+            returncode=1, stdout="", stderr=f"{database}: cluster ID not yet known\n"
+        ),
+        types.SimpleNamespace(returncode=2, stdout="", stderr="database corrupt\n"),
+    ):
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            try:
+                load_remote_db_info(remote_db_info_runner(rejected))(str(database))
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("non-exact db-cid failure was accepted")
+        assert "ovsdb-tool db-cid" in error.getvalue()
+
+    malformed_logs = (
+        "record 0:\n remote_addresses: ssl:192.0.2.11:6646\n"
+        "record 1:\n remote_addresses: ssl:192.0.2.11:6646\n",
+        "record 0:\n",
+        "record 0:\n remote_addresses: ssl:192.0.2.11:6646 ssl:192.0.2.99:6646\n",
+    )
+    for malformed in malformed_logs:
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            try:
+                load_remote_db_info(
+                    remote_db_info_runner(pending, malformed)
+                )(str(database))
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("malformed join-stub log was accepted")
+        assert "clustered database" in error.getvalue()
+
+
+# Exercise the production init-control dispatch with fake ovsdb-tool,
+# pvnctl, and systemctl processes. This covers the legacy unknown-CID stub,
+# new --cid-pinned stub, and the post-activation/pre-ledger-write resume state.
+with tempfile.TemporaryDirectory() as temporary:
+    root = pathlib.Path(temporary)
+    database = root / "pvn_control.db"
+    marker_path = root / "central-enabled"
+    command_log = root / "pvnctl-command.json"
+    fake_bin = root / "bin"
+    fake_bin.mkdir()
+    fake_ovsdb = fake_bin / "ovsdb-tool"
+    fake_pvnctl = fake_bin / "pvnctl"
+    fake_systemctl = fake_bin / "systemctl"
+    fake_ovsdb.write_text(r'''#!/usr/bin/python3
+import json
+import os
+import sys
+
+arguments = sys.argv[1:]
+operation = arguments[1] if arguments[0] == "--more" else arguments[0]
+database = arguments[-1]
+state = json.loads(os.environ["PVN_TEST_DB_STATE"])
+if operation == "db-name":
+    print("PVN_Control")
+elif operation == "db-is-clustered":
+    raise SystemExit(0)
+elif operation == "db-local-address":
+    print(state["local"])
+elif operation == "db-sid":
+    print(state["sid"])
+elif operation == "db-cid":
+    if state["cid"] is None:
+        print(f"{database}: cluster ID not yet known", file=sys.stderr)
+        raise SystemExit(2)
+    print(state["cid"])
+elif operation == "show-log":
+    sys.stdout.write(state["log"])
+else:
+    print(f"unexpected ovsdb-tool operation: {operation}", file=sys.stderr)
+    raise SystemExit(9)
+''')
+    fake_pvnctl.write_text(r'''#!/usr/bin/python3
+import json
+import os
+import pathlib
+import sys
+
+pathlib.Path(os.environ["PVN_TEST_CONTROL_DB"]).touch()
+pathlib.Path(os.environ["PVN_TEST_PVNCTL_LOG"]).write_text(json.dumps(sys.argv[1:]))
+''')
+    fake_systemctl.write_text(r'''#!/usr/bin/python3
+import os
+import sys
+
+if sys.argv[1:] != ["is-active", "pvn-central.target"]:
+    raise SystemExit(9)
+active = os.environ.get("PVN_TEST_CENTRAL_ACTIVE") == "1"
+print("active" if active else "inactive")
+raise SystemExit(0 if active else 3)
+''')
+    for executable in (fake_ovsdb, fake_pvnctl, fake_systemctl):
+        executable.chmod(0o755)
+
+    helper_source = module["REMOTE_HELPER"].replace(
+        'database = "/var/lib/pvn/control-db/pvn_control.db"',
+        f"database = {str(database)!r}",
+        1,
+    ).replace(
+        '"/etc/pvn/central/enabled"', repr(str(marker_path)),
+    ).replace(
+        '"/usr/bin/ovsdb-tool"', repr(str(fake_ovsdb)),
+    ).replace(
+        '"/usr/sbin/pvnctl"', repr(str(fake_pvnctl)),
+    )
+    expected_cid = "11111111-2222-3333-4444-555555555555"
+    request = {
+        "mode": "raft",
+        "cluster_id": str(uuid.uuid4()),
+        "expected_cluster_id": expected_cid,
+        "local": "ssl:192.0.2.12:6646",
+        "join": "ssl:192.0.2.11:6646",
+    }
+
+    def control_helper(state, *, exists=True, marked=False, active=False):
+        if exists:
+            database.touch()
+        elif database.exists():
+            database.unlink()
+        if marked:
+            marker_path.touch()
+        elif marker_path.exists():
+            marker_path.unlink()
+        if command_log.exists():
+            command_log.unlink()
+        environment = {
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "PVN_TEST_DB_STATE": json.dumps(state),
+            "PVN_TEST_CONTROL_DB": str(database),
+            "PVN_TEST_PVNCTL_LOG": str(command_log),
+            "PVN_TEST_CENTRAL_ACTIVE": "1" if active else "0",
+        }
+        return subprocess.run(
+            [sys.executable, "-c", helper_source, "init-control"],
+            input=json.dumps(request), text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=environment, check=False,
+        )
+
+    def record_zero(remote="ssl:192.0.2.11:6646"):
+        return (
+            'record 0:\n name: "PVN_Control\'\n'
+            ' local address: "ssl:192.0.2.12:6646"\n'
+            ' server_id: stub\n'
+            f' remote_addresses: {remote}\n\n'
+        )
+
+    legacy = {"cid": None, "local": request["local"], "sid": "legacy-sid",
+              "log": record_zero()}
+    result = control_helper(legacy)
+    assert result.returncode == 0, result.stderr
+    legacy_info = json.loads(result.stdout)
+    assert legacy_info["cluster_id_pending"] is True
+    assert legacy_info["preactivation_join"] is True
+
+    foreign_remote = {**legacy, "log": record_zero("ssl:192.0.2.99:6646")}
+    result = control_helper(foreign_remote)
+    assert result.returncode != 0 and "exact inactive pre-activation join" in result.stderr
+    assert not command_log.exists()
+
+    pinned_stub = {**legacy, "cid": expected_cid, "sid": "pinned-stub-sid"}
+    result = control_helper(pinned_stub)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["cluster_id"] == expected_cid
+
+    joined = {
+        **pinned_stub,
+        "sid": "joined-sid",
+        "log": record_zero() + "record 1:\n term: 1\n\n",
+    }
+    result = control_helper(joined, marked=True, active=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["preactivation_join"] is False
+    for marked, active in ((False, True), (True, False), (False, False)):
+        result = control_helper(joined, marked=marked, active=active)
+        assert result.returncode != 0
+        assert "marker/runtime state" in result.stderr
+
+    result = control_helper(pinned_stub, exists=False)
+    assert result.returncode == 0, result.stderr
+    invoked = json.loads(command_log.read_text())
+    assert "--cid" in invoked and invoked[invoked.index("--cid") + 1] == expected_cid
 
 
 def drift_topology(found_backend):
@@ -294,12 +613,48 @@ def staged_seed_ledger(found, control_cid, **overrides):
     return ledger
 
 
+def partial_central_ledger(found, cids, complete=1, **overrides):
+    ledger = planned_ledger(
+        found,
+        phase=f"central-{complete}",
+        central_complete=complete,
+        cert_fingerprints=complete_fingerprints(found),
+        control_db_cluster_id=cids["PVN_Control"],
+        db_cluster_ids=copy.deepcopy(cids),
+    )
+    ledger.update(overrides)
+    return ledger
+
+
 def enter_seed_activation_crash(backend):
     seed = backend.found.nodes[0].name
     backend.control_dbs[seed] = backend.cids["PVN_Control"]
     backend.central = [seed]
     backend.central_markers = [seed]
     backend.restart_pending = {seed: backend.found.nodes[0].package_version}
+
+
+def enter_partial_join_crash(backend, complete=1, cid_known=False):
+    active = backend.found.nodes[:complete]
+    backend.control_dbs = {
+        node.name: backend.cids["PVN_Control"] for node in active
+    }
+    backend.central = [node.name for node in active]
+    backend.central_markers = [node.name for node in active]
+    backend.restart_pending = {
+        node.name: node.package_version for node in active
+    }
+    backend.pending_control_dbs = {backend.found.nodes[complete].name}
+    pending = backend.found.nodes[complete]
+    backend.pending_control_cids = {
+        pending.name: backend.cids["PVN_Control"] if cid_known else None
+    }
+    backend.pending_control_remotes = {
+        pending.name: [f"ssl:{backend.found.nodes[0].control_ip}:6646"]
+    }
+    backend.pending_control_server_ids = {
+        pending.name: f"pending-sid-{pending.name}"
+    }
 
 
 lease_temporary = tempfile.TemporaryDirectory()
@@ -593,6 +948,127 @@ with tempfile.TemporaryDirectory() as temporary:
     ]
     for report_mutation in report_mutations:
         expect_real_probe_rejected(mutate_report=report_mutation)
+
+
+# A central-N package repin proves each completed voter against the durable
+# N/N CID set and accepts exactly one inactive record-0 Control join stub.
+# Both legacy unknown-CID and new --cid-pinned stubs use the same seed-remote
+# and unique-server-ID gate.
+with tempfile.TemporaryDirectory() as temporary:
+    backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary))
+    found = backend.discover()
+    cids = {name: f"partial-cid-{index}" for index, name in enumerate(DATABASES, 1)}
+    ledger = partial_central_ledger(found, cids)
+    seed, pending_node = found.nodes[:2]
+    active_databases = {
+        name: {
+            "exists": True,
+            "name": name,
+            "clustered": True,
+            "local_address": f"ssl:{seed.control_ip}:{port}",
+            "cluster_id": cids[name],
+            "cluster_id_pending": False,
+            "server_id": f"active-sid-{name}",
+        }
+        for name, port in DATABASES.items()
+    }
+    pending_control = {
+        "exists": True,
+        "name": "PVN_Control",
+        "clustered": True,
+        "local_address": f"ssl:{pending_node.control_ip}:6646",
+        "cluster_id": None,
+        "cluster_id_pending": True,
+        "preactivation_join": True,
+        "remote_addresses": [f"ssl:{seed.control_ip}:6646"],
+        "server_id": "pending-control-sid",
+    }
+    for index, node in enumerate(found.nodes):
+        pins = ledger["cert_fingerprints"]["nodes"][node.name]
+        databases = {name: {"exists": False} for name in DATABASES}
+        if index == 0:
+            databases = copy.deepcopy(active_databases)
+        elif index == 1:
+            databases["PVN_Control"] = copy.deepcopy(pending_control)
+        backend.probes[node.name].update({
+            "cert_hashes": {
+                "ca": ledger["cert_fingerprints"]["ca_certificate_sha256"],
+                "cert": pins["certificate_sha256"],
+                "public_key": pins["public_key_sha256"],
+            },
+            "pki_owner_present": True,
+            "seed_ca_present": index == 0,
+            "central_marker": index == 0,
+            "central_active": index == 0,
+            "node_marker": False,
+            "node_active": False,
+            "node_ready": False,
+            "central_restart_pending": node.package_version if index == 0 else None,
+            "databases": databases,
+        })
+    report = {
+        "healthy": True,
+        "target_active": True,
+        "databases": [
+            {
+                "database": name,
+                "healthy": True,
+                "member_count": 1,
+                "connected_members": 1,
+                "membership_change": False,
+                "cluster_id": cids[name],
+                "server_id": f"active-sid-{name}",
+                "address": f"ssl:{seed.control_ip}:{port}",
+            }
+            for name, port in DATABASES.items()
+        ],
+        "offline": copy.deepcopy(active_databases),
+    }
+    backend.central_status = lambda _node, _mode: copy.deepcopy(report)
+    baseline = copy.deepcopy(backend.probes)
+
+    reports = backend.assert_partial_central_package_repin_safe(found, ledger)
+    assert ControlPlane._verify_reports(found, reports, 1, cids) == cids
+    backend.probes[pending_node.name]["databases"]["PVN_Control"].update({
+        "cluster_id": cids["PVN_Control"], "cluster_id_pending": False,
+    })
+    reports = backend.assert_partial_central_package_repin_safe(found, ledger)
+    assert ControlPlane._verify_reports(found, reports, 1, cids) == cids
+
+    def reject_partial_probe(mutate):
+        backend.probes = copy.deepcopy(baseline)
+        mutate(backend.probes)
+        expect_error(
+            lambda: backend.assert_partial_central_package_repin_safe(found, ledger),
+            "repin refused",
+        )
+
+    partial_mutations = (
+        lambda probes: probes[pending_node.name]["databases"]["PVN_Control"].update(
+            remote_addresses=["ssl:192.0.2.99:6646"]
+        ),
+        lambda probes: probes[pending_node.name]["databases"]["PVN_Control"].update(
+            remote_addresses=[]
+        ),
+        lambda probes: probes[pending_node.name]["databases"]["PVN_Control"].update(
+            remote_addresses=[f"ssl:{seed.control_ip}:6646", "ssl:192.0.2.99:6646"]
+        ),
+        lambda probes: probes[pending_node.name]["databases"]["PVN_Control"].update(
+            server_id="active-sid-PVN_Control"
+        ),
+        lambda probes: probes[pending_node.name]["databases"]["PVN_Control"].update(
+            cluster_id="foreign-cid", cluster_id_pending=False
+        ),
+        lambda probes: probes[pending_node.name]["databases"]["OVN_Northbound"].update(
+            exists=True
+        ),
+        lambda probes: probes[seed.name].update(central_restart_pending=None),
+        lambda probes: probes[found.nodes[2].name]["databases"]["PVN_Control"].update(
+            exists=True
+        ),
+    )
+    for partial_mutation in partial_mutations:
+        reject_partial_probe(partial_mutation)
 
 
 # Legacy pmxcfs key material is never adopted or copied automatically.
@@ -1127,6 +1603,103 @@ with tempfile.TemporaryDirectory() as temporary:
     assert backend.log.count("central:pve-a") == 0
 
 
+# A rolling package update may also land at central-N after the next voter has
+# created, but not activated, its Control join stub. Plan is read-only and
+# apply repins only under the lease, then proves the ledger CID after startup.
+for cid_known in (False, True):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        pinned = discovery(package="0.1.1")
+        backend = FakeBackend(discovery(package="0.1.2"))
+        enter_partial_join_crash(backend, cid_known=cid_known)
+        store.create(partial_central_ledger(pinned, backend.cids))
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        before = copy.deepcopy(store.load())
+        plan = control.plan()
+        assert plan["read_only"] and plan["package_repin_required"] is True
+        assert plan["package_repin_source_phase"] == "central-1"
+        assert "central-1 pending-join crash window" in plan["actions"][0]
+        assert store.load() == before
+
+        original_update = store.update
+        repin_was_leased = []
+
+        def observe_partial_update(value):
+            previous = store.load()
+            if previous["snapshot"] != value["snapshot"]:
+                assert lease_state.exists(), "partial package snapshot repin escaped the lease"
+                repin_was_leased.append(True)
+            original_update(value)
+
+        store.update = observe_partial_update
+        result = control.apply("test-cluster")
+        assert result["complete"] and repin_was_leased == [True]
+        assert backend.central == ["pve-a", "pve-b", "pve-c"]
+        assert "init:pve-b" not in backend.log
+        assert store.load()["db_cluster_ids"] == backend.cids
+
+
+# The same recovery proof is count-independent: a five-voter central-3 ledger
+# resumes its pinned fourth-voter stub before creating the fifth voter.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    pinned = discovery(5, package="0.1.1")
+    backend = FakeBackend(discovery(5, package="0.1.2"))
+    enter_partial_join_crash(backend, complete=3, cid_known=True)
+    store.create(partial_central_ledger(pinned, backend.cids, complete=3))
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    plan = control.plan()
+    assert plan["package_repin_required"] and plan["package_repin_source_phase"] == "central-3"
+    result = control.apply("test-cluster")
+    assert result["complete"] and result["nodes"] == 5
+    assert backend.central == ["pve-a", "pve-b", "pve-c", "pve-d", "pve-e"]
+    assert "init:pve-d" not in backend.log and backend.log.count("init:pve-e") == 1
+
+
+def partial_runtime_repin_rejected(case):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        pinned = discovery(package="0.1.1")
+        backend = FakeBackend(discovery(package="0.1.2"))
+        enter_partial_join_crash(backend)
+        ledger = partial_central_ledger(pinned, backend.cids)
+        store.create(ledger)
+        pending = backend.found.nodes[1].name
+        if case == "wrong-remote":
+            backend.pending_control_remotes[pending] = ["ssl:192.0.2.99:6646"]
+        elif case == "missing-remote":
+            backend.pending_control_remotes[pending] = []
+        elif case == "extra-remote":
+            backend.pending_control_remotes[pending].append("ssl:192.0.2.99:6646")
+        elif case == "duplicate-sid":
+            backend.pending_control_server_ids[pending] = "sid-PVN_Control-pve-a"
+        elif case == "foreign-known-cid":
+            backend.pending_control_cids[pending] = "foreign-control-cid"
+        elif case == "missing-stub":
+            backend.pending_control_dbs.clear()
+        elif case == "next-marker":
+            backend.central_markers.append(pending)
+        elif case == "restart-marker-missing":
+            backend.restart_pending.clear()
+        elif case == "transport-active":
+            backend.node_targets.append("pve-a")
+        else:
+            raise AssertionError(case)
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        before = copy.deepcopy(store.load())
+        expect_error(control.plan, "repin refused")
+        assert store.load() == before
+        assert backend.central == ["pve-a"]
+
+
+for partial_case in (
+    "wrong-remote", "missing-remote", "extra-remote", "duplicate-sid",
+    "foreign-known-cid", "missing-stub", "next-marker",
+    "restart-marker-missing", "transport-active",
+):
+    partial_runtime_repin_rejected(partial_case)
+
+
 def staged_runtime_repin_rejected(case):
     with tempfile.TemporaryDirectory() as temporary:
         store = LedgerStore(pathlib.Path(temporary) / "private")
@@ -1270,6 +1843,47 @@ expect_staged_snapshot_repin_rejected(
 expect_staged_snapshot_repin_rejected(
     pinned, discovery(package="0.1.2"),
     db_cluster_ids={name: f"unexpected-{name}" for name in DATABASES},
+)
+
+
+def expect_partial_snapshot_repin_rejected(pinned, live, **ledger_overrides):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        backend = FakeBackend(live)
+        enter_partial_join_crash(backend)
+        store.create(partial_central_ledger(
+            pinned, backend.cids, **ledger_overrides
+        ))
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        before = copy.deepcopy(store.load())
+        expect_error(control.plan, "drift")
+        assert store.load() == before
+
+
+# The central-N exception is package-only and requires its exact durable phase,
+# zero transport progress, complete PKI pins, and the complete three-CID set.
+expect_partial_snapshot_repin_rejected(pinned, mixed)
+expect_partial_snapshot_repin_rejected(
+    discovery(package="0.1.2"), discovery(package="0.1.1")
+)
+expect_partial_snapshot_repin_rejected(pinned, topology_drift)
+expect_partial_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), phase="staged"
+)
+expect_partial_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), central_complete=2
+)
+expect_partial_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), nodes_complete=1
+)
+expect_partial_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), cert_fingerprints={}
+)
+expect_partial_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), db_cluster_ids={}
+)
+expect_partial_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), control_db_cluster_id="foreign-control-cid"
 )
 
 

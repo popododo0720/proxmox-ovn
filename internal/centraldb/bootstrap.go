@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,12 +31,15 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) ([]byte,
 }
 
 type InitOptions struct {
-	Database string
-	Schema   string
-	Mode     string
-	Local    string
-	Remotes  []string
+	Database  string
+	Schema    string
+	Mode      string
+	Local     string
+	Remotes   []string
+	ClusterID string
 }
+
+var clusterIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func Init(ctx context.Context, runner Runner, options InitOptions) error {
 	options.defaults()
@@ -54,8 +58,8 @@ func Init(ctx context.Context, runner Runner, options InitOptions) error {
 	var args []string
 	switch options.Mode {
 	case "standalone":
-		if options.Local != "" || len(options.Remotes) != 0 {
-			return errors.New("standalone initialization does not accept local or remote Raft addresses")
+		if options.Local != "" || len(options.Remotes) != 0 || options.ClusterID != "" {
+			return errors.New("standalone initialization does not accept Raft addresses or a cluster ID")
 		}
 		args = []string{"create", options.Database, options.Schema}
 	case "raft":
@@ -68,9 +72,15 @@ func Init(ctx context.Context, runner Runner, options InitOptions) error {
 			}
 		}
 		if len(options.Remotes) == 0 {
+			if options.ClusterID != "" {
+				return errors.New("new Raft cluster does not accept an existing cluster ID")
+			}
 			args = []string{"create-cluster", options.Database, options.Schema, options.Local}
 		} else {
-			args = append([]string{"join-cluster", options.Database, SchemaName, options.Local}, options.Remotes...)
+			if !clusterIDPattern.MatchString(options.ClusterID) {
+				return errors.New("Raft join requires a canonical lowercase cluster ID")
+			}
+			args = append([]string{"--cid=" + options.ClusterID, "join-cluster", options.Database, SchemaName, options.Local}, options.Remotes...)
 		}
 	default:
 		return fmt.Errorf("unsupported database mode %q", options.Mode)

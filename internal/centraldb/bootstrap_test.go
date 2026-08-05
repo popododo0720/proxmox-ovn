@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,12 +39,17 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 		return nil, errors.New("inactive")
 	}
 	if name == "ovsdb-tool" && len(args) > 0 {
-		switch args[0] {
+		operation := 0
+		if strings.HasPrefix(args[0], "--cid=") {
+			operation = 1
+		}
+		switch args[operation] {
 		case "create", "create-cluster", "join-cluster":
-			if err := os.WriteFile(args[1], []byte("created"), 0o600); err != nil {
+			database := args[operation+1]
+			if err := os.WriteFile(database, []byte("created"), 0o600); err != nil {
 				return nil, err
 			}
-			return nil, os.WriteFile(databaseLockPath(args[1]), nil, 0o600)
+			return nil, os.WriteFile(databaseLockPath(database), nil, 0o600)
 		}
 	}
 	return nil, nil
@@ -73,18 +79,41 @@ func TestInitStandaloneAndRaftJoin(t *testing.T) {
 	assertLockRemoved(t, bootstrap)
 	joined := filepath.Join(dir, "joined.db")
 	if err := Init(context.Background(), runner, InitOptions{
-		Database: joined,
-		Schema:   schema,
-		Mode:     "raft",
-		Local:    "ssl:192.0.2.2:6646",
-		Remotes:  []string{"ssl:192.0.2.1:6646"},
+		Database:  joined,
+		Schema:    schema,
+		Mode:      "raft",
+		Local:     "ssl:192.0.2.2:6646",
+		Remotes:   []string{"ssl:192.0.2.1:6646"},
+		ClusterID: "11111111-2222-3333-4444-555555555555",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	assertLockRemoved(t, joined)
-	want := []string{"join-cluster", joined, SchemaName, "ssl:192.0.2.2:6646", "ssl:192.0.2.1:6646"}
+	want := []string{"--cid=11111111-2222-3333-4444-555555555555", "join-cluster", joined, SchemaName, "ssl:192.0.2.2:6646", "ssl:192.0.2.1:6646"}
 	if got := runner.calls[2].args; !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestRaftJoinRequiresPinnedCanonicalClusterID(t *testing.T) {
+	dir := t.TempDir()
+	schema := filepath.Join(dir, "schema.json")
+	if err := os.WriteFile(schema, []byte(`{"name":"PVN_Control"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, clusterID := range []string{"", "foreign", "11111111-2222-3333-4444-55555555555A"} {
+		database := filepath.Join(dir, strings.ReplaceAll(clusterID, "/", "-")+"joined.db")
+		err := Init(context.Background(), &fakeRunner{}, InitOptions{
+			Database:  database,
+			Schema:    schema,
+			Mode:      "raft",
+			Local:     "ssl:192.0.2.2:6646",
+			Remotes:   []string{"ssl:192.0.2.1:6646"},
+			ClusterID: clusterID,
+		})
+		if err == nil {
+			t.Fatalf("cluster ID %q unexpectedly accepted", clusterID)
+		}
 	}
 }
 

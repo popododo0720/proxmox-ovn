@@ -243,6 +243,15 @@ membership and cluster IDs after every step, then activates transport nodes
 one at a time. A durable phase ledger makes a safe rerun converge forward
 without deleting or regenerating existing database or key material.
 
+Every new PVN Control join passes the ledger-pinned Raft cluster ID to
+`ovsdb-tool --cid`, so it cannot discover or adopt a different cluster. A
+legacy join stub created before that pinning was added may temporarily report
+`cluster ID not yet known`; it is accepted only while inactive, with its
+record-0 remote equal to the deterministic seed on port 6646 and a valid local
+identity. Activation is followed by the same bounded exact-membership/CID
+convergence gate. A foreign CID, remote, duplicate server ID, malformed log,
+or convergence timeout fails closed and no automatic delete or leave occurs.
+
 The OVN units use clustered NB/SB database ports 6643/6644 and publish
 mutual-TLS client listeners on 6641/6642. PVN Control uses client port 6645 and
 Raft port 6646. Allow 6643, 6644, and 6646 only among voters; allow 6641, 6642,
@@ -338,21 +347,32 @@ later run safely verifies/skips them while continuing the one remaining older
 version.
 
 The control-plane ledger also pins the package version on every node. Package
-drift normally stops `pvn-control-plane plan`. There are only two automatic
-forward-recovery exceptions: a wholly untouched `planned` ledger, or a Raft
-ledger in the exact `staged` crash window where the deterministic seed alone
-is marked and active, its pinned Control DB and all three databases are
-healthy single-member clusters, every non-seed still has no central database
-or activation state, and no transport target has started. The staged exception
-also requires the complete ledger-pinned PKI on every node and the seed's
-root-only `central-restart-pending` marker to match the uniformly installed,
-strictly newer package. Plan reports the required repin without writing. Apply
-repeats the proof under the cluster mutation lease, atomically replaces only
-the package-version snapshot, and then converges forward. It never adopts an
-unpinned database, regenerates keys, removes state, or consumes the restart
-marker. Any mixed/downgraded package, membership/topology difference, ledger
-progress, unexpected CID, marker, database, or service state remains a hard
-failure; do not edit the ledger to bypass it.
+drift normally stops `pvn-control-plane plan`. There are only three automatic
+forward-recovery exceptions:
+
+1. A wholly untouched `planned` ledger.
+2. A Raft ledger in the exact `staged` crash window where the deterministic
+   seed alone is marked and active, its pinned Control DB and all three
+   databases are healthy single-member clusters, and every non-seed is
+   pristine.
+3. An exact `central-N` ledger (`1 <= N < node count`) where the first N voters
+   are marked, active, healthy N/N members of all three pinned database
+   clusters; the next voter is inactive with only one record-0 PVN Control
+   join stub pointing at the seed; and every later voter is pristine. The stub
+   may contain the pinned CID or the legacy not-yet-known CID state.
+
+All three exceptions require zero transport progress. The staged and
+`central-N` cases additionally require complete ledger-pinned PKI and a
+root-only `central-restart-pending` marker matching the uniformly installed,
+strictly newer package on every already-active voter. The `central-N` proof
+also rejects a wrong/missing/extra seed remote, foreign CID, or server-ID
+collision before changing the ledger. Plan reports the required repin without
+writing. Apply repeats the proof under the cluster mutation lease, atomically
+replaces only the package-version snapshot, and then converges forward. It
+never adopts an unpinned database, regenerates keys, removes state, or consumes
+the restart marker. Any mixed/downgraded package, membership/topology
+difference, unexpected progress, CID, marker, database, or service state
+remains a hard failure; do not edit the ledger to bypass it.
 
 Package installation restarts only an already-active per-node
 manager/agent/controller stack. The updater deliberately does not restart

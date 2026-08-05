@@ -459,7 +459,30 @@ def read_owner(path, label):
         fail(f"{label} is not an object")
     return value
 
-def db_info(path):
+def join_stub_remote(path, required):
+    log = run(["/usr/bin/ovsdb-tool", "--more", "show-log", path], check=False)
+    if log.returncode != 0 or log.stderr != "":
+        fail(f"cannot inspect clustered database record-0 join log: {path}")
+    headers = re.findall(r"(?m)^record [0-9]+:$", log.stdout)
+    remotes = re.findall(r"(?m)^ remote_addresses: ([^\n]+)$", log.stdout)
+    if not headers:
+        fail(f"clustered database has no inspectable log records: {path}")
+    if headers != ["record 0:"]:
+        if required:
+            fail(f"pending clustered database has an invalid record-0 join log: {path}")
+        return None
+    if len(remotes) != 1:
+        fail(f"clustered database record-0 join remote is not singular: {path}")
+    remote = re.fullmatch(r"ssl:([^:]+):([0-9]+)", remotes[0])
+    if remote is None:
+        fail(f"clustered database join stub has invalid remote addresses: {path}")
+    remote_ip = ipv4(remote.group(1), "clustered database join remote IP")
+    remote_port = int(remote.group(2))
+    if not 1 <= remote_port <= 65535:
+        fail(f"clustered database join stub has invalid remote port: {path}")
+    return [f"ssl:{remote_ip}:{remote_port}"]
+
+def db_info(path, inspect_join_stub=False):
     result = {"exists": os.path.exists(path)}
     if not result["exists"]:
         return result
@@ -468,7 +491,30 @@ def db_info(path):
     result["clustered"] = clustered.returncode == 0
     if result["clustered"]:
         result["local_address"] = run(["/usr/bin/ovsdb-tool", "db-local-address", path]).stdout.strip()
-        result["cluster_id"] = run(["/usr/bin/ovsdb-tool", "db-cid", path]).stdout.strip()
+        cluster_id = run(["/usr/bin/ovsdb-tool", "db-cid", path], check=False)
+        if cluster_id.returncode == 0:
+            result["cluster_id"] = cluster_id.stdout.strip()
+            if not result["cluster_id"]:
+                fail(f"clustered database returned an empty cluster ID: {path}")
+            result["cluster_id_pending"] = False
+            if inspect_join_stub:
+                remotes = join_stub_remote(path, False)
+                result["preactivation_join"] = remotes is not None
+                if remotes is not None:
+                    result["remote_addresses"] = remotes
+        elif cluster_id.returncode == 2 and cluster_id.stdout == "" and \
+                cluster_id.stderr == f"{path}: cluster ID not yet known\n":
+            # ovsdb-tool join-cluster writes a local server record before an
+            # ovsdb-server has contacted the remote voter.  Preserve that
+            # exact, inspectable pre-activation state; every other db-cid
+            # failure remains fatal.
+            result["cluster_id"] = None
+            result["cluster_id_pending"] = True
+            result["preactivation_join"] = True
+            result["remote_addresses"] = join_stub_remote(path, True)
+        else:
+            detail = cluster_id.stderr.strip() or cluster_id.stdout.strip()
+            fail(f"/usr/bin/ovsdb-tool db-cid {path}: {detail or 'command failed'}")
         result["server_id"] = run(["/usr/bin/ovsdb-tool", "db-sid", path]).stdout.strip()
     return result
 
@@ -531,6 +577,9 @@ if action == "probe":
             certificate_hashes[label] = certificate_fingerprint(path)
         else:
             certificate_hashes[label] = None
+    central_active = run(
+        ["systemctl", "is-active", "pvn-central.target"], check=False
+    ).stdout.strip() == "active"
     print(json.dumps({
         "hostname": run(["hostname", "--fqdn"], check=False).stdout.strip() or run(["hostname"]).stdout.strip(),
         "package_version": version,
@@ -545,12 +594,14 @@ if action == "probe":
         "seed_ca_present": os.path.lexists(CA_DIR),
         "central_marker": os.path.exists("/etc/pvn/central/enabled"),
         "node_marker": os.path.exists("/etc/pvn/node-enabled"),
-        "central_active": run(["systemctl", "is-active", "pvn-central.target"], check=False).stdout.strip() == "active",
+        "central_active": central_active,
         "node_active": run(["systemctl", "is-active", "pvn-node.target"], check=False).stdout.strip() == "active",
         "node_ready": run(["systemctl", "is-active", "pvn-node-ready.service"], check=False).stdout.strip() == "active",
         "central_restart_pending": central_restart_pending(),
         "databases": {
-            "PVN_Control": db_info("/var/lib/pvn/control-db/pvn_control.db"),
+            "PVN_Control": db_info(
+                "/var/lib/pvn/control-db/pvn_control.db", inspect_join_stub=not central_active
+            ),
             "OVN_Northbound": db_info("/var/lib/ovn/ovnnb_db.db"),
             "OVN_Southbound": db_info("/var/lib/ovn/ovnsb_db.db"),
         },
@@ -857,8 +908,13 @@ elif action == "init-control":
     if expected_cluster_id is not None and (
             not isinstance(expected_cluster_id, str) or not expected_cluster_id):
         fail("expected Control DB cluster ID is invalid")
-    current = db_info(database)
+    inspect_join = payload["mode"] == "raft" and bool(payload.get("join"))
+    current = db_info(database, inspect_join_stub=inspect_join)
     created = not current["exists"]
+    central_marked = os.path.exists("/etc/pvn/central/enabled")
+    central_active = run(
+        ["systemctl", "is-active", "pvn-central.target"], check=False
+    ).stdout.strip() == "active"
     if current["exists"]:
         if current.get("name") != "PVN_Control": fail("existing Control DB has wrong schema name")
         if payload["mode"] == "raft":
@@ -866,25 +922,52 @@ elif action == "init-control":
                 fail("existing Control DB mode/local address drift")
             if expected_cluster_id is None:
                 fail("existing Control DB cluster ID is not pinned by the ledger")
-            if current.get("cluster_id") != expected_cluster_id:
+            if not current.get("server_id"):
+                fail("existing Control DB has no server ID")
+            if current.get("cluster_id_pending") is True or \
+                    current.get("preactivation_join") is True:
+                if current.get("preactivation_join") is not True or \
+                        current.get("remote_addresses") != [payload.get("join")] or \
+                        central_marked or central_active:
+                    fail("existing Control DB is not an exact inactive pre-activation join")
+                if current.get("cluster_id_pending") is not True and \
+                        current.get("cluster_id") != expected_cluster_id:
+                    fail("existing Control DB cluster ID differs from the ledger")
+            elif current.get("cluster_id") != expected_cluster_id:
                 fail("existing Control DB cluster ID differs from the ledger")
+            elif not central_marked or not central_active:
+                fail("existing activated Control DB lacks exact central marker/runtime state")
         elif current.get("clustered"):
             fail("existing standalone Control DB is clustered")
     else:
+        if central_marked or central_active:
+            fail("Control DB is absent while central marker/runtime state exists")
         command = ["/usr/sbin/pvnctl", "central", "init-control", "--mode", payload["mode"],
                    "--confirm", payload["cluster_id"]]
         if expected_local: command += ["--local", expected_local]
         if payload.get("join"): command += ["--join", payload["join"]]
+        if payload.get("join") and expected_cluster_id:
+            command += ["--cid", expected_cluster_id]
         run(command)
-        current = db_info(database)
+        current = db_info(database, inspect_join_stub=inspect_join)
         if not current.get("exists") or current.get("name") != "PVN_Control":
             fail("Control DB initialization did not create the expected schema")
         if payload["mode"] == "raft":
             if not current.get("clustered") or current.get("local_address") != expected_local:
                 fail("new Control DB mode/local address drift")
-            if not current.get("cluster_id"):
+            if payload.get("join") and (
+                    current.get("preactivation_join") is not True or
+                    current.get("remote_addresses") != [payload.get("join")] or
+                    not current.get("server_id")):
+                fail("new Control DB is not an exact pre-activation join")
+            if current.get("cluster_id_pending") is True:
+                if expected_cluster_id is None or not payload.get("join"):
+                    fail("new Control DB has an invalid pending cluster ID state")
+            elif not current.get("cluster_id"):
                 fail("new Control DB has no cluster ID")
-            if expected_cluster_id is not None and current.get("cluster_id") != expected_cluster_id:
+            if expected_cluster_id is not None and \
+                    current.get("cluster_id_pending") is not True and \
+                    current.get("cluster_id") != expected_cluster_id:
                 fail("new Control DB joined a different cluster ID")
         elif current.get("clustered"):
             fail("new standalone Control DB is clustered")
@@ -1243,6 +1326,120 @@ class SystemBackend:
             )
         return report
 
+    def assert_partial_central_package_repin_safe(
+        self, discovery: Discovery, ledger: dict[str, Any]
+    ) -> list[tuple[Node, dict[str, Any]]]:
+        """Prove an upgraded central-N ledger plus one pending join exactly."""
+        complete = ledger["central_complete"]
+        prefix = f"central-{complete} ledger package repin refused"
+        pki = ledger["cert_fingerprints"]
+        expected_cids = ledger["db_cluster_ids"]
+        reports: list[tuple[Node, dict[str, Any]]] = []
+        control_server_ids: set[str] = set()
+        for index, node in enumerate(discovery.nodes):
+            probe = self.probes[node.name]
+            pins = pki["nodes"][node.name]
+            expected_hashes = {
+                "ca": pki["ca_certificate_sha256"],
+                "cert": pins["certificate_sha256"],
+                "public_key": pins["public_key_sha256"],
+            }
+            if probe.get("cert_hashes") != expected_hashes or \
+                    probe.get("pki_owner_present") is not True:
+                raise ControlPlaneError(
+                    f"{prefix}: node {node.name} live PKI differs from the ledger pins"
+                )
+            if probe.get("seed_ca_present") is not (index == 0):
+                raise ControlPlaneError(f"{prefix}: seed CA placement drift on {node.name}")
+            if probe.get("node_marker") or probe.get("node_active") or \
+                    probe.get("node_ready"):
+                raise ControlPlaneError(
+                    f"{prefix}: transport state is active or marked on {node.name}"
+                )
+            databases = probe.get("databases")
+            if not isinstance(databases, dict) or set(databases) != set(DATABASES):
+                raise ControlPlaneError(f"{prefix}: database probe is incomplete on {node.name}")
+
+            if index < complete:
+                if probe.get("central_marker") is not True or \
+                        probe.get("central_active") is not True or \
+                        probe.get("central_restart_pending") != node.package_version:
+                    raise ControlPlaneError(
+                        f"{prefix}: completed voter {node.name} activation/restart state drift"
+                    )
+                for name, port in DATABASES.items():
+                    info = databases[name]
+                    if not isinstance(info, dict) or info.get("exists") is not True or \
+                            info.get("name") != name or info.get("clustered") is not True or \
+                            info.get("local_address") != f"ssl:{node.control_ip}:{port}" or \
+                            info.get("cluster_id_pending") is True or \
+                            info.get("cluster_id") != expected_cids[name] or \
+                            not info.get("server_id"):
+                        raise ControlPlaneError(
+                            f"{prefix}: completed voter {node.name} {name} identity drift"
+                        )
+                    if name == "PVN_Control":
+                        if info["server_id"] in control_server_ids:
+                            raise ControlPlaneError(
+                                f"{prefix}: completed voters repeat a Control DB server ID"
+                            )
+                        control_server_ids.add(info["server_id"])
+                report = self.central_status(node, discovery.mode)
+                offline = report.get("offline")
+                if not isinstance(offline, dict) or set(offline) != set(DATABASES):
+                    raise ControlPlaneError(
+                        f"{prefix}: live voter {node.name} database probe is incomplete"
+                    )
+                for name in DATABASES:
+                    if offline[name] != databases[name]:
+                        raise ControlPlaneError(
+                            f"{prefix}: online/offline probe drift on {node.name} {name}"
+                        )
+                reports.append((node, report))
+                continue
+
+            if probe.get("central_marker") or probe.get("central_active") or \
+                    probe.get("central_restart_pending") is not None:
+                raise ControlPlaneError(
+                    f"{prefix}: incomplete voter {node.name} has activation/restart state"
+                )
+            if index == complete:
+                control = databases["PVN_Control"]
+                if not isinstance(control, dict):
+                    raise ControlPlaneError(
+                        f"{prefix}: next voter {node.name} has a malformed Control DB probe"
+                    )
+                cid_is_legacy_pending = \
+                    control.get("cluster_id_pending") is True and \
+                    control.get("cluster_id") is None
+                cid_is_pinned = \
+                    control.get("cluster_id_pending") is False and \
+                    control.get("cluster_id") == expected_cids["PVN_Control"]
+                if control.get("exists") is not True or \
+                        control.get("name") != "PVN_Control" or \
+                        control.get("clustered") is not True or \
+                        control.get("local_address") != f"ssl:{node.control_ip}:6646" or \
+                        control.get("preactivation_join") is not True or \
+                        not (cid_is_legacy_pending or cid_is_pinned) or \
+                        control.get("remote_addresses") != [
+                            f"ssl:{discovery.nodes[0].control_ip}:6646"
+                        ] or \
+                        control.get("server_id") in control_server_ids or \
+                        not control.get("server_id"):
+                    raise ControlPlaneError(
+                        f"{prefix}: next voter {node.name} is not an exact pending Control DB join"
+                    )
+                if any(databases[name].get("exists") for name in
+                       ("OVN_Northbound", "OVN_Southbound")):
+                    raise ControlPlaneError(
+                        f"{prefix}: next voter {node.name} has unexpected OVN database state"
+                    )
+            elif any(info.get("exists") for info in databases.values()):
+                raise ControlPlaneError(
+                    f"{prefix}: later voter {node.name} has central database state"
+                )
+        return reports
+
     def _validate_ssh(
         self, records: list[tuple[int, str, str, str, str, str, str]]
     ) -> None:
@@ -1525,10 +1722,12 @@ class ControlPlane:
         ]
         if package_repin:
             source_phase = ledger["phase"]
-            description = (
-                "untouched planned ledger" if source_phase == "planned" else
-                "exact staged seed-activation crash window"
-            )
+            if source_phase == "planned":
+                description = "untouched planned ledger"
+            elif source_phase == "staged":
+                description = "exact staged seed-activation crash window"
+            else:
+                description = f"exact {source_phase} pending-join crash window"
             actions.insert(
                 0,
                 f"atomically repin the {description} to the uniform newer package",
@@ -1614,16 +1813,31 @@ class ControlPlane:
                 )
                 if discovery.mode == "raft":
                     control_cid = control_info.get("cluster_id")
-                    if not isinstance(control_cid, str) or not control_cid:
+                    pending_control_cid = control_info.get("cluster_id_pending") is True
+                    if pending_control_cid:
+                        db_cids = ledger["db_cluster_ids"]
+                        if node == seed or expected_control_cid is None or \
+                                control_info.get("cluster_id") is not None or \
+                                control_info.get("remote_addresses") != [
+                                    f"ssl:{seed.control_ip}:6646"
+                                ] or \
+                                not control_info.get("server_id") or \
+                                type(control_info.get("created")) is not bool or \
+                                set(db_cids) != set(DATABASES) or \
+                                db_cids.get("PVN_Control") != expected_control_cid:
+                            raise ControlPlaneError(
+                                f"node {node.name} has an unpinned pending Control DB join"
+                            )
+                    elif not isinstance(control_cid, str) or not control_cid:
                         raise ControlPlaneError(f"node {node.name} Control DB lacks a cluster ID")
-                    if expected_control_cid is None:
+                    if expected_control_cid is None and not pending_control_cid:
                         if control_info.get("created") is not True:
                             raise ControlPlaneError(
                                 "existing seed Control DB is not pinned by the ledger"
                             )
                         ledger["control_db_cluster_id"] = control_cid
                         self.store.update(ledger)
-                    elif control_cid != expected_control_cid:
+                    elif not pending_control_cid and control_cid != expected_control_cid:
                         raise ControlPlaneError(
                             f"node {node.name} Control DB cluster ID drift from the ledger"
                         )
@@ -1631,7 +1845,15 @@ class ControlPlane:
                     discovery, ledger, f"central target activation on {node.name}"
                 )
                 self.backend.activate_central(node)
-                cids = self._wait_central(discovery, index, ledger["db_cluster_ids"])
+                try:
+                    cids = self._wait_central(discovery, index, ledger["db_cluster_ids"])
+                except ControlPlaneError as error:
+                    if discovery.mode == "raft" and pending_control_cid:
+                        raise ControlPlaneError(
+                            f"node {node.name} pending Control DB did not learn the "
+                            f"ledger-pinned cluster ID after activation: {error}"
+                        ) from error
+                    raise
                 if not ledger["db_cluster_ids"]:
                     ledger["db_cluster_ids"] = cids
                 elif cids != ledger["db_cluster_ids"]:
@@ -1686,28 +1908,42 @@ class ControlPlane:
         if ledger.get("phase") == "planned":
             self.backend.assert_planned_package_repin_safe(discovery)
             return
-        if ledger.get("phase") != "staged":
-            raise ControlPlaneError("package repin source phase is unsupported")
-        prefix = "staged ledger package repin refused"
-        report = self.backend.assert_staged_seed_package_repin_safe(discovery, ledger)
-        try:
-            live_cids = self._verify_reports(
-                discovery, [(discovery.nodes[0], report)], 1, {}
+        if ledger.get("phase") == "staged":
+            prefix = "staged ledger package repin refused"
+            report = self.backend.assert_staged_seed_package_repin_safe(discovery, ledger)
+            try:
+                live_cids = self._verify_reports(
+                    discovery, [(discovery.nodes[0], report)], 1, {}
+                )
+            except ControlPlaneError as error:
+                raise ControlPlaneError(f"{prefix}: {error}") from error
+            offline = report.get("offline", {})
+            offline_cids = {
+                name: offline.get(name, {}).get("cluster_id") for name in DATABASES
+            }
+            if live_cids != offline_cids:
+                raise ControlPlaneError(
+                    f"{prefix}: online/offline seed database cluster IDs disagree"
+                )
+            if live_cids.get("PVN_Control") != ledger["control_db_cluster_id"]:
+                raise ControlPlaneError(
+                    f"{prefix}: healthy seed Control DB cluster ID differs from the ledger"
+                )
+            return
+        complete = ledger.get("central_complete")
+        if ledger.get("phase") == f"central-{complete}":
+            prefix = f"central-{complete} ledger package repin refused"
+            reports = self.backend.assert_partial_central_package_repin_safe(
+                discovery, ledger
             )
-        except ControlPlaneError as error:
-            raise ControlPlaneError(f"{prefix}: {error}") from error
-        offline = report.get("offline", {})
-        offline_cids = {
-            name: offline.get(name, {}).get("cluster_id") for name in DATABASES
-        }
-        if live_cids != offline_cids:
-            raise ControlPlaneError(
-                f"{prefix}: online/offline seed database cluster IDs disagree"
-            )
-        if live_cids.get("PVN_Control") != ledger["control_db_cluster_id"]:
-            raise ControlPlaneError(
-                f"{prefix}: healthy seed Control DB cluster ID differs from the ledger"
-            )
+            try:
+                self._verify_reports(
+                    discovery, reports, complete, ledger["db_cluster_ids"]
+                )
+            except ControlPlaneError as error:
+                raise ControlPlaneError(f"{prefix}: {error}") from error
+            return
+        raise ControlPlaneError("package repin source phase is unsupported")
 
     @staticmethod
     def _package_version_is_newer(candidate: str, pinned: str) -> bool:
@@ -1811,6 +2047,27 @@ class ControlPlane:
         return cls._package_snapshot_repin_allowed(discovery, ledger)
 
     @classmethod
+    def _partial_central_package_repin_allowed(
+        cls, discovery: Discovery, ledger: dict[str, Any]
+    ) -> bool:
+        complete = ledger.get("central_complete")
+        control_cid = ledger.get("control_db_cluster_id")
+        db_cids = ledger.get("db_cluster_ids")
+        if discovery.mode != "raft" or type(complete) is not int or \
+                not 1 <= complete < len(discovery.nodes) or \
+                ledger.get("phase") != f"central-{complete}" or \
+                ledger.get("nodes_complete") != 0 or \
+                not isinstance(control_cid, str) or not control_cid or \
+                not isinstance(db_cids, dict) or set(db_cids) != set(DATABASES) or \
+                db_cids.get("PVN_Control") != control_cid or \
+                not all(isinstance(value, str) and value for value in db_cids.values()) or \
+                not cls._cert_fingerprint_set_valid(
+                    discovery, ledger.get("cert_fingerprints")
+                ):
+            return False
+        return cls._package_snapshot_repin_allowed(discovery, ledger)
+
+    @classmethod
     def _verify_ledger(
         cls, discovery: Discovery, ledger: dict[str, Any],
         allow_package_repin: bool = False,
@@ -1820,7 +2077,8 @@ class ControlPlane:
         package_repin = ledger.get("snapshot") != discovery.snapshot() and \
             allow_package_repin and (
                 cls._planned_package_repin_allowed(discovery, ledger) or
-                cls._staged_seed_package_repin_allowed(discovery, ledger)
+                cls._staged_seed_package_repin_allowed(discovery, ledger) or
+                cls._partial_central_package_repin_allowed(discovery, ledger)
             )
         if ledger.get("snapshot") != discovery.snapshot() and not package_repin:
             raise ControlPlaneError("live membership/topology/package drift from the ledger")

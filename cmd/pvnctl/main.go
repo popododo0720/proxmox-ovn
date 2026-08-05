@@ -219,6 +219,7 @@ func centralInit(args []string) error {
 	mode := flags.String("mode", "standalone", "standalone or raft")
 	local := flags.String("local", "", "local Raft address (required format: ssl:IPv4:6646)")
 	join := flags.String("join", "", "comma-separated existing Raft members")
+	clusterID := flags.String("cid", "", "exact existing OVSDB Raft cluster ID for a join")
 	confirmation := flags.String("confirm", "", "exact PVN cluster ID")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -228,11 +229,12 @@ func centralInit(args []string) error {
 		return err
 	}
 	if err := centraldb.Init(context.Background(), centraldb.ExecRunner{}, centraldb.InitOptions{
-		Database: *database,
-		Schema:   *schema,
-		Mode:     *mode,
-		Local:    *local,
-		Remotes:  splitList(*join),
+		Database:  *database,
+		Schema:    *schema,
+		Mode:      *mode,
+		Local:     *local,
+		Remotes:   splitList(*join),
+		ClusterID: *clusterID,
 	}); err != nil {
 		return err
 	}
