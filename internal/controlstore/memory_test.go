@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -124,6 +125,63 @@ func TestMemoryReferencesUniquenessAndFiltering(t *testing.T) {
 	}
 	if len(resources) != 1 || resources[0].GetMetadata().ID != network.ID {
 		t.Fatalf("filtered resources = %#v", resources)
+	}
+}
+
+func TestMemoryRouterExternalGatewayReferences(t *testing.T) {
+	store := deterministicStore()
+	project, privateNetwork, privateSubnet := baseTopology(t, store)
+	provider := mustCreate(t, store, &model.ProviderNetwork{Name: "public", Shared: true}, "provider").(*model.ProviderNetwork)
+	externalNetwork := mustCreate(t, store, &model.Network{
+		ProjectID:         project.ID,
+		Name:              "public",
+		External:          true,
+		ProviderNetworkID: provider.ID,
+	}, "external-network").(*model.Network)
+	externalSubnet := mustCreate(t, store, &model.Subnet{
+		ProjectID: project.ID,
+		NetworkID: externalNetwork.ID,
+		Name:      "public-v4",
+		CIDR:      "192.0.2.0/24",
+		GatewayIP: "192.0.2.1",
+	}, "external-subnet").(*model.Subnet)
+
+	valid := &model.Router{
+		ProjectID:         project.ID,
+		Name:              "edge",
+		ExternalNetworkID: externalNetwork.ID,
+		ExternalSubnetID:  externalSubnet.ID,
+		ExternalIPAddress: "192.0.2.10",
+		EnableSNAT:        true,
+	}
+	router := mustCreate(t, store, valid, "router").(*model.Router)
+	if _, err := store.Delete(context.Background(), model.KindSubnet, externalSubnet.ID, externalSubnet.Revision, "delete-external-subnet"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("delete referenced external subnet error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*model.Router)
+	}{
+		{"internal network", func(candidate *model.Router) {
+			candidate.ExternalNetworkID = privateNetwork.ID
+			candidate.ExternalSubnetID = privateSubnet.ID
+			candidate.ExternalIPAddress = "10.0.0.10"
+		}},
+		{"subnet on another network", func(candidate *model.Router) { candidate.ExternalSubnetID = privateSubnet.ID }},
+		{"address outside subnet", func(candidate *model.Router) { candidate.ExternalIPAddress = "198.51.100.10" }},
+		{"gateway address", func(candidate *model.Router) { candidate.ExternalIPAddress = externalSubnet.GatewayIP }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := *router
+			candidate.ID = ""
+			candidate.Name = "invalid-" + strings.ReplaceAll(test.name, " ", "-")
+			test.mutate(&candidate)
+			if _, _, err := store.Create(context.Background(), &candidate, "invalid-"+test.name); !errors.Is(err, ErrConflict) {
+				t.Fatalf("Create() error = %v", err)
+			}
+		})
 	}
 }
 

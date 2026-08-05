@@ -217,6 +217,8 @@
         "name": {"type": "string"},
         "description": {"type": "string"},
         "external_network": {"type": {"key": {"type": "uuid", "refTable": "Network", "refType": "strong"}, "min": 0, "max": 1}},
+        "external_subnet": {"type": {"key": {"type": "uuid", "refTable": "Subnet", "refType": "strong"}, "min": 0, "max": 1}},
+        "external_ip_address": {"type": "string"},
         "enable_snat": {"type": "boolean"},
         "revision": {"type": {"key": {"type": "integer", "minInteger": 1}}},
         "applied_revision": {"type": {"key": {"type": "integer", "minInteger": 0}}},

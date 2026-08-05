@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -500,8 +501,29 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 			return err
 		}
 		if value.ExternalNetworkID != "" {
-			if _, err := s.requireLocked(model.KindNetwork, value.ExternalNetworkID, "external_network_id"); err != nil {
+			networkResource, err := s.requireLocked(model.KindNetwork, value.ExternalNetworkID, "external_network_id")
+			if err != nil {
 				return err
+			}
+			network := networkResource.(*model.Network)
+			if !network.External || network.ProviderNetworkID == "" {
+				return storeError(ErrConflict, "external_network_id must reference a provider-backed external network")
+			}
+			subnetResource, err := s.requireLocked(model.KindSubnet, value.ExternalSubnetID, "external_subnet_id")
+			if err != nil {
+				return err
+			}
+			subnet := subnetResource.(*model.Subnet)
+			if subnet.NetworkID != network.ID {
+				return storeError(ErrConflict, "external subnet belongs to a different network")
+			}
+			prefix, prefixErr := netip.ParsePrefix(subnet.CIDR)
+			address, addressErr := netip.ParseAddr(value.ExternalIPAddress)
+			if prefixErr != nil || addressErr != nil || !prefix.Contains(address) {
+				return storeError(ErrConflict, "external_ip_address must be inside the external subnet")
+			}
+			if subnet.GatewayIP != "" && address.String() == subnet.GatewayIP {
+				return storeError(ErrConflict, "external_ip_address must not equal the external subnet gateway")
 			}
 		}
 	case *model.RouterInterface:
@@ -697,7 +719,7 @@ func references(resource model.Resource, kind model.Kind, id string) bool {
 	case *model.IPAllocation:
 		return (kind == model.KindProject && value.ProjectID == id) || (kind == model.KindSubnet && value.SubnetID == id) || (kind == model.KindPort && value.PortID == id)
 	case *model.Router:
-		return (kind == model.KindProject && value.ProjectID == id) || (kind == model.KindNetwork && value.ExternalNetworkID == id)
+		return (kind == model.KindProject && value.ProjectID == id) || (kind == model.KindNetwork && value.ExternalNetworkID == id) || (kind == model.KindSubnet && value.ExternalSubnetID == id)
 	case *model.RouterInterface:
 		return (kind == model.KindProject && value.ProjectID == id) || (kind == model.KindRouter && value.RouterID == id) || (kind == model.KindSubnet && value.SubnetID == id) || (kind == model.KindPort && value.PortID == id)
 	case *model.FloatingIP:

@@ -175,7 +175,23 @@ func validateRouter(r *Router) error {
 	if err := required("project_id", r.ProjectID); err != nil {
 		return err
 	}
-	return validateName("name", r.Name)
+	if err := validateName("name", r.Name); err != nil {
+		return err
+	}
+	if r.ExternalNetworkID == "" {
+		if r.ExternalSubnetID != "" || r.ExternalIPAddress != "" {
+			return invalid("external_network_id", "is required when an external subnet or IP is configured")
+		}
+		return nil
+	}
+	if err := required("external_subnet_id", r.ExternalSubnetID); err != nil {
+		return err
+	}
+	address, err := netip.ParseAddr(r.ExternalIPAddress)
+	if err != nil || !address.Is4() {
+		return invalid("external_ip_address", "must be a valid IPv4 address")
+	}
+	return nil
 }
 
 func validateRouterInterface(r *RouterInterface) error {

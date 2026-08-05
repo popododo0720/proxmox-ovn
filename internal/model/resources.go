@@ -110,6 +110,8 @@ type Router struct {
 	Name              string `json:"name"`
 	Description       string `json:"description,omitempty"`
 	ExternalNetworkID string `json:"external_network_id,omitempty"`
+	ExternalSubnetID  string `json:"external_subnet_id,omitempty"`
+	ExternalIPAddress string `json:"external_ip_address,omitempty"`
 	EnableSNAT        bool   `json:"enable_snat"`
 }
 
