@@ -116,6 +116,7 @@ sed \
     -e 's#\[ -S /run/pvn/manager.sock \]#true#g' \
     -e "s#/usr/bin/systemctl#$readiness_bin/systemctl#g" \
     -e "s#/usr/bin/curl#$readiness_bin/curl#g" \
+    -e "s#/usr/bin/ovn-appctl#$readiness_bin/ovn-appctl#g" \
     -e "s#/usr/sbin/pvnctl#$readiness_bin/pvnctl#g" \
     -e "s#/usr/lib/pvn/pvn-ui-verify#$readiness_bin/ui-verify#g" \
     -e "s#/usr/bin/sleep#$readiness_bin/sleep#g" \
@@ -125,6 +126,8 @@ for command in systemctl pvnctl ui-verify sleep; do
     printf '#!/bin/sh\nexit 0\n' > "$readiness_bin/$command"
     chmod 0755 "$readiness_bin/$command"
 done
+printf '#!/bin/sh\nprintf "connected\\n"\n' > "$readiness_bin/ovn-appctl"
+chmod 0755 "$readiness_bin/ovn-appctl"
 printf '#!/bin/sh\nexit 22\n' > "$readiness_bin/curl"
 chmod 0755 "$readiness_bin/curl"
 if "$readiness_test" >/dev/null 2>&1; then
@@ -132,6 +135,12 @@ if "$readiness_test" >/dev/null 2>&1; then
     exit 1
 fi
 printf '#!/bin/sh\nexit 0\n' > "$readiness_bin/curl"
+printf '#!/bin/sh\nprintf "disconnected\\n"\n' > "$readiness_bin/ovn-appctl"
+if "$readiness_test" >/dev/null 2>&1; then
+    echo "PVN readiness must fail closed while OVN Southbound is disconnected" >&2
+    exit 1
+fi
+printf '#!/bin/sh\nprintf "connected\\n"\n' > "$readiness_bin/ovn-appctl"
 if ! "$readiness_test" >/dev/null 2>&1; then
     echo "PVN readiness did not accept a fully healthy test stack" >&2
     exit 1
