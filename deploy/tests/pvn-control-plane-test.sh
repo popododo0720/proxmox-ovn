@@ -90,6 +90,8 @@ class FakeBackend:
         self.discoveries = 0
         self.discover_hook = None
         self.staged_report_hook = None
+        self.complete_report_hook = None
+        self.doctor_fail = set()
 
     def discover(self):
         self.discoveries += 1
@@ -168,6 +170,36 @@ class FakeBackend:
             )
         return [(node, self.central_status(node, found.mode))
                 for node in found.nodes[:complete]]
+
+    def assert_complete_package_repin_safe(self, found, ledger):
+        names = [node.name for node in found.nodes]
+        expected_restart = {
+            node.name: node.package_version for node in found.nodes
+        }
+        if self.central != names or self.central_markers != names or \
+                self.nodes != names or self.node_markers != names or \
+                self.node_targets != names or set(self.control_dbs) != set(names) or \
+                self.pending_control_dbs or self.pending_control_remotes or \
+                self.pending_control_server_ids or self.pending_control_cids or \
+                self.restart_pending != expected_restart:
+            raise ControlPlaneError("complete ledger package repin refused: runtime shape")
+        if found.mode == "raft" and any(
+                self.control_dbs[name] != ledger["control_db_cluster_id"]
+                for name in names):
+            raise ControlPlaneError(
+                "complete ledger package repin refused: wrong Control CID"
+            )
+        reports = [(node, self.central_status(node, found.mode)) for node in found.nodes]
+        if self.complete_report_hook is not None:
+            self.complete_report_hook(reports)
+        for node in found.nodes:
+            status = self.node_status(node)
+            if not all(status.get(key) is True for key in
+                       ("ready", "service_ready", "doctor", "marker")):
+                raise ControlPlaneError(
+                    f"complete ledger package repin refused: doctor failed on {node.name}"
+                )
+        return reports
 
     def ensure_shared_config(self, config):
         encoded = json.dumps(config, sort_keys=True)
@@ -292,7 +324,14 @@ class FakeBackend:
             self.log.append("node:" + node.name)
 
     def node_status(self, node):
-        return {"ready": node.name in self.nodes, "marker": node.name in self.nodes}
+        service_ready = node.name in self.nodes
+        doctor = node.name not in self.doctor_fail
+        return {
+            "ready": service_ready and doctor,
+            "service_ready": service_ready,
+            "doctor": doctor,
+            "marker": node.name in self.node_markers,
+        }
 
 
 def expect_error(action, text):
@@ -626,6 +665,21 @@ def partial_central_ledger(found, cids, complete=1, **overrides):
     return ledger
 
 
+def complete_ledger(found, cids, **overrides):
+    count = len(found.nodes)
+    ledger = planned_ledger(
+        found,
+        phase="complete",
+        central_complete=count,
+        nodes_complete=count,
+        cert_fingerprints=complete_fingerprints(found),
+        control_db_cluster_id=cids["PVN_Control"] if found.mode == "raft" else None,
+        db_cluster_ids=copy.deepcopy(cids) if found.mode == "raft" else {},
+    )
+    ledger.update(overrides)
+    return ledger
+
+
 def enter_seed_activation_crash(backend):
     seed = backend.found.nodes[0].name
     backend.control_dbs[seed] = backend.cids["PVN_Control"]
@@ -654,6 +708,21 @@ def enter_partial_join_crash(backend, complete=1, cid_known=False):
     }
     backend.pending_control_server_ids = {
         pending.name: f"pending-sid-{pending.name}"
+    }
+
+
+def enter_complete_update(backend):
+    names = [node.name for node in backend.found.nodes]
+    backend.central = list(names)
+    backend.central_markers = list(names)
+    backend.nodes = list(names)
+    backend.node_markers = list(names)
+    backend.node_targets = list(names)
+    backend.control_dbs = {
+        name: backend.cids["PVN_Control"] for name in names
+    }
+    backend.restart_pending = {
+        node.name: node.package_version for node in backend.found.nodes
     }
 
 
@@ -1654,6 +1723,84 @@ with tempfile.TemporaryDirectory() as temporary:
     assert result["complete"] and result["nodes"] == 5
     assert backend.central == ["pve-a", "pve-b", "pve-c", "pve-d", "pve-e"]
     assert "init:pve-d" not in backend.log and backend.log.count("init:pve-e") == 1
+
+
+# A fully converged cluster may adopt one uniform forward package rollout only
+# while every active voter has an unconsumed restart marker for that exact
+# package, all three databases remain exact N/N, and a fresh node doctor passes.
+for count in (1, 3, 5):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        pinned = discovery(count, package="0.1.1")
+        backend = FakeBackend(discovery(count, package="0.1.2"))
+        enter_complete_update(backend)
+        store.create(complete_ledger(pinned, backend.cids))
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        before = copy.deepcopy(store.load())
+        plan = control.plan()
+        assert plan["read_only"] and plan["package_repin_required"] is True
+        assert plan["package_repin_source_phase"] == "complete"
+        assert "fully converged restart-pending cluster" in plan["actions"][0]
+        assert store.load() == before
+
+        original_update = store.update
+        repin_was_leased = []
+
+        def observe_complete_update(value):
+            previous = store.load()
+            if previous["snapshot"] != value["snapshot"]:
+                assert lease_state.exists(), "complete package snapshot repin escaped the lease"
+                repin_was_leased.append(True)
+            original_update(value)
+
+        store.update = observe_complete_update
+        result = control.apply(backend.found.confirmation)
+        assert result["complete"] and repin_was_leased == [True]
+        assert {node["package_version"] for node in store.load()["snapshot"]["nodes"]} == {
+            "0.1.2"
+        }
+        assert not any(entry.startswith(("init:", "central:", "node:"))
+                       for entry in backend.log)
+
+
+def complete_runtime_repin_rejected(case):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        pinned = discovery(package="0.1.1")
+        backend = FakeBackend(discovery(package="0.1.2"))
+        enter_complete_update(backend)
+        store.create(complete_ledger(pinned, backend.cids))
+        if case == "restart-marker-consumed":
+            backend.restart_pending.pop(backend.found.nodes[0].name)
+        elif case == "node-target-inactive":
+            backend.node_targets.remove(backend.found.nodes[1].name)
+        elif case == "doctor-failed":
+            backend.doctor_fail.add(backend.found.nodes[2].name)
+        elif case == "database-disconnected":
+            backend.complete_report_hook = lambda reports: \
+                reports[0][1]["databases"][0].update(connected_members=2)
+        elif case == "database-cid-drift":
+            backend.complete_report_hook = lambda reports: \
+                reports[1][1]["databases"][1].update(cluster_id="foreign-cid")
+        elif case == "control-cid-drift":
+            backend.control_dbs[backend.found.nodes[1].name] = "foreign-control-cid"
+        else:
+            raise AssertionError(case)
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        before = copy.deepcopy(store.load())
+        expect_error(control.plan, "repin refused")
+        assert store.load() == before
+
+
+for complete_case in (
+    "restart-marker-consumed",
+    "node-target-inactive",
+    "doctor-failed",
+    "database-disconnected",
+    "database-cid-drift",
+    "control-cid-drift",
+):
+    complete_runtime_repin_rejected(complete_case)
 
 
 def partial_runtime_repin_rejected(case):
