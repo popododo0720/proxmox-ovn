@@ -99,6 +99,8 @@ export function RoutersPage() {
         { key: 'name', label: 'Router', render: (item) => <strong>{item.name || item.id}</strong> },
         { key: 'project_id', label: 'Project', className: 'mono-cell' },
         { key: 'external_network_id', label: 'External network', className: 'mono-cell' },
+        { key: 'external_subnet_id', label: 'External subnet', className: 'mono-cell' },
+        { key: 'external_ip_address', label: 'Gateway IP', className: 'mono-cell' },
         { key: 'enable_snat', label: 'SNAT' },
         { key: 'state', label: 'State' },
       ]}
@@ -107,6 +109,8 @@ export function RoutersPage() {
         { name: 'name', label: 'Name', required: true, placeholder: 'edge' },
         { name: 'project_id', label: 'Project ID', required: true },
         { name: 'external_network_id', label: 'External network ID' },
+        { name: 'external_subnet_id', label: 'External subnet ID' },
+        { name: 'external_ip_address', label: 'Router external IPv4', placeholder: '203.0.113.10' },
         { name: 'enable_snat', label: 'Enable SNAT', type: 'checkbox', defaultValue: true },
       ]}
       allowDelete

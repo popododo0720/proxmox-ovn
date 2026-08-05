@@ -69,6 +69,8 @@ export interface Subnet extends BaseResource {
 export interface Router extends BaseResource {
   project_id?: string;
   external_network_id?: string;
+  external_subnet_id?: string;
+  external_ip_address?: string;
   enable_snat?: boolean;
 }
 
