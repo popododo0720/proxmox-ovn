@@ -250,6 +250,7 @@ for executable in \
     /usr/lib/pvn/pvn-node-ready \
     /usr/lib/pvn/pvn-guest-gate \
     /usr/lib/pvn/pvn-ui-verify \
+    /usr/bin/ovs-appctl \
     /usr/bin/test \
     /bin/chown \
     /bin/true

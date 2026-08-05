@@ -1,10 +1,11 @@
 #!/bin/sh
 set -eu
+set -f
 
 nb_port=${PVN_OVN_NB_PORT:-6641}
 sb_port=${PVN_OVN_SB_PORT:-6642}
 listen=${PVN_OVN_LISTEN:-}
-attempts=${PVN_OVN_LISTENER_ATTEMPTS:-30}
+attempts=${PVN_OVN_LISTENER_ATTEMPTS:-20}
 retry_delay=${PVN_OVN_LISTENER_RETRY_DELAY:-1}
 
 valid_port() {
@@ -14,12 +15,12 @@ valid_port() {
 
 valid_port "$nb_port" || { echo "invalid PVN_OVN_NB_PORT" >&2; exit 2; }
 valid_port "$sb_port" || { echo "invalid PVN_OVN_SB_PORT" >&2; exit 2; }
-[ "$attempts" -ge 1 ] 2>/dev/null && [ "$attempts" -le 300 ] 2>/dev/null || {
-    echo "PVN_OVN_LISTENER_ATTEMPTS must be between 1 and 300" >&2
+[ "$attempts" -ge 1 ] 2>/dev/null && [ "$attempts" -le 20 ] 2>/dev/null || {
+    echo "PVN_OVN_LISTENER_ATTEMPTS must be between 1 and 20" >&2
     exit 2
 }
-[ "$retry_delay" -ge 0 ] 2>/dev/null && [ "$retry_delay" -le 60 ] 2>/dev/null || {
-    echo "PVN_OVN_LISTENER_RETRY_DELAY must be between 0 and 60 seconds" >&2
+[ "$retry_delay" -ge 0 ] 2>/dev/null && [ "$retry_delay" -le 1 ] 2>/dev/null || {
+    echo "PVN_OVN_LISTENER_RETRY_DELAY must be between 0 and 1 second" >&2
     exit 2
 }
 [ "$nb_port" = 6641 ] || { echo "PVN OVN NB client port must be 6641" >&2; exit 2; }
@@ -40,21 +41,26 @@ fi
     exit 2
 }
 
-nb_socket=unix:/run/ovn/ovnnb_db.sock
-sb_socket=unix:/run/ovn/ovnsb_db.sock
+appctl=/usr/bin/ovs-appctl
 
 configure_listener() {
     label=$1
-    command=$2
-    socket=$3
-    endpoint=$4
+    control_socket=$2
+    unix_remote=$3
+    database_remote=$4
+    endpoint=$5
     attempt=1
     last_error=
 
     while [ "$attempt" -le "$attempts" ]; do
-        if last_error=$("$command" --timeout=3 --db="$socket" \
-            --inactivity-probe=60000 set-connection "$endpoint" 2>&1); then
+        status=0
+        configure_listener_once || status=$?
+        if [ "$status" -eq 0 ]; then
             return 0
+        fi
+        if [ "$status" -eq 2 ]; then
+            echo "$last_error" >&2
+            return 1
         fi
         if [ "$attempt" -lt "$attempts" ]; then
             sleep "$retry_delay"
@@ -67,7 +73,107 @@ configure_listener() {
     return 1
 }
 
-configure_listener NB /usr/bin/ovn-nbctl "$nb_socket" "pssl:${nb_port}:${listen}"
-configure_listener SB /usr/bin/ovn-sbctl "$sb_socket" "pssl:${sb_port}:${listen}"
+inspect_remotes() {
+    remotes=$1
+    saw_unix=0
+    saw_database=0
+    saw_endpoint=0
+    old_ifs=$IFS
+    IFS='
+'
+    for remote in $remotes; do
+        case "$remote" in
+            "$unix_remote") saw_unix=$((saw_unix + 1)) ;;
+            "$database_remote") saw_database=$((saw_database + 1)) ;;
+            "$endpoint") saw_endpoint=$((saw_endpoint + 1)) ;;
+            *)
+                IFS=$old_ifs
+                last_error="$label database exposes unexpected process remote: $remote"
+                return 2
+                ;;
+        esac
+    done
+    IFS=$old_ifs
+    if [ "$saw_unix" -ne 1 ] || [ "$saw_database" -gt 1 ] || \
+        [ "$saw_endpoint" -gt 1 ]; then
+        last_error="$label database process remote set is incomplete or duplicated"
+        return 2
+    fi
+    return 0
+}
+
+list_remotes() {
+    if ! listed=$("$appctl" --timeout=3 --target="$control_socket" \
+        ovsdb-server/list-remotes 2>&1); then
+        last_error="$label database list-remotes failed: $listed"
+        return 1
+    fi
+    inspect_remotes "$listed"
+}
+
+configure_listener_once() {
+    status=0
+    list_remotes || status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    if [ "$saw_database" -eq 0 ] && [ "$saw_endpoint" -eq 1 ]; then
+        return 0
+    fi
+
+    # Establish the node-local TLS endpoint before detaching the replicated
+    # remote source. A failed add leaves the existing listener source intact;
+    # a failed remove leaves both allowed remotes for the next retry.
+    if [ "$saw_endpoint" -eq 0 ]; then
+        if ! changed=$("$appctl" --timeout=3 --target="$control_socket" \
+            ovsdb-server/add-remote "$endpoint" 2>&1); then
+            last_error="$label database add-remote failed: $changed"
+            return 1
+        fi
+    fi
+    if [ "$saw_database" -eq 1 ]; then
+        if ! changed=$("$appctl" --timeout=3 --target="$control_socket" \
+            ovsdb-server/remove-remote "$database_remote" 2>&1); then
+            last_error="$label database remove-remote failed: $changed"
+            return 1
+        fi
+    fi
+
+    status=0
+    list_remotes || status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    if [ "$saw_database" -eq 0 ] && [ "$saw_endpoint" -eq 1 ]; then
+        return 0
+    fi
+    last_error="$label database process listener did not converge to the exact local remote set"
+    return 1
+}
+
+configure_nb() {
+    configure_listener NB /run/ovn/ovnnb_db.ctl \
+        punix:/var/run/ovn/ovnnb_db.sock \
+        db:OVN_Northbound,NB_Global,connections \
+        "pssl:${nb_port}:${listen}"
+}
+
+configure_sb() {
+    configure_listener SB /run/ovn/ovnsb_db.ctl \
+        punix:/var/run/ovn/ovnsb_db.sock \
+        db:OVN_Southbound,SB_Global,connections \
+        "pssl:${sb_port}:${listen}"
+}
+
+case $# in
+    0)
+        configure_nb
+        configure_sb
+        ;;
+    1)
+        case "$1" in
+            nb) configure_nb ;;
+            sb) configure_sb ;;
+            *) echo "usage: ${0##*/} [nb|sb]" >&2; exit 2 ;;
+        esac
+        ;;
+    *) echo "usage: ${0##*/} [nb|sb]" >&2; exit 2 ;;
+esac
 
 exit 0

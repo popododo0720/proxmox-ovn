@@ -258,6 +258,12 @@ Raft port 6646. Allow 6643, 6644, and 6646 only among voters; allow 6641, 6642,
 and 6645 only from PVN nodes. Port 8443 is the same-node PVN web/API endpoint.
 No insecure TCP listener is created.
 
+NB/SB client listeners are process-local `ovsdb-server` remotes, applied again
+after every database-process restart. PVN removes only the packaged replicated
+`db:...connections` reference from that process during migration and refuses
+any other unexpected remote; node-local listener addresses are never written
+to replicated `NB_Global` or `SB_Global` rows.
+
 PVN Control's client endpoint is fixed at 6645, its Raft endpoint is fixed at
 6646, and startup rejects other values. Its node-local control socket lives in
 `/run/pvn-control`, separate from the manager's `/run/pvn` runtime directory;
