@@ -152,7 +152,6 @@ def discover_members() -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
     nodes.sort(key=lambda item: (item["id"], item["name"]))
     membership_snapshot = {
         "cluster_name": cluster_name,
-        "members_version": members_version,
         "cluster_version": cluster_version,
         "nodes": [
             {"name": node["name"], "node_id": node["id"], "management_ip": node["ip"]}
@@ -575,7 +574,6 @@ def verify_membership_snapshot(expected):
     nodes.sort(key=lambda item: (item["node_id"], item["name"]))
     actual = {
         "cluster_name": cluster.get("name"),
-        "members_version": members_version,
         "cluster_version": cluster_version,
         "nodes": nodes,
     }

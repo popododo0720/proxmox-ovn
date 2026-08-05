@@ -30,8 +30,8 @@ mkdir -p "$PERL_DIR/PVE"
 cat > "$MEMBERS" <<'EOF'
 {
   "nodename": "prox1",
-  "version": 11,
-  "cluster": {"name": "lab-cluster", "version": 11, "nodes": 3, "quorate": 1},
+  "version": 9,
+  "cluster": {"name": "lab-cluster", "version": 3, "nodes": 3, "quorate": 1},
   "nodelist": {
     "prox2": {"id": 1, "online": 1, "ip": "192.168.0.126"},
     "prox1": {"id": 2, "online": 1, "ip": "192.168.0.80"},
@@ -145,10 +145,14 @@ Path(os.environ["PVN_TEST_REMOTE_HELPER"]).write_text(remote_helper, encoding="u
 
 host = args[destination_index][5:]
 node = request.get("node")
+node_members_version = {"prox1": 9, "prox2": 11, "prox3": 5}.get(node)
+if node_members_version is None:
+    stop("request does not identify a known PVE member")
 lease_held = Path(os.environ["PVN_TEST_GLOBAL_LOCK"]).is_file()
 with open(os.environ["PVN_TEST_LOG"], "a", encoding="utf-8") as stream:
-    stream.write("host=%s node=%s action=%s lease=%d transport=stdin argv_request=0 options=%s\n" % (
-        host, node, action, lease_held, " ".join(args[:destination_index]),
+    stream.write("host=%s node=%s action=%s lease=%d members_version=%d transport=stdin argv_request=0 options=%s\n" % (
+        host, node, action, lease_held, node_members_version,
+        " ".join(args[:destination_index]),
     ))
 
 cleanup_actions = {
@@ -156,9 +160,9 @@ cleanup_actions = {
 }
 members_path = Path(os.environ["PVN_TOPOLOGY_MEMBERS_FILE"])
 members = json.loads(members_path.read_text(encoding="utf-8"))
+members["version"] = node_members_version
 actual_membership = {
     "cluster_name": members["cluster"]["name"],
-    "members_version": members["version"],
     "cluster_version": members["cluster"]["version"],
     "nodes": sorted((
         {"name": name, "node_id": entry["id"], "management_ip": entry["ip"]}
@@ -166,6 +170,8 @@ actual_membership = {
         if entry.get("online") in (1, True, "1")
     ), key=lambda item: (item["node_id"], item["name"])),
 }
+if "members_version" in request.get("membership_snapshot", {}):
+    stop("node-local PVE members version leaked into the shared membership guard")
 if action not in cleanup_actions and request.get("membership_snapshot") != actual_membership:
     stop("exact PVE membership snapshot changed during topology apply")
 
@@ -231,9 +237,21 @@ def save():
 
 def drift_membership():
     current = json.loads(members_path.read_text(encoding="utf-8"))
-    current["version"] += 1
-    current["cluster"]["version"] += 1
-    current["nodelist"]["prox3"]["ip"] = "192.168.0.77"
+    kind = os.environ.get("PVN_TEST_MEMBERSHIP_DRIFT_KIND", "cluster-version")
+    if kind == "members-version":
+        current["version"] += 1
+    elif kind == "cluster-version":
+        current["cluster"]["version"] += 1
+    elif kind == "node-name":
+        current["nodelist"]["prox4"] = current["nodelist"].pop("prox3")
+    elif kind == "node-id":
+        current["nodelist"]["prox3"]["id"] = 4
+    elif kind == "node-ip":
+        current["nodelist"]["prox3"]["ip"] = "192.168.0.77"
+    elif kind == "node-offline":
+        current["nodelist"]["prox3"]["online"] = 0
+    else:
+        stop("unknown membership drift kind: %s" % kind)
     members_path.write_text(json.dumps(current, sort_keys=True), encoding="utf-8")
 
 
@@ -457,6 +475,12 @@ reset_state
 [ "$(grep -c 'action=probe' "$LOG")" -eq 3 ] || fail "plan did not probe all online members"
 [ "$(grep -c 'transport=stdin argv_request=0' "$LOG")" -eq 3 ] ||
     fail "remote requests were not carried exclusively through stdin"
+for node_version in prox1:9 prox2:11 prox3:5; do
+    node=${node_version%:*}
+    version=${node_version#*:}
+    grep -q "node=$node action=probe .*members_version=$version" "$LOG" ||
+        fail "plan did not tolerate node-local members version $version on $node"
+done
 assert_no_mutation
 grep -q 'guest-mtu=1300 ceiling=1342' "$WORK/plan.out" || fail "safe default guest MTU is wrong"
 grep -q 'live-mtu=1442 hardware-max-mtu=65535' "$WORK/plan.out" ||
@@ -473,6 +497,9 @@ grep -Fq 'sys.stdin.buffer.read(REMOTE_REQUEST_LIMIT + 1)' "$REMOTE_HELPER" ||
     fail "remote request stdin is not bounded"
 if grep -Fq 'sys.argv[2]' "$REMOTE_HELPER" || grep -Fq 'bytes.fromhex' "$REMOTE_HELPER"; then
     fail "remote request metadata is still decoded from process argv"
+fi
+if grep -Fq '"members_version":' "$REMOTE_HELPER"; then
+    fail "node-local PVE members version is still part of the remote equality guard"
 fi
 if grep -Fq 'pvesh("delete", "/nodes/%s/network"' "$REMOTE_HELPER"; then
     fail "remote helper still has broad pending-network deletion"
@@ -571,7 +598,8 @@ grep -q 'uses a provider NIC' "$WORK/provider-corosync.out" ||
 cp "$WORK/corosync.geneve" "$COROSYNC"
 
 reset_state
-"$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+PVN_TEST_MEMBERSHIP_DRIFT_KIND=members-version PVN_TEST_DRIFT_AFTER_STAGE_HOST=prox2 \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
     --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/apply.out"
 [ ! -e "$GLOBAL_LOCK" ] || fail "successful apply left the cluster-global lock behind"
 if grep -q 'lease=0' "$LOG"; then
@@ -585,6 +613,12 @@ fi
 [ "$(grep -c 'action=verify-network' "$LOG")" -eq 3 ] || fail "each applied node was not verified"
 [ "$(grep -c 'action=write-ledger' "$LOG")" -eq 1 ] || fail "shared ledger was not written exactly once"
 [ "$(grep -c 'action=verify-ledger' "$LOG")" -eq 3 ] || fail "shared ledger was not read back on every node"
+for node_version in prox1:9 prox2:11 prox3:5; do
+    node=${node_version%:*}
+    version=${node_version#*:}
+    grep -q "node=$node .*members_version=$version" "$LOG" ||
+        fail "apply did not tolerate node-local members version $version on $node"
+done
 grep -q 'PVN activation markers and central/node targets remain untouched' "$WORK/apply.out" ||
     fail "apply did not report the activation boundary"
 
@@ -677,22 +711,25 @@ assert state["nodes"]["prox2"]["staged"] is True
 assert all(value["network"] == "initial" for value in state["nodes"].values())
 PY
 
-reset_state
-if PVN_TEST_DRIFT_AFTER_STAGE_HOST=prox2 "$TOPOLOGY" apply \
-    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
-    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/membership-stage-drift.out" 2>&1
-then
-    fail "membership drift after network staging unexpectedly succeeded"
-fi
-grep -q 'PVE membership changed before network staging' "$WORK/membership-stage-drift.out" ||
-    fail "staging membership drift did not fail closed at the next mutation boundary"
-[ "$(grep -c 'action=stage-network' "$LOG")" -eq 1 ] ||
-    fail "another network candidate was staged after membership drift"
-for node in prox1 prox2 prox3; do
-    grep -q "node=$node action=discard-stage" "$LOG" ||
-        fail "membership drift did not sweep prepared node $node"
-done
-python3 - "$STATE" <<'PY'
+for drift_kind in cluster-version node-name node-id node-ip node-offline; do
+    reset_state
+    if PVN_TEST_MEMBERSHIP_DRIFT_KIND=$drift_kind PVN_TEST_DRIFT_AFTER_STAGE_HOST=prox2 \
+        "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+        --provider-port-ready "$ACK" --confirm lab-cluster \
+        > "$WORK/membership-stage-drift-$drift_kind.out" 2>&1
+    then
+        fail "$drift_kind membership drift after network staging unexpectedly succeeded"
+    fi
+    grep -Eq 'PVE membership changed before network staging|every cluster member must be online' \
+        "$WORK/membership-stage-drift-$drift_kind.out" ||
+        fail "$drift_kind membership drift did not fail closed at the next mutation boundary"
+    [ "$(grep -c 'action=stage-network' "$LOG")" -eq 1 ] ||
+        fail "another network candidate was staged after $drift_kind membership drift"
+    for node in prox1 prox2 prox3; do
+        grep -q "node=$node action=discard-stage" "$LOG" ||
+            fail "$drift_kind membership drift did not sweep prepared node $node"
+    done
+    python3 - "$STATE" <<'PY'
 import json
 import sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -700,9 +737,11 @@ assert all(not value["staged"] for value in state["nodes"].values())
 assert all(value["network"] == "initial" for value in state["nodes"].values())
 assert state["ledger"] is None
 PY
+done
 
 reset_state
-if PVN_TEST_DRIFT_BEFORE_LEDGER_HOST=prox3 "$TOPOLOGY" apply \
+if PVN_TEST_MEMBERSHIP_DRIFT_KIND=node-ip PVN_TEST_DRIFT_BEFORE_LEDGER_HOST=prox3 \
+    "$TOPOLOGY" apply \
     --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
     --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/membership-ledger-drift.out" 2>&1
 then
