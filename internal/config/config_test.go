@@ -22,12 +22,17 @@ func TestLoadAndEnvironmentOverrides(t *testing.T) {
 	}
 	t.Setenv("PVN_NODE_NAME", "pve-a")
 	t.Setenv("PVN_GUEST_MTU", "1450")
+	t.Setenv("PVN_TLS_CERT", "/run/credentials/pvn-manager.service/cert")
+	t.Setenv("PVN_TLS_KEY", "/run/credentials/pvn-manager.service/key")
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Cluster.NodeName != "pve-a" || cfg.Networking.GuestMTU != 1450 {
 		t.Fatalf("environment overrides not applied: %+v", cfg)
+	}
+	if cfg.Manager.TLSCert != "/run/credentials/pvn-manager.service/cert" || cfg.Manager.TLSKey != "/run/credentials/pvn-manager.service/key" {
+		t.Fatalf("credential overrides not applied: %+v", cfg.Manager)
 	}
 }
 

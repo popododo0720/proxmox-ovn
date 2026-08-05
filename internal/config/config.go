@@ -132,6 +132,12 @@ func applyEnv(cfg *Config) {
 	if value := os.Getenv("PVN_PVE_URL"); value != "" {
 		cfg.Manager.PVEURL = value
 	}
+	if value := os.Getenv("PVN_TLS_CERT"); value != "" {
+		cfg.Manager.TLSCert = value
+	}
+	if value := os.Getenv("PVN_TLS_KEY"); value != "" {
+		cfg.Manager.TLSKey = value
+	}
 	if value := os.Getenv("PVN_NODE_NAME"); value != "" {
 		cfg.Cluster.NodeName = value
 	}
