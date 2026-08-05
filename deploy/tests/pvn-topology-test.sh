@@ -221,6 +221,7 @@ else:
 
 node_state = state["nodes"].setdefault(node, {
     "network": "initial", "staged": False, "journal": False, "phase": None,
+    "effective_underlay_mtu": None,
 })
 if (
     os.environ.get("PVN_TEST_FAIL_FINAL_PROBE_HOST") == node
@@ -280,6 +281,10 @@ def report():
     network = node_state["network"]
     interfaces_sha = sha("interfaces-%s-%s" % (node, network))
     pending_sha = sha("interfaces-%s-desired" % node) if node_state["staged"] else None
+    bad_mtu_host = os.environ.get("PVN_TEST_UNRESTORABLE_MTU_HOST")
+    bad_mtu_role = os.environ.get("PVN_TEST_UNRESTORABLE_MTU_ROLE")
+    geneve_configured_mtu = 1450 if node == bad_mtu_host and bad_mtu_role == "geneve" else 1442
+    provider_configured_mtu = 1450 if node == bad_mtu_host and bad_mtu_role == "provider" else 1442
     return {
         "node": node,
         "interfaces_sha256": interfaces_sha,
@@ -293,11 +298,11 @@ def report():
         },
         "geneve": {
             "interface": "ens4", "address": geneve[node], "mac": "fa:16:3e:00:00:04",
-            "mtu": 1442, "max_mtu": 65535,
+            "mtu": 1442, "max_mtu": 65535, "configured_mtu": geneve_configured_mtu,
         },
         "provider": {
             "interface": "ens5", "address": provider[node], "mac": "fa:16:3e:00:00:05",
-            "mtu": 1442, "max_mtu": 65535,
+            "mtu": 1442, "max_mtu": 65535, "configured_mtu": provider_configured_mtu,
         },
         "network_state": network,
         "journal_phase": node_state["phase"],
@@ -313,6 +318,17 @@ def emit(**values):
 
 
 if action == "probe":
+    if node_state["network"] == "desired":
+        expected_effective_mtu = request.get("effective_underlay_mtu")
+        if expected_effective_mtu is None:
+            expected_effective_mtu = node_state.get("effective_underlay_mtu")
+        if expected_effective_mtu != 1442:
+            stop("desired-state probe lacks the journaled effective underlay MTU")
+        bad_bridge = os.environ.get("PVN_TEST_BAD_BRIDGE_MTU")
+        if os.environ.get("PVN_TEST_BAD_BRIDGE_MTU_HOST") == node and bad_bridge in {
+            "br-int", "br-provider",
+        }:
+            stop("desired %s MTU differs from the journaled effective MTU" % bad_bridge)
     response = report()
     if (
         os.environ.get("PVN_TEST_DRIFT_BEFORE_LEDGER_HOST") == node
@@ -324,6 +340,7 @@ if action == "probe":
 elif action == "prepare":
     node_state["journal"] = True
     node_state["phase"] = node_state["phase"] or "prepared"
+    node_state["effective_underlay_mtu"] = request.get("effective_underlay_mtu")
     save()
     emit(journal={"schema": 1}, report=report())
 elif action == "validate-corosync":
@@ -597,6 +614,26 @@ grep -q 'uses a provider NIC' "$WORK/provider-corosync.out" ||
     fail "provider/Corosync rejection reason is missing"
 cp "$WORK/corosync.geneve" "$COROSYNC"
 
+for mtu_role in geneve provider; do
+    reset_state
+    if PVN_TEST_UNRESTORABLE_MTU_HOST=prox2 PVN_TEST_UNRESTORABLE_MTU_ROLE=$mtu_role \
+        "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+        --provider-port-ready "$ACK" --confirm lab-cluster \
+        > "$WORK/unrestorable-$mtu_role-mtu.out" 2>&1
+    then
+        fail "$mtu_role configured MTU above the live-restorable ceiling unexpectedly applied"
+    fi
+    assert_no_mutation
+    grep -q "configured MTU 1450 on prox2 $mtu_role NIC" \
+        "$WORK/unrestorable-$mtu_role-mtu.out" ||
+        fail "$mtu_role unrestorable MTU rejection reason is missing"
+    grep -q 'exceeds its live-restorable MTU 1442' \
+        "$WORK/unrestorable-$mtu_role-mtu.out" ||
+        fail "$mtu_role unrestorable MTU ceiling is missing"
+    [ ! -e "$GLOBAL_LOCK" ] ||
+        fail "$mtu_role unrestorable MTU preflight left the cluster-global lock behind"
+done
+
 reset_state
 PVN_TEST_MEMBERSHIP_DRIFT_KIND=members-version PVN_TEST_DRIFT_AFTER_STAGE_HOST=prox2 \
     "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
@@ -629,6 +666,7 @@ state = json.load(open(sys.argv[1], encoding="utf-8"))
 ledger = json.loads(state["ledger"])
 assert ledger["phase"] == "complete"
 assert ledger["guest_mtu"] == 1300
+assert ledger["effective_underlay_mtu"] == 1442
 assert ledger["provider_bridge"] == "br-provider"
 assert ledger["physnet"] == "provider"
 assert ledger["provider_readiness"] == {
@@ -641,6 +679,27 @@ assert len(ledger["nodes"]) == 3
 assert all(row["control_ip"] == row["management_ip"] for row in ledger["nodes"])
 assert len(ledger["membership_hash"]) == 64
 PY
+
+: > "$LOG"
+"$TOPOLOGY" --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/completed-plan.out"
+[ "$(grep -c 'action=probe' "$LOG")" -eq 3 ] ||
+    fail "completed topology plan did not probe every desired node"
+assert_no_mutation
+
+for bridge in br-int br-provider; do
+    : > "$LOG"
+    if PVN_TEST_BAD_BRIDGE_MTU_HOST=prox2 PVN_TEST_BAD_BRIDGE_MTU=$bridge \
+        "$TOPOLOGY" --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+        > "$WORK/completed-$bridge-mtu.out" 2>&1
+    then
+        fail "completed topology plan accepted a mismatched $bridge MTU"
+    fi
+    assert_no_mutation
+    grep -q "desired $bridge MTU differs from the journaled effective MTU" \
+        "$WORK/completed-$bridge-mtu.out" ||
+        fail "completed topology $bridge MTU mismatch was not reported"
+done
 
 : > "$LOG"
 "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
