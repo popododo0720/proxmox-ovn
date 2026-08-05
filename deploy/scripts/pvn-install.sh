@@ -135,7 +135,7 @@ case "$ARCH" in
 esac
 
 if [ -z "$RELEASE_BASE_URL" ]; then
-    RELEASE_BASE_URL="https://github.com/pvnstack/proxmox-ovn/releases/download/v$VERSION"
+    RELEASE_BASE_URL="https://github.com/popododo0720/proxmox-ovn/releases/download/v$VERSION"
 fi
 while [ "${RELEASE_BASE_URL%/}" != "$RELEASE_BASE_URL" ]; do
     RELEASE_BASE_URL=${RELEASE_BASE_URL%/}
