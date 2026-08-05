@@ -337,6 +337,23 @@ failed node stops the sequence. Nodes already completed remain upgraded, and a
 later run safely verifies/skips them while continuing the one remaining older
 version.
 
+The control-plane ledger also pins the package version on every node. Package
+drift normally stops `pvn-control-plane plan`. There are only two automatic
+forward-recovery exceptions: a wholly untouched `planned` ledger, or a Raft
+ledger in the exact `staged` crash window where the deterministic seed alone
+is marked and active, its pinned Control DB and all three databases are
+healthy single-member clusters, every non-seed still has no central database
+or activation state, and no transport target has started. The staged exception
+also requires the complete ledger-pinned PKI on every node and the seed's
+root-only `central-restart-pending` marker to match the uniformly installed,
+strictly newer package. Plan reports the required repin without writing. Apply
+repeats the proof under the cluster mutation lease, atomically replaces only
+the package-version snapshot, and then converges forward. It never adopts an
+unpinned database, regenerates keys, removes state, or consumes the restart
+marker. Any mixed/downgraded package, membership/topology difference, ledger
+progress, unexpected CID, marker, database, or service state remains a hard
+failure; do not edit the ledger to bypass it.
+
 Package installation restarts only an already-active per-node
 manager/agent/controller stack. The updater deliberately does not restart
 active PVN Control, OVN NB/SB, or northd processes and verifies that their PIDs

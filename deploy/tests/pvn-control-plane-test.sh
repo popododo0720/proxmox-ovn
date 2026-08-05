@@ -67,7 +67,11 @@ class FakeBackend:
         self.staged = {}
         self.control_dbs = {}
         self.central = []
+        self.central_markers = []
         self.nodes = []
+        self.node_markers = []
+        self.node_targets = []
+        self.restart_pending = {}
         self.cids = {name: f"cid-{index}" for index, name in enumerate(DATABASES, 1)}
         self.block_at = None
         self.pki_variant = "one"
@@ -77,6 +81,7 @@ class FakeBackend:
         self.crash_after_init = None
         self.discoveries = 0
         self.discover_hook = None
+        self.staged_report_hook = None
 
     def discover(self):
         self.discoveries += 1
@@ -90,10 +95,36 @@ class FakeBackend:
             raise ControlPlaneError("unledgered state")
 
     def assert_planned_package_repin_safe(self, found):
-        if self.central or self.nodes or self.control_dbs:
+        if self.central or self.central_markers or self.nodes or self.node_markers or \
+                self.node_targets or self.restart_pending or self.control_dbs:
             raise ControlPlaneError(
                 "planned ledger package repin refused: activation or central database state"
             )
+
+    def assert_staged_seed_package_repin_safe(self, found, ledger):
+        seed = found.nodes[0]
+        if self.central != [seed.name] or self.central_markers != [seed.name] or \
+                self.nodes or self.node_markers or self.node_targets or \
+                self.restart_pending != {seed.name: seed.package_version} or \
+                set(self.control_dbs) != {seed.name}:
+            raise ControlPlaneError("staged ledger package repin refused: runtime shape")
+        if self.control_dbs[seed.name] != ledger["control_db_cluster_id"]:
+            raise ControlPlaneError("staged ledger package repin refused: wrong Control CID")
+        report = self.central_status(seed, found.mode)
+        report["offline"] = {
+            name: {
+                "exists": True,
+                "name": name,
+                "clustered": True,
+                "local_address": f"ssl:{seed.control_ip}:{port}",
+                "cluster_id": self.cids[name],
+                "server_id": f"sid-{name}-{seed.name}",
+            }
+            for name, port in DATABASES.items()
+        }
+        if self.staged_report_hook is not None:
+            self.staged_report_hook(report)
+        return report
 
     def ensure_shared_config(self, config):
         encoded = json.dumps(config, sort_keys=True)
@@ -166,6 +197,8 @@ class FakeBackend:
         return {"cluster_id": actual if mode == "raft" else None, "created": True}
 
     def activate_central(self, node):
+        if node.name not in self.central_markers:
+            self.central_markers.append(node.name)
         if node.name not in self.central:
             self.central.append(node.name)
             self.log.append("central:" + node.name)
@@ -193,6 +226,8 @@ class FakeBackend:
             raise AssertionError("transport activation preceded central convergence")
         if node.name not in self.nodes:
             self.nodes.append(node.name)
+            self.node_markers.append(node.name)
+            self.node_targets.append(node.name)
             self.log.append("node:" + node.name)
 
     def node_status(self, node):
@@ -230,6 +265,41 @@ def planned_ledger(found, **overrides):
     }
     ledger.update(overrides)
     return ledger
+
+
+def complete_fingerprints(found, variant="one"):
+    fingerprint = lambda value: hashlib.sha256(value.encode()).hexdigest()
+    return {
+        "ca_certificate_sha256": fingerprint("ca-" + variant),
+        "nodes": {
+            node.name: {
+                "certificate_sha256": fingerprint(
+                    "cert-" + variant + "-" + node.name
+                ),
+                "public_key_sha256": fingerprint("public-key-" + node.name),
+            }
+            for node in found.nodes
+        },
+    }
+
+
+def staged_seed_ledger(found, control_cid, **overrides):
+    ledger = planned_ledger(
+        found,
+        phase="staged",
+        cert_fingerprints=complete_fingerprints(found),
+        control_db_cluster_id=control_cid,
+    )
+    ledger.update(overrides)
+    return ledger
+
+
+def enter_seed_activation_crash(backend):
+    seed = backend.found.nodes[0].name
+    backend.control_dbs[seed] = backend.cids["PVN_Control"]
+    backend.central = [seed]
+    backend.central_markers = [seed]
+    backend.restart_pending = {seed: backend.found.nodes[0].package_version}
 
 
 lease_temporary = tempfile.TemporaryDirectory()
@@ -401,6 +471,128 @@ with tempfile.TemporaryDirectory() as temporary:
 with tempfile.TemporaryDirectory() as temporary:
     backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary), count=2)
     expect_error(backend.discover, "positive odd node count")
+
+
+# The real backend's staged-recovery probe accepts only the sole active seed,
+# pinned live PKI, exact offline database identities, no transport target, and
+# no database/activation state on either non-seed.
+with tempfile.TemporaryDirectory() as temporary:
+    backend, _, _ = canonical_topology_fixture(pathlib.Path(temporary))
+    found = backend.discover()
+    cids = {name: f"probe-cid-{index}" for index, name in enumerate(DATABASES, 1)}
+    ledger = staged_seed_ledger(found, cids["PVN_Control"])
+    seed = found.nodes[0]
+    seed_databases = {
+        name: {
+            "exists": True,
+            "name": name,
+            "clustered": True,
+            "local_address": f"ssl:{seed.control_ip}:{port}",
+            "cluster_id": cids[name],
+            "server_id": f"probe-sid-{name}",
+        }
+        for name, port in DATABASES.items()
+    }
+    for node in found.nodes:
+        pins = ledger["cert_fingerprints"]["nodes"][node.name]
+        backend.probes[node.name].update({
+            "cert_hashes": {
+                "ca": ledger["cert_fingerprints"]["ca_certificate_sha256"],
+                "cert": pins["certificate_sha256"],
+                "public_key": pins["public_key_sha256"],
+            },
+            "pki_owner_present": True,
+            "seed_ca_present": node == seed,
+            "central_marker": node == seed,
+            "central_active": node == seed,
+            "node_marker": False,
+            "node_active": False,
+            "node_ready": False,
+            "central_restart_pending": node.package_version if node == seed else None,
+            "databases": copy.deepcopy(seed_databases) if node == seed else {
+                name: {"exists": False} for name in DATABASES
+            },
+        })
+    report = {
+        "healthy": True,
+        "target_active": True,
+        "databases": [
+            {
+                "database": name,
+                "healthy": True,
+                "member_count": 1,
+                "connected_members": 1,
+                "membership_change": False,
+                "cluster_id": cids[name],
+                "server_id": f"probe-sid-{name}",
+                "address": f"ssl:{seed.control_ip}:{port}",
+            }
+            for name, port in DATABASES.items()
+        ],
+        "offline": copy.deepcopy(seed_databases),
+    }
+    baseline_probes = copy.deepcopy(backend.probes)
+    baseline_report = copy.deepcopy(report)
+    backend.central_status = lambda _node, _mode: copy.deepcopy(report)
+    accepted = backend.assert_staged_seed_package_repin_safe(found, ledger)
+    accepted_cids = ControlPlane._verify_reports(found, [(seed, accepted)], 1, {})
+    assert accepted_cids == cids
+
+    def expect_real_probe_rejected(mutate_probe=None, mutate_report=None):
+        backend.probes = copy.deepcopy(baseline_probes)
+        report.clear()
+        report.update(copy.deepcopy(baseline_report))
+        if mutate_probe is not None:
+            mutate_probe(backend.probes)
+        if mutate_report is not None:
+            mutate_report(report)
+        expect_error(
+            lambda: backend.assert_staged_seed_package_repin_safe(found, ledger),
+            "repin refused",
+        )
+
+    probe_mutations = [
+        lambda probes: probes[seed.name].update(central_restart_pending=None),
+        lambda probes: probes[seed.name].update(central_restart_pending="0.0.0"),
+        lambda probes: probes[seed.name]["cert_hashes"].update(public_key="0" * 64),
+        lambda probes: probes[seed.name].update(central_marker=False),
+        lambda probes: probes[seed.name].update(central_active=False),
+        lambda probes: probes[seed.name].update(node_active=True),
+        lambda probes: probes[seed.name].update(node_marker=True),
+        lambda probes: probes[seed.name].update(node_ready=True),
+        lambda probes: probes[found.nodes[1].name].update(central_marker=True),
+        lambda probes: probes[found.nodes[1].name].update(
+            central_restart_pending=found.nodes[1].package_version
+        ),
+        lambda probes: probes[found.nodes[1].name]["databases"]["PVN_Control"].update(
+            exists=True
+        ),
+        lambda probes: probes[seed.name]["databases"]["OVN_Northbound"].update(
+            name="Wrong_Northbound"
+        ),
+        lambda probes: probes[seed.name]["databases"]["OVN_Southbound"].update(
+            local_address="ssl:192.0.2.99:6644"
+        ),
+        lambda probes: probes[seed.name]["databases"]["PVN_Control"].update(
+            cluster_id="foreign-control-cid"
+        ),
+    ]
+    for probe_mutation in probe_mutations:
+        expect_real_probe_rejected(mutate_probe=probe_mutation)
+
+    report_mutations = [
+        lambda current: current["offline"]["OVN_Northbound"].update(
+            name="Wrong_Northbound"
+        ),
+        lambda current: current["offline"]["OVN_Southbound"].update(
+            local_address="ssl:192.0.2.99:6644"
+        ),
+        lambda current: current["offline"]["PVN_Control"].update(
+            cluster_id="foreign-control-cid"
+        ),
+    ]
+    for report_mutation in report_mutations:
+        expect_real_probe_rejected(mutate_report=report_mutation)
 
 
 # Legacy pmxcfs key material is never adopted or copied automatically.
@@ -896,6 +1088,131 @@ with tempfile.TemporaryDirectory() as temporary:
     }
 
 
+# A package rollout may land after the seed was activated and its Control CID
+# was durably pinned, but before the seed's 1/1 three-DB result was written.
+# This exact crash window is read-only in plan and is repinned atomically under
+# the mutation lease before normal forward convergence resumes.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    pinned = discovery(package="0.1.1")
+    backend = FakeBackend(discovery(package="0.1.2"))
+    enter_seed_activation_crash(backend)
+    store.create(staged_seed_ledger(pinned, backend.cids["PVN_Control"]))
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    before = copy.deepcopy(store.load())
+    plan = control.plan()
+    assert plan["read_only"] and plan["package_repin_required"] is True
+    assert plan["package_repin_source_phase"] == "staged"
+    assert "staged seed-activation crash window" in plan["actions"][0]
+    assert store.load() == before
+
+    original_update = store.update
+    repin_was_leased = []
+
+    def observe_update(value):
+        previous = store.load()
+        if previous["snapshot"] != value["snapshot"]:
+            assert lease_state.exists(), "staged package snapshot repin escaped the lease"
+            repin_was_leased.append(True)
+        original_update(value)
+
+    store.update = observe_update
+    result = control.apply("test-cluster")
+    assert result["complete"] and repin_was_leased == [True]
+    ledger = store.load()
+    assert {node["package_version"] for node in ledger["snapshot"]["nodes"]} == {
+        "0.1.2"
+    }
+    assert ledger["db_cluster_ids"] == backend.cids
+    assert backend.log.count("central:pve-a") == 0
+
+
+def staged_runtime_repin_rejected(case):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        pinned = discovery(package="0.1.1")
+        backend = FakeBackend(discovery(package="0.1.2"))
+        enter_seed_activation_crash(backend)
+        control_cid = backend.cids["PVN_Control"]
+        if case == "wrong-control-cid":
+            control_cid = "foreign-control-cid"
+        elif case == "nonseed-db":
+            backend.control_dbs["pve-b"] = backend.cids["PVN_Control"]
+        elif case == "nonseed-marker":
+            backend.central_markers.append("pve-b")
+        elif case == "node-active":
+            backend.node_targets.append("pve-a")
+        elif case == "node-marker":
+            backend.node_markers.append("pve-a")
+        elif case == "node-ready":
+            backend.nodes.append("pve-a")
+        elif case == "seed-marker-missing":
+            backend.central_markers.clear()
+        elif case == "seed-inactive":
+            backend.central.clear()
+        elif case == "restart-marker-missing":
+            backend.restart_pending.clear()
+        elif case == "restart-marker-wrong":
+            backend.restart_pending["pve-a"] = "0.1.1"
+        else:
+            raise AssertionError(case)
+        store.create(staged_seed_ledger(pinned, control_cid))
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        expect_error(control.plan, "repin refused")
+
+
+for runtime_case in (
+    "wrong-control-cid", "nonseed-db", "nonseed-marker", "node-active",
+    "node-marker", "node-ready", "seed-marker-missing", "seed-inactive",
+    "restart-marker-missing", "restart-marker-wrong",
+):
+    staged_runtime_repin_rejected(runtime_case)
+
+
+def staged_report_repin_rejected(mutate):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        pinned = discovery(package="0.1.1")
+        backend = FakeBackend(discovery(package="0.1.2"))
+        enter_seed_activation_crash(backend)
+        backend.staged_report_hook = mutate
+        store.create(staged_seed_ledger(pinned, backend.cids["PVN_Control"]))
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        expect_error(control.plan, "repin refused")
+
+
+def report_row(report, name):
+    return next(row for row in report["databases"] if row["database"] == name)
+
+
+# The live seed proof is exactly healthy 1/1 membership for all three schemas,
+# with no membership change and matching online/offline identities.
+report_mutations = [
+    lambda report: report.update(healthy=False),
+    lambda report: report.update(target_active=False),
+    lambda report: report["databases"].pop(),
+    lambda report: report_row(report, "OVN_Northbound").update(
+        database="Wrong_Northbound"
+    ),
+    lambda report: report_row(report, "PVN_Control").update(healthy=False),
+    lambda report: report_row(report, "OVN_Northbound").update(member_count=2),
+    lambda report: report_row(report, "OVN_Southbound").update(connected_members=0),
+    lambda report: report_row(report, "OVN_Northbound").update(membership_change=True),
+    lambda report: report_row(report, "PVN_Control").update(server_id=None),
+    lambda report: report_row(report, "OVN_Southbound").update(
+        address="ssl:192.0.2.99:6644"
+    ),
+    lambda report: report_row(report, "OVN_Northbound").update(
+        cluster_id="foreign-nb-cid"
+    ),
+    lambda report: report["offline"]["OVN_Southbound"].update(
+        cluster_id="foreign-offline-sb-cid"
+    ),
+]
+for report_mutation in report_mutations:
+    staged_report_repin_rejected(report_mutation)
+
+
 def expect_package_repin_rejected(pinned, live, **ledger_overrides):
     with tempfile.TemporaryDirectory() as temporary:
         store = LedgerStore(pathlib.Path(temporary) / "private")
@@ -920,6 +1237,42 @@ topology_drift = Discovery(**{
 expect_package_repin_rejected(pinned, topology_drift)
 
 
+def expect_staged_snapshot_repin_rejected(pinned, live, **ledger_overrides):
+    with tempfile.TemporaryDirectory() as temporary:
+        store = LedgerStore(pathlib.Path(temporary) / "private")
+        backend = FakeBackend(live)
+        enter_seed_activation_crash(backend)
+        store.create(staged_seed_ledger(
+            pinned, backend.cids["PVN_Control"], **ledger_overrides
+        ))
+        control = ControlPlane(backend, store, timeout=0.01, interval=0)
+        expect_error(control.plan, "drift")
+
+
+# The staged exception never widens package drift: mixed versions, downgrade,
+# topology drift, incomplete pins, or already-populated final DB CIDs all fail.
+expect_staged_snapshot_repin_rejected(pinned, mixed)
+expect_staged_snapshot_repin_rejected(
+    discovery(package="0.1.2"), discovery(package="0.1.1")
+)
+expect_staged_snapshot_repin_rejected(pinned, topology_drift)
+expect_staged_snapshot_repin_rejected(pinned, discovery(package="0.1.2"),
+                                      cert_fingerprints={})
+expect_staged_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), central_complete=1,
+)
+expect_staged_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), nodes_complete=1,
+)
+expect_staged_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"), control_db_cluster_id="",
+)
+expect_staged_snapshot_repin_rejected(
+    pinned, discovery(package="0.1.2"),
+    db_cluster_ids={name: f"unexpected-{name}" for name in DATABASES},
+)
+
+
 # Even an otherwise eligible planned snapshot is refused if a marker/service
 # or database appeared outside the zero-progress ledger.
 with tempfile.TemporaryDirectory() as temporary:
@@ -928,6 +1281,9 @@ with tempfile.TemporaryDirectory() as temporary:
     backend = FakeBackend(discovery(package="0.1.2"))
     backend.control_dbs["pve-a"] = "unexpected-cid"
     control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    expect_error(control.plan, "repin refused")
+    backend.control_dbs.clear()
+    backend.restart_pending["pve-a"] = "0.1.2"
     expect_error(control.plan, "repin refused")
 
 

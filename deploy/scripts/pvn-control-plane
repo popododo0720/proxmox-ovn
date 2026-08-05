@@ -472,6 +472,31 @@ def db_info(path):
         result["server_id"] = run(["/usr/bin/ovsdb-tool", "db-sid", path]).stdout.strip()
     return result
 
+def central_restart_pending():
+    directory = pathlib.Path("/var/lib/pvn-node")
+    path = directory / "central-restart-pending"
+    if not os.path.lexists(directory):
+        return None
+    try:
+        metadata = directory.lstat()
+    except OSError as error:
+        fail(f"cannot inspect central restart state directory: {error}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or \
+            (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, 0, 0o700):
+        fail("central restart state directory must be root:root mode 0700")
+    if not os.path.lexists(path):
+        return None
+    require_regular(path, 0, 0, 0o600, "central restart-required marker")
+    try:
+        raw = path.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        fail(f"cannot read central restart-required marker: {error}")
+    lines = raw.splitlines()
+    if len(lines) != 1 or raw != lines[0] + "\n" or \
+            not re.fullmatch(r"[A-Za-z0-9.+:~_-]+", lines[0]):
+        fail("central restart-required marker has invalid content")
+    return lines[0]
+
 def marker(path):
     if os.path.exists(path):
         return
@@ -521,7 +546,9 @@ if action == "probe":
         "central_marker": os.path.exists("/etc/pvn/central/enabled"),
         "node_marker": os.path.exists("/etc/pvn/node-enabled"),
         "central_active": run(["systemctl", "is-active", "pvn-central.target"], check=False).stdout.strip() == "active",
+        "node_active": run(["systemctl", "is-active", "pvn-node.target"], check=False).stdout.strip() == "active",
         "node_ready": run(["systemctl", "is-active", "pvn-node-ready.service"], check=False).stdout.strip() == "active",
+        "central_restart_pending": central_restart_pending(),
         "databases": {
             "PVN_Control": db_info("/var/lib/pvn/control-db/pvn_control.db"),
             "OVN_Northbound": db_info("/var/lib/ovn/ovnnb_db.db"),
@@ -1093,7 +1120,9 @@ class SystemBackend:
         for node in discovery.nodes:
             probe = self.probes[node.name]
             if probe.get("central_marker") or probe.get("node_marker") or \
-                    probe.get("central_active") or probe.get("node_ready"):
+                    probe.get("central_active") or probe.get("node_active") or \
+                    probe.get("node_ready") or \
+                    probe.get("central_restart_pending") is not None:
                 raise ControlPlaneError(
                     f"node {node.name} has active/marked PVN state without a cluster ledger"
                 )
@@ -1110,12 +1139,109 @@ class SystemBackend:
         for node in discovery.nodes:
             probe = self.probes[node.name]
             if probe.get("central_marker") or probe.get("node_marker") or \
-                    probe.get("central_active") or probe.get("node_ready") or \
+                    probe.get("central_active") or probe.get("node_active") or \
+                    probe.get("node_ready") or \
+                    probe.get("central_restart_pending") is not None or \
                     any(info.get("exists") for info in probe.get("databases", {}).values()):
                 raise ControlPlaneError(
                     f"planned ledger package repin refused: node {node.name} has "
                     "activation or central database state"
                 )
+
+    def assert_staged_seed_package_repin_safe(
+        self, discovery: Discovery, ledger: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Prove the exact seed-activated/still-unrecorded crash window.
+
+        This is deliberately narrower than normal forward convergence.  It is
+        used only before replacing package versions in a staged durable
+        snapshot, so every activation bit and database file must be accounted
+        for by the seed operation that immediately preceded the missed ledger
+        write.
+        """
+        prefix = "staged ledger package repin refused"
+        seed = discovery.nodes[0]
+        pki = ledger["cert_fingerprints"]
+        for node in discovery.nodes:
+            probe = self.probes[node.name]
+            hashes = probe.get("cert_hashes")
+            pins = pki["nodes"][node.name]
+            expected_hashes = {
+                "ca": pki["ca_certificate_sha256"],
+                "cert": pins["certificate_sha256"],
+                "public_key": pins["public_key_sha256"],
+            }
+            if hashes != expected_hashes or probe.get("pki_owner_present") is not True:
+                raise ControlPlaneError(
+                    f"{prefix}: node {node.name} live PKI differs from the ledger pins"
+                )
+            if node == seed:
+                if probe.get("central_restart_pending") != node.package_version:
+                    raise ControlPlaneError(
+                        f"{prefix}: seed central restart marker does not pin the installed package"
+                    )
+                if probe.get("seed_ca_present") is not True:
+                    raise ControlPlaneError(f"{prefix}: seed CA state is missing")
+                if probe.get("central_marker") is not True or \
+                        probe.get("central_active") is not True:
+                    raise ControlPlaneError(
+                        f"{prefix}: seed {node.name} is not the sole activated central target"
+                    )
+            elif probe.get("central_marker") or probe.get("central_active") or \
+                    probe.get("seed_ca_present"):
+                raise ControlPlaneError(
+                    f"{prefix}: non-seed {node.name} has central activation state"
+                )
+            elif probe.get("central_restart_pending") is not None:
+                raise ControlPlaneError(
+                    f"{prefix}: non-seed {node.name} has unexpected central restart state"
+                )
+            if probe.get("node_marker") or probe.get("node_active") or \
+                    probe.get("node_ready"):
+                raise ControlPlaneError(
+                    f"{prefix}: transport state is active or marked on {node.name}"
+                )
+
+            databases = probe.get("databases")
+            if not isinstance(databases, dict) or set(databases) != set(DATABASES):
+                raise ControlPlaneError(f"{prefix}: database probe is incomplete on {node.name}")
+            if node != seed:
+                if any(info.get("exists") for info in databases.values()):
+                    raise ControlPlaneError(
+                        f"{prefix}: non-seed {node.name} has central database state"
+                    )
+                continue
+            for name, port in DATABASES.items():
+                info = databases[name]
+                if not isinstance(info, dict) or not info.get("exists") or \
+                        info.get("name") != name or info.get("clustered") is not True or \
+                        info.get("local_address") != f"ssl:{seed.control_ip}:{port}" or \
+                        not info.get("cluster_id") or not info.get("server_id"):
+                    raise ControlPlaneError(
+                        f"{prefix}: seed {name} offline identity is not exact"
+                    )
+            if databases["PVN_Control"].get("cluster_id") != \
+                    ledger["control_db_cluster_id"]:
+                raise ControlPlaneError(
+                    f"{prefix}: seed Control DB cluster ID differs from the ledger"
+                )
+
+        report = self.central_status(seed, discovery.mode)
+        offline = report.get("offline")
+        if not isinstance(offline, dict) or set(offline) != set(DATABASES):
+            raise ControlPlaneError(f"{prefix}: live seed database probe is incomplete")
+        for name, port in DATABASES.items():
+            info = offline[name]
+            if not isinstance(info, dict) or not info.get("exists") or \
+                    info.get("name") != name or info.get("clustered") is not True or \
+                    info.get("local_address") != f"ssl:{seed.control_ip}:{port}" or \
+                    not info.get("cluster_id") or not info.get("server_id"):
+                raise ControlPlaneError(f"{prefix}: live seed {name} identity is not exact")
+        if offline["PVN_Control"].get("cluster_id") != ledger["control_db_cluster_id"]:
+            raise ControlPlaneError(
+                f"{prefix}: live seed Control DB cluster ID differs from the ledger"
+            )
+        return report
 
     def _validate_ssh(
         self, records: list[tuple[int, str, str, str, str, str, str]]
@@ -1385,10 +1511,10 @@ class ControlPlane:
         package_repin = False
         if ledger is not None:
             package_repin = self._verify_ledger(
-                discovery, ledger, allow_planned_package_repin=True
+                discovery, ledger, allow_package_repin=True
             )
             if package_repin:
-                self.backend.assert_planned_package_repin_safe(discovery)
+                self._assert_package_repin_safe(discovery, ledger)
         actions = [
             "freeze membership/topology/package in the private pmxcfs ledger",
             "render shared config and preserve a seed-local private cluster CA",
@@ -1398,9 +1524,14 @@ class ControlPlane:
             "activate transport nodes one at a time after central convergence",
         ]
         if package_repin:
+            source_phase = ledger["phase"]
+            description = (
+                "untouched planned ledger" if source_phase == "planned" else
+                "exact staged seed-activation crash window"
+            )
             actions.insert(
                 0,
-                "atomically repin the untouched planned ledger to the uniform newer package",
+                f"atomically repin the {description} to the uniform newer package",
             )
         return {
             "read_only": True,
@@ -1409,6 +1540,7 @@ class ControlPlane:
             "nodes": [node.frozen() for node in discovery.nodes],
             "existing_phase": ledger.get("phase") if ledger else None,
             "package_repin_required": package_repin,
+            "package_repin_source_phase": ledger.get("phase") if package_repin else None,
             "actions": actions,
         }
 
@@ -1437,10 +1569,10 @@ class ControlPlane:
                 self.store.create(ledger)
             else:
                 package_repin = self._verify_ledger(
-                    discovery, ledger, allow_planned_package_repin=True
+                    discovery, ledger, allow_package_repin=True
                 )
                 if package_repin:
-                    self.backend.assert_planned_package_repin_safe(discovery)
+                    self._assert_package_repin_safe(discovery, ledger)
                     ledger = copy.deepcopy(ledger)
                     ledger["snapshot"] = discovery.snapshot()
                     self.store.update(ledger)
@@ -1548,6 +1680,35 @@ class ControlPlane:
             )
         self._verify_ledger(live, persisted)
 
+    def _assert_package_repin_safe(
+        self, discovery: Discovery, ledger: dict[str, Any]
+    ) -> None:
+        if ledger.get("phase") == "planned":
+            self.backend.assert_planned_package_repin_safe(discovery)
+            return
+        if ledger.get("phase") != "staged":
+            raise ControlPlaneError("package repin source phase is unsupported")
+        prefix = "staged ledger package repin refused"
+        report = self.backend.assert_staged_seed_package_repin_safe(discovery, ledger)
+        try:
+            live_cids = self._verify_reports(
+                discovery, [(discovery.nodes[0], report)], 1, {}
+            )
+        except ControlPlaneError as error:
+            raise ControlPlaneError(f"{prefix}: {error}") from error
+        offline = report.get("offline", {})
+        offline_cids = {
+            name: offline.get(name, {}).get("cluster_id") for name in DATABASES
+        }
+        if live_cids != offline_cids:
+            raise ControlPlaneError(
+                f"{prefix}: online/offline seed database cluster IDs disagree"
+            )
+        if live_cids.get("PVN_Control") != ledger["control_db_cluster_id"]:
+            raise ControlPlaneError(
+                f"{prefix}: healthy seed Control DB cluster ID differs from the ledger"
+            )
+
     @staticmethod
     def _package_version_is_newer(candidate: str, pinned: str) -> bool:
         try:
@@ -1569,14 +1730,9 @@ class ControlPlane:
         return compared.returncode == 0
 
     @classmethod
-    def _planned_package_repin_allowed(
+    def _package_snapshot_repin_allowed(
         cls, discovery: Discovery, ledger: dict[str, Any]
     ) -> bool:
-        if ledger.get("phase") != "planned" or ledger.get("central_complete") != 0 or \
-                ledger.get("nodes_complete") != 0 or \
-                ledger.get("control_db_cluster_id") is not None or \
-                ledger.get("db_cluster_ids") != {}:
-            return False
         pinned = ledger.get("snapshot")
         live = discovery.snapshot()
         if not isinstance(pinned, dict):
@@ -1607,15 +1763,65 @@ class ControlPlane:
                 node["package_version"] = None
         return pinned_without_versions == live_without_versions
 
+    @staticmethod
+    def _cert_fingerprint_set_valid(
+        discovery: Discovery, pki: Any
+    ) -> bool:
+        if not isinstance(pki, dict):
+            return False
+        ca_hash = pki.get("ca_certificate_sha256")
+        node_pins = pki.get("nodes")
+        if set(pki) != {"ca_certificate_sha256", "nodes"} or \
+                not isinstance(ca_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", ca_hash) or \
+                not isinstance(node_pins, dict) or \
+                set(node_pins) != {node.name for node in discovery.nodes}:
+            return False
+        return all(
+            isinstance(pins, dict) and
+            set(pins) == {"certificate_sha256", "public_key_sha256"} and
+            all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in pins.values())
+            for pins in node_pins.values()
+        )
+
+    @classmethod
+    def _planned_package_repin_allowed(
+        cls, discovery: Discovery, ledger: dict[str, Any]
+    ) -> bool:
+        if ledger.get("phase") != "planned" or ledger.get("central_complete") != 0 or \
+                ledger.get("nodes_complete") != 0 or \
+                ledger.get("control_db_cluster_id") is not None or \
+                ledger.get("db_cluster_ids") != {}:
+            return False
+        return cls._package_snapshot_repin_allowed(discovery, ledger)
+
+    @classmethod
+    def _staged_seed_package_repin_allowed(
+        cls, discovery: Discovery, ledger: dict[str, Any]
+    ) -> bool:
+        control_cid = ledger.get("control_db_cluster_id")
+        if discovery.mode != "raft" or ledger.get("phase") != "staged" or \
+                ledger.get("central_complete") != 0 or ledger.get("nodes_complete") != 0 or \
+                not isinstance(control_cid, str) or not control_cid or \
+                ledger.get("db_cluster_ids") != {} or \
+                not cls._cert_fingerprint_set_valid(
+                    discovery, ledger.get("cert_fingerprints")
+                ):
+            return False
+        return cls._package_snapshot_repin_allowed(discovery, ledger)
+
     @classmethod
     def _verify_ledger(
         cls, discovery: Discovery, ledger: dict[str, Any],
-        allow_planned_package_repin: bool = False,
+        allow_package_repin: bool = False,
     ) -> bool:
         if ledger.get("version") != LEDGER_VERSION:
             raise ControlPlaneError("unsupported control-plane ledger version")
         package_repin = ledger.get("snapshot") != discovery.snapshot() and \
-            allow_planned_package_repin and cls._planned_package_repin_allowed(discovery, ledger)
+            allow_package_repin and (
+                cls._planned_package_repin_allowed(discovery, ledger) or
+                cls._staged_seed_package_repin_allowed(discovery, ledger)
+            )
         if ledger.get("snapshot") != discovery.snapshot() and not package_repin:
             raise ControlPlaneError("live membership/topology/package drift from the ledger")
         try:
@@ -1632,20 +1838,8 @@ class ControlPlane:
         pki = ledger.get("cert_fingerprints")
         if not isinstance(pki, dict):
             raise ControlPlaneError("ledger PKI fingerprints are invalid")
-        if pki:
-            ca_hash = pki.get("ca_certificate_sha256")
-            node_pins = pki.get("nodes")
-            if set(pki) != {"ca_certificate_sha256", "nodes"} or \
-                    not isinstance(ca_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", ca_hash) or \
-                    not isinstance(node_pins, dict) or \
-                    set(node_pins) != {node.name for node in discovery.nodes}:
-                raise ControlPlaneError("ledger PKI fingerprint set is invalid")
-            for name, pins in node_pins.items():
-                if not isinstance(pins, dict) or \
-                        set(pins) != {"certificate_sha256", "public_key_sha256"} or \
-                        any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
-                            for value in pins.values()):
-                    raise ControlPlaneError(f"ledger PKI fingerprints for {name} are invalid")
+        if pki and not cls._cert_fingerprint_set_valid(discovery, pki):
+            raise ControlPlaneError("ledger PKI fingerprint set is invalid")
         if "control_db_cluster_id" not in ledger:
             raise ControlPlaneError("ledger lacks the Control DB cluster ID pin field")
         control_cid = ledger.get("control_db_cluster_id")
