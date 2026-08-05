@@ -1,7 +1,7 @@
 #!/bin/sh
 # Checksum-verifying bootstrap for a fail-closed, sequential PVN package update.
 # Intended for:
-#   bash -c "$(curl -fsSL https://PUBLIC_URL/pvn-update.sh)"
+#   pvn_bootstrap=$(curl -fsSL https://PUBLIC_URL/pvn-update.sh) && bash -c "$pvn_bootstrap"
 set -eu
 
 PROGRAM=${0##*/}

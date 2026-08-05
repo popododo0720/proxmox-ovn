@@ -49,6 +49,20 @@ cp "$PVN_TEST_ASSETS/$asset" "$output"
 EOF
 chmod 0755 "$BIN/curl"
 
+# Simulate the outer public-script fetch separately from the bootstrap's own
+# checksum-verified asset downloads. In failure mode it emits executable
+# partial output before returning curl's failure status.
+cat > "$BIN/public-curl" <<'EOF'
+#!/bin/sh
+set -eu
+if [ "${PVN_TEST_PUBLIC_CURL_FAIL:-0}" -eq 1 ]; then
+    printf '%s\n' ': > "$PVN_TEST_PUBLIC_BOOTSTRAP_RAN"'
+    exit 22
+fi
+cat "$PVN_TEST_PUBLIC_BOOTSTRAP"
+EOF
+chmod 0755 "$BIN/public-curl"
+
 cat > "$ASSETS/pvn-cluster-install" <<'EOF'
 #!/bin/sh
 set -eu
@@ -138,6 +152,8 @@ export PVN_TEST_CURL_LOG=$CURL_LOG
 export PVN_TEST_INSTALLER_LOG=$INSTALLER_LOG
 export PVN_TEST_DEB_LOG=$DEB_LOG
 export PVN_TEST_SETUP_LOG=$SETUP_LOG
+export PVN_TEST_PUBLIC_BOOTSTRAP=$BOOTSTRAP
+export PVN_TEST_PUBLIC_BOOTSTRAP_RAN=$WORK/public-bootstrap-ran
 
 fail() {
     echo "pvn-install test failed: $*" >&2
@@ -170,6 +186,17 @@ assert_temp_cleaned() {
 }
 
 sh -n "$BOOTSTRAP"
+
+# The documented assignment-and-AND wrapper preserves curl's nonzero status
+# and never executes even partial response data.
+if PVN_TEST_PUBLIC_CURL_FAIL=1 sh -c \
+    'pvn_bootstrap=$($1 -fsSL https://releases.example.invalid/pvn-install.sh) && bash -c "$pvn_bootstrap"' \
+    sh "$BIN/public-curl"
+then
+    fail "public bootstrap wrapper masked curl failure"
+fi
+[ ! -e "$PVN_TEST_PUBLIC_BOOTSTRAP_RAN" ] ||
+    fail "public bootstrap wrapper executed partial curl output"
 
 # With no inventory/key settings the one-line bootstrap selects local PVE
 # discovery and never asks for deployment-host paths.
@@ -362,7 +389,7 @@ assert_temp_cleaned
 # for an inventory or identity. Empty confirmation stops safely.
 reset_logs
 printf '\n' | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "pvn_bootstrap=\$($BIN/public-curl -fsSL https://releases.example.invalid/pvn-install.sh) && PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 bash -c \"\$pvn_bootstrap\"" \
     /dev/null > "$WORK/local-interactive-stop.out"
 [ "$(wc -l < "$INSTALLER_LOG")" -eq 1 ] ||
     fail "default local interactive flow ran more than preflight"
@@ -378,7 +405,7 @@ assert_temp_cleaned
 # Supplying one advanced setting explicitly prompts only for its missing pair.
 reset_logs
 printf '%s\n' "$IDENTITY" | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_PHASE=preflight bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "pvn_bootstrap=\$($BIN/public-curl -fsSL https://releases.example.invalid/pvn-install.sh) && PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_PHASE=preflight bash -c \"\$pvn_bootstrap\"" \
     /dev/null > "$WORK/advanced-prompt.out"
 grep -q 'SSH private-key path' "$WORK/advanced-prompt.out" ||
     fail "explicit advanced flow did not prompt for the missing identity"
@@ -386,11 +413,11 @@ grep -q 'SSH private-key path' "$WORK/advanced-prompt.out" ||
     fail "advanced prompt did not forward both paths"
 assert_temp_cleaned
 
-# This exercises the exact command-substitution shape. A blank terminal reply
-# performs preflight and safely stops without invoking install.
+# This exercises the documented fail-propagating wrapper. A blank terminal
+# reply proves that its inner bash still owns /dev/tty and stops safely.
 reset_logs
 printf '\n' | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_IDENTITY='$IDENTITY' bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "pvn_bootstrap=\$($BIN/public-curl -fsSL https://releases.example.invalid/pvn-install.sh) && PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_IDENTITY='$IDENTITY' bash -c \"\$pvn_bootstrap\"" \
     /dev/null > "$WORK/interactive-stop.out"
 [ "$(wc -l < "$INSTALLER_LOG")" -eq 1 ] ||
     fail "implicit interactive blank confirmation ran more than preflight"
@@ -400,7 +427,7 @@ grep -q 'installation was not requested' "$WORK/interactive-stop.out" ||
 
 reset_logs
 printf 'lab-cluster\n' | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_IDENTITY='$IDENTITY' bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "pvn_bootstrap=\$($BIN/public-curl -fsSL https://releases.example.invalid/pvn-install.sh) && PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_INVENTORY='$INVENTORY' PVN_IDENTITY='$IDENTITY' bash -c \"\$pvn_bootstrap\"" \
     /dev/null > "$WORK/interactive-apply.out"
 [ "$(wc -l < "$INSTALLER_LOG")" -eq 2 ] ||
     fail "implicit interactive apply did not run exactly preflight then install"
@@ -415,7 +442,7 @@ assert_temp_cleaned
 write_members 2
 reset_logs
 if printf 'lab-cluster\ny\n' | script -qefc \
-    "PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_CP_MEMBERS='$MEMBERS' PVN_TOPOLOGY_BIN='$BIN/pvn-topology' PVN_CONTROL_PLANE_BIN='$BIN/pvn-control-plane' bash -c \"\$(cat '$BOOTSTRAP')\"" \
+    "pvn_bootstrap=\$($BIN/public-curl -fsSL https://releases.example.invalid/pvn-install.sh) && PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.4 PVN_CP_MEMBERS='$MEMBERS' PVN_TOPOLOGY_BIN='$BIN/pvn-topology' PVN_CONTROL_PLANE_BIN='$BIN/pvn-control-plane' bash -c \"\$pvn_bootstrap\"" \
     /dev/null > "$WORK/interactive-unsupported-full.out" 2>&1
 then
     fail "interactive unsupported cluster reached full setup"

@@ -30,8 +30,11 @@ migration coordination are intentionally outside the first release.
 Run this as `root` on any node in the target PVE cluster:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)"
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh) && bash -c "$pvn_bootstrap"
 ```
+
+The `&&` prevents Bash from executing an incomplete response when `curl`
+fails; the inner Bash still inherits the terminal used by interactive prompts.
 
 The script discovers native PVE membership, requires every member to be online
 and quorate, downloads the release assets over HTTPS, verifies their SHA-256
@@ -56,15 +59,15 @@ host networking.
 Package-only non-interactive install:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
-  pvn-install.sh install --apply --confirm CLUSTER_NAME
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh) && \
+  bash -c "$pvn_bootstrap" pvn-install.sh install --apply --confirm CLUSTER_NAME
 ```
 
 Non-interactive full setup:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
-  pvn-install.sh install --apply --confirm CLUSTER_NAME --full \
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh) && \
+  bash -c "$pvn_bootstrap" pvn-install.sh install --apply --confirm CLUSTER_NAME --full \
   --geneve-cidr 192.168.100.0/24 \
   --provider-cidr 192.168.200.0/24 \
   --guest-mtu 1300 \

@@ -55,8 +55,12 @@ password or private key in that file.
 The public release entry point is:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)"
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh) && bash -c "$pvn_bootstrap"
 ```
+
+The assignment returns `curl`'s failure status, so `&&` prevents Bash from
+executing partial response data. The inner Bash still inherits `/dev/tty` for
+the interactive confirmations below.
 
 The bootstrap accepts only HTTPS, downloads the versioned DEB, cluster
 installer, and native PVE lease helper into a private temporary directory,
@@ -68,16 +72,16 @@ offers the separate topology/control-plane phase.
 Use the hosted bootstrap's `install` phase first as a dry run:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
-  pvn-install.sh install
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh) && \
+  bash -c "$pvn_bootstrap" pvn-install.sh install
 ```
 
 After reviewing every target and the printed cluster name, repeat with both
 write gates:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
-  pvn-install.sh install --apply --confirm CLUSTER_NAME
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh) && \
+  bash -c "$pvn_bootstrap" pvn-install.sh install --apply --confirm CLUSTER_NAME
 ```
 
 To run every phase non-interactively, first make the outer OpenStack provider
@@ -85,8 +89,8 @@ ports trusted/port-security-disabled for arbitrary guest MAC/IP traffic, then
 use all write gates:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
-  pvn-install.sh install --apply --confirm CLUSTER_NAME --full \
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh) && \
+  bash -c "$pvn_bootstrap" pvn-install.sh install --apply --confirm CLUSTER_NAME --full \
   --geneve-cidr 192.168.100.0/24 \
   --provider-cidr 192.168.200.0/24 \
   --guest-mtu 1300 \
@@ -308,16 +312,16 @@ all three against `SHA256SUMS`, prints a read-only plan, and asks for the exact
 deployment ID before changing a node:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh)"
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh) && bash -c "$pvn_bootstrap"
 ```
 
 For non-interactive automation, plan first and then explicitly apply:
 
 ```sh
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh)" \
-  pvn-update.sh plan
-bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh)" \
-  pvn-update.sh apply --confirm CLUSTER_NAME
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh) && \
+  bash -c "$pvn_bootstrap" pvn-update.sh plan
+pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-update.sh) && \
+  bash -c "$pvn_bootstrap" pvn-update.sh apply --confirm CLUSTER_NAME
 ```
 
 The updater takes the shared PVE `mutation` lease, pins the exact online

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Thin, checksum-verifying bootstrap intended for:
-#   bash -c "$(curl -fsSL https://PUBLIC_URL/pvn-install.sh)"
+#   pvn_bootstrap=$(curl -fsSL https://PUBLIC_URL/pvn-install.sh) && bash -c "$pvn_bootstrap"
 # On a PVE node the default discovers local standalone/cluster membership and
 # runs read-only preflight. Inventory/key prompts exist only for an explicitly
 # selected advanced deployment-host flow.
