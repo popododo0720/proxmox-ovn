@@ -229,12 +229,18 @@ func (c *Controller) reconcileAll(ctx context.Context, freshness time.Duration) 
 	if _, err := c.store.RecoverExpiredOperations(ctx, now.Add(-c.lease), now, operationRecoveryBatch); err != nil {
 		failures = append(failures, fmt.Errorf("recover expired operation leases: %w", err))
 	}
-	recent := make(map[string]struct{})
+	kinds := append([]model.Kind(nil), dependencyOrder...)
 	if freshness > 0 {
-		operations, err := c.store.List(ctx, model.KindOperation, controlstore.ListOptions{})
-		if err != nil {
-			failures = append(failures, fmt.Errorf("list operation audit records: %w", err))
-		} else {
+		kinds = append([]model.Kind{model.KindOperation}, kinds...)
+	}
+	snapshot, err := c.store.Snapshot(ctx, kinds, controlstore.ListOptions{})
+	if err != nil {
+		failures = append(failures, fmt.Errorf("read reconciliation snapshot: %w", err))
+	}
+	recent := make(map[string]struct{})
+	if err == nil && freshness > 0 {
+		operations := snapshot[model.KindOperation]
+		if operations != nil {
 			cutoff := now.Add(-freshness)
 			for _, resource := range operations {
 				operation := resource.(*model.Operation)
@@ -245,27 +251,25 @@ func (c *Controller) reconcileAll(ctx context.Context, freshness time.Duration) 
 			}
 		}
 	}
-	for _, kind := range dependencyOrder {
-		resources, err := c.store.List(ctx, kind, controlstore.ListOptions{})
-		if err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		for _, resource := range resources {
-			meta := resource.GetMetadata()
-			if freshness > 0 && meta.State == model.ResourceReady && meta.AppliedRevision >= meta.Revision {
-				if _, ok := recent[operationKey(kind, meta.ID, meta.Revision)]; ok {
-					continue
+	if err == nil {
+		for _, kind := range dependencyOrder {
+			resources := snapshot[kind]
+			for _, resource := range resources {
+				meta := resource.GetMetadata()
+				if freshness > 0 && meta.State == model.ResourceReady && meta.AppliedRevision >= meta.Revision {
+					if _, ok := recent[operationKey(kind, meta.ID, meta.Revision)]; ok {
+						continue
+					}
 				}
-			}
-			// A forced pass repairs OVN drift left by a manager that died
-			// between an external write and desired-state confirmation.
-			freshSince := time.Time{}
-			if freshness > 0 {
-				freshSince = now.Add(-freshness)
-			}
-			if err := c.reconcile(ctx, kind, meta.ID, true, freshSince); err != nil {
-				failures = append(failures, err)
+				// A forced pass repairs OVN drift left by a manager that died
+				// between an external write and desired-state confirmation.
+				freshSince := time.Time{}
+				if freshness > 0 {
+					freshSince = now.Add(-freshness)
+				}
+				if err := c.reconcile(ctx, kind, meta.ID, true, freshSince); err != nil {
+					failures = append(failures, err)
+				}
 			}
 		}
 	}

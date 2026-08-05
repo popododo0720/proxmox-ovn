@@ -237,42 +237,66 @@ func (s *Store) Get(ctx context.Context, kind model.Kind, id string) (model.Reso
 }
 
 func (s *Store) List(ctx context.Context, kind model.Kind, options controlstore.ListOptions) ([]model.Resource, error) {
+	snapshot, err := s.Snapshot(ctx, []model.Kind{kind}, options)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot[kind], nil
+}
+
+func (s *Store) Snapshot(ctx context.Context, kinds []model.Kind, options controlstore.ListOptions) (controlstore.ResourceSnapshot, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	if !kind.Valid() {
-		return nil, storeError(controlstore.ErrNotFound, "unknown resource kind %q", kind)
+	requested := make([]model.Kind, 0, len(kinds))
+	seen := make(map[model.Kind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		if !kind.Valid() {
+			return nil, storeError(controlstore.ErrNotFound, "unknown resource kind %q", kind)
+		}
+		if _, duplicate := seen[kind]; duplicate {
+			continue
+		}
+		seen[kind] = struct{}{}
+		requested = append(requested, kind)
 	}
 	if options.Limit < 0 {
 		return nil, storeError(controlstore.ErrConflict, "list limit cannot be negative")
+	}
+	if len(requested) == 0 {
+		return controlstore.ResourceSnapshot{}, nil
 	}
 	current, err := s.load(ctx)
 	if err != nil {
 		return nil, err
 	}
-	resources := make([]model.Resource, 0, len(current.resources[kind]))
-	for _, entry := range current.resources[kind] {
-		if matches(entry.resource, options) {
-			resources = append(resources, entry.resource)
+	result := make(controlstore.ResourceSnapshot, len(requested))
+	for _, kind := range requested {
+		resources := make([]model.Resource, 0, len(current.resources[kind]))
+		for _, entry := range current.resources[kind] {
+			if matches(entry.resource, options) {
+				resources = append(resources, entry.resource)
+			}
 		}
-	}
-	sort.Slice(resources, func(i, j int) bool {
-		left, right := resources[i].GetMetadata(), resources[j].GetMetadata()
-		if options.RecentFirst && !left.CreatedAt.Equal(right.CreatedAt) {
-			return left.CreatedAt.After(right.CreatedAt)
+		sort.Slice(resources, func(i, j int) bool {
+			left, right := resources[i].GetMetadata(), resources[j].GetMetadata()
+			if options.RecentFirst && !left.CreatedAt.Equal(right.CreatedAt) {
+				return left.CreatedAt.After(right.CreatedAt)
+			}
+			return left.ID < right.ID
+		})
+		if options.Limit > 0 && len(resources) > options.Limit {
+			resources = resources[:options.Limit]
 		}
-		return left.ID < right.ID
-	})
-	if options.Limit > 0 && len(resources) > options.Limit {
-		resources = resources[:options.Limit]
-	}
-	result := make([]model.Resource, 0, len(resources))
-	for _, resource := range resources {
-		copyResource, err := model.Clone(resource)
-		if err != nil {
-			return nil, err
+		clones := make([]model.Resource, 0, len(resources))
+		for _, resource := range resources {
+			copyResource, err := model.Clone(resource)
+			if err != nil {
+				return nil, err
+			}
+			clones = append(clones, copyResource)
 		}
-		result = append(result, copyResource)
+		result[kind] = clones
 	}
 	return result, nil
 }

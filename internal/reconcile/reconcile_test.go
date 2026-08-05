@@ -77,6 +77,29 @@ type recoveryObservingStore struct {
 	limit       int
 }
 
+type snapshotObservingStore struct {
+	controlstore.Store
+	mu            sync.Mutex
+	snapshotCalls int
+	listCalls     int
+	kinds         [][]model.Kind
+}
+
+func (store *snapshotObservingStore) List(ctx context.Context, kind model.Kind, options controlstore.ListOptions) ([]model.Resource, error) {
+	store.mu.Lock()
+	store.listCalls++
+	store.mu.Unlock()
+	return store.Store.List(ctx, kind, options)
+}
+
+func (store *snapshotObservingStore) Snapshot(ctx context.Context, kinds []model.Kind, options controlstore.ListOptions) (controlstore.ResourceSnapshot, error) {
+	store.mu.Lock()
+	store.snapshotCalls++
+	store.kinds = append(store.kinds, append([]model.Kind(nil), kinds...))
+	store.mu.Unlock()
+	return store.Store.Snapshot(ctx, kinds, options)
+}
+
 func (store *recoveryObservingStore) RecoverExpiredOperations(ctx context.Context, leaseCutoff, recoveredAt time.Time, limit int) (int, error) {
 	store.mu.Lock()
 	store.calls++
@@ -537,6 +560,44 @@ func TestControllerFullPassRecoversExpiredOperationsBeforeReconciling(t *testing
 	defer store.mu.Unlock()
 	if store.calls != 2 || !store.leaseCutoff.Equal(now.Add(-5*time.Minute)) || !store.recoveredAt.Equal(now) || store.limit != operationRecoveryBatch {
 		t.Fatalf("recovery calls=%d cutoff=%v recovered=%v limit=%d", store.calls, store.leaseCutoff, store.recoveredAt, store.limit)
+	}
+}
+
+func TestControllerFullPassReadsOneDependencySnapshot(t *testing.T) {
+	base := controlstore.NewMemory()
+	project := createProject(t, base)
+	store := &snapshotObservingStore{Store: base}
+	renderer := NewFakeRenderer()
+	controller := NewController(store, renderer)
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls := renderer.Calls(model.KindProject, project.ID); calls != 1 {
+		t.Fatalf("initial renderer calls=%d want 1", calls)
+	}
+	if err := controller.ReconcilePeriodic(context.Background(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if calls := renderer.Calls(model.KindProject, project.ID); calls != 1 {
+		t.Fatalf("fresh periodic renderer calls=%d want 1", calls)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.snapshotCalls != 2 || store.listCalls != 0 {
+		t.Fatalf("snapshot calls=%d list calls=%d, want 2 and 0", store.snapshotCalls, store.listCalls)
+	}
+	wantForced := dependencyOrder
+	wantPeriodic := append([]model.Kind{model.KindOperation}, dependencyOrder...)
+	for index, want := range [][]model.Kind{wantForced, wantPeriodic} {
+		if len(store.kinds[index]) != len(want) {
+			t.Fatalf("snapshot %d kinds=%v want=%v", index, store.kinds[index], want)
+		}
+		for kindIndex := range want {
+			if store.kinds[index][kindIndex] != want[kindIndex] {
+				t.Fatalf("snapshot %d kinds=%v want=%v", index, store.kinds[index], want)
+			}
+		}
 	}
 }
 

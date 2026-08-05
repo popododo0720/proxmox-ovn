@@ -42,10 +42,19 @@ type ListOptions struct {
 	Limit       int
 }
 
+// ResourceSnapshot is an atomic, read-only view of one or more resource
+// kinds. Each requested kind is filtered, ordered, and limited independently
+// using the same semantics as List.
+type ResourceSnapshot map[model.Kind][]model.Resource
+
 type Store interface {
 	Create(context.Context, model.Resource, string) (model.Resource, bool, error)
 	Get(context.Context, model.Kind, string) (model.Resource, error)
 	List(context.Context, model.Kind, ListOptions) ([]model.Resource, error)
+	// Snapshot reads and clones all requested kinds from one store view. This is
+	// intended for control-plane passes that must avoid reloading the complete
+	// durable database once per kind. Duplicate kinds are collapsed.
+	Snapshot(context.Context, []model.Kind, ListOptions) (ResourceSnapshot, error)
 	Update(context.Context, model.Resource, int64, string) (model.Resource, bool, error)
 	// ObserveNodeHeartbeat records runtime liveness without changing the
 	// desired-state revision or reconciliation status of the node.

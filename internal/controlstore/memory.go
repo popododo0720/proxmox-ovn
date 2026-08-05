@@ -154,40 +154,61 @@ func (s *Memory) Get(ctx context.Context, kind model.Kind, id string) (model.Res
 }
 
 func (s *Memory) List(ctx context.Context, kind model.Kind, options ListOptions) ([]model.Resource, error) {
+	snapshot, err := s.Snapshot(ctx, []model.Kind{kind}, options)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot[kind], nil
+}
+
+func (s *Memory) Snapshot(ctx context.Context, kinds []model.Kind, options ListOptions) (ResourceSnapshot, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	if !kind.Valid() {
-		return nil, storeError(ErrNotFound, "unknown resource kind %q", kind)
+	requested := make([]model.Kind, 0, len(kinds))
+	seen := make(map[model.Kind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		if !kind.Valid() {
+			return nil, storeError(ErrNotFound, "unknown resource kind %q", kind)
+		}
+		if _, duplicate := seen[kind]; duplicate {
+			continue
+		}
+		seen[kind] = struct{}{}
+		requested = append(requested, kind)
 	}
 	if options.Limit < 0 {
 		return nil, storeError(ErrConflict, "list limit cannot be negative")
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	resources := make([]model.Resource, 0, len(s.resources[kind]))
-	for _, resource := range s.resources[kind] {
-		if matches(resource, options) {
-			resources = append(resources, resource)
+	result := make(ResourceSnapshot, len(requested))
+	for _, kind := range requested {
+		resources := make([]model.Resource, 0, len(s.resources[kind]))
+		for _, resource := range s.resources[kind] {
+			if matches(resource, options) {
+				resources = append(resources, resource)
+			}
 		}
-	}
-	sort.Slice(resources, func(i, j int) bool {
-		left, right := resources[i].GetMetadata(), resources[j].GetMetadata()
-		if options.RecentFirst && !left.CreatedAt.Equal(right.CreatedAt) {
-			return left.CreatedAt.After(right.CreatedAt)
+		sort.Slice(resources, func(i, j int) bool {
+			left, right := resources[i].GetMetadata(), resources[j].GetMetadata()
+			if options.RecentFirst && !left.CreatedAt.Equal(right.CreatedAt) {
+				return left.CreatedAt.After(right.CreatedAt)
+			}
+			return left.ID < right.ID
+		})
+		if options.Limit > 0 && len(resources) > options.Limit {
+			resources = resources[:options.Limit]
 		}
-		return left.ID < right.ID
-	})
-	if options.Limit > 0 && len(resources) > options.Limit {
-		resources = resources[:options.Limit]
-	}
-	result := make([]model.Resource, 0, len(resources))
-	for _, resource := range resources {
-		copyResource, err := model.Clone(resource)
-		if err != nil {
-			return nil, err
+		clones := make([]model.Resource, 0, len(resources))
+		for _, resource := range resources {
+			copyResource, err := model.Clone(resource)
+			if err != nil {
+				return nil, err
+			}
+			clones = append(clones, copyResource)
 		}
-		result = append(result, copyResource)
+		result[kind] = clones
 	}
 	return result, nil
 }

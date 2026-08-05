@@ -22,6 +22,7 @@ type fakeDatabase struct {
 	rows     rawDatabase
 	epoch    int64
 	sequence int64
+	loads    int
 	closed   bool
 }
 
@@ -42,7 +43,14 @@ func (f *fakeDatabase) load(ctx context.Context) (rawDatabase, error) {
 	if f.closed {
 		return nil, errors.New("database closed")
 	}
+	f.loads++
 	return cloneRawDatabase(f.rows), nil
+}
+
+func (f *fakeDatabase) loadCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loads
 }
 
 func (f *fakeDatabase) initialize(ctx context.Context, row ovsdb.Row) error {
@@ -347,6 +355,35 @@ func TestStoreListRecentFirstAndLimit(t *testing.T) {
 	}
 	if _, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{Limit: -1}); !errors.Is(err, controlstore.ErrConflict) {
 		t.Fatalf("negative limit error=%v", err)
+	}
+}
+
+func TestStoreSnapshotLoadsDatabaseOnceAndClonesAllKinds(t *testing.T) {
+	database := newFakeDatabase()
+	store := deterministicStore(database)
+	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project")
+	provider := mustCreate(t, store, &model.ProviderNetwork{Name: "provider"}, "provider")
+	before := database.loadCount()
+	snapshot, err := store.Snapshot(context.Background(), []model.Kind{model.KindProject, model.KindProviderNetwork, model.KindOperation, model.KindProject}, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loads := database.loadCount() - before; loads != 1 {
+		t.Fatalf("Snapshot() database loads=%d want 1", loads)
+	}
+	if len(snapshot) != 3 || len(snapshot[model.KindProject]) != 1 || snapshot[model.KindProject][0].GetMetadata().ID != project.GetMetadata().ID {
+		t.Fatalf("project snapshot=%#v", snapshot[model.KindProject])
+	}
+	if len(snapshot[model.KindProviderNetwork]) != 1 || snapshot[model.KindProviderNetwork][0].GetMetadata().ID != provider.GetMetadata().ID {
+		t.Fatalf("provider snapshot=%#v", snapshot[model.KindProviderNetwork])
+	}
+	if len(snapshot[model.KindOperation]) != 0 {
+		t.Fatalf("internal operation rows leaked into snapshot: %#v", snapshot[model.KindOperation])
+	}
+	snapshot[model.KindProject][0].(*model.Project).Name = "caller-mutated"
+	loaded, err := store.Get(context.Background(), model.KindProject, project.GetMetadata().ID)
+	if err != nil || loaded.(*model.Project).Name != "tenant" {
+		t.Fatalf("snapshot mutation leaked into store: project=%#v err=%v", loaded, err)
 	}
 }
 

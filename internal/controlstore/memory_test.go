@@ -151,6 +151,46 @@ func TestMemoryListRecentFirstAndLimit(t *testing.T) {
 	}
 }
 
+func TestMemorySnapshotPreservesListSemanticsAndIsolation(t *testing.T) {
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	store := NewMemory(WithClock(func() time.Time { return now }))
+	older := mustCreate(t, store, &model.Project{Name: "older", PoolID: "pool-older"}, "older")
+	now = now.Add(time.Second)
+	newer := mustCreate(t, store, &model.Project{Name: "newer", PoolID: "pool-newer"}, "newer")
+	provider := mustCreate(t, store, &model.ProviderNetwork{Name: "provider"}, "provider")
+	mustCreate(t, store, &model.Network{ProjectID: older.GetMetadata().ID, Name: "older-network"}, "older-network")
+	newerNetwork := mustCreate(t, store, &model.Network{ProjectID: newer.GetMetadata().ID, Name: "newer-network"}, "newer-network")
+
+	snapshot, err := store.Snapshot(context.Background(), []model.Kind{model.KindProject, model.KindProviderNetwork, model.KindProject}, ListOptions{RecentFirst: true, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 2 || len(snapshot[model.KindProject]) != 1 || snapshot[model.KindProject][0].GetMetadata().ID != newer.GetMetadata().ID || snapshot[model.KindProject][0].GetMetadata().ID == older.GetMetadata().ID {
+		t.Fatalf("project snapshot=%#v", snapshot[model.KindProject])
+	}
+	if len(snapshot[model.KindProviderNetwork]) != 1 || snapshot[model.KindProviderNetwork][0].GetMetadata().ID != provider.GetMetadata().ID {
+		t.Fatalf("provider snapshot=%#v", snapshot[model.KindProviderNetwork])
+	}
+	filtered, err := store.Snapshot(context.Background(), []model.Kind{model.KindNetwork}, ListOptions{ProjectID: newer.GetMetadata().ID})
+	if err != nil || len(filtered[model.KindNetwork]) != 1 || filtered[model.KindNetwork][0].GetMetadata().ID != newerNetwork.GetMetadata().ID {
+		t.Fatalf("filtered snapshot=%#v err=%v", filtered[model.KindNetwork], err)
+	}
+	snapshot[model.KindProject][0].(*model.Project).Name = "caller-mutated"
+	loaded, err := store.Get(context.Background(), model.KindProject, newer.GetMetadata().ID)
+	if err != nil || loaded.(*model.Project).Name != "newer" {
+		t.Fatalf("snapshot mutation leaked into store: project=%#v err=%v", loaded, err)
+	}
+	if _, err := store.Snapshot(context.Background(), []model.Kind{"invalid"}, ListOptions{}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("invalid snapshot kind error=%v", err)
+	}
+	if _, err := store.Snapshot(context.Background(), []model.Kind{model.KindProject}, ListOptions{Limit: -1}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("negative snapshot limit error=%v", err)
+	}
+	if _, err := store.List(context.Background(), model.Kind("invalid"), ListOptions{Limit: -1}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("List validation precedence changed: error=%v", err)
+	}
+}
+
 func TestMemoryPrunesOnlyOldSupersededReconcileAudits(t *testing.T) {
 	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	store := NewMemory(WithClock(func() time.Time { return now }))
