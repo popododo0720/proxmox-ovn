@@ -65,6 +65,12 @@ exit "${PVN_TEST_INSTALLER_STATUS:-0}"
 EOF
 chmod 0755 "$ASSETS/pvn-cluster-install"
 
+cat > "$ASSETS/pvn-cluster-lease" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 0755 "$ASSETS/pvn-cluster-lease"
+
 cat > "$BIN/pvn-topology" <<'EOF'
 #!/bin/sh
 set -eu
@@ -83,7 +89,8 @@ printf 'test deb payload\n' > "$ASSETS/pvn-node_0.1.1_amd64.deb"
 make_manifest() {
     (
         cd "$ASSETS"
-        sha256sum pvn-node_0.1.1_amd64.deb pvn-cluster-install > SHA256SUMS
+        sha256sum pvn-node_0.1.1_amd64.deb pvn-cluster-install \
+            pvn-cluster-lease > SHA256SUMS
     )
 }
 make_manifest
@@ -197,9 +204,10 @@ fi
 
 reset_logs
 PVN_PHASE=preflight run_bootstrap > "$WORK/preflight.out"
-[ "$(wc -l < "$CURL_LOG")" -eq 3 ] || fail "bootstrap did not download exactly three files"
+[ "$(wc -l < "$CURL_LOG")" -eq 4 ] || fail "bootstrap did not download exactly four files"
 grep -q '/pvn-node_0.1.1_amd64.deb ' "$CURL_LOG" || fail "versioned DEB was not downloaded"
 grep -q '/pvn-cluster-install ' "$CURL_LOG" || fail "cluster installer was not downloaded"
+grep -q '/pvn-cluster-lease ' "$CURL_LOG" || fail "cluster lease helper was not downloaded"
 grep -q '/SHA256SUMS ' "$CURL_LOG" || fail "SHA256SUMS was not downloaded"
 [ "$(cat "$INSTALLER_LOG")" = "preflight --inventory $INVENTORY --identity $IDENTITY" ] ||
     fail "explicit preflight arguments were incorrect"

@@ -227,6 +227,39 @@ printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  %s\n' 
 EOF
 chmod 0755 "$BIN/sha256sum"
 
+cat > "$BIN/pvn-cluster-lease" <<'EOF'
+#!/bin/sh
+set -eu
+action=$1
+domain=$2
+token=${3:-}
+path=$PVN_TEST_GLOBAL_LOCK
+[ "$domain" = install ]
+case "$action" in
+    acquire)
+        [ ! -e "$path" ] || {
+            echo "test lease already exists" >&2
+            exit 1
+        }
+        IFS= read -r owner
+        printf '%s\n' "$owner" | grep -Fq "\"token\":\"$token\""
+        printf '%s\n' "$owner" > "$path"
+        chmod 0600 "$path"
+        printf '%s\n' "$path"
+        ;;
+    release)
+        [ -f "$path" ]
+        grep -Fq "\"token\":\"$token\"" "$path"
+        rm -f "$path"
+        ;;
+    show)
+        cat "$path"
+        ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod 0755 "$BIN/pvn-cluster-lease"
+
 export PATH="$BIN:$PATH"
 export PVN_TEST_LOG=$LOG
 export PVN_TEST_REMOTE_SCRIPT=$REMOTE_SCRIPT
@@ -290,7 +323,8 @@ run_local_pve() {
     PVN_PVE_COROSYNC_CONF=$PVE_COROSYNC \
     PVN_PVE_NODES_DIR=$PVE_NODES \
     PVN_PVE_IDENTITY=$PVE_IDENTITY \
-    PVN_PVE_GLOBAL_LOCK_FILE=$PVE_GLOBAL_LOCK \
+    PVN_CLUSTER_LEASE_BIN=$BIN/pvn-cluster-lease \
+    PVN_TEST_GLOBAL_LOCK=$PVE_GLOBAL_LOCK \
     PVN_PVECM_BIN=$BIN/pvecm \
     PVN_LOCAL_SH_BIN=$BIN/local-sh \
     PVN_CP_BIN=$BIN/cp \

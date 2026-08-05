@@ -260,8 +260,10 @@ trap 'exit 130' HUP INT TERM
 
 DEB_NAME=pvn-node_${VERSION}_${ARCH}.deb
 INSTALLER_NAME=pvn-cluster-install
+LEASE_NAME=pvn-cluster-lease
 DEB_PATH=$WORK/$DEB_NAME
 INSTALLER_PATH=$WORK/$INSTALLER_NAME
+LEASE_PATH=$WORK/$LEASE_NAME
 
 download() {
     pvn_download_url=$1
@@ -294,11 +296,13 @@ verify_checksum() {
 echo "Downloading PVN $VERSION ($ARCH) from $RELEASE_BASE_URL"
 download "$RELEASE_BASE_URL/$DEB_NAME" "$DEB_PATH"
 download "$RELEASE_BASE_URL/$INSTALLER_NAME" "$INSTALLER_PATH"
+download "$RELEASE_BASE_URL/$LEASE_NAME" "$LEASE_PATH"
 download "$RELEASE_BASE_URL/SHA256SUMS" "$WORK/SHA256SUMS"
 
 verify_checksum "$DEB_PATH" "$WORK/SHA256SUMS"
 verify_checksum "$INSTALLER_PATH" "$WORK/SHA256SUMS"
-chmod 0700 "$INSTALLER_PATH"
+verify_checksum "$LEASE_PATH" "$WORK/SHA256SUMS"
+chmod 0700 "$INSTALLER_PATH" "$LEASE_PATH"
 
 run_cluster_installer() {
     pvn_run_phase=$1
@@ -316,7 +320,7 @@ run_cluster_installer() {
     if [ "$pvn_run_apply" -eq 1 ]; then
         set -- "$@" --apply --confirm "$pvn_run_confirm"
     fi
-    "$INSTALLER_PATH" "$@"
+    PVN_CLUSTER_LEASE_BIN=$LEASE_PATH "$INSTALLER_PATH" "$@"
 }
 
 run_topology() {

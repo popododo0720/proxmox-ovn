@@ -89,8 +89,9 @@ release: deb
 	pvn_deb="pvn-node_$(DEB_VERSION)_$${pvn_arch}.deb"; \
 	install -m 0755 deploy/scripts/pvn-install.sh dist/pvn-install.sh; \
 	install -m 0755 deploy/scripts/pvn-cluster-install dist/pvn-cluster-install; \
+	install -m 0755 deploy/scripts/pvn-cluster-lease dist/pvn-cluster-lease; \
 	cd dist; \
-	sha256sum "$$pvn_deb" pvn-cluster-install pvn-install.sh > SHA256SUMS
+	sha256sum "$$pvn_deb" pvn-cluster-install pvn-cluster-lease pvn-install.sh > SHA256SUMS
 
 clean:
 	rm -rf bin coverage dist

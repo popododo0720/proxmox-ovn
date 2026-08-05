@@ -5,6 +5,7 @@
 set -eu
 
 PROGRAM=${0##*/}
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
 PHASE=
 INVENTORY=
 IDENTITY=
@@ -22,7 +23,13 @@ PVE_MEMBERS_FILE=${PVN_PVE_MEMBERS_FILE:-/etc/pve/.members}
 PVE_COROSYNC_CONF=${PVN_PVE_COROSYNC_CONF:-/etc/pve/corosync.conf}
 PVE_NODES_DIR=${PVN_PVE_NODES_DIR:-/etc/pve/nodes}
 PVE_CLUSTER_IDENTITY=${PVN_PVE_IDENTITY:-/root/.ssh/id_rsa}
-PVE_GLOBAL_LOCK_FILE=${PVN_PVE_GLOBAL_LOCK_FILE:-/etc/pve/priv/lock/pvn-install.lock}
+if [ -n "${PVN_CLUSTER_LEASE_BIN:-}" ]; then
+    CLUSTER_LEASE_BIN=$PVN_CLUSTER_LEASE_BIN
+elif [ -x "$SCRIPT_DIR/pvn-cluster-lease" ]; then
+    CLUSTER_LEASE_BIN=$SCRIPT_DIR/pvn-cluster-lease
+else
+    CLUSTER_LEASE_BIN=/usr/lib/pvn/pvn-cluster-lease
+fi
 CURRENT_HOST=
 CURRENT_REMOTE_DEB=
 STAGED_RECORDS=
@@ -507,107 +514,28 @@ fi
 
 acquire_pve_global_lock() {
     [ "$LOCAL_PVE" = true ] && [ "$PVE_MODE" = cluster ] || return 0
-    case "$PVE_GLOBAL_LOCK_FILE" in
-        /*) ;;
-        *) fail "PVN_PVE_GLOBAL_LOCK_FILE must be an absolute path" ;;
-    esac
-    PVE_GLOBAL_LOCK_TOKEN=$("$PYTHON_BIN" - "$PVE_GLOBAL_LOCK_FILE" \
-        "$PVE_LOCAL_NODE" "$PVE_CONFIRM_ID" "$$" <<'PVN_LOCK_ACQUIRE'
-import json
-import os
-import secrets
-import stat
-import sys
-import time
-
-path, node, deployment, installer_pid = sys.argv[1:]
-parent = os.path.dirname(path)
-try:
-    parent_stat = os.lstat(parent)
-except OSError as error:
-    print(f"PVN cluster-global lock directory is unavailable: {error}", file=sys.stderr)
-    raise SystemExit(1)
-if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(parent_stat.st_mode):
-    print("PVN cluster-global lock parent is not a directory", file=sys.stderr)
-    raise SystemExit(1)
-if parent_stat.st_uid != 0 or stat.S_IMODE(parent_stat.st_mode) & 0o022:
-    print("PVN cluster-global lock parent has unsafe ownership or mode", file=sys.stderr)
-    raise SystemExit(1)
-
-token = secrets.token_hex(24)
-record = {
-    "deployment": deployment,
-    "node": node,
-    "pid": int(installer_pid),
-    "started": int(time.time()),
-    "token": token,
-}
-flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-if hasattr(os, "O_NOFOLLOW"):
-    flags |= os.O_NOFOLLOW
-try:
-    descriptor = os.open(path, flags, 0o600)
-except FileExistsError:
-    try:
-        with open(path, "r", encoding="utf-8") as existing_file:
-            existing_record = json.load(existing_file)
-        existing = json.dumps(
-            {
-                key: existing_record.get(key)
-                for key in ("deployment", "node", "pid", "started")
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
-        existing = "unreadable-owner-record"
-    print(
-        f"PVN cluster-global install lock already exists at {path}: {existing}; "
-        "verify its owner and remove it manually only if stale",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-except OSError as error:
-    print(f"cannot create PVN cluster-global install lock: {error}", file=sys.stderr)
-    raise SystemExit(1)
-try:
-    payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    os.write(descriptor, payload)
-finally:
-    os.close(descriptor)
-print(token)
-PVN_LOCK_ACQUIRE
-    ) || fail "could not acquire the PVE cluster-global install lock"
+    [ -x "$CLUSTER_LEASE_BIN" ] ||
+        fail "PVE cluster lease helper is unavailable: $CLUSTER_LEASE_BIN"
+    PVE_GLOBAL_LOCK_TOKEN=$("$PYTHON_BIN" -c \
+        'import secrets; print(secrets.token_hex(24))') ||
+        fail "could not generate the PVE cluster-global install token"
     case "$PVE_GLOBAL_LOCK_TOKEN" in
         ''|*[!0-9a-f]*) fail "cluster-global lock returned an invalid owner token" ;;
     esac
+    pvn_lock_owner=$("$PYTHON_BIN" -c \
+        'import json,sys,time; print(json.dumps({"domain":"install","deployment":sys.argv[1],"node":sys.argv[2],"pid":int(sys.argv[3]),"started":int(time.time()),"token":sys.argv[4]},sort_keys=True,separators=(",",":")))' \
+        "$PVE_CONFIRM_ID" "$PVE_LOCAL_NODE" "$$" "$PVE_GLOBAL_LOCK_TOKEN") ||
+        fail "could not create the PVE cluster-global install owner record"
+    printf '%s\n' "$pvn_lock_owner" |
+        "$CLUSTER_LEASE_BIN" acquire install "$PVE_GLOBAL_LOCK_TOKEN" >/dev/null ||
+        fail "could not acquire the PVE cluster-global install lease"
     PVE_GLOBAL_LOCK_HELD=true
 }
 
 release_pve_global_lock() {
     [ "$PVE_GLOBAL_LOCK_HELD" = true ] || return 0
-    if ! "$PYTHON_BIN" - "$PVE_GLOBAL_LOCK_FILE" "$PVE_GLOBAL_LOCK_TOKEN" <<'PVN_LOCK_RELEASE'
-import json
-import os
-import stat
-import sys
-
-path, token = sys.argv[1:]
-try:
-    metadata = os.lstat(path)
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise RuntimeError("lock path is not a regular file")
-    with open(path, "r", encoding="utf-8") as lock_file:
-        record = json.load(lock_file)
-    if not isinstance(record, dict) or record.get("token") != token:
-        raise RuntimeError("owner token no longer matches")
-    os.unlink(path)
-except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as error:
-    print(f"refusing to remove PVN cluster-global lock {path}: {error}", file=sys.stderr)
-    raise SystemExit(1)
-PVN_LOCK_RELEASE
-    then
-        echo "$PROGRAM: warning: cluster-global lock was not removed; inspect $PVE_GLOBAL_LOCK_FILE manually" >&2
+    if ! "$CLUSTER_LEASE_BIN" release install "$PVE_GLOBAL_LOCK_TOKEN"; then
+        echo "$PROGRAM: warning: cluster-global install lease was not removed; run pvn-cluster-lease show install" >&2
         return 1
     fi
     PVE_GLOBAL_LOCK_HELD=false
