@@ -1,3 +1,9 @@
+proxmox-ovn (0.2.3) unstable; urgency=medium
+
+  * Adopt the pristine packaged OVN host defaults during first activation.
+
+ -- PVN Project <root@localhost>  Wed, 05 Aug 2026 08:45:00 +0000
+
 proxmox-ovn (0.2.2) unstable; urgency=medium
 
   * Make topology MTU recovery fail closed and add rolling cluster updates.
