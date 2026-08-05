@@ -29,16 +29,25 @@ const networkFields = [
   { name: 'name', label: 'Name', required: true, placeholder: 'application' },
   { name: 'project_id', label: 'Project ID', required: true },
   { name: 'mtu', label: 'Guest MTU', type: 'number' as const, defaultValue: 1400 },
+  { name: 'external', label: 'Provider-backed external network', type: 'checkbox' as const },
+  { name: 'provider_network_id', label: 'Provider network ID', help: 'Required only for an external network.' },
   { name: 'description', label: 'Description' },
 ];
 
 export function ProjectsPage() {
   return <ResourcePage<Project>
     title="Projects"
-    description="PVE pools synchronized into isolated PVN project boundaries."
+    description="Existing PVE pools mapped into isolated PVN project boundaries."
     endpoint="/projects"
     columns={projectColumns}
-    emptyMessage="Create a PVE pool, then let PVN synchronize it as a project."
+    createLabel="Project mapping"
+    createFields={[
+      { name: 'name', label: 'Name', required: true, placeholder: 'tenant-a' },
+      { name: 'pool_id', label: 'Existing PVE pool ID', required: true, placeholder: 'tenant-a' },
+      { name: 'description', label: 'Description' },
+    ]}
+    allowDelete
+    emptyMessage="Create a PVE pool first, then map its ID here."
   />;
 }
 
@@ -177,6 +186,7 @@ export function FloatingIPsPage() {
       { name: 'project_id', label: 'Project ID', required: true },
       { name: 'provider_network_id', label: 'Provider network ID', required: true },
       { name: 'address', label: 'Floating IPv4 address', required: true, placeholder: '203.0.113.42' },
+      { name: 'router_id', label: 'Router ID', help: 'Required when associating this address with a port.' },
       { name: 'port_id', label: 'Destination port ID' },
       { name: 'fixed_ip_address', label: 'Destination fixed IP' },
     ]}
