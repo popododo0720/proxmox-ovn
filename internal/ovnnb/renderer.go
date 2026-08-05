@@ -611,7 +611,7 @@ func (renderer *Renderer) routerGatewayArgs(router *model.Router, networkID, rou
 		"--", "--may-exist", "lsp-add", logicalSwitchUUID(networkID), switchPort,
 		"--", "lsp-set-type", switchPort, "router",
 		"--", "lsp-set-addresses", switchPort, "router",
-		"--", "lsp-set-options", switchPort, "router-port="+routerPort,
+		"--", "lsp-set-options", switchPort, "router-port="+routerPort, "nat-addresses=router",
 		"--", "set", "Logical_Switch_Port", switchPort,
 	)
 	return append(args, metadataAssignments(router, map[string]string{"pvn-network": networkID, "pvn-project": router.ProjectID, "pvn-role": "external-gateway"})...)

@@ -466,7 +466,7 @@ func TestRouterRendersCentralizedGatewayDefaultRouteAndSNAT(t *testing.T) {
 	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
 	for _, expected := range [][]string{
 		{"lrp-add " + logicalRouterUUID(fixture.router.ID) + " " + routerPort, "192.0.2.10/24"},
-		{"lsp-add " + logicalSwitchUUID(fixture.externalNetwork.ID) + " " + switchPort, "lsp-set-type " + switchPort + " router", "router-port=" + routerPort},
+		{"lsp-add " + logicalSwitchUUID(fixture.externalNetwork.ID) + " " + switchPort, "lsp-set-type " + switchPort + " router", "router-port=" + routerPort, "nat-addresses=router"},
 		{"create Logical_Router_Static_Route", routeUUID, `ip_prefix="0.0.0.0/0"`, `nexthop="192.0.2.1"`, `output_port="` + routerPort + `"`},
 		{"add Logical_Router " + logicalRouterUUID(fixture.router.ID) + " static_routes " + routeUUID},
 		{"lrp-set-gateway-chassis " + routerPort + " chassis-a 32767", "lrp-set-gateway-chassis " + routerPort + " chassis-b 32766"},
