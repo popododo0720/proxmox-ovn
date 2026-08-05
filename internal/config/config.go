@@ -85,8 +85,8 @@ func Default() Config {
 			PVEURL:        "https://127.0.0.1:8006",
 			UnixSocket:    "/run/pvn/manager.sock",
 			WebRoot:       "/usr/share/pvn/web",
-			TLSCert:       "/etc/pve/local/pveproxy-ssl.pem",
-			TLSKey:        "/etc/pve/local/pveproxy-ssl.key",
+			TLSCert:       "/etc/pve/local/pve-ssl.pem",
+			TLSKey:        "/etc/pve/local/pve-ssl.key",
 		},
 		Agent: AgentConfig{
 			PollEvery:    2 * time.Second,
