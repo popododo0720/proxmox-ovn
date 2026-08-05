@@ -11,6 +11,7 @@ import (
 
 	"github.com/pvnstack/proxmox-ovn/internal/buildinfo"
 	"github.com/pvnstack/proxmox-ovn/internal/central"
+	"github.com/pvnstack/proxmox-ovn/internal/centraldb"
 	"github.com/pvnstack/proxmox-ovn/internal/config"
 	"github.com/pvnstack/proxmox-ovn/internal/diagnostic"
 	"github.com/pvnstack/proxmox-ovn/internal/nodestate"
@@ -61,13 +62,26 @@ func doctor(args []string) error {
 }
 
 func centralCommand(args []string) error {
-	if len(args) == 0 || args[0] != "plan" {
-		return errors.New("usage: pvnctl central plan --nodes pve-a,pve-b [--existing pve-a]")
+	if len(args) == 0 {
+		return errors.New("usage: pvnctl central <plan|init-control|promote-control>")
 	}
+	switch args[0] {
+	case "plan":
+		return centralPlan(args[1:])
+	case "init-control":
+		return centralInit(args[1:])
+	case "promote-control":
+		return centralPromote(args[1:])
+	default:
+		return fmt.Errorf("unknown central command %q", args[0])
+	}
+}
+
+func centralPlan(args []string) error {
 	flags := flag.NewFlagSet("central plan", flag.ContinueOnError)
 	nodeNames := flags.String("nodes", "", "comma-separated online eligible nodes")
 	existingNames := flags.String("existing", "", "comma-separated existing voters")
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	names := splitList(*nodeNames)
@@ -80,6 +94,73 @@ func centralCommand(args []string) error {
 		return err
 	}
 	return writeJSON(os.Stdout, plan)
+}
+
+func centralInit(args []string) error {
+	flags := flag.NewFlagSet("central init-control", flag.ContinueOnError)
+	configPath := flags.String("config", config.DefaultPath, "PVN config path")
+	database := flags.String("database", centraldb.DefaultDatabase, "control database path")
+	schema := flags.String("schema", centraldb.DefaultSchema, "control schema path")
+	mode := flags.String("mode", "standalone", "standalone or raft")
+	local := flags.String("local", "", "local Raft address, normally ssl:IP:6646")
+	join := flags.String("join", "", "comma-separated existing Raft members")
+	confirmation := flags.String("confirm", "", "exact PVN cluster ID")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := confirmedConfig(*configPath, *confirmation)
+	if err != nil {
+		return err
+	}
+	if err := centraldb.Init(context.Background(), centraldb.ExecRunner{}, centraldb.InitOptions{
+		Database: *database,
+		Schema:   *schema,
+		Mode:     *mode,
+		Local:    *local,
+		Remotes:  splitList(*join),
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("initialized %s PVN control database for cluster %s\n", *mode, cfg.Cluster.ID)
+	return nil
+}
+
+func centralPromote(args []string) error {
+	flags := flag.NewFlagSet("central promote-control", flag.ContinueOnError)
+	configPath := flags.String("config", config.DefaultPath, "PVN config path")
+	database := flags.String("database", centraldb.DefaultDatabase, "control database path")
+	local := flags.String("local", "", "local Raft address, normally ssl:IP:6646")
+	confirmation := flags.String("confirm", "", "exact PVN cluster ID")
+	apply := flags.Bool("apply", false, "perform the promotion")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if !*apply {
+		return errors.New("promotion is destructive to the service model; stop pvn-manager and pvn-control-db, then pass --apply")
+	}
+	if _, err := confirmedConfig(*configPath, *confirmation); err != nil {
+		return err
+	}
+	backup, err := centraldb.Promote(context.Background(), centraldb.ExecRunner{}, centraldb.PromoteOptions{
+		Database: *database,
+		Local:    *local,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("promoted PVN control database to Raft; standalone backup: %s\n", backup)
+	return nil
+}
+
+func confirmedConfig(path, confirmation string) (config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return config.Config{}, err
+	}
+	if confirmation == "" || confirmation != cfg.Cluster.ID {
+		return config.Config{}, errors.New("--confirm must exactly match cluster.id")
+	}
+	return cfg, nil
 }
 
 func nodeCommand(args []string) error {
