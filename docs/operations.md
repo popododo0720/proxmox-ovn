@@ -14,87 +14,82 @@ their individual controller, database, and northd units instead. If OVN was
 already used by another system, do not install PVN until that ownership is
 resolved.
 
-## 1. Inventory and read-only discovery
+## 1. Native cluster discovery
 
-The example three-node deployment inventory is installed as
-`inventory/pve-cluster.example`. It must list the full PVE cluster
-membership exactly once in `PVN_TARGET_NODES`; the installer parses that field
-and never sources the file. Entries are management SSH destinations only.
-Pass the root SSH private key separately with `--identity`; do not store a
-password or private key in the inventory.
+Run the public installer on any target PVE node. The default mode reads native
+PVE membership, requires quorum and every declared member online, and uses
+Proxmox's root cluster key plus each node's own `ssh_known_hosts` pin. It never
+asks for or uses a password. The current automated control-plane bootstrap
+supports one standalone PVE node or exactly three clustered PVE nodes.
 
-Before running the installer, verify and populate the deployment host's SSH
-`known_hosts` entries through a trusted channel. The installer requires
-strict host-key checking and root public-key authentication. It disables
-password and keyboard-interactive authentication, uses only the supplied key,
-and never prompts for credentials.
-
-The package-safety preflight is not a topology-readiness check. Before writing
-configuration, separately discover on every node:
+Before writing configuration, the topology preflight discovers on every node:
 
 - PVE hostname, cluster membership, quorum, and PVE major version;
 - management and intended Geneve addresses, routes, and underlay MTU;
 - current OVS/OVN packages, services, bridges, ports, and external IDs; and
-- the operator-owned provider bridge, uplink, VLAN policy, and gateway path.
+- the intended provider NIC, routes, and any existing bridge ownership.
 
-Do not infer a Geneve address, provider bridge, or physical uplink from the
-management addresses. PVN never creates a provider bridge, attaches a physical
-NIC, changes a host address, or rewrites `/etc/network/interfaces`.
-
-After key-based SSH access is available, collect the same read-only topology
-report from the example inventory nodes before activation:
+Package discovery is read-only:
 
 ```sh
-PVN_IDENTITY=/root/.ssh/id_ed25519
-mkdir -p ./pvn-discovery
-for host in pve-a.example.net pve-b.example.net pve-c.example.net; do
-  ssh -i "$PVN_IDENTITY" -o BatchMode=yes \
-    -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
-    -o PubkeyAuthentication=yes -o IdentitiesOnly=yes \
-    -o StrictHostKeyChecking=yes root@"$host" 'sh -s' \
-    < deploy/scripts/pvn-host-discover > "./pvn-discovery/$host.txt"
-done
+./deploy/scripts/pvn-cluster-install preflight --local-pve
 ```
 
-PVN never infers a Geneve address, provider bridge, physical uplink, VLAN
-policy, or gateway path from a management address. No package or installer
-phase auto-wires a provider network.
+Topology planning is also read-only and identifies Geneve/provider NICs only
+from explicitly supplied CIDRs:
+
+```sh
+/usr/lib/pvn/pvn-topology plan \
+  --geneve-cidr 192.168.100.0/24 \
+  --provider-cidr 192.168.200.0/24
+```
+
+An external inventory and identity file remain available as an advanced
+package-distribution mode. They do not perform topology/control-plane setup.
+The example is installed as `inventory/pve-cluster.example`; never put a
+password or private key in that file.
 
 ## 2. Safe cluster package stage
 
-The intended release entry point is:
+The public release entry point is:
 
 ```sh
-bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)"
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)"
 ```
 
-`RELEASE_HOST` is a placeholder, not a live public endpoint. When hosting a
-release locally, publish `pvn-install.sh` and a release directory containing
-the versioned `pvn-node` DEB, `pvn-cluster-install`, and `SHA256SUMS`. The
-bootstrap accepts only an HTTPS release directory, downloads the three release
-files into a private temporary directory, verifies the DEB and cluster
-installer against `SHA256SUMS`, and removes the directory on exit. With no
-arguments it prompts on the terminal for the inventory and private-key paths,
-then runs the read-only preflight first. After a successful preflight it asks
-for the exact PVE cluster name. Press Enter to stop without installing; only
-the matching cluster name enters the package-apply phase.
+The bootstrap accepts only HTTPS, downloads the versioned DEB, cluster
+installer, and native PVE lease helper into a private temporary directory,
+verifies every executable against `SHA256SUMS`, and removes the directory on
+exit. It first prints the full discovered membership. Press Enter to stop; only
+the exact cluster name enters the package-apply phase. After package install it
+offers the separate topology/control-plane phase.
 
 Use the hosted bootstrap's `install` phase first as a dry run:
 
 ```sh
-bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)" pvn-install.sh \
-  install --inventory /path/to/inventory --identity /root/.ssh/id_ed25519 \
-  --release-base-url https://RELEASE_HOST/releases/v0.1.1
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
+  pvn-install.sh install
 ```
 
 After reviewing every target and the printed cluster name, repeat with both
 write gates:
 
 ```sh
-bash -c "$(curl -fsSL https://RELEASE_HOST/pvn-install.sh)" pvn-install.sh \
-  install --inventory /path/to/inventory --identity /root/.ssh/id_ed25519 \
-  --release-base-url https://RELEASE_HOST/releases/v0.1.1 \
-  --apply --confirm CLUSTER_ID
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
+  pvn-install.sh install --apply --confirm CLUSTER_NAME
+```
+
+To run every phase non-interactively, first make the outer OpenStack provider
+ports trusted/port-security-disabled for arbitrary guest MAC/IP traffic, then
+use all write gates:
+
+```sh
+bash -c "$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/latest/download/pvn-install.sh)" \
+  pvn-install.sh install --apply --confirm CLUSTER_NAME --full \
+  --geneve-cidr 192.168.100.0/24 \
+  --provider-cidr 192.168.200.0/24 \
+  --guest-mtu 1300 \
+  --provider-port-ready OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP
 ```
 
 From a source checkout, build the DEB, set the three local paths, and run the
@@ -104,7 +99,7 @@ underlying installer directly:
 make deb
 PVN_INVENTORY=deploy/inventory/pve-cluster.example
 PVN_IDENTITY=/root/.ssh/id_ed25519
-PVN_DEB=dist/pvn-node_0.1.1_amd64.deb
+PVN_DEB=dist/pvn-node_VERSION_amd64.deb
 
 ./deploy/scripts/pvn-cluster-install preflight \
   --inventory "$PVN_INVENTORY" --identity "$PVN_IDENTITY"
@@ -170,47 +165,55 @@ cannot be patched or if the installed loader differs from the packaged copy.
 left unchanged by the UI installer; they also fail the later PVE 9 doctor check
 and therefore cannot be activated accidentally.
 
-## 3. Prepare the host and PKI
+## 3. Apply the inert host topology
 
-Each node needs a distinct, stable Geneve IPv4 address. With a 1500-byte
-underlay, PVN's default tenant MTU is 1400. The operator must create and test
-both OVS bridges before PVN activation:
-
-- `br-int`, the OVN integration bridge; and
-- the configured provider bridge, such as `br-provider`, already connected to
-  the intended physical/provider path.
-
-Create the CA once on a protected deployment host, never on a PVE node. Keep
-`ca-key.pem` off the cluster:
+Each node needs a distinct, stable Geneve IPv4 address. The topology command
+derives a safe guest MTU from the live Geneve/provider paths unless
+`--guest-mtu` is supplied. Review its read-only plan, then use all three write
+gates:
 
 ```sh
-pvnctl pki init-ca --config ./config.json \
-  --directory ./pki/ca --confirm CLUSTER_ID
-pvnctl pki issue-node --config ./config.json \
-  --ca-cert ./pki/ca/ca.pem --ca-key ./pki/ca/ca-key.pem \
-  --directory ./pki/nodes --name pve-a --dns pve-a \
-  --ips CONTROL_IP,GENEVE_IP --confirm CLUSTER_ID
+/usr/lib/pvn/pvn-topology plan \
+  --geneve-cidr GENEVE_CIDR --provider-cidr PROVIDER_CIDR
+
+/usr/lib/pvn/pvn-topology apply \
+  --geneve-cidr GENEVE_CIDR --provider-cidr PROVIDER_CIDR \
+  --guest-mtu GUEST_MTU \
+  --provider-port-ready OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+  --confirm CLUSTER_NAME
 ```
 
-Install the public CA as `/etc/pvn/pki/ca.pem` and the node's unique pair as
-`node.pem` and `node-key.pem`. Use `root:pvn`, mode `0644` for certificates and
-`0640` for the private key. Never copy a node key between hosts.
+The apply transaction creates `br-int` and `br-provider`, moves only the
+selected provider NIC under OVS, and publishes a root-private shared topology
+ledger after every node verifies the desired state. If a selected Geneve NIC
+carries a Corosync ring, the command first migrates that ring to the
+already-verified management address; a provider NIC carrying any Corosync ring
+is rejected. Any failure rolls back all network changes owned by that
+transaction. It never creates an activation marker or starts PVN/OVN.
 
-## 4. Stage shared and node-local configuration
+## 4. Plan configuration and node-local PKI
 
-Copy `examples/config.json` to `/etc/pve/pvn/config.json` on one quorate node.
-Set a stable cluster UUID and all three PVN Control, OVN NB, and OVN SB client
-endpoints. Do not weaken pmxcfs permissions for the `pvn` service account.
-At each manager activation, systemd reads this file as root and supplies an
-immutable credential copy that only the unprivileged manager can read. The
-root agent and host-configuration service continue to read pmxcfs directly.
-Consequently, a manager restart is required to load a later shared-config
-edit.
+`pvn-control-plane plan` validates the completed topology ledger, exact package
+version, inactive targets, empty PVN databases, and absence of conflicting PKI
+without writing anything:
 
-On every node, install `examples/node.env` as `/etc/pvn/node.env` and set its
-real hostname, Geneve address, local PVE URL, and roles. Install
-`examples/ovn-host.env` as `/etc/pvn/ovn-host.env`. Both files are local, not
-pmxcfs data, and must be `root:pvn` mode `0640`.
+```sh
+/usr/lib/pvn/pvn-control-plane plan
+```
+
+During apply, each node generates its own Ed25519 private key locally. Only its
+CSR crosses SSH to the deterministic seed node. The seed keeps the cluster CA
+key only in `/var/lib/pvn-ca` (`root:root`, mode `0600`), returns public
+certificates, and never places a private key in pmxcfs or sends one over SSH.
+The root-private control-plane ledger pins the CA certificate and every node's
+certificate/public-key fingerprints before public certificates are installed.
+Legacy shared PKI or unexpected seed-CA state fails closed and requires a
+manual audit.
+
+The same apply renders shared `/etc/pve/pvn/config.json` and node-local
+`/etc/pvn/*.env` files. At manager activation systemd supplies an immutable
+credential copy of the shared configuration to the unprivileged manager. A
+manager restart is required to load a later shared-config edit.
 
 `pvn-ovn-host-config.service` only sets the OVN remote, Geneve endpoint, and
 the requested physnet-to-bridge mapping in OVS. It fails if either bridge is
@@ -220,53 +223,26 @@ Do not create `/etc/pvn/node-enabled` or enable `pvn-node.target` yet. A
 production manager fails closed when PVN Control or OVN NB is unavailable, so
 bootstrap the central voters first.
 
-## 5. Select and bootstrap central voters
+## 5. Bootstrap central voters and transport nodes
 
-Preview deterministic 1/3/5 placement:
-
-```sh
-pvnctl central plan --nodes pve-a,pve-b,pve-c
-```
-
-For the three-node deployment, all three nodes are Raft voters. Complete the
-first voter before joining the next one. On the first voter:
-
-1. Install `examples/control-db.env`, `examples/ovn-central-seed.env`, and
-   `examples/ovn-listeners.env` under `/etc/pvn/central/`; use node-specific
-   addresses in the first two files, owner `root:pvn`, and mode `0640`.
-2. Initialize PVN Control while every central unit is stopped.
-3. Create the marker last, then enable the target.
+Apply only after reviewing the plan, using the exact PVE cluster name:
 
 ```sh
-pvnctl central init-control --mode raft \
-  --local ssl:FIRST_CONTROL_IP:6646 --confirm CLUSTER_ID
-touch /etc/pvn/central/enabled
-systemctl enable --now pvn-central.target
-systemctl --no-pager --full status pvn-central.target
+/usr/lib/pvn/pvn-control-plane apply --confirm CLUSTER_NAME
 ```
 
-The seed environment makes Debian's OVN units create clustered NB and SB
-databases at ports 6643 and 6644. `pvn-ovn-db-listeners.service` then publishes
-mutual-TLS client listeners on 6641 and 6642. No insecure TCP listener is
-created. OVN stores these passive listeners in replicated Connection rows, so
-they bind all local addresses on every voter; host firewall policy is required.
+One PVE node uses standalone databases. Exactly three PVE nodes use all three
+as Raft voters. The apply process initializes the deterministic seed, joins
+one voter at a time, verifies exact membership and cluster IDs after every
+step, then activates transport nodes one at a time. A durable phase ledger
+makes a safe rerun converge forward without deleting or regenerating existing
+database or key material.
 
-On the second voter, use `examples/ovn-central-join.env`, point both OVN remote
-cluster addresses at the first voter, and join PVN Control:
-
-```sh
-pvnctl central init-control --mode raft \
-  --local ssl:SECOND_CONTROL_IP:6646 \
-  --join ssl:FIRST_CONTROL_IP:6646 --confirm CLUSTER_ID
-touch /etc/pvn/central/enabled
-systemctl enable --now pvn-central.target
-```
-
-Repeat for the third voter with its own local addresses and certificate. Start
-only one new voter at a time and verify membership/quorum for PVN Control, OVN
-NB, and OVN SB before continuing. Allow 6643, 6644, and 6646 only among voters;
-allow 6641, 6642, and 6645 only from PVN nodes. Port 8443 is the same-node PVN
-web/API endpoint.
+The OVN units use clustered NB/SB database ports 6643/6644 and publish
+mutual-TLS client listeners on 6641/6642. PVN Control uses client port 6645 and
+Raft port 6646. Allow 6643, 6644, and 6646 only among voters; allow 6641, 6642,
+and 6645 only from PVN nodes. Port 8443 is the same-node PVN web/API endpoint.
+No insecure TCP listener is created.
 
 PVN Control's client endpoint is fixed at 6645, its Raft endpoint is fixed at
 6646, and startup rejects other values. Its node-local control socket lives in
@@ -278,24 +254,18 @@ standalone OVN database, insecure OVN listeners, or a join configuration with
 no remote seed. Nodes that are not voters never get the activation marker and
 keep all central services inactive.
 
-### One- or two-node installations
+### One-node installations
 
-Use one selected central node and `init-control --mode standalone`; set
-`PVN_CONTROL_MODE=standalone` and use `examples/ovn-central-standalone.env`.
-Promotion to Raft is a maintenance operation, never
-automatic. Back up all three databases, stop managers and central services,
-run `pvnctl central promote-control --local ssl:IP:6646 --confirm CLUSTER_ID
---apply`, then convert OVN NB/SB using the matching OVN 25.03 procedure before
-joining additional voters.
+The automated bootstrap selects standalone mode. Promotion to Raft is a
+maintenance operation and is never automatic. Two-node control-plane bootstrap
+is intentionally rejected because it cannot provide majority availability.
 
 ## 6. Activate every transport node
 
-After all selected central voters have quorum, activate PVE nodes one at a
-time:
+The control-plane apply activates PVE nodes only after all selected central
+voters have quorum. Verify each local stack after it completes:
 
 ```sh
-install -o root -g root -m 0644 /dev/null /etc/pvn/node-enabled
-systemctl enable --now pvn-node.target
 systemctl --no-pager --full status \
   pvn-node.target pvn-node-ready pvn-manager pvn-agent ovn-controller
 ```
