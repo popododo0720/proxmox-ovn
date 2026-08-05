@@ -77,12 +77,11 @@ func Init(ctx context.Context, runner Runner, options InitOptions) error {
 	}
 
 	output, runErr := runner.Run(ctx, "ovsdb-tool", args...)
-	lockErr := removeDatabaseLock(options.Database)
 	if runErr != nil {
 		return commandError("initialize PVN control database", output, runErr)
 	}
-	if lockErr != nil {
-		return fmt.Errorf("remove initialization lock: %w", lockErr)
+	if err := removeDatabaseLock(options.Database); err != nil {
+		return fmt.Errorf("remove initialization lock: %w", err)
 	}
 	if err := os.Chmod(options.Database, 0o600); err != nil {
 		return fmt.Errorf("secure database: %w", err)

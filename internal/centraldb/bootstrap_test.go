@@ -20,6 +20,15 @@ type fakeRunner struct {
 	active bool
 }
 
+type failedInitRunner struct{}
+
+func (failedInitRunner) Run(_ context.Context, _ string, args ...string) ([]byte, error) {
+	if err := os.WriteFile(databaseLockPath(args[1]), nil, 0o600); err != nil {
+		return nil, err
+	}
+	return []byte("initialization failed"), errors.New("exit status 1")
+}
+
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, call{name: name, args: append([]string(nil), args...)})
 	if name == "systemctl" {
@@ -83,6 +92,22 @@ func assertLockRemoved(t *testing.T, database string) {
 	t.Helper()
 	if _, err := os.Lstat(databaseLockPath(database)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("database lock was not removed: %v", err)
+	}
+}
+
+func TestInitPreservesLockWhenOVSDBToolFails(t *testing.T) {
+	dir := t.TempDir()
+	schema := filepath.Join(dir, "schema.json")
+	if err := os.WriteFile(schema, []byte(`{"name":"PVN_Control"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(dir, "failed.db")
+	err := Init(context.Background(), failedInitRunner{}, InitOptions{Database: database, Schema: schema})
+	if err == nil {
+		t.Fatal("failed ovsdb-tool command was accepted")
+	}
+	if _, lockErr := os.Lstat(databaseLockPath(database)); lockErr != nil {
+		t.Fatalf("failed initialization lock was removed: %v", lockErr)
 	}
 }
 
