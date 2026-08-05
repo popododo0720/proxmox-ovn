@@ -6,9 +6,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pvnstack/proxmox-ovn/internal/buildinfo"
 	"github.com/pvnstack/proxmox-ovn/internal/central"
@@ -18,6 +20,7 @@ import (
 	"github.com/pvnstack/proxmox-ovn/internal/hostconfig"
 	"github.com/pvnstack/proxmox-ovn/internal/nodestate"
 	"github.com/pvnstack/proxmox-ovn/internal/pki"
+	"github.com/pvnstack/proxmox-ovn/internal/raftstatus"
 )
 
 func main() {
@@ -139,9 +142,11 @@ func doctor(args []string) error {
 
 func centralCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: pvnctl central <plan|init-control|promote-control>")
+		return errors.New("usage: pvnctl central <status|plan|init-control|promote-control>")
 	}
 	switch args[0] {
+	case "status":
+		return centralStatus(args[1:])
 	case "plan":
 		return centralPlan(args[1:])
 	case "init-control":
@@ -151,6 +156,40 @@ func centralCommand(args []string) error {
 	default:
 		return fmt.Errorf("unknown central command %q", args[0])
 	}
+}
+
+func centralStatus(args []string) error {
+	return centralStatusWith(raftstatus.ExecRunner{}, os.Stdout, args)
+}
+
+func centralStatusWith(runner raftstatus.Runner, output io.Writer, args []string) error {
+	flags := flag.NewFlagSet("central status", flag.ContinueOnError)
+	controlSocket := flags.String("pvn-control-ctl", raftstatus.DefaultControlSocket, "exact PVN Control unixctl socket path")
+	nbSocket := flags.String("ovn-nb-ctl", raftstatus.DefaultNBSocket, "exact OVN Northbound unixctl socket path")
+	sbSocket := flags.String("ovn-sb-ctl", raftstatus.DefaultSBSocket, "exact OVN Southbound unixctl socket path")
+	timeout := flags.Duration("timeout", raftstatus.DefaultTimeout, "timeout for each local database query")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("central status does not accept positional arguments")
+	}
+	if *timeout < time.Second || *timeout > time.Minute {
+		return errors.New("--timeout must be between 1s and 1m")
+	}
+
+	report := raftstatus.Inspect(context.Background(), runner, raftstatus.DefaultAppctlPath, *timeout, []raftstatus.Target{
+		{Component: "pvn-control", Database: centraldb.SchemaName, ControlSocket: *controlSocket},
+		{Component: "ovn-northbound", Database: "OVN_Northbound", ControlSocket: *nbSocket},
+		{Component: "ovn-southbound", Database: "OVN_Southbound", ControlSocket: *sbSocket},
+	})
+	if err := writeJSON(output, report); err != nil {
+		return err
+	}
+	if !report.Healthy {
+		return errors.New("one or more local Raft databases are unavailable or unhealthy")
+	}
+	return nil
 }
 
 func centralPlan(args []string) error {
@@ -312,7 +351,7 @@ func splitList(raw string) []string {
 	return values
 }
 
-func writeJSON(file *os.File, value any) error {
+func writeJSON(file io.Writer, value any) error {
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(value)
