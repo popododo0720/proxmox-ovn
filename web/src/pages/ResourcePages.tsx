@@ -1,5 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
-import { useApi } from '../api/context';
+import { useState } from 'react';
 import type {
   FloatingIP,
   Network,
@@ -15,10 +14,9 @@ import type {
   SecurityGroupRule,
   Subnet,
 } from '../api/types';
-import { ErrorState } from '../components/ErrorState';
+import { PortAttachmentPanel } from '../components/PortAttachmentPanel';
 import { ResourcePage, formatValue, type Column } from '../components/ResourcePage';
 import { StatusPill } from '../components/StatusPill';
-import { pveBridge } from '../pve/bridge';
 
 const projectColumns: Column<Project>[] = [
   { key: 'name', label: 'Project', render: (item) => <strong>{item.name || item.id}</strong> },
@@ -139,38 +137,11 @@ export function RoutersPage() {
 }
 
 export function PortsPage() {
-  const api = useApi();
-  const [ports, setPorts] = useState<Port[]>([]);
-  const [node, setNode] = useState('');
-  const [vmid, setVmid] = useState('');
-  const [vmConfig, setVmConfig] = useState<Record<string, unknown> | null>(null);
-  const [bridgeError, setBridgeError] = useState('');
-  const [reading, setReading] = useState(false);
-
-  useEffect(() => {
-    void api.ports().then((result) => setPorts(result.items)).catch(() => setPorts([]));
-  }, [api]);
-
-  const nics = useMemo(() => {
-    if (!vmConfig) return [];
-    return Object.entries(vmConfig).filter(([key]) => /^net\d+$/.test(key)).sort(([a], [b]) => a.localeCompare(b));
-  }, [vmConfig]);
-
-  async function inspectVM() {
-    setBridgeError('');
-    setVmConfig(null);
-    setReading(true);
-    try {
-      setVmConfig(await pveBridge.getQemuConfig(node.trim(), Number(vmid)));
-    } catch (reason) {
-      setBridgeError(reason instanceof Error ? reason.message : 'Could not read the VM configuration');
-    } finally {
-      setReading(false);
-    }
-  }
+  const [tableKey, setTableKey] = useState(0);
 
   return <div className="stacked-pages">
     <ResourcePage<Port>
+      key={tableKey}
       title="Ports & VM attachments"
       description="Logical switch ports, fixed IP allocations, and chassis bindings."
       endpoint="/ports"
@@ -184,26 +155,7 @@ export function PortsPage() {
       ]}
       emptyMessage="Ports are created when a VM NIC is attached to a PVN network."
     />
-    <section className="resource-section compact-section">
-      <div className="page-heading">
-        <div>
-          <span className="eyebrow">PVE bridge</span>
-          <h1>Inspect VM NICs</h1>
-          <p>Reads QEMU configuration through the containing Proxmox UI session.</p>
-        </div>
-        <StatusPill value={pveBridge.available ? 'connected' : 'unavailable'} />
-      </div>
-      <div className="attachment-card">
-        <label className="form-field"><span>Node</span><input value={node} onChange={(event) => setNode(event.target.value)} placeholder="pve-01" /></label>
-        <label className="form-field"><span>VM ID</span><input type="number" min="1" value={vmid} onChange={(event) => setVmid(event.target.value)} placeholder="100" /></label>
-        <button className="button button-primary" disabled={reading || !node || !vmid || !pveBridge.available} onClick={() => void inspectVM()}>{reading ? 'Reading…' : 'Read NICs'}</button>
-      </div>
-      {bridgeError && <ErrorState title="PVE request failed" message={bridgeError} />}
-      {vmConfig && <div className="nic-list">
-        <div className="nic-list-heading"><strong>{nics.length} configured NICs</strong><span>{ports.length} PVN ports visible</span></div>
-        {nics.length ? nics.map(([key, value]) => <div className="nic-row" key={key}><code>{key}</code><span>{String(value)}</span></div>) : <p className="muted">This VM has no configured NICs.</p>}
-      </div>}
-    </section>
+    <PortAttachmentPanel onChanged={() => setTableKey((value) => value + 1)} />
   </div>;
 }
 
