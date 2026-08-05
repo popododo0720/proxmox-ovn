@@ -1,3 +1,11 @@
+proxmox-ovn (0.2.5) unstable; urgency=medium
+
+  * Support every positive odd central voter count with five-node coverage.
+  * Make central startup and standalone/Raft update health checks deterministic.
+  * Add revision-safe UI workflows and bounded operation history retention.
+
+ -- PVN Project <root@localhost>  Wed, 05 Aug 2026 09:50:00 +0000
+
 proxmox-ovn (0.2.4) unstable; urgency=medium
 
   * Re-pin untouched planned ledgers after safe upgrades and gate full setup membership.
