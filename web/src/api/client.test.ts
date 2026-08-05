@@ -42,6 +42,32 @@ describe('ApiClient', () => {
     expect(updateHeaders.get('Idempotency-Key')).toBeTruthy();
   });
 
+  it('uses revision-guarded port lifecycle actions', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ data: { id: 'port-1', revision: 3, generation: 2, binding_status: 'binding' } }))
+      .mockResolvedValueOnce(jsonResponse({ data: { id: 'port-1', revision: 4, generation: 2, binding_status: 'detaching' } }));
+    const client = new ApiClient('/api/v1', fetcher as unknown as typeof fetch);
+    client.setCSRFToken('csrf-value');
+
+    await client.attachPort('port-1', { node_id: 'pve-a', vmid: 100, nic: 'net1', generation: 1 }, 2, 'attach-key');
+    await client.detachPort('port-1', { generation: 2 }, 3, 'detach-key');
+
+    const attachURL = fetcher.mock.calls[0][0] as URL;
+    const attach = fetcher.mock.calls[0][1] as RequestInit;
+    expect(attachURL.pathname).toBe('/api/v1/ports/port-1/attach');
+    expect(attach.method).toBe('POST');
+    expect(new Headers(attach.headers).get('If-Match')).toBe('"2"');
+    expect(new Headers(attach.headers).get('Idempotency-Key')).toBe('attach-key');
+    expect(JSON.parse(String(attach.body))).toEqual({ node_id: 'pve-a', vmid: 100, nic: 'net1', generation: 1 });
+
+    const detachURL = fetcher.mock.calls[1][0] as URL;
+    const detach = fetcher.mock.calls[1][1] as RequestInit;
+    expect(detachURL.pathname).toBe('/api/v1/ports/port-1/detach');
+    expect(new Headers(detach.headers).get('If-Match')).toBe('"3"');
+    expect(new Headers(detach.headers).get('Idempotency-Key')).toBe('detach-key');
+    expect(JSON.parse(String(detach.body))).toEqual({ generation: 2 });
+  });
+
   it('surfaces structured API errors', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({
       error: { code: 'revision_conflict', message: 'resource changed', details: { current: 3 } },

@@ -95,6 +95,17 @@ export interface Port extends BaseResource {
   requested_chassis?: string;
 }
 
+export interface PortAttachInput {
+  node_id: string;
+  vmid: number;
+  nic: `net${number}`;
+  generation: number;
+}
+
+export interface PortDetachInput {
+  generation: number;
+}
+
 export interface FloatingIP extends BaseResource {
   project_id?: string;
   provider_network_id?: string;

@@ -8,6 +8,8 @@ import type {
   NodeStatus,
   Operation,
   Port,
+  PortAttachInput,
+  PortDetachInput,
   Project,
   ProviderNetwork,
   ProviderSegment,
@@ -198,6 +200,24 @@ export class ApiClient {
   nodes = () => this.list<NodeStatus>('/nodes');
   operations = (limit = 100) => this.list<Operation>('/operations', { limit });
   health = () => this.request<HealthStatus>('/health');
+
+  attachPort(id: ResourceID, input: PortAttachInput, revision: number, idempotencyKey: string = crypto.randomUUID()): Promise<Port> {
+    return this.request<Port>(`/ports/${encodeURIComponent(id)}/attach`, {
+      method: 'POST',
+      body: input,
+      revision,
+      idempotencyKey,
+    });
+  }
+
+  detachPort(id: ResourceID, input: PortDetachInput, revision: number, idempotencyKey: string = crypto.randomUUID()): Promise<Port> {
+    return this.request<Port>(`/ports/${encodeURIComponent(id)}/detach`, {
+      method: 'POST',
+      body: input,
+      revision,
+      idempotencyKey,
+    });
+  }
 }
 
 export const apiClient = new ApiClient();
