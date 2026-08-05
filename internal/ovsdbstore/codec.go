@@ -597,8 +597,7 @@ func encodeIdempotencyRow(scope string, fingerprint [sha256.Size]byte, resource 
 	if err != nil {
 		return nil, err
 	}
-	hash := sha256.Sum256([]byte(scope))
-	id := internalIDPrefix + "idem_" + hex.EncodeToString(hash[:])
+	id := idempotencyRowID(scope)
 	timestamp := formatTime(now)
 	return ovsdb.Row{
 		"id": id, "action": "idempotency", "target_kind": string(resource.ResourceKind()),
@@ -614,6 +613,11 @@ func encodeIdempotencyRow(scope string, fingerprint [sha256.Size]byte, resource 
 			idemDeleted:      strconv.FormatBool(deleted),
 		}),
 	}, nil
+}
+
+func idempotencyRowID(scope string) string {
+	hash := sha256.Sum256([]byte(scope))
+	return internalIDPrefix + "idem_" + hex.EncodeToString(hash[:])
 }
 
 func formatTime(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) }

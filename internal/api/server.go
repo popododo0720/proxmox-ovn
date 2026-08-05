@@ -17,7 +17,11 @@ import (
 	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
-const maxRequestBody = 1 << 20
+const (
+	maxRequestBody         = 1 << 20
+	defaultOperationsLimit = 100
+	maximumOperationsLimit = 500
+)
 
 var ErrUnauthenticated = errors.New("PVE session is not authenticated")
 
@@ -284,6 +288,22 @@ func (s *Server) list(writer http.ResponseWriter, request *http.Request, kind mo
 			return
 		}
 		options.VMID = vmid
+	}
+	if kind == model.KindOperation {
+		options.RecentFirst = true
+		options.Limit = defaultOperationsLimit
+		if values, supplied := request.URL.Query()["limit"]; supplied {
+			if len(values) != 1 || values[0] == "" {
+				writeError(writer, http.StatusBadRequest, "invalid_request", "limit must be supplied exactly once", nil)
+				return
+			}
+			limit, err := strconv.Atoi(values[0])
+			if err != nil || limit < 1 || limit > maximumOperationsLimit {
+				writeError(writer, http.StatusBadRequest, "invalid_request", fmt.Sprintf("limit must be an integer between 1 and %d", maximumOperationsLimit), nil)
+				return
+			}
+			options.Limit = limit
+		}
 	}
 	resources, err := s.store.List(request.Context(), kind, options)
 	if err != nil {

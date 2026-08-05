@@ -30,6 +30,7 @@ type Controller struct {
 	heartbeat time.Duration
 	now       func() time.Time
 	newOwner  func() string
+	retention operationRetention
 }
 
 // ErrReconcileLeaseActive means deletion was durably recorded but cleanup must
@@ -41,7 +42,14 @@ const (
 	operationLease       = 5 * time.Minute
 	maxConvergencePasses = 8
 	maxHeartbeatInterval = 30 * time.Second
+	defaultOperationKeep = 1000
+	defaultOperationAge  = 24 * time.Hour
 )
+
+type operationRetention struct {
+	keep int
+	age  time.Duration
+}
 
 type Option func(*Controller)
 
@@ -56,10 +64,21 @@ func WithLeaseDuration(duration time.Duration) Option {
 	}
 }
 
+// WithOperationRetention configures the minimum number and age of terminal,
+// superseded reconcile audit records retained by periodic reconciliation.
+func WithOperationRetention(keep int, age time.Duration) Option {
+	return func(controller *Controller) {
+		if keep >= 0 && age > 0 {
+			controller.retention = operationRetention{keep: keep, age: age}
+		}
+	}
+}
+
 func NewController(store controlstore.Store, renderer Renderer, options ...Option) *Controller {
 	controller := &Controller{
 		store: store, renderer: renderer, locks: make(map[string]*sync.Mutex),
 		lease: operationLease, heartbeat: heartbeatInterval(operationLease), now: time.Now, newOwner: randomLeaseOwner,
+		retention: operationRetention{keep: defaultOperationKeep, age: defaultOperationAge},
 	}
 	for _, option := range options {
 		option(controller)
@@ -191,6 +210,9 @@ func (c *Controller) ReconcileAll(ctx context.Context) error {
 				failures = append(failures, err)
 			}
 		}
+	}
+	if _, err := c.store.PruneOperations(ctx, c.now().UTC().Add(-c.retention.age), c.retention.keep); err != nil {
+		failures = append(failures, fmt.Errorf("prune operation audit records: %w", err))
 	}
 	return errors.Join(failures...)
 }

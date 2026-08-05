@@ -60,6 +60,23 @@ type renewalObservingStore struct {
 	fail    error
 }
 
+type retentionObservingStore struct {
+	controlstore.Store
+	mu     sync.Mutex
+	calls  int
+	before time.Time
+	keep   int
+}
+
+func (store *retentionObservingStore) PruneOperations(ctx context.Context, before time.Time, keep int) (int, error) {
+	store.mu.Lock()
+	store.calls++
+	store.before = before
+	store.keep = keep
+	store.mu.Unlock()
+	return store.Store.PruneOperations(ctx, before, keep)
+}
+
 func (store *renewalObservingStore) RenewOperationLease(ctx context.Context, operationID string, expectedRevision int64, leaseOwner string, renewedAt time.Time) (*model.Operation, error) {
 	if store.fail != nil {
 		select {
@@ -298,6 +315,22 @@ func TestControllerReconcileAll(t *testing.T) {
 	providers, _ := store.List(context.Background(), model.KindProviderNetwork, controlstore.ListOptions{})
 	if projects[0].GetMetadata().State != model.ResourceReady || providers[0].GetMetadata().State != model.ResourceReady {
 		t.Fatal("ReconcileAll did not render all resources")
+	}
+}
+
+func TestControllerReconcileAllRunsConservativeOperationRetention(t *testing.T) {
+	base := controlstore.NewMemory()
+	store := &retentionObservingStore{Store: base}
+	controller := NewController(store, NewFakeRenderer(), WithOperationRetention(25, 6*time.Hour))
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	controller.now = func() time.Time { return now }
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.calls != 1 || store.keep != 25 || !store.before.Equal(now.Add(-6*time.Hour)) {
+		t.Fatalf("retention calls=%d keep=%d before=%v", store.calls, store.keep, store.before)
 	}
 }
 

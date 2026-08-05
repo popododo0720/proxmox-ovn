@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
@@ -80,17 +81,24 @@ func (s *Server) heartbeatNode(writer http.ResponseWriter, request *http.Request
 			return
 		}
 
-		candidateResource, err := model.Clone(current)
-		if err != nil {
-			s.storeError(writer, err)
-			return
-		}
-		candidate := candidateResource.(*model.Node)
-		candidate.LastSeenAt = &observedAt
-		if heartbeat.Roles != nil {
+		var updated *model.Node
+		if heartbeat.Roles != nil && !slices.Equal(current.Roles, explicitRoles) {
+			candidateResource, cloneErr := model.Clone(current)
+			if cloneErr != nil {
+				s.storeError(writer, cloneErr)
+				return
+			}
+			candidate := candidateResource.(*model.Node)
+			candidate.LastSeenAt = &observedAt
 			candidate.Roles = explicitRoles
+			updatedResource, _, updateErr := s.store.Update(request.Context(), candidate, current.Revision, "")
+			err = updateErr
+			if err == nil {
+				updated = s.markHeartbeatNodeReady(request.Context(), updatedResource.(*model.Node))
+			}
+		} else {
+			updated, err = s.store.ObserveNodeHeartbeat(request.Context(), current.ID, current.Revision, observedAt)
 		}
-		updated, _, err := s.store.Update(request.Context(), candidate, current.Revision, "")
 		if errors.Is(err, controlstore.ErrPrecondition) {
 			continue
 		}
@@ -98,12 +106,11 @@ func (s *Server) heartbeatNode(writer http.ResponseWriter, request *http.Request
 			s.storeError(writer, err)
 			return
 		}
-		ready := s.markHeartbeatNodeReady(request.Context(), updated.(*model.Node))
 		if !s.recordHeartbeatMembership(writer, heartbeat, observedAt) {
 			return
 		}
-		setETag(writer, ready.Revision)
-		writeJSON(writer, http.StatusOK, map[string]any{"data": ready})
+		setETag(writer, updated.Revision)
+		writeJSON(writer, http.StatusOK, map[string]any{"data": updated})
 		return
 	}
 	writeError(writer, http.StatusConflict, "heartbeat_conflict", "node heartbeat could not be serialized after concurrent updates", nil)

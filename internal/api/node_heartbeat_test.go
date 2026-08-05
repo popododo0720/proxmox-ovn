@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
+	"github.com/popododo0720/proxmox-ovn/internal/reconcile"
 )
 
 func TestRuntimeNodeHeartbeatRegistersAndPreservesAdminState(t *testing.T) {
@@ -40,8 +42,11 @@ func TestRuntimeNodeHeartbeatRegistersAndPreservesAdminState(t *testing.T) {
 		t.Fatalf("preserve status=%d body=%s", preservedResponse.Code, preservedResponse.Body.String())
 	}
 	preserved := decodeData[model.Node](t, preservedResponse)
-	if preserved.Enabled || !reflect.DeepEqual(preserved.Roles, admin.Roles) || preserved.Revision <= admin.Revision {
+	if preserved.Enabled || !reflect.DeepEqual(preserved.Roles, admin.Roles) || preserved.Revision != admin.Revision || preserved.State != admin.State || preserved.AppliedRevision != admin.AppliedRevision || !preserved.UpdatedAt.Equal(admin.UpdatedAt) {
 		t.Fatalf("preserved node=%#v admin=%#v", preserved, admin)
+	}
+	if preserved.LastSeenAt == nil || admin.LastSeenAt == nil || !preserved.LastSeenAt.After(*admin.LastSeenAt) {
+		t.Fatalf("heartbeat observation did not advance last_seen_at: preserved=%#v admin=%#v", preserved.LastSeenAt, admin.LastSeenAt)
 	}
 
 	explicitResponse := request(t, server.RuntimeHandler(), http.MethodPost, path, map[string]any{
@@ -54,6 +59,70 @@ func TestRuntimeNodeHeartbeatRegistersAndPreservesAdminState(t *testing.T) {
 	wantRoles := []model.NodeRole{model.NodeRoleCompute, model.NodeRoleGateway, model.NodeRoleCentral}
 	if explicit.Enabled || !reflect.DeepEqual(explicit.Roles, wantRoles) {
 		t.Fatalf("explicit node=%#v", explicit)
+	}
+}
+
+func TestRuntimeNodeHeartbeatsDoNotAmplifyDesiredRevisionsOrOperations(t *testing.T) {
+	store := controlstore.NewMemory()
+	renderer := reconcile.NewFakeRenderer()
+	controller := reconcile.NewController(store, renderer)
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	server, err := New(Options{Store: store, Reconciler: controller, Clock: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/runtime/nodes/heartbeat"
+	body := map[string]any{"name": "pve01", "chassis_id": "chassis-01", "roles": []string{"compute"}}
+	registered := request(t, server.RuntimeHandler(), http.MethodPost, path, body, nil)
+	if registered.Code != http.StatusOK {
+		t.Fatalf("register status=%d body=%s", registered.Code, registered.Body.String())
+	}
+	initial := decodeData[model.Node](t, registered)
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 6 {
+		now = now.Add(30 * time.Second)
+		response := request(t, server.RuntimeHandler(), http.MethodPost, path, body, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("heartbeat status=%d body=%s", response.Code, response.Body.String())
+		}
+		observed := decodeData[model.Node](t, response)
+		if observed.Revision != initial.Revision || observed.AppliedRevision != initial.AppliedRevision {
+			t.Fatalf("observation changed desired metadata: initial=%#v observed=%#v", initial.Metadata, observed.Metadata)
+		}
+		if err := controller.ReconcileAll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	operations, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 {
+		t.Fatalf("unchanged heartbeats created %d operations, want 1: %#v", len(operations), operations)
+	}
+
+	// A real desired role change still advances the revision and receives its
+	// own reconcile audit record.
+	now = now.Add(30 * time.Second)
+	changed := request(t, server.RuntimeHandler(), http.MethodPost, path, map[string]any{
+		"name": "pve01", "chassis_id": "chassis-01", "roles": []string{"compute", "gateway"},
+	}, nil)
+	if changed.Code != http.StatusOK {
+		t.Fatalf("role update status=%d body=%s", changed.Code, changed.Body.String())
+	}
+	changedNode := decodeData[model.Node](t, changed)
+	if changedNode.Revision != initial.Revision+1 {
+		t.Fatalf("role update revision=%d want %d", changedNode.Revision, initial.Revision+1)
+	}
+	if err := controller.ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operations, err = store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil || len(operations) != 2 {
+		t.Fatalf("real change operations=%d err=%v: %#v", len(operations), err, operations)
 	}
 }
 

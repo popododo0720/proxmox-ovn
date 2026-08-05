@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
@@ -87,6 +88,46 @@ func TestHealthAndSession(t *testing.T) {
 	health = request(t, unauthenticated, http.MethodGet, "/api/v1/health", nil, nil)
 	if health.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated health status=%d body=%s", health.Code, health.Body.String())
+	}
+}
+
+func TestOperationsListIsRecentAndBounded(t *testing.T) {
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	store := controlstore.NewMemory(controlstore.WithClock(func() time.Time { return now }))
+	for revision := int64(1); revision <= 105; revision++ {
+		_, _, err := store.Create(context.Background(), &model.Operation{
+			Action: "bind", TargetKind: model.KindPort, TargetID: "port-a", TargetRevision: revision,
+		}, fmt.Sprintf("operation-%03d", revision))
+		if err != nil {
+			t.Fatalf("create operation %d: %v", revision, err)
+		}
+		now = now.Add(time.Second)
+	}
+	server := testServer(t, store, nil)
+
+	defaultResponse := request(t, server, http.MethodGet, "/api/v1/operations", nil, nil)
+	if defaultResponse.Code != http.StatusOK {
+		t.Fatalf("default list status=%d body=%s", defaultResponse.Code, defaultResponse.Body.String())
+	}
+	defaults := decodeData[[]model.Operation](t, defaultResponse)
+	if len(defaults) != defaultOperationsLimit || defaults[0].TargetRevision != 105 || defaults[len(defaults)-1].TargetRevision != 6 {
+		t.Fatalf("default recent operations len=%d first=%d last=%d", len(defaults), defaults[0].TargetRevision, defaults[len(defaults)-1].TargetRevision)
+	}
+
+	limitedResponse := request(t, server, http.MethodGet, "/api/v1/operations?limit=2", nil, nil)
+	if limitedResponse.Code != http.StatusOK {
+		t.Fatalf("limited list status=%d body=%s", limitedResponse.Code, limitedResponse.Body.String())
+	}
+	limited := decodeData[[]model.Operation](t, limitedResponse)
+	if len(limited) != 2 || limited[0].TargetRevision != 105 || limited[1].TargetRevision != 104 {
+		t.Fatalf("limited recent operations=%#v", limited)
+	}
+
+	for _, query := range []string{"0", "501", "invalid", "", "1&limit=2"} {
+		response := request(t, server, http.MethodGet, "/api/v1/operations?limit="+query, nil, nil)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("limit %q status=%d body=%s", query, response.Code, response.Body.String())
+		}
 	}
 }
 

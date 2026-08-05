@@ -20,7 +20,10 @@ import (
 	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
-const maxWriteAttempts = 64
+const (
+	maxWriteAttempts       = 64
+	maxOperationPruneBatch = 256
+)
 
 // Config defines the secure OVSDB connection. Only unix: and ssl: endpoints
 // are accepted. SSL endpoints require certificate authentication and a CA.
@@ -236,26 +239,167 @@ func (s *Store) List(ctx context.Context, kind model.Kind, options controlstore.
 	if !kind.Valid() {
 		return nil, storeError(controlstore.ErrNotFound, "unknown resource kind %q", kind)
 	}
+	if options.Limit < 0 {
+		return nil, storeError(controlstore.ErrConflict, "list limit cannot be negative")
+	}
 	current, err := s.load(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]string, 0, len(current.resources[kind]))
-	for id, entry := range current.resources[kind] {
+	resources := make([]model.Resource, 0, len(current.resources[kind]))
+	for _, entry := range current.resources[kind] {
 		if matches(entry.resource, options) {
-			ids = append(ids, id)
+			resources = append(resources, entry.resource)
 		}
 	}
-	sort.Strings(ids)
-	result := make([]model.Resource, 0, len(ids))
-	for _, id := range ids {
-		copyResource, err := model.Clone(current.resources[kind][id].resource)
+	sort.Slice(resources, func(i, j int) bool {
+		left, right := resources[i].GetMetadata(), resources[j].GetMetadata()
+		if options.RecentFirst && !left.CreatedAt.Equal(right.CreatedAt) {
+			return left.CreatedAt.After(right.CreatedAt)
+		}
+		return left.ID < right.ID
+	})
+	if options.Limit > 0 && len(resources) > options.Limit {
+		resources = resources[:options.Limit]
+	}
+	result := make([]model.Resource, 0, len(resources))
+	for _, resource := range resources {
+		copyResource, err := model.Clone(resource)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, copyResource)
 	}
 	return result, nil
+}
+
+// ObserveNodeHeartbeat persists runtime liveness while retaining the exact
+// desired-state metadata used to fence reconcilers. The store transaction
+// epoch serializes this observational write with administrative updates.
+func (s *Store) ObserveNodeHeartbeat(ctx context.Context, id string, expectedRevision int64, observedAt time.Time) (*model.Node, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if id == "" || observedAt.IsZero() {
+		return nil, storeError(controlstore.ErrConflict, "node id and heartbeat observation time are required")
+	}
+	if isReservedID(id) {
+		return nil, storeError(controlstore.ErrNotFound, "node %q was not found", id)
+	}
+	for attempt := 0; attempt < maxWriteAttempts; attempt++ {
+		current, err := s.load(ctx)
+		if err != nil {
+			return nil, err
+		}
+		entry, exists := current.resources[model.KindNode][id]
+		if !exists {
+			return nil, storeError(controlstore.ErrNotFound, "node %q was not found", id)
+		}
+		stored := entry.resource.(*model.Node)
+		if expectedRevision < 1 || stored.Revision != expectedRevision {
+			return nil, storeError(controlstore.ErrPrecondition, "expected revision %d but current revision is %d", expectedRevision, stored.Revision)
+		}
+		if stored.LastSeenAt != nil && !stored.LastSeenAt.Before(observedAt) {
+			result, err := model.Clone(stored)
+			if err != nil {
+				return nil, err
+			}
+			return result.(*model.Node), nil
+		}
+		candidateResource, err := model.Clone(stored)
+		if err != nil {
+			return nil, err
+		}
+		candidate := candidateResource.(*model.Node)
+		timestamp := observedAt.UTC()
+		candidate.LastSeenAt = &timestamp
+		row, err := encodeResource(candidate, current)
+		if err != nil {
+			return nil, err
+		}
+		changes := []change{{type_: changeUpdate, table: kindTables[model.KindNode], id: id, expectedRevision: expectedRevision, row: row}}
+		if err := s.database.commit(ctx, current.epoch, changes, formatTime(timestamp)); err != nil {
+			if errors.Is(err, errSerialization) {
+				continue
+			}
+			return nil, err
+		}
+		result, err := model.Clone(candidate)
+		if err != nil {
+			return nil, err
+		}
+		return result.(*model.Node), nil
+	}
+	return nil, storeError(controlstore.ErrConflict, "node heartbeat observation could not be serialized after concurrent changes")
+}
+
+func (s *Store) PruneOperations(ctx context.Context, before time.Time, keep int) (int, error) {
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
+	if before.IsZero() || keep < 0 {
+		return 0, storeError(controlstore.ErrConflict, "operation retention cutoff and non-negative keep count are required")
+	}
+	for attempt := 0; attempt < maxWriteAttempts; attempt++ {
+		current, err := s.load(ctx)
+		if err != nil {
+			return 0, err
+		}
+		operations := make([]*model.Operation, 0, len(current.resources[model.KindOperation]))
+		for _, entry := range current.resources[model.KindOperation] {
+			operation := entry.resource.(*model.Operation)
+			if operation.Action != "reconcile" || operation.CompletedAt == nil || (operation.OperationStatus != model.OperationSucceeded && operation.OperationStatus != model.OperationFailed) {
+				continue
+			}
+			operations = append(operations, operation)
+		}
+		sort.Slice(operations, func(i, j int) bool {
+			left, right := operations[i], operations[j]
+			if !left.CompletedAt.Equal(*right.CompletedAt) {
+				return left.CompletedAt.After(*right.CompletedAt)
+			}
+			return left.ID < right.ID
+		})
+		if len(operations) <= keep {
+			return 0, nil
+		}
+		changes := make([]change, 0, maxOperationPruneBatch*2)
+		pruned := 0
+		for _, operation := range operations[keep:] {
+			if pruned == maxOperationPruneBatch {
+				break
+			}
+			if !operation.CompletedAt.Before(before) || !operationSuperseded(current, operation) {
+				continue
+			}
+			scope := idempotencyScope("create", model.KindOperation, "", operation.IdempotencyKey)
+			record, exists := current.idempotency[scope]
+			if !exists || record.resource.GetMetadata().ID != operation.ID {
+				continue
+			}
+			changes = append(changes,
+				change{type_: changeDelete, table: kindTables[model.KindOperation], id: operation.ID, expectedRevision: operation.Revision},
+				change{type_: changeDelete, table: kindTables[model.KindOperation], id: idempotencyRowID(scope), expectedRevision: 1},
+			)
+			pruned++
+		}
+		if pruned == 0 {
+			return 0, nil
+		}
+		if err := s.database.commit(ctx, current.epoch, changes, formatTime(s.now().UTC())); err != nil {
+			if errors.Is(err, errSerialization) {
+				continue
+			}
+			return 0, err
+		}
+		return pruned, nil
+	}
+	return 0, storeError(controlstore.ErrConflict, "operation retention could not be serialized after concurrent changes")
+}
+
+func operationSuperseded(current *snapshot, operation *model.Operation) bool {
+	target, exists := current.resources[operation.TargetKind][operation.TargetID]
+	return !exists || target.resource.GetMetadata().Revision > operation.TargetRevision
 }
 
 func (s *Store) Update(ctx context.Context, resource model.Resource, expectedRevision int64, key string) (model.Resource, bool, error) {

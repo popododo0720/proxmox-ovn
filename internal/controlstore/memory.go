@@ -29,6 +29,8 @@ type Memory struct {
 	newID       func() string
 }
 
+const maxOperationPruneBatch = 256
+
 type MemoryOption func(*Memory)
 
 func WithClock(clock func() time.Time) MemoryOption {
@@ -152,24 +154,136 @@ func (s *Memory) List(ctx context.Context, kind model.Kind, options ListOptions)
 	if !kind.Valid() {
 		return nil, storeError(ErrNotFound, "unknown resource kind %q", kind)
 	}
+	if options.Limit < 0 {
+		return nil, storeError(ErrConflict, "list limit cannot be negative")
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	ids := make([]string, 0, len(s.resources[kind]))
-	for id, resource := range s.resources[kind] {
+	resources := make([]model.Resource, 0, len(s.resources[kind]))
+	for _, resource := range s.resources[kind] {
 		if matches(resource, options) {
-			ids = append(ids, id)
+			resources = append(resources, resource)
 		}
 	}
-	sort.Strings(ids)
-	result := make([]model.Resource, 0, len(ids))
-	for _, id := range ids {
-		copyResource, err := model.Clone(s.resources[kind][id])
+	sort.Slice(resources, func(i, j int) bool {
+		left, right := resources[i].GetMetadata(), resources[j].GetMetadata()
+		if options.RecentFirst && !left.CreatedAt.Equal(right.CreatedAt) {
+			return left.CreatedAt.After(right.CreatedAt)
+		}
+		return left.ID < right.ID
+	})
+	if options.Limit > 0 && len(resources) > options.Limit {
+		resources = resources[:options.Limit]
+	}
+	result := make([]model.Resource, 0, len(resources))
+	for _, resource := range resources {
+		copyResource, err := model.Clone(resource)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, copyResource)
 	}
 	return result, nil
+}
+
+func (s *Memory) ObserveNodeHeartbeat(ctx context.Context, id string, expectedRevision int64, observedAt time.Time) (*model.Node, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if id == "" || observedAt.IsZero() {
+		return nil, storeError(ErrConflict, "node id and heartbeat observation time are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resource, exists := s.resources[model.KindNode][id]
+	if !exists {
+		return nil, storeError(ErrNotFound, "node %q was not found", id)
+	}
+	stored := resource.(*model.Node)
+	if expectedRevision < 1 || stored.Revision != expectedRevision {
+		return nil, storeError(ErrPrecondition, "expected revision %d but current revision is %d", expectedRevision, stored.Revision)
+	}
+	if stored.LastSeenAt != nil && !stored.LastSeenAt.Before(observedAt) {
+		result, err := model.Clone(stored)
+		if err != nil {
+			return nil, err
+		}
+		return result.(*model.Node), nil
+	}
+	copyResource, err := model.Clone(stored)
+	if err != nil {
+		return nil, err
+	}
+	observed := copyResource.(*model.Node)
+	timestamp := observedAt.UTC()
+	observed.LastSeenAt = &timestamp
+	// LastSeenAt is observed runtime state. In particular, do not advance the
+	// desired revision, reset an error, or make a pending node ready here.
+	s.resources[model.KindNode][id] = observed
+	result, err := model.Clone(observed)
+	if err != nil {
+		return nil, err
+	}
+	return result.(*model.Node), nil
+}
+
+func (s *Memory) PruneOperations(ctx context.Context, before time.Time, keep int) (int, error) {
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
+	if before.IsZero() || keep < 0 {
+		return 0, storeError(ErrConflict, "operation retention cutoff and non-negative keep count are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidates := terminalReconcileOperations(s.resources[model.KindOperation])
+	if len(candidates) <= keep {
+		return 0, nil
+	}
+	pruned := 0
+	for _, operation := range candidates[keep:] {
+		if pruned == maxOperationPruneBatch {
+			break
+		}
+		if operation.CompletedAt == nil || !operation.CompletedAt.Before(before) || !s.operationSupersededLocked(operation) {
+			continue
+		}
+		scope := idempotencyScope("create", model.KindOperation, "", operation.IdempotencyKey)
+		record, exists := s.idempotency[scope]
+		if !exists || record.resource.GetMetadata().ID != operation.ID {
+			// The operation and its replay token are one retention unit. Leaving
+			// either half behind would break deterministic reconcile replay.
+			continue
+		}
+		delete(s.resources[model.KindOperation], operation.ID)
+		delete(s.idempotency, scope)
+		pruned++
+	}
+	return pruned, nil
+}
+
+func terminalReconcileOperations(resources map[string]model.Resource) []*model.Operation {
+	operations := make([]*model.Operation, 0, len(resources))
+	for _, resource := range resources {
+		operation := resource.(*model.Operation)
+		if operation.Action != "reconcile" || operation.CompletedAt == nil || (operation.OperationStatus != model.OperationSucceeded && operation.OperationStatus != model.OperationFailed) {
+			continue
+		}
+		operations = append(operations, operation)
+	}
+	sort.Slice(operations, func(i, j int) bool {
+		left, right := operations[i], operations[j]
+		if !left.CompletedAt.Equal(*right.CompletedAt) {
+			return left.CompletedAt.After(*right.CompletedAt)
+		}
+		return left.ID < right.ID
+	})
+	return operations
+}
+
+func (s *Memory) operationSupersededLocked(operation *model.Operation) bool {
+	target, exists := s.resources[operation.TargetKind][operation.TargetID]
+	return !exists || target.GetMetadata().Revision > operation.TargetRevision
 }
 
 func (s *Memory) Update(ctx context.Context, resource model.Resource, expectedRevision int64, key string) (model.Resource, bool, error) {

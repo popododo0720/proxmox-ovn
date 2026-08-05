@@ -265,6 +265,108 @@ func TestOperationRequiresAnIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestStoreObserveNodeHeartbeatDoesNotChangeDesiredMetadata(t *testing.T) {
+	database := newFakeDatabase()
+	store := deterministicStore(database)
+	node := mustCreate(t, store, &model.Node{Name: "pve-a", ChassisID: "chassis-a", Roles: []model.NodeRole{model.NodeRoleCompute}, Enabled: true}, "node").(*model.Node)
+	readyResource, err := store.MarkReconciled(context.Background(), model.KindNode, node.ID, node.Revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := readyResource.(*model.Node)
+	observedAt := ready.UpdatedAt.Add(time.Minute)
+	observed, err := store.ObserveNodeHeartbeat(context.Background(), node.ID, node.Revision, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.Revision != ready.Revision || observed.AppliedRevision != ready.AppliedRevision || observed.State != ready.State || !observed.UpdatedAt.Equal(ready.UpdatedAt) {
+		t.Fatalf("observation changed desired metadata: ready=%#v observed=%#v", ready.Metadata, observed.Metadata)
+	}
+	if observed.LastSeenAt == nil || !observed.LastSeenAt.Equal(observedAt) {
+		t.Fatalf("last_seen_at=%v want %v", observed.LastSeenAt, observedAt)
+	}
+	loaded, err := store.Get(context.Background(), model.KindNode, node.ID)
+	if err != nil || loaded.GetMetadata().Revision != node.Revision {
+		t.Fatalf("persisted observed node=%#v err=%v", loaded, err)
+	}
+	if _, err := store.ObserveNodeHeartbeat(context.Background(), node.ID, node.Revision+1, observedAt.Add(time.Minute)); !errors.Is(err, controlstore.ErrPrecondition) {
+		t.Fatalf("stale desired revision error=%v", err)
+	}
+}
+
+func TestStoreListRecentFirstAndLimit(t *testing.T) {
+	database := newFakeDatabase()
+	now := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	var sequence atomic.Int64
+	store := newStore(database,
+		WithClock(func() time.Time { return now }),
+		WithIDGenerator(func() string { return fmt.Sprintf("operation-%d", sequence.Add(1)) }),
+	)
+	for revision := int64(1); revision <= 4; revision++ {
+		mustCreate(t, store, &model.Operation{Action: "bind", TargetKind: model.KindPort, TargetID: "port-a", TargetRevision: revision}, fmt.Sprintf("operation-%d", revision))
+		now = now.Add(time.Second)
+	}
+	resources, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{RecentFirst: true, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 2 || resources[0].GetMetadata().ID != "operation-4" || resources[1].GetMetadata().ID != "operation-3" {
+		t.Fatalf("recent limited operations=%#v", resources)
+	}
+	if _, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{Limit: -1}); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("negative limit error=%v", err)
+	}
+}
+
+func TestStorePrunesOperationAndDurableReplayTokenTogether(t *testing.T) {
+	database := newFakeDatabase()
+	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	store := newStore(database, WithClock(func() time.Time { return now }))
+	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool-a"}, "project").(*model.Project)
+	for revision := int64(2); revision <= 4; revision++ {
+		project.Description = fmt.Sprintf("revision-%d", revision)
+		updated, _, err := store.Update(context.Background(), project, project.Revision, fmt.Sprintf("project-%d", revision))
+		if err != nil {
+			t.Fatal(err)
+		}
+		project = updated.(*model.Project)
+	}
+	for revision := int64(1); revision <= 3; revision++ {
+		now = now.Add(time.Hour)
+		key := fmt.Sprintf("reconcile:%s:%d", project.ID, revision)
+		operation := mustCreate(t, store, &model.Operation{
+			Action: "reconcile", TargetKind: model.KindProject, TargetID: project.ID, TargetRevision: revision,
+			OperationStatus: model.OperationQueued,
+		}, key).(*model.Operation)
+		completed := now
+		operation.CompletedAt = &completed
+		operation.OperationStatus = model.OperationSucceeded
+		if _, _, err := store.Update(context.Background(), operation, operation.Revision, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now = now.Add(48 * time.Hour)
+	database.mu.Lock()
+	rowsBefore := len(database.rows[kindTables[model.KindOperation]])
+	database.mu.Unlock()
+	pruned, err := store.PruneOperations(context.Background(), now.Add(-24*time.Hour), 1)
+	if err != nil || pruned != 2 {
+		t.Fatalf("PruneOperations() pruned=%d err=%v", pruned, err)
+	}
+	operations, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil || len(operations) != 1 || operations[0].(*model.Operation).TargetRevision != 3 {
+		t.Fatalf("retained operations=%#v err=%v", operations, err)
+	}
+	database.mu.Lock()
+	operationRows := cloneRawDatabase(database.rows)[kindTables[model.KindOperation]]
+	database.mu.Unlock()
+	// Each pruned public operation must remove its paired durable idempotency
+	// row; unrelated resource replay tokens remain untouched.
+	if len(operationRows) != rowsBefore-4 {
+		t.Fatalf("Operation table rows=%d want %d", len(operationRows), rowsBefore-4)
+	}
+}
+
 func TestStoreIdempotencyIsDurableAcrossManagers(t *testing.T) {
 	database := newFakeDatabase()
 	first := deterministicStore(database)
