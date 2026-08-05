@@ -353,7 +353,7 @@ later run safely verifies/skips them while continuing the one remaining older
 version.
 
 The control-plane ledger also pins the package version on every node. Package
-drift normally stops `pvn-control-plane plan`. There are only three automatic
+drift normally stops `pvn-control-plane plan`. There are only four automatic
 forward-recovery exceptions:
 
 1. A wholly untouched `planned` ledger.
@@ -366,19 +366,27 @@ forward-recovery exceptions:
    clusters; the next voter is inactive with only one record-0 PVN Control
    join stub pointing at the seed; and every later voter is pristine. The stub
    may contain the pinned CID or the legacy not-yet-known CID state.
+4. An exact `complete` ledger immediately after a uniform forward package
+   rollout. Every central and transport target/marker must remain active, a
+   fresh `pvnctl doctor` must pass on every node, ledger-pinned PKI and seed-CA
+   placement must be exact, and the online/offline identity of every database
+   must agree with healthy N/N membership and the pinned CIDs. Every voter must
+   still carry a root-only restart marker equal to its newly installed package.
 
-All three exceptions require zero transport progress. The staged and
+The first three exceptions require zero transport progress. The staged and
 `central-N` cases additionally require complete ledger-pinned PKI and a
 root-only `central-restart-pending` marker matching the uniformly installed,
 strictly newer package on every already-active voter. The `central-N` proof
 also rejects a wrong/missing/extra seed remote, foreign CID, or server-ID
-collision before changing the ledger. Plan reports the required repin without
-writing. Apply repeats the proof under the cluster mutation lease, atomically
-replaces only the package-version snapshot, and then converges forward. It
+collision before changing the ledger. The `complete` proof additionally
+cross-checks each live Raft row with the corresponding offline database SID,
+CID, and local address. Plan reports the required repin without writing. Apply
+repeats the proof under the cluster mutation lease, atomically replaces only
+the package-version snapshot, and then converges or revalidates forward. It
 never adopts an unpinned database, regenerates keys, removes state, or consumes
 the restart marker. Any mixed/downgraded package, membership/topology
-difference, unexpected progress, CID, marker, database, or service state
-remains a hard failure; do not edit the ledger to bypass it.
+difference, unexpected progress, CID, marker, database, doctor, or service
+state remains a hard failure; do not edit the ledger to bypass it.
 
 Package installation restarts only an already-active per-node
 manager/agent/controller stack. The updater deliberately does not restart
@@ -392,6 +400,13 @@ after verifying that voter. Never activate a previously inactive target or
 restart enough voters concurrently to lose quorum. Mixed-version compatibility
 is required for the duration of this rolling window; use a maintenance window
 for releases that declare a breaking database or wire-protocol change.
+
+For an already `complete` ledger, run `pvn-control-plane plan` and its confirmed
+`apply` immediately after the package rollout, while every restart marker still
+exists. The successful apply repins the durable package snapshot. Only then
+perform the one-voter-at-a-time restart sequence below and consume each marker;
+clearing or consuming a marker before the repin intentionally makes recovery
+fail closed.
 
 Do not clear the marker while a voter still runs the old process. Once every
 database has converged beyond the one-member seed, use this sequence on exactly
