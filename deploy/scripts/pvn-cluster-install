@@ -1,0 +1,676 @@
+#!/bin/sh
+# Install pvn-node from one deployment host without activating PVN or touching
+# host networking. The install phase is a dry run unless both --apply and a
+# matching --confirm value are supplied.
+set -eu
+
+PROGRAM=${0##*/}
+PHASE=
+INVENTORY=
+IDENTITY=
+DEB=
+APPLY=false
+CONFIRM=
+SSH_BIN=${PVN_SSH_BIN:-ssh}
+SCP_BIN=${PVN_SCP_BIN:-scp}
+CURRENT_HOST=
+CURRENT_REMOTE_DEB=
+STAGED_RECORDS=
+
+usage() {
+    cat >&2 <<EOF
+usage:
+  $PROGRAM preflight --inventory FILE --identity PRIVATE_KEY
+  $PROGRAM install --inventory FILE --identity PRIVATE_KEY --deb FILE [--apply --confirm CLUSTER_ID]
+
+preflight is always read-only. install is also read-only unless --apply and a
+--confirm value matching the PVE cluster name reported by pvecm are both used.
+EOF
+    exit 2
+}
+
+fail() {
+    echo "$PROGRAM: $*" >&2
+    exit 1
+}
+
+need_value() {
+    [ "$#" -ge 2 ] || usage
+    [ -n "$2" ] || usage
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        preflight|install)
+            [ -z "$PHASE" ] || usage
+            PHASE=$1
+            shift
+            ;;
+        --inventory)
+            need_value "$@"
+            INVENTORY=$2
+            shift 2
+            ;;
+        --identity)
+            need_value "$@"
+            IDENTITY=$2
+            shift 2
+            ;;
+        --deb)
+            need_value "$@"
+            DEB=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --confirm)
+            need_value "$@"
+            CONFIRM=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+[ -n "$PHASE" ] || usage
+[ -n "$INVENTORY" ] || usage
+[ -n "$IDENTITY" ] || usage
+[ -r "$INVENTORY" ] && [ -f "$INVENTORY" ] ||
+    fail "inventory is not a readable regular file: $INVENTORY"
+[ -r "$IDENTITY" ] && [ -f "$IDENTITY" ] ||
+    fail "SSH identity is not a readable regular file: $IDENTITY"
+[ ! -L "$IDENTITY" ] || fail "SSH identity must not be a symlink: $IDENTITY"
+
+identity_owner=$(stat -c '%u' "$IDENTITY" 2>/dev/null || true)
+identity_mode=$(stat -c '%a' "$IDENTITY" 2>/dev/null || true)
+[ "$identity_owner" = "$(id -u)" ] ||
+    fail "SSH identity must be owned by the deployment user"
+case "$identity_mode" in
+    400|600) ;;
+    *) fail "SSH identity mode must be 0400 or 0600 (found ${identity_mode:-unknown})" ;;
+esac
+
+case "$PHASE" in
+    preflight)
+        [ "$APPLY" = false ] || fail "preflight is read-only and does not accept --apply"
+        [ -z "$DEB" ] || fail "preflight does not accept --deb"
+        ;;
+    install)
+        [ -n "$DEB" ] || usage
+        [ -r "$DEB" ] && [ -f "$DEB" ] ||
+            fail "DEB is not a readable regular file: $DEB"
+        if [ "$APPLY" = true ]; then
+            [ -n "$CONFIRM" ] ||
+                fail "--apply requires --confirm CLUSTER_ID"
+        fi
+        ;;
+esac
+
+for command_name in "$SSH_BIN" sed awk grep wc stat id; do
+    command -v "$command_name" >/dev/null 2>&1 ||
+        fail "required command is unavailable: $command_name"
+done
+
+# Read only the one supported field. Never source an inventory: doing so would
+# execute arbitrary shell code on the deployment host.
+inventory_values=$(sed -n \
+    's/^[[:space:]]*PVN_TARGET_NODES[[:space:]]*=[[:space:]]*//p' \
+    "$INVENTORY")
+inventory_lines=$(printf '%s\n' "$inventory_values" | awk 'NF { count++ } END { print count + 0 }')
+[ "$inventory_lines" -eq 1 ] ||
+    fail "inventory must contain exactly one PVN_TARGET_NODES assignment"
+
+case "$inventory_values" in
+    \"*\") inventory_values=${inventory_values#\"}; inventory_values=${inventory_values%\"} ;;
+    \'*\') inventory_values=${inventory_values#\'}; inventory_values=${inventory_values%\'} ;;
+esac
+
+NODES=
+NODE_COUNT=0
+for node in $inventory_values; do
+    case "$node" in
+        ''|*[!A-Za-z0-9._-]*|-*)
+            fail "unsafe node name in inventory: $node"
+            ;;
+    esac
+    case " $NODES " in
+        *" $node "*) fail "duplicate node in inventory: $node" ;;
+    esac
+    NODES=${NODES:+$NODES }$node
+    NODE_COUNT=$((NODE_COUNT + 1))
+done
+[ "$NODE_COUNT" -gt 0 ] || fail "inventory contains no target nodes"
+
+ssh_run() {
+    pvn_ssh_host=$1
+    shift
+    "$SSH_BIN" \
+        -i "$IDENTITY" \
+        -o BatchMode=yes \
+        -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o PubkeyAuthentication=yes \
+        -o PreferredAuthentications=publickey \
+        -o IdentitiesOnly=yes \
+        -o NumberOfPasswordPrompts=0 \
+        -o StrictHostKeyChecking=yes \
+        -o ConnectTimeout=10 \
+        -- "root@$pvn_ssh_host" sh -s -- "$@" <<'PVN_REMOTE'
+set -eu
+
+remote_fail() {
+    echo "PVN cluster install precondition failed: $*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 ||
+        remote_fail "required command is unavailable: $1"
+}
+
+package_state() {
+    pvn_pkg_state=$(dpkg-query -W -f='${db:Status-Status}' pvn-node 2>/dev/null || true)
+    case "$pvn_pkg_state" in
+        '') echo absent ;;
+        installed) echo installed ;;
+        *) remote_fail "pvn-node has incomplete dpkg state: $pvn_pkg_state" ;;
+    esac
+}
+
+check_inactive() {
+    pvn_checked_package_state=$1
+    for pvn_unit in \
+        pvn-node.target pvn-central.target pvn-node-ready.service \
+        pvn-manager.service pvn-agent.service pvn-ovn-host-config.service \
+        pvn-control-db.service pvn-ovn-db-listeners.service \
+        ovn-host.service ovn-central.service ovn-controller.service \
+        ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service \
+        ovn-northd.service
+    do
+        pvn_load=$(systemctl show --property=LoadState --value "$pvn_unit" 2>/dev/null || true)
+        case "$pvn_load" in
+            loaded|masked)
+                pvn_active=$(systemctl is-active "$pvn_unit" 2>/dev/null || true)
+                [ "$pvn_active" = inactive ] ||
+                    remote_fail "$pvn_unit must be inactive, found ${pvn_active:-unknown}"
+                ;;
+            not-found|'')
+                [ "$pvn_checked_package_state" = absent ] ||
+                    remote_fail "$pvn_unit is missing from an installed pvn-node package"
+                ;;
+            *)
+                remote_fail "$pvn_unit has unsafe load state ${pvn_load:-unknown}"
+                ;;
+        esac
+        pvn_enabled=$(systemctl is-enabled "$pvn_unit" 2>/dev/null || true)
+        case "$pvn_enabled" in
+            enabled|enabled-runtime|linked|linked-runtime|alias)
+                if [ "$pvn_checked_package_state" = installed ]; then
+                    case "$pvn_unit" in
+                        ovn-ovsdb-server-nb.service|ovn-ovsdb-server-sb.service)
+                            # Debian enables these database units. The packaged
+                            # ConditionPathExists central marker keeps this
+                            # exact inert retry from starting them.
+                            ;;
+                        *) remote_fail "$pvn_unit is enabled" ;;
+                    esac
+                else
+                    remote_fail "$pvn_unit is enabled before first installation"
+                fi
+                ;;
+            not-found|'')
+                [ "$pvn_checked_package_state" = absent ] ||
+                    remote_fail "$pvn_unit enable state is unknown"
+                ;;
+        esac
+        if [ "$pvn_checked_package_state" = installed ]; then
+            case "$pvn_unit" in
+                ovn-host.service|ovn-central.service)
+                    [ "$pvn_enabled" = masked ] ||
+                        remote_fail "$pvn_unit must remain masked"
+                    ;;
+            esac
+        fi
+    done
+
+    [ ! -e /etc/pvn/node-enabled ] ||
+        remote_fail "/etc/pvn/node-enabled exists"
+    [ ! -e /etc/pvn/central/enabled ] ||
+        remote_fail "/etc/pvn/central/enabled exists"
+}
+
+check_absent_ownership() {
+    if [ -d /etc/pvn ] && find /etc/pvn -mindepth 1 -print -quit | grep -q .; then
+        remote_fail "stale /etc/pvn state exists before first installation"
+    fi
+    [ ! -e /var/lib/ovn/ovnnb_db.db ] ||
+        remote_fail "an existing OVN Northbound database is present"
+    [ ! -e /var/lib/ovn/ovnsb_db.db ] ||
+        remote_fail "an existing OVN Southbound database is present"
+
+    if command -v ovs-vsctl >/dev/null 2>&1; then
+        if ! pvn_ovs_external_ids=$(ovs-vsctl --timeout=10 --data=bare \
+            --no-heading get Open_vSwitch . external_ids 2>/dev/null); then
+            remote_fail "existing OVS ownership cannot be inspected"
+        fi
+        for pvn_ovs_key in \
+            ovn-remote ovn-encap-ip ovn-encap-type ovn-bridge ovn-bridge-mappings
+        do
+            case "$pvn_ovs_external_ids" in
+                *"$pvn_ovs_key"*)
+                    remote_fail "existing OVS external_id $pvn_ovs_key is already owned"
+                    ;;
+            esac
+        done
+    fi
+}
+
+check_pve_and_quorum() {
+    pvn_pve_version=$(dpkg-query -W -f='${Version}' pve-manager 2>/dev/null || true)
+    pvn_pve_version=${pvn_pve_version#*:}
+    case "$pvn_pve_version" in
+        9|9.*) ;;
+        *) remote_fail "PVE 9 is required; found ${pvn_pve_version:-unknown}" ;;
+    esac
+
+    pvn_cluster_status=$(pvecm status 2>/dev/null) ||
+        remote_fail "pvecm status failed"
+    pvn_cluster_id=$(printf '%s\n' "$pvn_cluster_status" |
+        awk '$1 == "Name:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
+        remote_fail "cannot determine the PVE cluster name"
+    case "$pvn_cluster_id" in
+        ''|*[!A-Za-z0-9._-]*) remote_fail "unsafe PVE cluster name" ;;
+    esac
+    pvn_quorate=$(printf '%s\n' "$pvn_cluster_status" |
+        awk '$1 == "Quorate:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
+        remote_fail "cannot determine quorum state"
+    [ "$pvn_quorate" = Yes ] || remote_fail "PVE cluster is not quorate"
+    pvn_cluster_nodes=$(printf '%s\n' "$pvn_cluster_status" |
+        awk '$1 == "Nodes:" { print $2; found++ } END { if (found != 1) exit 1 }') ||
+        remote_fail "cannot determine cluster node count"
+    case "$pvn_cluster_nodes" in
+        ''|*[!0-9]*) remote_fail "invalid cluster node count" ;;
+    esac
+}
+
+check_clean_ui_template() {
+    pvn_template=/usr/share/pve-manager/index.html.tpl
+    pvn_loader=/usr/share/pve-manager/js/pvn-loader.js
+    [ -f "$pvn_template" ] || remote_fail "PVE UI template is missing"
+    [ ! -L "$pvn_template" ] || remote_fail "PVE UI template is a symlink"
+
+    awk '
+        $0 == "    <script type=\"text/javascript\" src=\"/pve2/js/pvemanagerlib.js?ver=[% version %]\"></script>" { anchors++ }
+        index($0, "<!-- PVN-LOADER:BEGIN -->") { begins++ }
+        index($0, "<!-- PVN-LOADER:END -->") { ends++ }
+        index($0, "/pve2/js/pvn-loader.js") { tags++ }
+        END {
+            if (anchors != 1 || begins != 0 || ends != 0 || tags != 0) exit 1
+        }
+    ' "$pvn_template" ||
+        remote_fail "PVE 9 UI template is unsupported, malformed, or already modified"
+    [ ! -e "$pvn_loader" ] ||
+        remote_fail "an unmanaged PVN UI loader already exists"
+}
+
+check_ui() {
+    pvn_package_state=$1
+    if [ "$pvn_package_state" = installed ]; then
+        [ -x /usr/lib/pvn/pvn-ui-verify ] ||
+            remote_fail "installed pvn-ui-verify is missing"
+        /usr/lib/pvn/pvn-ui-verify ||
+            remote_fail "installed PVN UI verification failed"
+    else
+        check_clean_ui_template
+    fi
+}
+
+run_preflight() {
+    require_command dpkg-query
+    require_command pvecm
+    require_command systemctl
+    require_command awk
+    require_command dpkg
+    require_command sha256sum
+    require_command apt-get
+    require_command find
+    require_command grep
+    [ "$(id -u)" -eq 0 ] || remote_fail "SSH user is not root"
+
+    pvn_package_state=$(package_state)
+    check_pve_and_quorum
+    check_inactive "$pvn_package_state"
+    check_ui "$pvn_package_state"
+    if [ "$pvn_package_state" = absent ]; then
+        check_absent_ownership
+        pvn_package_version=absent
+    else
+        pvn_package_version=$(dpkg-query -W -f='${Version}' pvn-node 2>/dev/null || true)
+        [ -n "$pvn_package_version" ] ||
+            remote_fail "installed pvn-node version cannot be determined"
+    fi
+    pvn_arch=$(dpkg --print-architecture)
+    case "$pvn_arch" in
+        ''|*[!A-Za-z0-9_-]*) remote_fail "invalid dpkg architecture" ;;
+    esac
+}
+
+pvn_action=${1:-}
+shift || true
+case "$pvn_action" in
+    probe)
+        [ "$#" -eq 0 ] || remote_fail "invalid probe arguments"
+        run_preflight
+        pvn_hostname=$(hostname --fqdn 2>/dev/null || hostname)
+        case "$pvn_hostname" in
+            ''|*[!A-Za-z0-9._-]*) remote_fail "unsafe or empty node hostname" ;;
+        esac
+        pvn_node_id=$(printf '%s\n' "$pvn_cluster_status" |
+            awk '$1 == "Node" && $2 == "ID:" { print $3; found++ } END { if (found != 1) exit 1 }') ||
+            remote_fail "cannot determine local PVE node ID"
+        case "$pvn_node_id" in
+            ''|*[!A-Fa-f0-9x]*) remote_fail "invalid local PVE node ID" ;;
+        esac
+        printf 'PVN_PREFLIGHT cluster=%s nodes=%s pve=%s arch=%s package=%s version=%s hostname=%s nodeid=%s\n' \
+            "$pvn_cluster_id" "$pvn_cluster_nodes" "$pvn_pve_version" \
+            "$pvn_arch" "$pvn_package_state" "$pvn_package_version" \
+            "$pvn_hostname" "$pvn_node_id"
+        ;;
+    prepare)
+        [ "$#" -eq 0 ] || remote_fail "invalid prepare arguments"
+        require_command mktemp
+        umask 077
+        mktemp /var/tmp/pvn-node.XXXXXXXX.deb
+        ;;
+    verify)
+        [ "$#" -eq 2 ] || remote_fail "invalid verify arguments"
+        pvn_remote_deb=$1
+        pvn_expected_sha=$2
+        case "$pvn_remote_deb" in
+            /var/tmp/pvn-node.*.deb) ;;
+            *) remote_fail "unsafe staged package path" ;;
+        esac
+        case "$pvn_expected_sha" in
+            *[!0-9a-f]*|'') remote_fail "invalid expected SHA-256" ;;
+        esac
+        [ "${#pvn_expected_sha}" -eq 64 ] || remote_fail "invalid expected SHA-256 length"
+        [ -f "$pvn_remote_deb" ] && [ ! -L "$pvn_remote_deb" ] ||
+            remote_fail "staged package is not a regular file"
+        pvn_actual_sha=$(sha256sum -- "$pvn_remote_deb" | awk '{ print $1 }')
+        [ "$pvn_actual_sha" = "$pvn_expected_sha" ] ||
+            remote_fail "staged package SHA-256 mismatch"
+        ;;
+    apply)
+        [ "$#" -eq 4 ] || remote_fail "invalid apply arguments"
+        pvn_remote_deb=$1
+        pvn_expected_sha=$2
+        pvn_expected_version=$3
+        pvn_expected_arch=$4
+        case "$pvn_remote_deb" in
+            /var/tmp/pvn-node.*.deb) ;;
+            *) remote_fail "unsafe staged package path" ;;
+        esac
+
+        # Recheck every safety condition immediately before the first write to
+        # systemd state. This also prevents an active PVN node from being
+        # treated as an idempotent package upgrade.
+        run_preflight
+        [ "$pvn_expected_arch" = all ] || [ "$pvn_arch" = "$pvn_expected_arch" ] ||
+            remote_fail "package architecture $pvn_expected_arch does not match $pvn_arch"
+        pvn_actual_sha=$(sha256sum -- "$pvn_remote_deb" | awk '{ print $1 }')
+        [ "$pvn_actual_sha" = "$pvn_expected_sha" ] ||
+            remote_fail "staged package changed after verification"
+
+        # Aggregate OVN units are masked before apt can install dependencies.
+        # No bridge, interface, provider uplink, or activation marker is touched.
+        systemctl mask ovn-host.service ovn-central.service >/dev/null
+        [ "$(systemctl is-enabled ovn-host.service 2>/dev/null || true)" = masked ] ||
+            remote_fail "ovn-host.service could not be masked"
+        [ "$(systemctl is-enabled ovn-central.service 2>/dev/null || true)" = masked ] ||
+            remote_fail "ovn-central.service could not be masked"
+
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -- "$pvn_remote_deb"
+
+        pvn_installed_version=$(dpkg-query -W -f='${Version}' pvn-node 2>/dev/null || true)
+        [ "$pvn_installed_version" = "$pvn_expected_version" ] ||
+            remote_fail "installed pvn-node version does not match the DEB"
+        [ "$(systemctl is-enabled ovn-host.service 2>/dev/null || true)" = masked ] ||
+            remote_fail "ovn-host.service is not masked after installation"
+        [ "$(systemctl is-enabled ovn-central.service 2>/dev/null || true)" = masked ] ||
+            remote_fail "ovn-central.service is not masked after installation"
+        check_inactive installed
+        [ "$(package_state)" = installed ] ||
+            remote_fail "pvn-node is not completely installed"
+        check_ui installed
+        ;;
+    cleanup)
+        [ "$#" -eq 1 ] || remote_fail "invalid cleanup arguments"
+        pvn_remote_deb=$1
+        case "$pvn_remote_deb" in
+            /var/tmp/pvn-node.*.deb) rm -f -- "$pvn_remote_deb" ;;
+            *) remote_fail "unsafe staged package path" ;;
+        esac
+        ;;
+    *)
+        remote_fail "unknown remote action"
+        ;;
+esac
+PVN_REMOTE
+}
+
+scp_deb() {
+    pvn_scp_host=$1
+    pvn_scp_path=$2
+    "$SCP_BIN" -q \
+        -i "$IDENTITY" \
+        -o BatchMode=yes \
+        -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o PubkeyAuthentication=yes \
+        -o PreferredAuthentications=publickey \
+        -o IdentitiesOnly=yes \
+        -o NumberOfPasswordPrompts=0 \
+        -o StrictHostKeyChecking=yes \
+        -o ConnectTimeout=10 \
+        -- "$DEB" "root@$pvn_scp_host:$pvn_scp_path"
+}
+
+DISCOVERED_CLUSTER_ID=
+DISCOVERED_ARCH=
+DISCOVERED_PACKAGE_VERSIONS=
+
+preflight_all() {
+    pvn_expected_cluster=
+    pvn_expected_arch=
+    pvn_seen_hostnames=
+    pvn_seen_node_ids=
+    pvn_versions=
+    for pvn_host in $NODES; do
+        echo "[$pvn_host] read-only preflight"
+        pvn_probe=$(ssh_run "$pvn_host" probe) ||
+            fail "preflight failed on $pvn_host"
+        set -- $pvn_probe
+        [ "$#" -eq 9 ] && [ "$1" = PVN_PREFLIGHT ] ||
+            fail "unexpected preflight response from $pvn_host"
+        pvn_cluster=${2#cluster=}
+        pvn_reported_nodes=${3#nodes=}
+        pvn_pve=${4#pve=}
+        pvn_arch=${5#arch=}
+        pvn_package=${6#package=}
+        pvn_package_version=${7#version=}
+        pvn_hostname=${8#hostname=}
+        pvn_node_id=${9#nodeid=}
+        [ "$2" = "cluster=$pvn_cluster" ] &&
+            [ "$3" = "nodes=$pvn_reported_nodes" ] &&
+            [ "$4" = "pve=$pvn_pve" ] &&
+            [ "$5" = "arch=$pvn_arch" ] &&
+            [ "$6" = "package=$pvn_package" ] &&
+            [ "$7" = "version=$pvn_package_version" ] &&
+            [ "$8" = "hostname=$pvn_hostname" ] &&
+            [ "$9" = "nodeid=$pvn_node_id" ] ||
+            fail "malformed preflight response from $pvn_host"
+        [ "$pvn_reported_nodes" = "$NODE_COUNT" ] ||
+            fail "$pvn_host reports $pvn_reported_nodes cluster nodes, but inventory has $NODE_COUNT"
+        if [ -z "$pvn_expected_cluster" ]; then
+            pvn_expected_cluster=$pvn_cluster
+            pvn_expected_arch=$pvn_arch
+        else
+            [ "$pvn_cluster" = "$pvn_expected_cluster" ] ||
+                fail "$pvn_host belongs to cluster $pvn_cluster, expected $pvn_expected_cluster"
+            [ "$pvn_arch" = "$pvn_expected_arch" ] ||
+                fail "$pvn_host architecture $pvn_arch differs from $pvn_expected_arch"
+        fi
+        case " $pvn_seen_hostnames " in
+            *" $pvn_hostname "*)
+                fail "$pvn_host duplicates PVE hostname $pvn_hostname"
+                ;;
+        esac
+        case " $pvn_seen_node_ids " in
+            *" $pvn_node_id "*)
+                fail "$pvn_host duplicates PVE node ID $pvn_node_id"
+                ;;
+        esac
+        pvn_seen_hostnames=${pvn_seen_hostnames:+$pvn_seen_hostnames }$pvn_hostname
+        pvn_seen_node_ids=${pvn_seen_node_ids:+$pvn_seen_node_ids }$pvn_node_id
+        pvn_versions=${pvn_versions:+$pvn_versions }$pvn_package_version
+        echo "[$pvn_host] ok: node=$pvn_hostname/$pvn_node_id cluster=$pvn_cluster pve=$pvn_pve arch=$pvn_arch package=$pvn_package:$pvn_package_version inactive"
+    done
+    DISCOVERED_CLUSTER_ID=$pvn_expected_cluster
+    DISCOVERED_ARCH=$pvn_expected_arch
+    DISCOVERED_PACKAGE_VERSIONS=$pvn_versions
+}
+
+cleanup_staged() {
+    if [ -n "$CURRENT_HOST" ] && [ -n "$CURRENT_REMOTE_DEB" ]; then
+        ssh_run "$CURRENT_HOST" cleanup "$CURRENT_REMOTE_DEB" >/dev/null 2>&1 ||
+            echo "$PROGRAM: warning: could not remove $CURRENT_REMOTE_DEB from $CURRENT_HOST" >&2
+        CURRENT_HOST=
+        CURRENT_REMOTE_DEB=
+    fi
+    for pvn_staged_record in $STAGED_RECORDS; do
+        pvn_staged_host=${pvn_staged_record%%:*}
+        pvn_staged_path=${pvn_staged_record#*:}
+        ssh_run "$pvn_staged_host" cleanup "$pvn_staged_path" >/dev/null 2>&1 ||
+            echo "$PROGRAM: warning: could not remove $pvn_staged_path from $pvn_staged_host" >&2
+    done
+    STAGED_RECORDS=
+}
+
+trap cleanup_staged 0
+trap 'exit 130' HUP INT TERM
+
+if [ "$PHASE" = preflight ]; then
+    preflight_all
+    [ -z "$CONFIRM" ] || [ "$CONFIRM" = "$DISCOVERED_CLUSTER_ID" ] ||
+        fail "confirmation '$CONFIRM' does not match cluster '$DISCOVERED_CLUSTER_ID'"
+    echo "Preflight passed for all $NODE_COUNT nodes in cluster $DISCOVERED_CLUSTER_ID; no changes made."
+    exit 0
+fi
+
+for command_name in "$SCP_BIN" dpkg-deb sha256sum; do
+    command -v "$command_name" >/dev/null 2>&1 ||
+        fail "required command is unavailable: $command_name"
+done
+
+DEB_PACKAGE=$(dpkg-deb -f "$DEB" Package 2>/dev/null || true)
+[ "$DEB_PACKAGE" = pvn-node ] || fail "DEB package must be pvn-node"
+DEB_VERSION=$(dpkg-deb -f "$DEB" Version 2>/dev/null || true)
+DEB_ARCH=$(dpkg-deb -f "$DEB" Architecture 2>/dev/null || true)
+case "$DEB_VERSION" in
+    ''|*[!A-Za-z0-9.+:~_-]*) fail "DEB has an unsafe or empty version" ;;
+esac
+case "$DEB_ARCH" in
+    ''|*[!A-Za-z0-9_-]*) fail "DEB has an unsafe or empty architecture" ;;
+esac
+DEB_SHA=$(sha256sum -- "$DEB" | awk '{ print $1 }')
+case "$DEB_SHA" in
+    *[!0-9a-f]*|'') fail "could not calculate a valid DEB SHA-256" ;;
+esac
+[ "${#DEB_SHA}" -eq 64 ] || fail "could not calculate a valid DEB SHA-256"
+
+if [ "$APPLY" = true ]; then
+    command -v flock >/dev/null 2>&1 || fail "required command is unavailable: flock"
+    pvn_lock_file=${PVN_INSTALL_LOCK_FILE:-/run/lock/pvn-cluster-install.lock}
+    case "$pvn_lock_file" in
+        /*) ;;
+        *) fail "PVN_INSTALL_LOCK_FILE must be an absolute path" ;;
+    esac
+    exec 9>"$pvn_lock_file" || fail "cannot open local install lock: $pvn_lock_file"
+    flock -n 9 || fail "another PVN cluster install is already running"
+fi
+
+preflight_all
+
+[ "$DEB_ARCH" = all ] || [ "$DEB_ARCH" = "$DISCOVERED_ARCH" ] ||
+    fail "DEB architecture $DEB_ARCH does not match cluster architecture $DISCOVERED_ARCH"
+
+for pvn_seen_version in $DISCOVERED_PACKAGE_VERSIONS; do
+    case "$pvn_seen_version" in
+        absent|"$DEB_VERSION") ;;
+        *)
+            fail "installed pvn-node $pvn_seen_version is not an inert retry of $DEB_VERSION"
+            ;;
+    esac
+done
+
+if [ "$APPLY" = false ]; then
+    echo "Dry run: pvn-node $DEB_VERSION ($DEB_SHA) would be installed on: $NODES"
+    echo "Re-run with --apply --confirm $DISCOVERED_CLUSTER_ID to install; no changes made."
+    exit 0
+fi
+
+[ "$CONFIRM" = "$DISCOVERED_CLUSTER_ID" ] ||
+    fail "confirmation '$CONFIRM' does not match cluster '$DISCOVERED_CLUSTER_ID'"
+
+# Stage and hash the identical package on every node before apt changes any
+# node. A failed copy or hash therefore leaves the whole cluster uninstalled.
+for pvn_host in $NODES; do
+    echo "[$pvn_host] staging verified pvn-node $DEB_VERSION"
+    CURRENT_HOST=$pvn_host
+    CURRENT_REMOTE_DEB=$(ssh_run "$pvn_host" prepare) ||
+        fail "could not create a staging file on $pvn_host"
+    case "$CURRENT_REMOTE_DEB" in
+        /var/tmp/pvn-node.*.deb) ;;
+        *) fail "unsafe staging path returned by $pvn_host" ;;
+    esac
+    case "$CURRENT_REMOTE_DEB" in
+        *[!A-Za-z0-9._/-]*) fail "unsafe staging path returned by $pvn_host" ;;
+    esac
+    scp_deb "$pvn_host" "$CURRENT_REMOTE_DEB" ||
+        fail "could not copy the DEB to $pvn_host"
+    ssh_run "$pvn_host" verify "$CURRENT_REMOTE_DEB" "$DEB_SHA" ||
+        fail "DEB verification failed on $pvn_host"
+
+    STAGED_RECORDS=${STAGED_RECORDS:+$STAGED_RECORDS }$pvn_host:$CURRENT_REMOTE_DEB
+    CURRENT_HOST=
+    CURRENT_REMOTE_DEB=
+done
+
+for pvn_staged_record in $STAGED_RECORDS; do
+    pvn_host=${pvn_staged_record%%:*}
+    pvn_remote_deb=${pvn_staged_record#*:}
+    echo "[$pvn_host] masking OVN aggregate units and installing"
+    ssh_run "$pvn_host" apply "$pvn_remote_deb" "$DEB_SHA" \
+        "$DEB_VERSION" "$DEB_ARCH" ||
+        fail "package installation failed on $pvn_host"
+    echo "[$pvn_host] installed and verified inactive"
+done
+
+# Remove all staged artifacts, then prove the final state on every node rather
+# than trusting only the per-node apt command.
+cleanup_staged
+preflight_all
+for pvn_seen_version in $DISCOVERED_PACKAGE_VERSIONS; do
+    [ "$pvn_seen_version" = "$DEB_VERSION" ] ||
+        fail "final sweep found pvn-node $pvn_seen_version, expected $DEB_VERSION"
+done
+
+echo "Installed pvn-node $DEB_VERSION on all $NODE_COUNT nodes in cluster $DISCOVERED_CLUSTER_ID."
+echo "No PVN activation marker or network/provider configuration was created."
