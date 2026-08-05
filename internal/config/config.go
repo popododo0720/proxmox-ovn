@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -175,11 +178,26 @@ func (c Config) Validate() error {
 	if c.Agent.Bridge == "" {
 		problems = append(problems, "agent.bridge is required")
 	}
+	if !filepath.IsAbs(c.Agent.SystemIDFile) {
+		problems = append(problems, "agent.system_id_file must be an absolute path")
+	}
 	if c.Networking.EncapType != "geneve" {
 		problems = append(problems, "networking.encap_type must be geneve")
 	}
+	if c.Networking.EncapIP != "" {
+		address, err := netip.ParseAddr(c.Networking.EncapIP)
+		if err != nil || !address.Is4() {
+			problems = append(problems, "networking.encap_ip must be an IPv4 address")
+		}
+	}
 	if c.Networking.GuestMTU < 576 || c.Networking.GuestMTU > 9000 {
 		problems = append(problems, "networking.guest_mtu must be between 576 and 9000")
+	}
+	if strings.TrimSpace(c.Networking.Physnet) == "" {
+		problems = append(problems, "networking.physnet is required")
+	}
+	if strings.TrimSpace(c.Networking.ProviderBridge) == "" {
+		problems = append(problems, "networking.provider_bridge is required")
 	}
 	parsedPVE, err := url.Parse(c.Manager.PVEURL)
 	if err != nil || parsedPVE.Scheme != "https" || parsedPVE.Host == "" {
@@ -193,8 +211,63 @@ func (c Config) Validate() error {
 	} else if parsedManager.Scheme == "unix" && (parsedManager.Path == "" || parsedManager.Host != "") {
 		problems = append(problems, "agent.manager_url Unix address must be an absolute socket path")
 	}
+	usesOVNTLS := false
+	for label, endpoints := range map[string][]string{
+		"ovn.control_db": c.OVN.ControlDB,
+		"ovn.northbound": c.OVN.Northbound,
+		"ovn.southbound": c.OVN.Southbound,
+	} {
+		needsTLS, endpointProblems := validateOVSDBEndpoints(label, endpoints)
+		usesOVNTLS = usesOVNTLS || needsTLS
+		problems = append(problems, endpointProblems...)
+	}
+	if usesOVNTLS {
+		for label, path := range map[string]string{
+			"ovn.tls_ca":   c.OVN.TLSCA,
+			"ovn.tls_cert": c.OVN.TLSCert,
+			"ovn.tls_key":  c.OVN.TLSKey,
+		} {
+			if !filepath.IsAbs(path) {
+				problems = append(problems, label+" must be an absolute path when SSL endpoints are configured")
+			}
+		}
+	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+func validateOVSDBEndpoints(label string, endpoints []string) (bool, []string) {
+	if len(endpoints) == 0 {
+		return false, []string{label + " requires at least one endpoint"}
+	}
+	usesTLS := false
+	var problems []string
+	for _, endpoint := range endpoints {
+		if strings.TrimSpace(endpoint) != endpoint || strings.ContainsAny(endpoint, "\r\n\x00,") {
+			problems = append(problems, fmt.Sprintf("%s contains an unsafe endpoint %q", label, endpoint))
+			continue
+		}
+		switch {
+		case strings.HasPrefix(endpoint, "unix:"):
+			if !filepath.IsAbs(strings.TrimPrefix(endpoint, "unix:")) {
+				problems = append(problems, fmt.Sprintf("%s Unix endpoint must use an absolute path: %q", label, endpoint))
+			}
+		case strings.HasPrefix(endpoint, "ssl:"):
+			usesTLS = true
+			host, port, err := net.SplitHostPort(strings.TrimPrefix(endpoint, "ssl:"))
+			if err != nil || host == "" || port == "" {
+				problems = append(problems, fmt.Sprintf("%s SSL endpoint must use ssl:HOST:PORT syntax: %q", label, endpoint))
+				continue
+			}
+			portNumber, portErr := strconv.Atoi(port)
+			if portErr != nil || portNumber < 1 || portNumber > 65535 {
+				problems = append(problems, fmt.Sprintf("%s SSL endpoint has an invalid port: %q", label, endpoint))
+			}
+		default:
+			problems = append(problems, fmt.Sprintf("%s endpoint must use unix: or ssl: transport: %q", label, endpoint))
+		}
+	}
+	return usesTLS, problems
 }
