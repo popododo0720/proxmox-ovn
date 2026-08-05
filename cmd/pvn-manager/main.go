@@ -113,6 +113,10 @@ func run(arguments []string) error {
 	if defaults.sessionTTL <= 0 {
 		return errors.New("session-ttl must be positive")
 	}
+	_, listenPort, listenErr := net.SplitHostPort(defaults.listen)
+	if listenErr != nil || listenPort != "8443" {
+		return errors.New("listen address must use port 8443 for the Proxmox PVN UI")
+	}
 	if defaults.reconcileEvery <= 0 {
 		return errors.New("reconcile interval must be positive")
 	}

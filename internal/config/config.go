@@ -175,6 +175,14 @@ func (c Config) Validate() error {
 	if c.Agent.PollEvery <= 0 {
 		problems = append(problems, "agent.poll_every must be positive")
 	}
+	if c.Manager.PublicPort != 8443 {
+		problems = append(problems, "manager.public_port must be 8443 for the Proxmox PVN UI")
+	}
+	listenHost, listenPort, listenErr := net.SplitHostPort(c.Manager.ListenAddress)
+	_ = listenHost
+	if listenErr != nil || listenPort != strconv.Itoa(c.Manager.PublicPort) {
+		problems = append(problems, "manager.listen_address must use manager.public_port")
+	}
 	if c.Agent.Bridge == "" {
 		problems = append(problems, "agent.bridge is required")
 	}

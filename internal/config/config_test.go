@@ -52,6 +52,20 @@ func TestValidateAgentManagerTransport(t *testing.T) {
 	}
 }
 
+func TestValidatePinsManagerPortToPVNLoader(t *testing.T) {
+	cfg := validConfig()
+	cfg.Manager.PublicPort = 9443
+	cfg.Manager.ListenAddress = ":9443"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be 8443") {
+		t.Fatalf("non-loader manager port must fail: %v", err)
+	}
+	cfg = validConfig()
+	cfg.Manager.ListenAddress = ":9443"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must use manager.public_port") {
+		t.Fatalf("mismatched listen port must fail: %v", err)
+	}
+}
+
 func TestValidateOVSDBTransportsAndTLS(t *testing.T) {
 	cfg := validConfig()
 	cfg.OVN.Northbound = []string{"tcp:127.0.0.1:6641"}
