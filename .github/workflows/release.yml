@@ -71,6 +71,14 @@ jobs:
             "pvn-node_${PVN_RELEASE_VERSION}_${PVN_RELEASE_ARCH}.deb"
             pvn-update.sh
           )
+          payloads=(
+            pvn-cluster-install
+            pvn-cluster-lease
+            pvn-cluster-update
+            pvn-install.sh
+            "pvn-node_${PVN_RELEASE_VERSION}_${PVN_RELEASE_ARCH}.deb"
+            pvn-update.sh
+          )
           mapfile -t actual < <(
             find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort
           )
@@ -93,7 +101,28 @@ jobs:
               exit 1
             }
           done
-          (cd dist && sha256sum --check SHA256SUMS)
+          manifest=()
+          while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line =~ ^[0-9a-f]{64}[[:space:]][[:space:]]([A-Za-z0-9._-]+)$ ]]; then
+              manifest+=("${BASH_REMATCH[1]}")
+            else
+              printf 'invalid SHA256SUMS entry: %s\n' "$line" >&2
+              exit 1
+            fi
+          done < dist/SHA256SUMS
+          mapfile -t manifest < <(printf '%s\n' "${manifest[@]}" | LC_ALL=C sort)
+          mapfile -t payloads < <(printf '%s\n' "${payloads[@]}" | LC_ALL=C sort)
+          if (( ${#manifest[@]} != ${#payloads[@]} )); then
+            printf 'SHA256SUMS does not cover the exact payload set\n' >&2
+            exit 1
+          fi
+          for index in "${!payloads[@]}"; do
+            if [[ ${manifest[$index]} != "${payloads[$index]}" ]]; then
+              printf 'SHA256SUMS does not cover the exact payload set\n' >&2
+              exit 1
+            fi
+          done
+          (cd dist && sha256sum --check --strict SHA256SUMS)
 
       - name: Publish GitHub Release
         shell: bash
@@ -110,8 +139,36 @@ jobs:
             "dist/pvn-node_${PVN_RELEASE_VERSION}_${PVN_RELEASE_ARCH}.deb"
             dist/pvn-update.sh
           )
+          expected_names=(
+            SHA256SUMS
+            pvn-cluster-install
+            pvn-cluster-lease
+            pvn-cluster-update
+            pvn-install.sh
+            "pvn-node_${PVN_RELEASE_VERSION}_${PVN_RELEASE_ARCH}.deb"
+            pvn-update.sh
+          )
+          is_expected_name() {
+            local candidate=$1 expected
+            for expected in "${expected_names[@]}"; do
+              [[ $candidate == "$expected" ]] && return 0
+            done
+            return 1
+          }
           if gh release view "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing_output=$(gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            existing_names=()
+            if [[ -n $existing_output ]]; then
+              mapfile -t existing_names <<< "$existing_output"
+            fi
+            for existing in "${existing_names[@]}"; do
+              if ! is_expected_name "$existing"; then
+                printf 'existing release has unexpected asset: %s\n' "$existing" >&2
+                exit 1
+              fi
+            done
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
@@ -119,3 +176,21 @@ jobs:
               --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
               --title "PVN $GITHUB_REF_NAME"
           fi
+          final_output=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          final_names=()
+          if [[ -n $final_output ]]; then
+            mapfile -t final_names <<< "$final_output"
+          fi
+          mapfile -t final_names < <(printf '%s\n' "${final_names[@]}" | LC_ALL=C sort)
+          mapfile -t expected_names < <(printf '%s\n' "${expected_names[@]}" | LC_ALL=C sort)
+          if (( ${#final_names[@]} != ${#expected_names[@]} )); then
+            printf 'published release does not contain exactly seven assets\n' >&2
+            exit 1
+          fi
+          for index in "${!expected_names[@]}"; do
+            if [[ ${final_names[$index]} != "${expected_names[$index]}" ]]; then
+              printf 'published release asset set is not exact\n' >&2
+              exit 1
+            fi
+          done
