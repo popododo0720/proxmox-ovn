@@ -156,7 +156,7 @@ func (s *Server) buildDefaultSecurityGroupBackfillPlan(ctx context.Context) (*de
 	portsByProject := make(map[string][]*model.Port)
 	for _, resource := range snapshot[model.KindPort] {
 		port := resource.(*model.Port)
-		if len(port.SecurityGroupIDs) == 0 {
+		if port.State != model.ResourceDeleting && len(port.SecurityGroupIDs) == 0 {
 			portsByProject[port.ProjectID] = append(portsByProject[port.ProjectID], port)
 		}
 	}

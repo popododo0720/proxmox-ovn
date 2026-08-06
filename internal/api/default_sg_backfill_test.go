@@ -98,6 +98,14 @@ func TestDefaultSecurityGroupBackfillPlanIsReadOnlyAndHumanReadable(t *testing.T
 	missingPolicy := mustCreateDefaultSecurityGroupBackfillResource(t, store, &model.Port{
 		ProjectID: zeta.ID, NetworkID: zetaNetwork.ID, Name: "legacy", MACAddress: "02:00:00:00:20:01", AdminStateUp: true,
 	}).(*model.Port)
+	deleting := mustCreateDefaultSecurityGroupBackfillResource(t, store, &model.Port{
+		ProjectID: zeta.ID, NetworkID: zetaNetwork.ID, Name: "deleting", MACAddress: "02:00:00:00:20:02", AdminStateUp: true,
+	}).(*model.Port)
+	deletingResource, _, err := store.BeginDelete(context.Background(), model.KindPort, deleting.ID, deleting.Revision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleting = deletingResource.(*model.Port)
 	reconciler.reset()
 
 	permissions := map[string]any{globalPath: map[string]bool{"SDN.Audit": true}}
@@ -135,6 +143,7 @@ func TestDefaultSecurityGroupBackfillPlanIsReadOnlyAndHumanReadable(t *testing.T
 	assertDefaultSecurityGroupBackfillPort(t, store, attached.ID, attached.Revision, nil)
 	assertDefaultSecurityGroupBackfillPort(t, store, explicit.ID, explicit.Revision, []string{custom.ID})
 	assertDefaultSecurityGroupBackfillPort(t, store, missingPolicy.ID, missingPolicy.Revision, nil)
+	assertDefaultSecurityGroupBackfillPort(t, store, deleting.ID, deleting.Revision, nil)
 	if _, err := store.Get(context.Background(), model.KindSecurityGroup, defaultsecurity.DefaultSecurityGroupID(zeta.ID)); !errors.Is(err, controlstore.ErrNotFound) {
 		t.Fatalf("plan created zeta default policy: %v", err)
 	}
