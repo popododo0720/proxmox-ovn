@@ -88,7 +88,8 @@ export function DefaultSecurityGroupBackfillPanel({ onApplied }: { onApplied?: (
     !project.default_ready && project.legacy_ports.length > 0), [plan]);
   const expectedCluster = preview?.cluster || plan?.cluster || '';
   const previewAllowsApply = Boolean(
-    preview?.dry_run && preview.cluster === plan?.cluster && preview.planned > preview.failed && plan?.can_apply,
+    preview?.dry_run && preview.plan_token && preview.plan_token === plan?.plan_token
+      && preview.cluster === plan?.cluster && preview.planned > preview.failed && plan?.can_apply,
   );
   const exactConfirmation = Boolean(expectedCluster && confirmation === expectedCluster);
 
@@ -110,17 +111,22 @@ export function DefaultSecurityGroupBackfillPanel({ onApplied }: { onApplied?: (
   }
 
   async function dryRun() {
+    if (!plan) return;
+    const planToken = plan.plan_token;
     setBusy('dry-run');
     setError('');
     setPreview(undefined);
     setReport(undefined);
     setConfirmation('');
     try {
-      const value = await api.applyDefaultSecurityGroupBackfill();
+      const value = await api.applyDefaultSecurityGroupBackfill({ plan_token: planToken });
       if (!value.dry_run) throw new Error('unexpected non-dry-run response');
       setPreview(value);
     } catch (reason) {
       if (endpointUnavailable(reason)) setHidden(true);
+      else if (reason instanceof ApiError && reason.code === 'backfill_plan_stale') {
+        await recoverStalePlan();
+      }
       else setError('The backfill dry-run could not be completed. No ports were changed.');
     } finally {
       setBusy('');
@@ -132,7 +138,11 @@ export function DefaultSecurityGroupBackfillPanel({ onApplied }: { onApplied?: (
     setBusy('apply');
     setError('');
     try {
-      const value = await api.applyDefaultSecurityGroupBackfill({ dry_run: false, confirm: confirmation });
+      const value = await api.applyDefaultSecurityGroupBackfill({
+        dry_run: false,
+        confirm: confirmation,
+        plan_token: preview!.plan_token,
+      });
       if (value.dry_run) throw new Error('unexpected dry-run response');
       setReport(value);
       setPreview(undefined);
@@ -146,6 +156,9 @@ export function DefaultSecurityGroupBackfillPanel({ onApplied }: { onApplied?: (
       }
     } catch (reason) {
       if (endpointUnavailable(reason)) setHidden(true);
+      else if (reason instanceof ApiError && reason.code === 'backfill_plan_stale') {
+        await recoverStalePlan();
+      }
       else {
         setPreview(undefined);
         setConfirmation('');
@@ -153,6 +166,19 @@ export function DefaultSecurityGroupBackfillPanel({ onApplied }: { onApplied?: (
       }
     } finally {
       setBusy('');
+    }
+  }
+
+  async function recoverStalePlan() {
+    setPreview(undefined);
+    setReport(undefined);
+    setConfirmation('');
+    try {
+      setPlan(await api.defaultSecurityGroupBackfillPlan());
+      setError('The backfill plan changed. Review the refreshed ports and run a new dry-run before applying.');
+    } catch (reason) {
+      if (endpointUnavailable(reason)) setHidden(true);
+      else setError('The backfill plan changed and could not be refreshed. Refresh it before running a new dry-run.');
     }
   }
 

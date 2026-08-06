@@ -51,7 +51,7 @@ func TestDefaultSecurityGroupBackfillAuthorizationAndConfirmation(t *testing.T) 
 	if response.Code != http.StatusOK {
 		t.Fatalf("default dry run status=%d body=%s", response.Code, response.Body.String())
 	}
-	if report := decodeData[defaultSecurityGroupBackfillApplyData](t, response); !report.DryRun {
+	if report := decodeData[defaultSecurityGroupBackfillApplyData](t, response); !report.DryRun || !strings.HasPrefix(report.PlanToken, "v1.") {
 		t.Fatal("omitted dry_run performed an actual apply")
 	}
 
@@ -60,6 +60,10 @@ func TestDefaultSecurityGroupBackfillAuthorizationAndConfirmation(t *testing.T) 
 		if response.Code != http.StatusBadRequest || apiErrorCode(t, response) != "confirmation_required" {
 			t.Fatalf("confirm=%q status=%d body=%s", confirmation, response.Code, response.Body.String())
 		}
+	}
+	response = request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{"dry_run": false, "confirm": "cluster-a"}, nil)
+	if response.Code != http.StatusBadRequest || apiErrorCode(t, response) != "plan_token_required" {
+		t.Fatalf("missing plan token status=%d body=%s", response.Code, response.Body.String())
 	}
 
 	response = request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{"unknown": true}, nil)
@@ -117,6 +121,9 @@ func TestDefaultSecurityGroupBackfillPlanIsReadOnlyAndHumanReadable(t *testing.T
 	plan := decodeData[defaultSecurityGroupBackfillPlanData](t, response)
 	if plan.Cluster != "cluster-a" || plan.GeneratedAt != "2026-08-06T01:02:03Z" {
 		t.Fatalf("cluster=%q generated_at=%q", plan.Cluster, plan.GeneratedAt)
+	}
+	if !strings.HasPrefix(plan.PlanToken, "v1.") {
+		t.Fatalf("plan token is missing or unversioned: %q", plan.PlanToken)
 	}
 	if plan.Warning != defaultSecurityGroupBackfillWarning || !plan.CanApply || plan.TotalLegacyPorts != 2 || plan.TotalAttachedPorts != 1 {
 		t.Fatalf("plan summary=%+v", plan)
@@ -189,7 +196,9 @@ func TestDefaultSecurityGroupBackfillApplyIsBoundedRerunnableAndPartial(t *testi
 		t.Fatalf("dry run created policy: %v", err)
 	}
 
-	applyResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{"dry_run": false, "confirm": "cluster-a"}, nil)
+	applyResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"dry_run": false, "confirm": "cluster-a", "plan_token": dryReport.PlanToken,
+	}, nil)
 	if applyResponse.Code != http.StatusOK {
 		t.Fatalf("apply status=%d body=%s", applyResponse.Code, applyResponse.Body.String())
 	}
@@ -207,13 +216,100 @@ func TestDefaultSecurityGroupBackfillApplyIsBoundedRerunnableAndPartial(t *testi
 		t.Fatalf("good baseline=%+v err=%v", inspection, err)
 	}
 
-	rerunResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{"dry_run": false, "confirm": "cluster-a"}, nil)
+	rerunPreviewResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{}, nil)
+	if rerunPreviewResponse.Code != http.StatusOK {
+		t.Fatalf("rerun preview status=%d body=%s", rerunPreviewResponse.Code, rerunPreviewResponse.Body.String())
+	}
+	rerunPreview := decodeData[defaultSecurityGroupBackfillApplyData](t, rerunPreviewResponse)
+	rerunResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"dry_run": false, "confirm": "cluster-a", "plan_token": rerunPreview.PlanToken,
+	}, nil)
 	if rerunResponse.Code != http.StatusOK {
 		t.Fatalf("rerun status=%d body=%s", rerunResponse.Code, rerunResponse.Body.String())
 	}
 	rerun := decodeData[defaultSecurityGroupBackfillApplyData](t, rerunResponse)
 	if rerun.Planned != 1 || rerun.Migrated != 0 || rerun.Failed != 1 || len(rerun.Results) != 1 || rerun.Results[0].PortID != blockedPort.ID {
 		t.Fatalf("rerun report=%+v", rerun)
+	}
+}
+
+func TestDefaultSecurityGroupBackfillApplyRejectsCandidateSetOrRevisionNotPreviewed(t *testing.T) {
+	store := controlstore.NewMemory()
+	project, network := createDefaultSecurityGroupBackfillProject(t, store, "stale", "pool-stale")
+	first := mustCreateDefaultSecurityGroupBackfillResource(t, store, &model.Port{
+		ProjectID: project.ID, NetworkID: network.ID, Name: "legacy-a", MACAddress: "02:00:00:00:45:01", AdminStateUp: true,
+	}).(*model.Port)
+	reconciler := &defaultSecurityGroupBackfillReadyReconciler{store: store}
+	permissions := map[string]any{globalPath: map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "Sys.Modify": true}}
+	server := newDefaultSecurityGroupBackfillTestServer(t, store, reconciler, permissions)
+
+	previewResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{}, nil)
+	if previewResponse.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s", previewResponse.Code, previewResponse.Body.String())
+	}
+	preview := decodeData[defaultSecurityGroupBackfillApplyData](t, previewResponse)
+	second := mustCreateDefaultSecurityGroupBackfillResource(t, store, &model.Port{
+		ProjectID: project.ID, NetworkID: network.ID, Name: "legacy-b", MACAddress: "02:00:00:00:45:02", AdminStateUp: true,
+	}).(*model.Port)
+
+	staleDryRunResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"plan_token": preview.PlanToken,
+	}, nil)
+	if staleDryRunResponse.Code != http.StatusConflict || apiErrorCode(t, staleDryRunResponse) != "backfill_plan_stale" {
+		t.Fatalf("dry-run stale status=%d body=%s", staleDryRunResponse.Code, staleDryRunResponse.Body.String())
+	}
+	staleResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"dry_run": false, "confirm": "cluster-a", "plan_token": preview.PlanToken,
+	}, nil)
+	if staleResponse.Code != http.StatusConflict || apiErrorCode(t, staleResponse) != "backfill_plan_stale" {
+		t.Fatalf("candidate-set stale status=%d body=%s", staleResponse.Code, staleResponse.Body.String())
+	}
+	assertDefaultSecurityGroupBackfillPort(t, store, first.ID, first.Revision, nil)
+	assertDefaultSecurityGroupBackfillPort(t, store, second.ID, second.Revision, nil)
+	if _, err := store.Get(context.Background(), model.KindSecurityGroup, defaultsecurity.DefaultSecurityGroupID(project.ID)); !errors.Is(err, controlstore.ErrNotFound) {
+		t.Fatalf("stale plan repaired policy before rejection: %v", err)
+	}
+
+	previewResponse = request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{}, nil)
+	freshSetPreview := decodeData[defaultSecurityGroupBackfillApplyData](t, previewResponse)
+	if freshSetPreview.PlanToken == preview.PlanToken {
+		t.Fatal("adding a legacy candidate did not change the plan token")
+	}
+	firstCloneResource, err := model.Clone(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClone := firstCloneResource.(*model.Port)
+	firstClone.Name = "legacy-a-renamed"
+	updatedResource, _, err := store.Update(context.Background(), firstClone, first.Revision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first = updatedResource.(*model.Port)
+
+	staleResponse = request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"dry_run": false, "confirm": "cluster-a", "plan_token": freshSetPreview.PlanToken,
+	}, nil)
+	if staleResponse.Code != http.StatusConflict || apiErrorCode(t, staleResponse) != "backfill_plan_stale" {
+		t.Fatalf("revision stale status=%d body=%s", staleResponse.Code, staleResponse.Body.String())
+	}
+	assertDefaultSecurityGroupBackfillPort(t, store, first.ID, first.Revision, nil)
+	assertDefaultSecurityGroupBackfillPort(t, store, second.ID, second.Revision, nil)
+
+	previewResponse = request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{}, nil)
+	freshRevisionPreview := decodeData[defaultSecurityGroupBackfillApplyData](t, previewResponse)
+	if freshRevisionPreview.PlanToken == freshSetPreview.PlanToken {
+		t.Fatal("changing a candidate revision did not change the plan token")
+	}
+	applyResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"dry_run": false, "confirm": "cluster-a", "plan_token": freshRevisionPreview.PlanToken,
+	}, nil)
+	if applyResponse.Code != http.StatusOK {
+		t.Fatalf("fresh apply status=%d body=%s", applyResponse.Code, applyResponse.Body.String())
+	}
+	report := decodeData[defaultSecurityGroupBackfillApplyData](t, applyResponse)
+	if report.Migrated != 2 || report.Failed != 0 {
+		t.Fatalf("fresh report=%+v", report)
 	}
 }
 
@@ -231,7 +327,14 @@ func TestDefaultSecurityGroupBackfillRevisionCASCanBeRetried(t *testing.T) {
 	permissions := map[string]any{globalPath: map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "Sys.Modify": true}}
 	server := newDefaultSecurityGroupBackfillTestServer(t, store, reconciler, permissions)
 
-	response := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{"dry_run": false, "confirm": "cluster-a"}, nil)
+	previewResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{}, nil)
+	if previewResponse.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s", previewResponse.Code, previewResponse.Body.String())
+	}
+	preview := decodeData[defaultSecurityGroupBackfillApplyData](t, previewResponse)
+	response := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"dry_run": false, "confirm": "cluster-a", "plan_token": preview.PlanToken,
+	}, nil)
 	if response.Code != http.StatusOK {
 		t.Fatalf("first apply status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -243,7 +346,14 @@ func TestDefaultSecurityGroupBackfillRevisionCASCanBeRetried(t *testing.T) {
 	assertDefaultSecurityGroupBackfillPort(t, store, failPort.ID, failPort.Revision, nil)
 	assertDefaultSecurityGroupBackfillPort(t, store, okPort.ID, okPort.Revision+1, []string{defaultID})
 
-	response = request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{"dry_run": false, "confirm": "cluster-a"}, nil)
+	retryPreviewResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{}, nil)
+	if retryPreviewResponse.Code != http.StatusOK {
+		t.Fatalf("retry preview status=%d body=%s", retryPreviewResponse.Code, retryPreviewResponse.Body.String())
+	}
+	retryPreview := decodeData[defaultSecurityGroupBackfillApplyData](t, retryPreviewResponse)
+	response = request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"dry_run": false, "confirm": "cluster-a", "plan_token": retryPreview.PlanToken,
+	}, nil)
 	if response.Code != http.StatusOK {
 		t.Fatalf("retry status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -264,7 +374,14 @@ func TestDefaultSecurityGroupBackfillRequiresReadyBaseline(t *testing.T) {
 	permissions := map[string]any{globalPath: map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "Sys.Modify": true}}
 	server := newDefaultSecurityGroupBackfillTestServer(t, store, reconciler, permissions)
 
-	response := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{"dry_run": false, "confirm": "cluster-a"}, nil)
+	previewResponse := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{}, nil)
+	if previewResponse.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s", previewResponse.Code, previewResponse.Body.String())
+	}
+	preview := decodeData[defaultSecurityGroupBackfillApplyData](t, previewResponse)
+	response := request(t, server, http.MethodPost, defaultSecurityGroupBackfillApplyPath, map[string]any{
+		"dry_run": false, "confirm": "cluster-a", "plan_token": preview.PlanToken,
+	}, nil)
 	if response.Code != http.StatusOK {
 		t.Fatalf("apply status=%d body=%s", response.Code, response.Body.String())
 	}

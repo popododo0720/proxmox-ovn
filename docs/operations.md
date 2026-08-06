@@ -360,7 +360,11 @@ Applying requires typing the exact PVE cluster name and changes policy for
 attached traffic immediately. Review any required external ingress rules
 before applying.
 
-The operation is revision-fenced and rerunnable. It repairs the reserved
+The dry run issues an opaque plan token covering the exact candidate ports and
+their revisions. Apply accepts only that preview: if a port is added or changes
+first, PVN rejects the whole request and the page refreshes the plan for a new
+review and dry run. The token is intentionally not displayed in the normal UI.
+The operation remains revision-fenced and rerunnable. It repairs the reserved
 baseline first, migrates only ports whose security-group list is still empty,
 and reports concurrent or blocked ports separately for a later retry. Planning
 requires global `SDN.Audit`; applying requires global `SDN.Allocate` and

@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -21,6 +24,7 @@ const (
 type defaultSecurityGroupBackfillPlanData struct {
 	Cluster            string                                `json:"cluster"`
 	GeneratedAt        string                                `json:"generated_at"`
+	PlanToken          string                                `json:"plan_token"`
 	Warning            string                                `json:"warning"`
 	TotalLegacyPorts   int                                   `json:"total_legacy_ports"`
 	TotalAttachedPorts int                                   `json:"total_attached_ports"`
@@ -54,19 +58,21 @@ type defaultSecurityGroupBackfillPort struct {
 }
 
 type defaultSecurityGroupBackfillApplyRequest struct {
-	DryRun  *bool  `json:"dry_run,omitempty"`
-	Confirm string `json:"confirm,omitempty"`
+	DryRun    *bool  `json:"dry_run,omitempty"`
+	Confirm   string `json:"confirm,omitempty"`
+	PlanToken string `json:"plan_token,omitempty"`
 }
 
 type defaultSecurityGroupBackfillApplyData struct {
-	Cluster  string                                   `json:"cluster"`
-	DryRun   bool                                     `json:"dry_run"`
-	Warning  string                                   `json:"warning"`
-	Planned  int                                      `json:"planned"`
-	Migrated int                                      `json:"migrated"`
-	Skipped  int                                      `json:"skipped"`
-	Failed   int                                      `json:"failed"`
-	Results  []defaultSecurityGroupBackfillPortResult `json:"results"`
+	Cluster   string                                   `json:"cluster"`
+	DryRun    bool                                     `json:"dry_run"`
+	PlanToken string                                   `json:"plan_token"`
+	Warning   string                                   `json:"warning"`
+	Planned   int                                      `json:"planned"`
+	Migrated  int                                      `json:"migrated"`
+	Skipped   int                                      `json:"skipped"`
+	Failed    int                                      `json:"failed"`
+	Results   []defaultSecurityGroupBackfillPortResult `json:"results"`
 }
 
 type defaultSecurityGroupBackfillPortResult struct {
@@ -118,9 +124,17 @@ func (s *Server) defaultSecurityGroupBackfillApply(writer http.ResponseWriter, r
 		writeError(writer, http.StatusBadRequest, "confirmation_required", "apply requires confirm to exactly match the configured PVN cluster name", map[string]any{"cluster": s.clusterName})
 		return
 	}
+	if !dryRun && input.PlanToken == "" {
+		writeError(writer, http.StatusBadRequest, "plan_token_required", "apply requires the plan token returned by a current dry-run", nil)
+		return
+	}
 	plan, err := s.buildDefaultSecurityGroupBackfillPlan(request.Context())
 	if err != nil {
 		s.storeError(writer, err)
+		return
+	}
+	if input.PlanToken != "" && input.PlanToken != plan.PlanToken {
+		writeError(writer, http.StatusConflict, "backfill_plan_stale", "the legacy port plan changed; run a new dry-run before applying", nil)
 		return
 	}
 	report := s.applyDefaultSecurityGroupBackfill(request.Context(), plan, dryRun)
@@ -222,12 +236,68 @@ func (s *Server) buildDefaultSecurityGroupBackfillPlan(ctx context.Context) (*de
 		}
 		plan.Projects = append(plan.Projects, projectPlan)
 	}
+	plan.PlanToken, err = defaultSecurityGroupBackfillPlanToken(plan)
+	if err != nil {
+		return nil, err
+	}
 	return plan, nil
+}
+
+// defaultSecurityGroupBackfillPlanToken binds a mutation to the exact legacy
+// port set and policy eligibility that an operator previewed. Names and the
+// generation timestamp are intentionally excluded because they are display
+// metadata; resource identities, expected revisions, attachment scope, and
+// default-policy state determine what the apply is allowed to affect.
+func defaultSecurityGroupBackfillPlanToken(plan *defaultSecurityGroupBackfillPlanData) (string, error) {
+	type tokenPort struct {
+		ID       string `json:"id"`
+		Revision int64  `json:"revision"`
+		Attached bool   `json:"attached"`
+	}
+	type tokenProject struct {
+		ID                     string                        `json:"id"`
+		DefaultSecurityGroupID string                        `json:"default_security_group_id"`
+		DefaultReady           bool                          `json:"default_ready"`
+		BlockedReason          defaultsecurity.BlockedReason `json:"blocked_reason,omitempty"`
+		MissingResourceIDs     []string                      `json:"missing_resource_ids,omitempty"`
+		Ports                  []tokenPort                   `json:"ports"`
+	}
+	type tokenPayload struct {
+		Version  int            `json:"version"`
+		Cluster  string         `json:"cluster"`
+		Projects []tokenProject `json:"projects"`
+	}
+
+	payload := tokenPayload{Version: 1, Cluster: plan.Cluster, Projects: make([]tokenProject, 0, len(plan.Projects))}
+	for _, project := range plan.Projects {
+		if len(project.LegacyPorts) == 0 {
+			continue
+		}
+		missing := append([]string(nil), project.MissingResourceIDs...)
+		sort.Strings(missing)
+		entry := tokenProject{
+			ID: project.ProjectID, DefaultSecurityGroupID: project.DefaultSecurityGroupID,
+			DefaultReady: project.DefaultReady, BlockedReason: project.BlockedReason,
+			MissingResourceIDs: missing, Ports: make([]tokenPort, 0, len(project.LegacyPorts)),
+		}
+		for _, port := range project.LegacyPorts {
+			entry.Ports = append(entry.Ports, tokenPort{ID: port.PortID, Revision: port.Revision, Attached: port.Attached})
+		}
+		sort.Slice(entry.Ports, func(left, right int) bool { return entry.Ports[left].ID < entry.Ports[right].ID })
+		payload.Projects = append(payload.Projects, entry)
+	}
+	sort.Slice(payload.Projects, func(left, right int) bool { return payload.Projects[left].ID < payload.Projects[right].ID })
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("encode default security backfill plan token: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return "v1." + hex.EncodeToString(digest[:]), nil
 }
 
 func (s *Server) applyDefaultSecurityGroupBackfill(ctx context.Context, plan *defaultSecurityGroupBackfillPlanData, dryRun bool) *defaultSecurityGroupBackfillApplyData {
 	report := &defaultSecurityGroupBackfillApplyData{
-		Cluster: plan.Cluster, DryRun: dryRun, Warning: plan.Warning,
+		Cluster: plan.Cluster, DryRun: dryRun, PlanToken: plan.PlanToken, Warning: plan.Warning,
 		Results: make([]defaultSecurityGroupBackfillPortResult, 0, plan.TotalLegacyPorts),
 	}
 	policyManager := defaultsecurity.New(s.store, s.reconciler)

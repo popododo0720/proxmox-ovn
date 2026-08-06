@@ -16,6 +16,7 @@ const unavailablePortID = '44444444-4444-4444-8444-444444444444';
 const plan: DefaultSecurityGroupBackfillPlan = {
   cluster: 'pve-lab',
   generated_at: '2026-08-06T01:00:00Z',
+  plan_token: 'v1.plan-token',
   warning: `machine warning ${portID}`,
   total_legacy_ports: 3,
   total_attached_ports: 1,
@@ -74,6 +75,7 @@ const plan: DefaultSecurityGroupBackfillPlan = {
 const dryRun: DefaultSecurityGroupBackfillReport = {
   cluster: 'pve-lab',
   dry_run: true,
+  plan_token: 'v1.plan-token',
   warning: `machine warning ${portID}`,
   planned: 3,
   migrated: 0,
@@ -93,6 +95,7 @@ const dryRun: DefaultSecurityGroupBackfillReport = {
 const partialApply: DefaultSecurityGroupBackfillReport = {
   cluster: 'pve-lab',
   dry_run: false,
+  plan_token: 'v1.plan-token',
   warning: `machine warning ${portID}`,
   planned: 3,
   migrated: 2,
@@ -141,7 +144,7 @@ describe('DefaultSecurityGroupBackfillPanel', () => {
 
     fireEvent.click(within(panel).getByRole('button', { name: 'Dry-run' }));
     expect(await within(panel).findByText('Dry-run complete')).toBeInTheDocument();
-    expect(applyDefaultSecurityGroupBackfill).toHaveBeenNthCalledWith(1);
+    expect(applyDefaultSecurityGroupBackfill).toHaveBeenNthCalledWith(1, { plan_token: 'v1.plan-token' });
 
     const applyButton = within(panel).getByRole('button', { name: 'Apply backfill' });
     const confirmation = within(panel).getByRole('textbox', { name: /Type pve-lab to confirm/ });
@@ -156,11 +159,16 @@ describe('DefaultSecurityGroupBackfillPanel', () => {
     expect(within(panel).getByText('2 migrated · 0 skipped · 1 failed')).toBeInTheDocument();
     expect(within(panel).getByText('database · Unavailable project')).toBeInTheDocument();
     expect(within(panel).getByText('complete')).toBeInTheDocument();
-    expect(applyDefaultSecurityGroupBackfill).toHaveBeenNthCalledWith(2, { dry_run: false, confirm: 'pve-lab' });
+    expect(applyDefaultSecurityGroupBackfill).toHaveBeenNthCalledWith(2, {
+      dry_run: false,
+      confirm: 'pve-lab',
+      plan_token: 'v1.plan-token',
+    });
     expect(onApplied).toHaveBeenCalledOnce();
     await waitFor(() => expect(defaultSecurityGroupBackfillPlan).toHaveBeenCalledTimes(2));
     expect(panel).not.toHaveTextContent(portID);
     expect(panel).not.toHaveTextContent('failed resource');
+    expect(panel).not.toHaveTextContent('v1.plan-token');
   });
 
   it.each([403, 404, 405, 501])('quietly hides the optional panel when the endpoint returns %s', async (status) => {
@@ -194,11 +202,14 @@ describe('DefaultSecurityGroupBackfillPanel', () => {
     await waitFor(() => expect(screen.queryByText('Legacy security policy backfill')).not.toBeInTheDocument());
   });
 
-  it('requires a new dry-run after an apply request fails', async () => {
-    const defaultSecurityGroupBackfillPlan = vi.fn().mockResolvedValue(plan);
+  it('refreshes a stale plan and requires a new dry-run before apply', async () => {
+    const refreshedPlan = { ...plan, plan_token: 'v1.refreshed-plan-token' };
+    const defaultSecurityGroupBackfillPlan = vi.fn()
+      .mockResolvedValueOnce(plan)
+      .mockResolvedValueOnce(refreshedPlan);
     const applyDefaultSecurityGroupBackfill = vi.fn()
       .mockResolvedValueOnce(dryRun)
-      .mockRejectedValueOnce(new ApiError(`conflict ${portID}`, 409));
+      .mockRejectedValueOnce(new ApiError(`conflict ${portID}`, 409, 'backfill_plan_stale'));
     const onApplied = vi.fn();
 
     render(
@@ -213,9 +224,17 @@ describe('DefaultSecurityGroupBackfillPanel', () => {
     fireEvent.change(confirmation, { target: { value: 'pve-lab' } });
     fireEvent.click(within(panel).getByRole('button', { name: 'Apply backfill' }));
 
-    expect(await within(panel).findByText('The backfill could not be applied. Run a new dry-run before trying again.')).toBeInTheDocument();
+    expect(await within(panel).findByText('The backfill plan changed. Review the refreshed ports and run a new dry-run before applying.')).toBeInTheDocument();
     expect(within(panel).queryByRole('button', { name: 'Apply backfill' })).not.toBeInTheDocument();
+    expect(defaultSecurityGroupBackfillPlan).toHaveBeenCalledTimes(2);
+    expect(applyDefaultSecurityGroupBackfill).toHaveBeenNthCalledWith(2, {
+      dry_run: false,
+      confirm: 'pve-lab',
+      plan_token: 'v1.plan-token',
+    });
     expect(panel).not.toHaveTextContent(portID);
+    expect(panel).not.toHaveTextContent('v1.plan-token');
+    expect(panel).not.toHaveTextContent('v1.refreshed-plan-token');
     expect(onApplied).not.toHaveBeenCalled();
   });
 });

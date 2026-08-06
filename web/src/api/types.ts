@@ -143,6 +143,7 @@ export interface DefaultSecurityGroupBackfillProject {
 export interface DefaultSecurityGroupBackfillPlan {
   cluster: string;
   generated_at: string;
+  plan_token: string;
   warning: string;
   total_legacy_ports: number;
   total_attached_ports: number;
@@ -153,6 +154,7 @@ export interface DefaultSecurityGroupBackfillPlan {
 export interface DefaultSecurityGroupBackfillInput {
   dry_run?: boolean;
   confirm?: string;
+  plan_token?: string;
 }
 
 export type DefaultSecurityGroupBackfillStatus = 'planned' | 'migrated' | 'skipped' | 'failed';
@@ -173,6 +175,7 @@ export interface DefaultSecurityGroupBackfillResult {
 export interface DefaultSecurityGroupBackfillReport {
   cluster: string;
   dry_run: boolean;
+  plan_token: string;
   warning: string;
   planned: number;
   migrated: number;

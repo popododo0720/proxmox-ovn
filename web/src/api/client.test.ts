@@ -141,7 +141,7 @@ describe('ApiClient', () => {
 
     await client.defaultSecurityGroupBackfillPlan();
     await client.applyDefaultSecurityGroupBackfill();
-    await client.applyDefaultSecurityGroupBackfill({ dry_run: false, confirm: 'pve-lab' });
+    await client.applyDefaultSecurityGroupBackfill({ dry_run: false, confirm: 'pve-lab', plan_token: 'v1.opaque' });
 
     const planURL = fetcher.mock.calls[0][0] as URL;
     const plan = fetcher.mock.calls[0][1] as RequestInit;
@@ -156,7 +156,7 @@ describe('ApiClient', () => {
     expect(new Headers(dryRun.headers).get('X-PVN-CSRF-Token')).toBe('csrf-value');
 
     const apply = fetcher.mock.calls[2][1] as RequestInit;
-    expect(JSON.parse(String(apply.body))).toEqual({ dry_run: false, confirm: 'pve-lab' });
+    expect(JSON.parse(String(apply.body))).toEqual({ dry_run: false, confirm: 'pve-lab', plan_token: 'v1.opaque' });
     expect(new Headers(apply.headers).get('X-PVN-CSRF-Token')).toBe('csrf-value');
   });
 
