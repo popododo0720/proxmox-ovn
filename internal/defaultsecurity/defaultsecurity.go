@@ -335,7 +335,7 @@ func (m *Manager) reconcileAndRequireReady(ctx context.Context, resource model.R
 	}
 	meta := resource.GetMetadata()
 	if err := m.reconciler.Reconcile(ctx, resource.ResourceKind(), meta.ID); err != nil {
-		return nil, fmt.Errorf("realize default security policy %s %q: %w", resource.ResourceKind(), meta.ID, err)
+		return nil, fmt.Errorf("realize default security policy %s: %w", resource.ResourceKind(), err)
 	}
 	latest, err := m.store.Get(ctx, resource.ResourceKind(), meta.ID)
 	if err != nil {
@@ -343,7 +343,7 @@ func (m *Manager) reconcileAndRequireReady(ctx context.Context, resource model.R
 	}
 	latestMeta := latest.GetMetadata()
 	if latestMeta.State != model.ResourceReady || latestMeta.AppliedRevision != latestMeta.Revision {
-		return nil, fmt.Errorf("default security policy %s %q was not fully realized", resource.ResourceKind(), latestMeta.ID)
+		return nil, fmt.Errorf("default security policy %s was not fully realized", resource.ResourceKind())
 	}
 	return latest, nil
 }
