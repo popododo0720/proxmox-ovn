@@ -18,8 +18,10 @@ import (
 	"github.com/popododo0720/proxmox-ovn/internal/central"
 	"github.com/popododo0720/proxmox-ovn/internal/centraldb"
 	"github.com/popododo0720/proxmox-ovn/internal/config"
+	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 	"github.com/popododo0720/proxmox-ovn/internal/diagnostic"
 	"github.com/popododo0720/proxmox-ovn/internal/hostconfig"
+	"github.com/popododo0720/proxmox-ovn/internal/model"
 	"github.com/popododo0720/proxmox-ovn/internal/nodestate"
 	"github.com/popododo0720/proxmox-ovn/internal/ovnnb"
 	"github.com/popododo0720/proxmox-ovn/internal/ovsdbstore"
@@ -58,6 +60,100 @@ func run(args []string) error {
 
 type forcedReconciler interface {
 	ReconcileAll(context.Context) error
+}
+
+type recoverySnapshotter interface {
+	Snapshot(context.Context, []model.Kind, controlstore.ListOptions) (controlstore.ResourceSnapshot, error)
+}
+
+type verifiedRecoveryReconciler struct {
+	reconciler forcedReconciler
+	store      recoverySnapshotter
+}
+
+func (reconciler verifiedRecoveryReconciler) ReconcileAll(ctx context.Context) error {
+	if reconciler.reconciler == nil || reconciler.store == nil {
+		return errors.New("verified recovery reconciler is not configured")
+	}
+	before, err := reconciler.store.Snapshot(ctx, []model.Kind{model.KindOperation}, controlstore.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("read pre-reconciliation operation snapshot: %w", err)
+	}
+	if err := reconciler.reconciler.ReconcileAll(ctx); err != nil {
+		return err
+	}
+	after, err := reconciler.store.Snapshot(ctx, model.Kinds(), controlstore.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("verify post-reconciliation control state: %w", err)
+	}
+	return verifyRecoveryReconcilePass(before, after)
+}
+
+type recoveryTarget struct {
+	kind     model.Kind
+	id       string
+	revision int64
+}
+
+func verifyRecoveryReconcilePass(before, after controlstore.ResourceSnapshot) error {
+	previousRevisions := make(map[string]int64)
+	for _, resource := range before[model.KindOperation] {
+		operation, ok := resource.(*model.Operation)
+		if !ok {
+			return errors.New("pre-reconciliation operation snapshot has an invalid resource type")
+		}
+		previousRevisions[operation.ID] = operation.Revision
+	}
+
+	operations := make(map[recoveryTarget][]*model.Operation)
+	for _, resource := range after[model.KindOperation] {
+		operation, ok := resource.(*model.Operation)
+		if !ok {
+			return errors.New("post-reconciliation operation snapshot has an invalid resource type")
+		}
+		if operation.Action != "reconcile" {
+			continue
+		}
+		target := recoveryTarget{kind: operation.TargetKind, id: operation.TargetID, revision: operation.TargetRevision}
+		operations[target] = append(operations[target], operation)
+	}
+
+	var incomplete []string
+	for _, kind := range model.Kinds() {
+		if kind == model.KindOperation {
+			continue
+		}
+		for _, resource := range after[kind] {
+			meta := resource.GetMetadata()
+			label := fmt.Sprintf("%s %q revision %d", kind, meta.ID, meta.Revision)
+			if meta.State != model.ResourceReady || meta.AppliedRevision != meta.Revision {
+				incomplete = append(incomplete, fmt.Sprintf("%s is %s at applied revision %d", label, meta.State, meta.AppliedRevision))
+				continue
+			}
+			matching := operations[recoveryTarget{kind: kind, id: meta.ID, revision: meta.Revision}]
+			if len(matching) != 1 {
+				incomplete = append(incomplete, fmt.Sprintf("%s has %d matching reconcile operations", label, len(matching)))
+				continue
+			}
+			operation := matching[0]
+			if operation.OperationStatus != model.OperationSucceeded || operation.CompletedAt == nil {
+				incomplete = append(incomplete, fmt.Sprintf("%s reconcile operation is %s", label, operation.OperationStatus))
+				continue
+			}
+			if previous, found := previousRevisions[operation.ID]; found && operation.Revision <= previous {
+				incomplete = append(incomplete, fmt.Sprintf("%s reconcile operation did not complete in this pass", label))
+			}
+		}
+	}
+	if len(incomplete) == 0 {
+		return nil
+	}
+	const reportLimit = 20
+	reported := incomplete
+	if len(reported) > reportLimit {
+		reported = append(append([]string(nil), reported[:reportLimit]...), fmt.Sprintf("and %d more", len(incomplete)-reportLimit))
+	}
+	return fmt.Errorf("forced OVN reconciliation did not complete every current desired revision (a manager or writer lease may still be active): %s", strings.Join(reported, "; "))
 }
 
 type recoveryRuntime struct {
@@ -103,7 +199,7 @@ func recoveryCommandWith(args []string, dependencies recoveryDependencies) error
 		return errors.New("recovery reconcile-ovn must run as root")
 	}
 	if !*apply {
-		return errors.New("recovery reconciliation writes OVN; freeze every manager and pass --apply")
+		return errors.New("recovery reconciliation writes PVN Control and OVN; freeze every manager and pass --apply")
 	}
 	if *timeout < time.Minute || *timeout > 30*time.Minute {
 		return errors.New("--timeout must be between 1m and 30m")
@@ -171,7 +267,10 @@ func openRecoveryRuntime(ctx context.Context, cfg config.Config) (recoveryRuntim
 		return recoveryRuntime{}, err
 	}
 	controller := reconcile.NewController(store, renderer, reconcile.WithLeaseDuration(cfg.Cluster.OrphanGrace))
-	return recoveryRuntime{reconciler: controller, close: store.Close}, nil
+	return recoveryRuntime{
+		reconciler: verifiedRecoveryReconciler{reconciler: controller, store: store},
+		close:      store.Close,
+	}, nil
 }
 
 func endpointsUseSSL(endpoints []string) bool {

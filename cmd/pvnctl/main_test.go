@@ -13,18 +13,41 @@ import (
 	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/config"
+	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 	"github.com/popododo0720/proxmox-ovn/internal/diagnostic"
+	"github.com/popododo0720/proxmox-ovn/internal/model"
 	"github.com/popododo0720/proxmox-ovn/internal/nodestate"
 	"github.com/popododo0720/proxmox-ovn/internal/raftstatus"
 )
 
 type recoveryReconcilerStub struct {
-	calls int
-	err   error
+	calls       int
+	err         error
+	deadline    time.Time
+	hasDeadline bool
 }
 
-func (stub *recoveryReconcilerStub) ReconcileAll(context.Context) error {
+type recoverySnapshotterStub struct {
+	snapshots []controlstore.ResourceSnapshot
+	errors    []error
+	calls     int
+}
+
+func (stub *recoverySnapshotterStub) Snapshot(context.Context, []model.Kind, controlstore.ListOptions) (controlstore.ResourceSnapshot, error) {
+	index := stub.calls
 	stub.calls++
+	if index < len(stub.errors) && stub.errors[index] != nil {
+		return nil, stub.errors[index]
+	}
+	if index >= len(stub.snapshots) {
+		return nil, errors.New("unexpected snapshot call")
+	}
+	return stub.snapshots[index], nil
+}
+
+func (stub *recoveryReconcilerStub) ReconcileAll(ctx context.Context) error {
+	stub.calls++
+	stub.deadline, stub.hasDeadline = ctx.Deadline()
 	return stub.err
 }
 
@@ -139,6 +162,7 @@ func TestRecoveryReconcileOVNRequiresExplicitRootGates(t *testing.T) {
 		{name: "dry run", args: []string{"reconcile-ovn", "--confirm", "lab-cluster"}, want: "pass --apply"},
 		{name: "wrong confirmation", args: []string{"reconcile-ovn", "--apply", "--confirm", "other"}, want: "exactly match"},
 		{name: "short timeout", args: []string{"reconcile-ovn", "--apply", "--confirm", "lab-cluster", "--timeout", "59s"}, want: "between 1m and 30m"},
+		{name: "long timeout", args: []string{"reconcile-ovn", "--apply", "--confirm", "lab-cluster", "--timeout", "31m"}, want: "between 1m and 30m"},
 		{name: "positional", args: []string{"reconcile-ovn", "--apply", "--confirm", "lab-cluster", "extra"}, want: "does not accept positional"},
 	}
 	for _, test := range tests {
@@ -184,6 +208,10 @@ func TestRecoveryReconcileOVNRunsOneForcedPassAndCloses(t *testing.T) {
 	if reconciler.calls != 1 || closed != 1 {
 		t.Fatalf("reconcile calls=%d close calls=%d", reconciler.calls, closed)
 	}
+	remaining := time.Until(reconciler.deadline)
+	if !reconciler.hasDeadline || remaining < 90*time.Second || remaining > 2*time.Minute {
+		t.Fatalf("reconcile deadline present=%v remaining=%s", reconciler.hasDeadline, remaining)
+	}
 	var report map[string]string
 	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
 		t.Fatalf("decode output: %v", err)
@@ -223,6 +251,94 @@ func TestRecoveryReconcileOVNPropagatesOpenAndReconcileFailures(t *testing.T) {
 	}
 	if closed != 1 {
 		t.Fatalf("close calls=%d", closed)
+	}
+}
+
+func TestVerifiedRecoveryReconcilerRequiresACompletedOperationFromThisPass(t *testing.T) {
+	completed := time.Now().UTC()
+	project := &model.Project{Metadata: model.Metadata{
+		ID: "project-a", Revision: 3, AppliedRevision: 3, State: model.ResourceReady,
+	}}
+	operation := &model.Operation{
+		Metadata: model.Metadata{ID: "operation-a", Revision: 8},
+		Action:   "reconcile", TargetKind: model.KindProject, TargetID: project.ID, TargetRevision: project.Revision,
+		OperationStatus: model.OperationSucceeded, CompletedAt: &completed,
+	}
+	store := &recoverySnapshotterStub{snapshots: []controlstore.ResourceSnapshot{
+		{model.KindOperation: {operation}},
+		{model.KindProject: {project}, model.KindOperation: {operation}},
+	}}
+	forced := &recoveryReconcilerStub{}
+	err := (verifiedRecoveryReconciler{reconciler: forced, store: store}).ReconcileAll(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "did not complete in this pass") {
+		t.Fatalf("stale operation verification error=%v", err)
+	}
+	if forced.calls != 1 || store.calls != 2 {
+		t.Fatalf("reconcile calls=%d snapshot calls=%d", forced.calls, store.calls)
+	}
+}
+
+func TestVerifiedRecoveryReconcilerAcceptsNewlyCompletedDesiredRevision(t *testing.T) {
+	completed := time.Now().UTC()
+	project := &model.Project{Metadata: model.Metadata{
+		ID: "project-a", Revision: 3, AppliedRevision: 3, State: model.ResourceReady,
+	}}
+	before := &model.Operation{
+		Metadata: model.Metadata{ID: "operation-a", Revision: 8},
+		Action:   "reconcile", TargetKind: model.KindProject, TargetID: project.ID, TargetRevision: project.Revision,
+		OperationStatus: model.OperationRunning,
+	}
+	after := &model.Operation{
+		Metadata: model.Metadata{ID: before.ID, Revision: 10},
+		Action:   "reconcile", TargetKind: model.KindProject, TargetID: project.ID, TargetRevision: project.Revision,
+		OperationStatus: model.OperationSucceeded, CompletedAt: &completed,
+	}
+	store := &recoverySnapshotterStub{snapshots: []controlstore.ResourceSnapshot{
+		{model.KindOperation: {before}},
+		{model.KindProject: {project}, model.KindOperation: {after}},
+	}}
+	forced := &recoveryReconcilerStub{}
+	if err := (verifiedRecoveryReconciler{reconciler: forced, store: store}).ReconcileAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if forced.calls != 1 || store.calls != 2 {
+		t.Fatalf("reconcile calls=%d snapshot calls=%d", forced.calls, store.calls)
+	}
+}
+
+func TestVerifiedRecoveryReconcilerFailsClosedOnIncompleteControlState(t *testing.T) {
+	project := &model.Project{Metadata: model.Metadata{
+		ID: "project-a", Revision: 3, AppliedRevision: 2, State: model.ResourcePending,
+	}}
+	store := &recoverySnapshotterStub{snapshots: []controlstore.ResourceSnapshot{
+		{model.KindOperation: nil},
+		{model.KindProject: {project}, model.KindOperation: nil},
+	}}
+	err := (verifiedRecoveryReconciler{reconciler: &recoveryReconcilerStub{}, store: store}).ReconcileAll(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "is pending at applied revision 2") {
+		t.Fatalf("incomplete control state error=%v", err)
+	}
+}
+
+func TestVerifiedRecoveryReconcilerPropagatesSnapshotAndPassFailures(t *testing.T) {
+	wantSnapshot := errors.New("control snapshot unavailable")
+	store := &recoverySnapshotterStub{errors: []error{wantSnapshot}}
+	forced := &recoveryReconcilerStub{}
+	if err := (verifiedRecoveryReconciler{reconciler: forced, store: store}).ReconcileAll(context.Background()); !errors.Is(err, wantSnapshot) {
+		t.Fatalf("pre-snapshot error=%v", err)
+	}
+	if forced.calls != 0 {
+		t.Fatalf("forced reconcile ran after failed pre-snapshot: %d", forced.calls)
+	}
+
+	wantPass := errors.New("northbound write failed")
+	store = &recoverySnapshotterStub{snapshots: []controlstore.ResourceSnapshot{{model.KindOperation: nil}}}
+	forced = &recoveryReconcilerStub{err: wantPass}
+	if err := (verifiedRecoveryReconciler{reconciler: forced, store: store}).ReconcileAll(context.Background()); !errors.Is(err, wantPass) {
+		t.Fatalf("reconcile pass error=%v", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("post-snapshot ran after failed pass: %d calls", store.calls)
 	}
 }
 
