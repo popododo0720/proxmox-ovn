@@ -63,9 +63,11 @@ silently overwritten.
 
 The first release follows the centralized OpenStack/Neutron OVN model.
 Selected PVE nodes are gateway chassis. Logical routers provide centralized
-SNAT and floating IPs toward a flat or VLAN provider network. The physical
-provider bridge must be prepared by the operator; PVN validates it but never
-rewires physical interfaces.
+SNAT and floating IPs toward a flat or VLAN provider network. The manager
+runtime validates provider wiring and never rewires physical interfaces. The
+separately confirmed full-setup installer may create `br-provider` and move the
+explicitly selected uplink into it after its destructive topology preflight;
+operators using package-only or manual setup must prepare that bridge instead.
 
 The default assumes a 1500-byte underlay and advertises a 1400-byte tenant MTU
 for Geneve. BGP, IPv6, metadata service, load balancers, LXC, and coordinated
