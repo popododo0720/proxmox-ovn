@@ -33,6 +33,10 @@ from typing import Any, Iterator
 
 
 LEDGER_VERSION = 1
+LEGACY_SCHEMA2_PINNED_PACKAGE = "0.2.13"
+LEGACY_SCHEMA2_CANDIDATE_PACKAGE = "0.2.14"
+LEGACY_SCHEMA2_PINNED_CLUSTER_VERSION = 3
+LEGACY_SCHEMA2_CANDIDATE_CLUSTER_VERSION = 4
 DEFAULT_MEMBERS = "/etc/pve/.members"
 DEFAULT_TOPOLOGY = "/etc/pve/priv/pvn/topology.json"
 DEFAULT_PRIVATE = "/etc/pve/priv/pvn"
@@ -1370,6 +1374,11 @@ class SystemBackend:
             )
             if topology.get("corosync") != expected_corosync:
                 raise ControlPlaneError("topology Corosync pin is not canonical")
+            if expected_corosync["config_version"] != cluster_version:
+                raise ControlPlaneError(
+                    "topology Corosync config_version differs from the "
+                    "current PVE cluster version"
+                )
         legacy_topology = copy.deepcopy(topology)
         legacy_topology["schema"] = 1
         legacy_topology.pop("corosync", None)
@@ -2477,6 +2486,30 @@ class ControlPlane:
             and legacy_digest != discovery.topology_sha256
         )
 
+    @staticmethod
+    def _legacy_schema2_cluster_version_bridge(
+        discovery: Discovery,
+        pinned: dict[str, Any],
+        live: dict[str, Any],
+        pinned_package: str,
+        live_package: str,
+    ) -> bool:
+        # v0.2.14's schema-2 topology migration advanced the already-running
+        # Corosync configuration exactly once before the complete control
+        # snapshot could be atomically repinned.  Accept only that released
+        # one-step boundary; this is not a general config-version relaxation.
+        return (
+            discovery.mode == "raft"
+            and pinned_package == LEGACY_SCHEMA2_PINNED_PACKAGE
+            and live_package == LEGACY_SCHEMA2_CANDIDATE_PACKAGE
+            and pinned.get("cluster_version")
+            == LEGACY_SCHEMA2_PINNED_CLUSTER_VERSION
+            and live.get("cluster_version")
+            == LEGACY_SCHEMA2_CANDIDATE_CLUSTER_VERSION
+            and discovery.cluster_version
+            == LEGACY_SCHEMA2_CANDIDATE_CLUSTER_VERSION
+        )
+
     @classmethod
     def _topology_schema_snapshot_repin_allowed(
         cls, discovery: Discovery, ledger: dict[str, Any]
@@ -2534,6 +2567,18 @@ class ControlPlane:
         if topology_transition:
             pinned_without_versions["topology_sha256"] = \
                 live_without_versions["topology_sha256"]
+            if pinned_without_versions.get("cluster_version") != \
+                    live_without_versions.get("cluster_version"):
+                if not cls._legacy_schema2_cluster_version_bridge(
+                    discovery,
+                    pinned_without_versions,
+                    live_without_versions,
+                    pinned_version,
+                    live_version,
+                ):
+                    return False
+                pinned_without_versions["cluster_version"] = \
+                    live_without_versions["cluster_version"]
         return pinned_without_versions == live_without_versions
 
     @staticmethod

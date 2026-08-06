@@ -1080,6 +1080,11 @@ with tempfile.TemporaryDirectory() as temporary:
     )
 
     invalid = copy.deepcopy(topology)
+    invalid["corosync"]["config_version"] = 4
+    topology_path.write_text(json.dumps(invalid))
+    expect_error(backend.discover, "differs from the current PVE cluster version")
+
+    invalid = copy.deepcopy(topology)
     invalid["schema"] = 1
     topology_path.write_text(json.dumps(invalid))
     expect_error(backend.discover, "schema 2")
@@ -1150,6 +1155,10 @@ with tempfile.TemporaryDirectory() as temporary:
     )
     reject_corosync_probe(
         lambda probe: probe["corosync"].update(sha256="f" * 64),
+        "differs from the topology ledger pin",
+    )
+    reject_corosync_probe(
+        lambda probe: probe["corosync"].update(config_version=4),
         "differs from the topology ledger pin",
     )
     backend.test_probes = baseline_probes
@@ -2494,8 +2503,10 @@ legacy_topology_digest = "1" * 64
 schema2_topology_digest = "2" * 64
 
 
-def schema_projection_pair(count=3, live_package="0.1.1"):
-    pinned = discovery(count, package="0.1.1")
+def schema_projection_pair(
+    count=3, live_package="0.1.1", pinned_package="0.1.1"
+):
+    pinned = discovery(count, package=pinned_package)
     pinned = Discovery(**{
         **pinned.__dict__,
         "topology_sha256": legacy_topology_digest,
@@ -2522,6 +2533,55 @@ combined_repin = ControlPlane._verify_ledger(
     schema2_new_package, schema1_complete_ledger, allow_package_repin=True
 )
 assert combined_repin.topology_schema and combined_repin.package
+
+# The released v0.2.13 -> v0.2.14 schema migration has one exact additional
+# boundary: Corosync and the completed schema-2 topology are already at
+# config_version 4 while the complete control snapshot still pins version 3.
+# Only the combined package/schema repin may bridge that single stale field.
+legacy_bridge_pinned, legacy_bridge_live = schema_projection_pair(
+    live_package="0.2.14", pinned_package="0.2.13"
+)
+legacy_bridge_live = Discovery(**{
+    **legacy_bridge_live.__dict__, "cluster_version": 4,
+})
+legacy_bridge_ledger = complete_ledger(legacy_bridge_pinned, schema_cids)
+legacy_bridge_repin = ControlPlane._verify_ledger(
+    legacy_bridge_live, legacy_bridge_ledger, allow_package_repin=True
+)
+assert legacy_bridge_repin == LedgerRepin(package=True, topology_schema=True)
+
+# Nearby states remain fail closed: no package transition, a different package
+# pair, a wider Corosync version jump, or a non-complete control ledger.
+unsafe_legacy_bridges = []
+for pinned_package, live_package, pinned_cluster, live_cluster in (
+    ("0.2.13", "0.2.13", 3, 4),
+    ("0.2.12", "0.2.14", 3, 4),
+    ("0.2.13", "0.2.15", 3, 4),
+    ("0.2.13", "0.2.14", 3, 5),
+    ("0.2.13", "0.2.14", 2, 4),
+):
+    unsafe_pinned, unsafe_live = schema_projection_pair(
+        live_package=live_package, pinned_package=pinned_package
+    )
+    unsafe_pinned = Discovery(**{
+        **unsafe_pinned.__dict__, "cluster_version": pinned_cluster,
+    })
+    unsafe_live = Discovery(**{
+        **unsafe_live.__dict__, "cluster_version": live_cluster,
+    })
+    unsafe_legacy_bridges.append(
+        (unsafe_live, complete_ledger(unsafe_pinned, schema_cids))
+    )
+unsafe_legacy_bridges.append(
+    (legacy_bridge_live, planned_ledger(legacy_bridge_pinned))
+)
+for unsafe_live, unsafe_ledger in unsafe_legacy_bridges:
+    expect_error(
+        lambda live=unsafe_live, ledger=unsafe_ledger: ControlPlane._verify_ledger(
+            live, ledger, allow_package_repin=True
+        ),
+        "drift",
+    )
 
 # A projection never bootstraps trust from planned, staged, central-N, or
 # nodes-N progress. Combined package/schema drift is rejected there as well.
@@ -2609,6 +2669,41 @@ for count in (1, 3):
                 LedgerRepin()
             assert not any(entry.startswith(("init:", "central:", "node:"))
                            for entry in backend.log)
+
+# The exact one-step legacy bridge is also committed only under the mutation
+# lease after the complete live proof, then becomes an ordinary exact rerun.
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(legacy_bridge_live)
+    enter_complete_update(backend)
+    store.create(legacy_bridge_ledger)
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    before = copy.deepcopy(store.load())
+    plan = control.plan()
+    assert plan["read_only"] is True
+    assert plan["package_repin_required"] is True
+    assert plan["topology_schema_repin_required"] is True
+    assert store.load() == before
+    original_update = store.update
+    repin_was_leased = []
+
+    def observe_legacy_bridge_update(value):
+        if value["snapshot"] != store.load()["snapshot"]:
+            assert lease_state.exists(), "legacy snapshot bridge escaped the lease"
+            repin_was_leased.append(True)
+        original_update(value)
+
+    store.update = observe_legacy_bridge_update
+    result = control.apply(legacy_bridge_live.confirmation)
+    assert result["complete"] is True and repin_was_leased == [True]
+    committed = store.load()
+    assert committed["snapshot"]["cluster_version"] == 4
+    assert {
+        row["package_version"] for row in committed["snapshot"]["nodes"]
+    } == {"0.2.14"}
+    assert ControlPlane._verify_ledger(
+        legacy_bridge_live, committed
+    ) == LedgerRepin()
 
 # A crash before the atomic snapshot write leaves the legacy pin intact and a
 # rerun performs the same complete proof before committing it once.
