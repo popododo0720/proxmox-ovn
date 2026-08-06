@@ -98,7 +98,11 @@ func (renderer *Renderer) Delete(ctx context.Context, resource model.Resource) e
 		if err := safeID(value.LSPName); err != nil {
 			return fmt.Errorf("invalid LSP name: %w", err)
 		}
-		_, err := renderer.client.run(ctx, "--", "--if-exists", "lsp-del", value.LSPName)
+		uuid, err := renderer.lookupOwnedRow(ctx, logicalSwitchPortOwnedRow(value.ID, value.LSPName))
+		if err != nil || uuid == "" {
+			return wrapRender("delete port", value.ID, err)
+		}
+		_, err = renderer.client.run(ctx, "--", "--if-exists", "lsp-del", uuid)
 		return wrapRender("delete port", value.ID, err)
 	case *model.Router:
 		return renderer.deleteRouter(ctx, value)
@@ -125,7 +129,10 @@ func (renderer *Renderer) Delete(ctx context.Context, resource model.Resource) e
 }
 
 func (renderer *Renderer) deleteFloatingIP(ctx context.Context, floatingIP *model.FloatingIP) error {
-	uuid := deterministicUUID("floating-ip-nat:" + floatingIP.ID)
+	uuid, err := renderer.lookupOwnedRow(ctx, floatingIPOwnedRow(floatingIP.ID))
+	if err != nil || uuid == "" {
+		return wrapRender("delete floating IP", floatingIP.ID, err)
+	}
 	routers, err := renderer.store.List(ctx, model.KindRouter, controlstore.ListOptions{})
 	if err != nil {
 		return err
@@ -136,7 +143,13 @@ func (renderer *Renderer) deleteFloatingIP(ctx context.Context, floatingIP *mode
 		if !ok {
 			return fmt.Errorf("control store returned %T while listing routers", resource)
 		}
-		args = append(args, "--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(router.ID), "nat", uuid)
+		routerUUID, lookupErr := renderer.lookupOwnedRow(ctx, logicalRouterOwnedRow(router.ID))
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if routerUUID != "" {
+			args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "nat", uuid)
+		}
 	}
 	args = append(args, "--", "--if-exists", "destroy", "NAT", uuid)
 	_, err = renderer.client.run(ctx, args...)
@@ -206,7 +219,13 @@ func (renderer *Renderer) deleteACL(ctx context.Context, owner string) error {
 		if !ok {
 			return fmt.Errorf("control store returned %T while listing security groups", resource)
 		}
-		args = append(args, "--", "--if-exists", "remove", "Port_Group", portGroup(group.ID), "acls", uuid)
+		groupUUID, lookupErr := renderer.lookupOwnedRow(ctx, portGroupOwnedRow(group.ID))
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if groupUUID != "" {
+			args = append(args, "--", "--if-exists", "remove", "Port_Group", groupUUID, "acls", uuid)
+		}
 	}
 	args = append(args, "--", "--if-exists", "destroy", "ACL", uuid)
 	_, err = renderer.client.run(ctx, args...)
@@ -220,7 +239,8 @@ func (renderer *Renderer) network(ctx context.Context, network *model.Network) e
 	name := logicalSwitch(network.ID)
 	assignments := []string{stringAssignment("name", name)}
 	assignments = append(assignments, metadataAssignments(network, map[string]string{"pvn-project": network.ProjectID})...)
-	if _, err := renderer.ensureOwnedRow(ctx, logicalSwitchOwnedRow(network.ID), assignments); err != nil {
+	switchUUID, err := renderer.ensureOwnedRow(ctx, logicalSwitchOwnedRow(network.ID), assignments)
+	if err != nil {
 		return wrapRender("network", network.ID, err)
 	}
 	if network.ProviderNetworkID == "" {
@@ -230,7 +250,7 @@ func (renderer *Renderer) network(ctx context.Context, network *model.Network) e
 	if err != nil {
 		return wrapRender("network provider segment", network.ID, err)
 	}
-	return renderer.renderProviderPort(ctx, segment, network)
+	return renderer.renderProviderPort(ctx, segment, network, switchUUID)
 }
 
 func (renderer *Renderer) subnet(ctx context.Context, subnet *model.Subnet) error {
@@ -312,11 +332,18 @@ func (renderer *Renderer) attachDHCPToPorts(ctx context.Context, subnet *model.S
 		if err := safeID(port.LSPName); err != nil {
 			return fmt.Errorf("port %q has an unsafe LSP name: %w", port.ID, err)
 		}
+		portUUID, lookupErr := renderer.lookupOwnedRow(ctx, logicalSwitchPortOwnedRow(port.ID, port.LSPName))
+		if lookupErr != nil {
+			return wrapRender("attach subnet DHCP to port", port.ID, lookupErr)
+		}
+		if portUUID == "" {
+			continue
+		}
 		var arguments []string
 		if uuid == "" {
-			arguments = []string{"clear", "Logical_Switch_Port", port.LSPName, "dhcpv4_options"}
+			arguments = []string{"clear", "Logical_Switch_Port", portUUID, "dhcpv4_options"}
 		} else {
-			arguments = []string{"lsp-set-dhcpv4-options", port.LSPName, uuid}
+			arguments = []string{"lsp-set-dhcpv4-options", portUUID, uuid}
 		}
 		if _, err := renderer.client.run(ctx, arguments...); err != nil {
 			return wrapRender("attach subnet DHCP to port", port.ID, err)
@@ -335,6 +362,10 @@ func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
 	}
 	if network.ProjectID != port.ProjectID {
 		return fmt.Errorf("port %q and network %q belong to different projects", port.ID, network.ID)
+	}
+	switchUUID, err := renderer.requireOwnedRow(ctx, logicalSwitchOwnedRow(network.ID))
+	if err != nil {
+		return wrapRender("port network", port.ID, err)
 	}
 	if err := safeID(port.LSPName); err != nil {
 		return fmt.Errorf("invalid LSP name: %w", err)
@@ -369,18 +400,33 @@ func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
 	if port.AdminStateUp && port.BindingStatus != model.PortUnbound && port.BindingStatus != model.PortDetaching && port.BindingStatus != model.PortBindingError {
 		enabledState = "enabled"
 	}
-	arguments := []string{
-		"--", "--may-exist", "lsp-add", logicalSwitchUUID(network.ID), port.LSPName,
-		"--", "lsp-set-addresses", port.LSPName, strings.Join(addresses, " "),
-		"--", "lsp-set-port-security", port.LSPName, strings.Join(addresses, " "),
-		"--", "lsp-set-enabled", port.LSPName, enabledState,
-		"--", "set", "Logical_Switch_Port", port.LSPName,
+	portUUID, err := renderer.lookupOwnedRow(ctx, logicalSwitchPortOwnedRow(port.ID, port.LSPName))
+	if err != nil {
+		return wrapRender("port ownership", port.ID, err)
 	}
+	target := portUUID
+	arguments := make([]string, 0, 24)
+	if target == "" {
+		target = port.LSPName
+		arguments = append(arguments, "--", "--may-exist", "lsp-add", switchUUID, port.LSPName)
+	}
+	arguments = append(arguments,
+		"--", "lsp-set-addresses", target, strings.Join(addresses, " "),
+		"--", "lsp-set-port-security", target, strings.Join(addresses, " "),
+		"--", "lsp-set-enabled", target, enabledState,
+		"--", "set", "Logical_Switch_Port", target,
+	)
 	arguments = append(arguments, metadataAssignments(port, map[string]string{"pvn-project": port.ProjectID, "pvn-network": port.NetworkID})...)
 	if _, err := renderer.client.run(ctx, arguments...); err != nil {
 		return wrapRender("port", port.ID, err)
 	}
-	optionArgs := []string{"lsp-set-options", port.LSPName}
+	if portUUID == "" {
+		portUUID, err = renderer.requireOwnedRow(ctx, logicalSwitchPortOwnedRow(port.ID, port.LSPName))
+		if err != nil {
+			return wrapRender("port", port.ID, err)
+		}
+	}
+	optionArgs := []string{"lsp-set-options", portUUID}
 	if port.RequestedChassis != "" {
 		if err := safeID(port.RequestedChassis); err != nil {
 			return fmt.Errorf("invalid requested chassis: %w", err)
@@ -390,13 +436,13 @@ func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
 	if _, err := renderer.client.run(ctx, optionArgs...); err != nil {
 		return wrapRender("port chassis request", port.ID, err)
 	}
-	if err := renderer.portDHCP(ctx, port); err != nil {
+	if err := renderer.portDHCP(ctx, port, portUUID); err != nil {
 		return err
 	}
-	return renderer.portGroups(ctx, port)
+	return renderer.portGroups(ctx, port, portUUID)
 }
 
-func (renderer *Renderer) portDHCP(ctx context.Context, port *model.Port) error {
+func (renderer *Renderer) portDHCP(ctx context.Context, port *model.Port, portUUID string) error {
 	var selected string
 	for _, fixed := range port.FixedIPs {
 		subnet, err := getResource[*model.Subnet](ctx, renderer.store, model.KindSubnet, fixed.SubnetID)
@@ -416,10 +462,10 @@ func (renderer *Renderer) portDHCP(ctx context.Context, port *model.Port) error 
 		}
 	}
 	if selected == "" {
-		_, err := renderer.client.run(ctx, "clear", "Logical_Switch_Port", port.LSPName, "dhcpv4_options")
+		_, err := renderer.client.run(ctx, "clear", "Logical_Switch_Port", portUUID, "dhcpv4_options")
 		return wrapRender("clear port DHCP", port.ID, err)
 	}
-	_, err := renderer.client.run(ctx, "lsp-set-dhcpv4-options", port.LSPName, selected)
+	_, err := renderer.client.run(ctx, "lsp-set-dhcpv4-options", portUUID, selected)
 	return wrapRender("port DHCP", port.ID, err)
 }
 
@@ -446,16 +492,21 @@ func (renderer *Renderer) router(ctx context.Context, router *model.Router) erro
 	name := logicalRouter(router.ID)
 	assignments := []string{stringAssignment("name", name)}
 	assignments = append(assignments, metadataAssignments(router, map[string]string{"pvn-project": router.ProjectID})...)
-	if _, err := renderer.ensureOwnedRow(ctx, logicalRouterOwnedRow(router.ID), assignments); err != nil {
+	routerUUID, err := renderer.ensureOwnedRow(ctx, logicalRouterOwnedRow(router.ID), assignments)
+	if err != nil {
 		return wrapRender("router", router.ID, err)
 	}
 	if external == nil {
-		return renderer.clearRouterExternal(ctx, router)
+		return renderer.clearRouterExternal(ctx, router, routerUUID)
 	}
-	if err := renderer.renderRouterGateway(ctx, router, external, gatewayChassis); err != nil {
+	externalSwitchUUID, err := renderer.requireOwnedRow(ctx, logicalSwitchOwnedRow(external.network.ID))
+	if err != nil {
+		return wrapRender("router external network", router.ID, err)
+	}
+	if err := renderer.renderRouterGateway(ctx, router, routerUUID, externalSwitchUUID, external, gatewayChassis); err != nil {
 		return err
 	}
-	return renderer.reconcileRouterSNAT(ctx, router)
+	return renderer.reconcileRouterSNAT(ctx, router, routerUUID)
 }
 
 type routerExternal struct {
@@ -563,11 +614,11 @@ func hasNodeRole(roles []model.NodeRole, expected model.NodeRole) bool {
 	return false
 }
 
-func (renderer *Renderer) renderRouterGateway(ctx context.Context, router *model.Router, external *routerExternal, chassis []string) error {
+func (renderer *Renderer) renderRouterGateway(ctx context.Context, router *model.Router, routerUUID, externalSwitchUUID string, external *routerExternal, chassis []string) error {
 	routerPort := gatewayRouterPort(router.ID)
 	switchPort := gatewaySwitchPort(router.ID)
 	network := fmt.Sprintf("%s/%d", external.externalIP, external.prefix.Bits())
-	args := renderer.routerGatewayArgs(router, external.network.ID, routerPort, switchPort, network, false)
+	args := renderer.routerGatewayArgs(router, routerUUID, externalSwitchUUID, external.network.ID, routerPort, switchPort, network, false)
 	if _, err := renderer.client.run(ctx, args...); err != nil {
 		// The --may-exist forms intentionally reject a changed LRP network or
 		// an LSP that belongs to another switch. Only retry destructively after
@@ -578,18 +629,18 @@ func (renderer *Renderer) renderRouterGateway(ctx context.Context, router *model
 		if routerPortLookupErr != nil || switchPortLookupErr != nil || (len(strings.TrimSpace(string(routerPortOutput))) == 0 && len(strings.TrimSpace(string(switchPortOutput))) == 0) {
 			return wrapRender("router gateway", router.ID, err)
 		}
-		args = renderer.routerGatewayArgs(router, external.network.ID, routerPort, switchPort, network, true)
+		args = renderer.routerGatewayArgs(router, routerUUID, externalSwitchUUID, external.network.ID, routerPort, switchPort, network, true)
 		if _, retryErr := renderer.client.run(ctx, args...); retryErr != nil {
 			return wrapRender("move router gateway", router.ID, retryErr)
 		}
 	}
-	if err := renderer.renderRouterDefaultRoute(ctx, router, external.gateway, routerPort); err != nil {
+	if err := renderer.renderRouterDefaultRoute(ctx, router, routerUUID, external.gateway, routerPort); err != nil {
 		return err
 	}
 	return renderer.syncGatewayChassis(ctx, router.ID, routerPort, chassis)
 }
 
-func (renderer *Renderer) routerGatewayArgs(router *model.Router, networkID, routerPort, switchPort, network string, move bool) []string {
+func (renderer *Renderer) routerGatewayArgs(router *model.Router, routerUUID, switchUUID, networkID, routerPort, switchPort, network string, move bool) []string {
 	mac := deterministicMAC("router-gateway:" + router.ID)
 	args := make([]string, 0, 40)
 	if move {
@@ -599,12 +650,12 @@ func (renderer *Renderer) routerGatewayArgs(router *model.Router, networkID, rou
 		)
 	}
 	args = append(args,
-		"--", "--may-exist", "lrp-add", logicalRouterUUID(router.ID), routerPort, mac, network,
+		"--", "--may-exist", "lrp-add", routerUUID, routerPort, mac, network,
 		"--", "set", "Logical_Router_Port", routerPort, stringAssignment("mac", mac), stringAssignment("networks", network),
 	)
 	args = append(args, metadataAssignments(router, map[string]string{"pvn-project": router.ProjectID, "pvn-role": "external-gateway"})...)
 	args = append(args,
-		"--", "--may-exist", "lsp-add", logicalSwitchUUID(networkID), switchPort,
+		"--", "--may-exist", "lsp-add", switchUUID, switchPort,
 		"--", "lsp-set-type", switchPort, "router",
 		"--", "lsp-set-addresses", switchPort, "router",
 		"--", "lsp-set-options", switchPort, "router-port="+routerPort, "nat-addresses=router",
@@ -613,8 +664,7 @@ func (renderer *Renderer) routerGatewayArgs(router *model.Router, networkID, rou
 	return append(args, metadataAssignments(router, map[string]string{"pvn-network": networkID, "pvn-project": router.ProjectID, "pvn-role": "external-gateway"})...)
 }
 
-func (renderer *Renderer) renderRouterDefaultRoute(ctx context.Context, router *model.Router, gateway netip.Addr, routerPort string) error {
-	uuid := routerDefaultRouteUUID(router.ID)
+func (renderer *Renderer) renderRouterDefaultRoute(ctx context.Context, router *model.Router, routerUUID string, gateway netip.Addr, routerPort string) error {
 	assignments := []string{
 		stringAssignment("ip_prefix", "0.0.0.0/0"),
 		stringAssignment("nexthop", gateway.String()),
@@ -624,8 +674,8 @@ func (renderer *Renderer) renderRouterDefaultRoute(ctx context.Context, router *
 		mapAssignment("external_ids", "pvn-router", router.ID),
 		mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(router.Revision, 10)),
 	}
-	if err := renderer.ensureAttachedRow(ctx, "Logical_Router_Static_Route", uuid, assignments,
-		"Logical_Router", logicalRouterUUID(router.ID), "static_routes"); err != nil {
+	if _, err := renderer.ensureOwnedAttachedRow(ctx, routerDefaultRouteOwnedRow(router.ID), assignments,
+		"Logical_Router", routerUUID, "static_routes"); err != nil {
 		return wrapRender("router default route", router.ID, err)
 	}
 	return nil
@@ -733,7 +783,15 @@ func (renderer *Renderer) routerInterface(ctx context.Context, routerInterface *
 	switchPort := "pvn-rsp-" + compact(routerInterface.ID)
 	mac := deterministicMAC("router:" + routerInterface.ID)
 	portNetwork := fmt.Sprintf("%s/%d", gateway, prefix.Bits())
-	args := renderer.routerInterfaceArgs(routerInterface, router.ID, subnet.NetworkID, routerPort, switchPort, mac, portNetwork, false)
+	routerUUID, err := renderer.requireOwnedRow(ctx, logicalRouterOwnedRow(router.ID))
+	if err != nil {
+		return wrapRender("router interface router", routerInterface.ID, err)
+	}
+	switchUUID, err := renderer.requireOwnedRow(ctx, logicalSwitchOwnedRow(subnet.NetworkID))
+	if err != nil {
+		return wrapRender("router interface network", routerInterface.ID, err)
+	}
+	args := renderer.routerInterfaceArgs(routerInterface, routerUUID, switchUUID, routerPort, switchPort, mac, portNetwork, false)
 	if _, err = renderer.client.run(ctx, args...); err != nil {
 		// The may-exist forms reject a changed subnet or logical switch. Probe
 		// both deterministic PVN port names before replacing them atomically;
@@ -743,15 +801,15 @@ func (renderer *Renderer) routerInterface(ctx context.Context, routerInterface *
 		if routerPortLookupErr != nil || switchPortLookupErr != nil || (len(strings.TrimSpace(string(routerPortOutput))) == 0 && len(strings.TrimSpace(string(switchPortOutput))) == 0) {
 			return wrapRender("router interface", routerInterface.ID, err)
 		}
-		args = renderer.routerInterfaceArgs(routerInterface, router.ID, subnet.NetworkID, routerPort, switchPort, mac, portNetwork, true)
+		args = renderer.routerInterfaceArgs(routerInterface, routerUUID, switchUUID, routerPort, switchPort, mac, portNetwork, true)
 		if _, retryErr := renderer.client.run(ctx, args...); retryErr != nil {
 			return wrapRender("move router interface", routerInterface.ID, retryErr)
 		}
 	}
-	return renderer.reconcileRouterSNAT(ctx, router)
+	return renderer.reconcileRouterSNAT(ctx, router, routerUUID)
 }
 
-func (renderer *Renderer) routerInterfaceArgs(routerInterface *model.RouterInterface, routerID, networkID, routerPort, switchPort, mac, portNetwork string, move bool) []string {
+func (renderer *Renderer) routerInterfaceArgs(routerInterface *model.RouterInterface, routerUUID, switchUUID, routerPort, switchPort, mac, portNetwork string, move bool) []string {
 	args := make([]string, 0, 36)
 	if move {
 		args = append(args,
@@ -760,9 +818,9 @@ func (renderer *Renderer) routerInterfaceArgs(routerInterface *model.RouterInter
 		)
 	}
 	args = append(args,
-		"--", "--may-exist", "lrp-add", logicalRouterUUID(routerID), routerPort, mac, portNetwork,
+		"--", "--may-exist", "lrp-add", routerUUID, routerPort, mac, portNetwork,
 		"--", "set", "Logical_Router_Port", routerPort, stringAssignment("mac", mac), stringAssignment("networks", portNetwork),
-		"--", "--may-exist", "lsp-add", logicalSwitchUUID(networkID), switchPort,
+		"--", "--may-exist", "lsp-add", switchUUID, switchPort,
 		"--", "lsp-set-type", switchPort, "router",
 		"--", "lsp-set-addresses", switchPort, "router",
 		"--", "lsp-set-options", switchPort, "router-port="+routerPort,
@@ -772,8 +830,9 @@ func (renderer *Renderer) routerInterfaceArgs(routerInterface *model.RouterInter
 	return args
 }
 
-func (renderer *Renderer) reconcileRouterSNAT(ctx context.Context, router *model.Router) error {
+func (renderer *Renderer) reconcileRouterSNAT(ctx context.Context, router *model.Router, routerUUID string) error {
 	actual, err := renderer.findMany(ctx, "NAT",
+		mapAssignment("external_ids", "pvn-managed", "true"),
 		mapAssignment("external_ids", "pvn-kind", "router-snat"),
 		mapAssignment("external_ids", "pvn-router", router.ID),
 	)
@@ -828,10 +887,13 @@ func (renderer *Renderer) reconcileRouterSNAT(ctx context.Context, router *model
 				mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(router.Revision, 10)),
 				mapAssignment("external_ids", "pvn-interface-revision", strconv.FormatInt(routerInterface.Revision, 10)),
 			}
-			if err := renderer.ensureAttachedRow(ctx, "NAT", uuid, assignments,
-				"Logical_Router", logicalRouterUUID(router.ID), "nat"); err != nil {
+			actual, err := renderer.ensureOwnedAttachedRow(ctx, routerSNATOwnedRow(router.ID, routerInterface.ID), assignments,
+				"Logical_Router", routerUUID, "nat")
+			if err != nil {
 				return wrapRender("router SNAT", routerInterface.ID, err)
 			}
+			delete(desired, uuid)
+			desired[actual] = true
 		}
 	}
 	stale := make([]string, 0)
@@ -840,16 +902,16 @@ func (renderer *Renderer) reconcileRouterSNAT(ctx context.Context, router *model
 			stale = append(stale, uuid)
 		}
 	}
-	return renderer.removeRouterSNATRows(ctx, router.ID, stale)
+	return renderer.removeRouterSNATRows(ctx, router.ID, routerUUID, stale)
 }
 
-func (renderer *Renderer) removeRouterSNATRows(ctx context.Context, routerID string, uuids []string) error {
+func (renderer *Renderer) removeRouterSNATRows(ctx context.Context, routerID, routerUUID string, uuids []string) error {
 	if len(uuids) == 0 {
 		return nil
 	}
 	args := make([]string, 0, len(uuids)*12)
 	for _, uuid := range uuids {
-		args = append(args, "--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(routerID), "nat", uuid)
+		args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "nat", uuid)
 	}
 	for _, uuid := range uuids {
 		args = append(args, "--", "--if-exists", "destroy", "NAT", uuid)
@@ -859,12 +921,23 @@ func (renderer *Renderer) removeRouterSNATRows(ctx context.Context, routerID str
 }
 
 func (renderer *Renderer) deleteRouterInterface(ctx context.Context, routerInterface *model.RouterInterface) error {
-	uuid := routerSNATUUID(routerInterface.RouterID, routerInterface.ID)
+	routerUUID, err := renderer.lookupOwnedRow(ctx, logicalRouterOwnedRow(routerInterface.RouterID))
+	if err != nil {
+		return wrapRender("delete router interface", routerInterface.ID, err)
+	}
+	snatUUID, err := renderer.lookupOwnedRow(ctx, routerSNATOwnedRow(routerInterface.RouterID, routerInterface.ID))
+	if err != nil {
+		return wrapRender("delete router interface", routerInterface.ID, err)
+	}
 	args := []string{
 		"--", "--if-exists", "lsp-del", "pvn-rsp-" + compact(routerInterface.ID),
 		"--", "--if-exists", "lrp-del", "pvn-lrp-" + compact(routerInterface.ID),
-		"--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(routerInterface.RouterID), "nat", uuid,
-		"--", "--if-exists", "destroy", "NAT", uuid,
+	}
+	if routerUUID != "" && snatUUID != "" {
+		args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "nat", snatUUID)
+	}
+	if snatUUID != "" {
+		args = append(args, "--", "--if-exists", "destroy", "NAT", snatUUID)
 	}
 	if _, err := renderer.client.run(ctx, args...); err != nil {
 		return wrapRender("delete router interface", routerInterface.ID, err)
@@ -876,26 +949,38 @@ func (renderer *Renderer) deleteRouterInterface(ctx context.Context, routerInter
 	if err != nil {
 		return err
 	}
-	return renderer.reconcileRouterSNAT(ctx, router)
+	if routerUUID == "" {
+		return fmt.Errorf("router %q remains in desired state but its PVN-owned Logical_Router row is absent", router.ID)
+	}
+	return renderer.reconcileRouterSNAT(ctx, router, routerUUID)
 }
 
-func (renderer *Renderer) clearRouterExternal(ctx context.Context, router *model.Router) error {
+func (renderer *Renderer) clearRouterExternal(ctx context.Context, router *model.Router, routerUUID string) error {
 	snats, err := renderer.findMany(ctx, "NAT",
+		mapAssignment("external_ids", "pvn-managed", "true"),
 		mapAssignment("external_ids", "pvn-kind", "router-snat"),
 		mapAssignment("external_ids", "pvn-router", router.ID),
 	)
 	if err != nil {
 		return wrapRender("list router SNAT", router.ID, err)
 	}
+	routeUUID, err := renderer.lookupOwnedRow(ctx, routerDefaultRouteOwnedRow(router.ID))
+	if err != nil {
+		return wrapRender("read router default route", router.ID, err)
+	}
 	args := []string{
 		"--", "--if-exists", "lsp-del", gatewaySwitchPort(router.ID),
 		"--", "--if-exists", "lrp-del", gatewayRouterPort(router.ID),
-		"--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(router.ID), "static_routes", routerDefaultRouteUUID(router.ID),
+	}
+	if routeUUID != "" {
+		args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "static_routes", routeUUID)
 	}
 	for _, uuid := range snats {
-		args = append(args, "--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(router.ID), "nat", uuid)
+		args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "nat", uuid)
 	}
-	args = append(args, "--", "--if-exists", "destroy", "Logical_Router_Static_Route", routerDefaultRouteUUID(router.ID))
+	if routeUUID != "" {
+		args = append(args, "--", "--if-exists", "destroy", "Logical_Router_Static_Route", routeUUID)
+	}
 	for _, uuid := range snats {
 		args = append(args, "--", "--if-exists", "destroy", "NAT", uuid)
 	}
@@ -905,24 +990,39 @@ func (renderer *Renderer) clearRouterExternal(ctx context.Context, router *model
 
 func (renderer *Renderer) deleteRouter(ctx context.Context, router *model.Router) error {
 	snats, err := renderer.findMany(ctx, "NAT",
+		mapAssignment("external_ids", "pvn-managed", "true"),
 		mapAssignment("external_ids", "pvn-kind", "router-snat"),
 		mapAssignment("external_ids", "pvn-router", router.ID),
 	)
 	if err != nil {
 		return wrapRender("list router SNAT", router.ID, err)
 	}
+	routerUUID, err := renderer.lookupOwnedRow(ctx, logicalRouterOwnedRow(router.ID))
+	if err != nil {
+		return wrapRender("read router", router.ID, err)
+	}
+	routeUUID, err := renderer.lookupOwnedRow(ctx, routerDefaultRouteOwnedRow(router.ID))
+	if err != nil {
+		return wrapRender("read router default route", router.ID, err)
+	}
 	args := []string{
 		"--", "--if-exists", "lsp-del", gatewaySwitchPort(router.ID),
 		"--", "--if-exists", "lrp-del", gatewayRouterPort(router.ID),
-		"--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(router.ID), "static_routes", routerDefaultRouteUUID(router.ID),
+	}
+	if routerUUID != "" && routeUUID != "" {
+		args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "static_routes", routeUUID)
 	}
 	for _, uuid := range snats {
-		args = append(args, "--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(router.ID), "nat", uuid)
+		if routerUUID != "" {
+			args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "nat", uuid)
+		}
 	}
-	args = append(args,
-		"--", "--if-exists", "lr-del", logicalRouterUUID(router.ID),
-		"--", "--if-exists", "destroy", "Logical_Router_Static_Route", routerDefaultRouteUUID(router.ID),
-	)
+	if routerUUID != "" {
+		args = append(args, "--", "--if-exists", "lr-del", routerUUID)
+	}
+	if routeUUID != "" {
+		args = append(args, "--", "--if-exists", "destroy", "Logical_Router_Static_Route", routeUUID)
+	}
 	for _, uuid := range snats {
 		args = append(args, "--", "--if-exists", "destroy", "NAT", uuid)
 	}
@@ -934,19 +1034,29 @@ func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.Floa
 	if err := validateReferencedIDs(floatingIP.ProjectID, floatingIP.ProviderNetworkID); err != nil {
 		return err
 	}
-	uuid := deterministicUUID("floating-ip-nat:" + floatingIP.ID)
+	row := floatingIPOwnedRow(floatingIP.ID)
 	routers, err := renderer.store.List(ctx, model.KindRouter, controlstore.ListOptions{})
 	if err != nil {
 		return err
 	}
 	if floatingIP.RouterID == "" || floatingIP.FixedIPAddress == "" {
+		uuid, lookupErr := renderer.lookupOwnedRow(ctx, row)
+		if lookupErr != nil || uuid == "" {
+			return wrapRender("remove floating IP", floatingIP.ID, lookupErr)
+		}
 		args := make([]string, 0, len(routers)*7+6)
 		for _, resource := range routers {
 			router, ok := resource.(*model.Router)
 			if !ok {
 				return fmt.Errorf("control store returned %T while listing routers", resource)
 			}
-			args = append(args, "--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(router.ID), "nat", uuid)
+			routerUUID, lookupErr := renderer.lookupOwnedRow(ctx, logicalRouterOwnedRow(router.ID))
+			if lookupErr != nil {
+				return lookupErr
+			}
+			if routerUUID != "" {
+				args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "nat", uuid)
+			}
 		}
 		args = append(args, "--", "--if-exists", "destroy", "NAT", uuid)
 		_, err := renderer.client.run(ctx, args...)
@@ -1002,15 +1112,35 @@ func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.Floa
 		mapAssignment("external_ids", "pvn-project", floatingIP.ProjectID),
 		mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(floatingIP.Revision, 10)),
 	}
-	existing, findErr := renderer.findUUID(ctx, "NAT", uuid)
+	existing, findErr := renderer.lookupOwnedRow(ctx, row)
 	if findErr != nil {
 		return findErr
 	}
+	routerRows := make(map[string]string, len(routers))
+	for _, resource := range routers {
+		candidate, ok := resource.(*model.Router)
+		if !ok {
+			return fmt.Errorf("control store returned %T while listing routers", resource)
+		}
+		actual, lookupErr := renderer.lookupOwnedRow(ctx, logicalRouterOwnedRow(candidate.ID))
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if actual != "" {
+			routerRows[candidate.ID] = actual
+		}
+	}
+	targetRouterUUID := routerRows[router.ID]
+	if targetRouterUUID == "" {
+		return fmt.Errorf("router %q has no PVN-owned Logical_Router row", router.ID)
+	}
+	childUUID := existing
 	args := []string{"--"}
 	if existing == "" {
-		args = append(args, "--id="+uuid, "create", "NAT")
+		childUUID = row.deterministicUUID
+		args = append(args, "--id="+childUUID, "create", "NAT")
 	} else {
-		args = append(args, "set", "NAT", uuid)
+		args = append(args, "set", "NAT", childUUID)
 	}
 	args = append(args, assignments...)
 	for _, resource := range routers {
@@ -1019,15 +1149,21 @@ func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.Floa
 			return fmt.Errorf("control store returned %T while listing routers", resource)
 		}
 		if candidate.ID != router.ID {
-			args = append(args, "--", "--if-exists", "remove", "Logical_Router", logicalRouterUUID(candidate.ID), "nat", uuid)
+			if candidateRouterUUID := routerRows[candidate.ID]; candidateRouterUUID != "" {
+				args = append(args, "--", "--if-exists", "remove", "Logical_Router", candidateRouterUUID, "nat", childUUID)
+			}
 		}
 	}
-	args = append(args, "--", "add", "Logical_Router", logicalRouterUUID(router.ID), "nat", uuid)
+	args = append(args, "--", "add", "Logical_Router", targetRouterUUID, "nat", childUUID)
 	_, err = renderer.client.run(ctx, args...)
 	if err != nil && existing == "" {
 		// Deterministic UUIDs turn active-active creates into a harmless race.
-		if found, retryErr := renderer.findUUID(ctx, "NAT", uuid); retryErr == nil && found != "" {
+		if found, retryErr := renderer.lookupOwnedRow(ctx, row); retryErr == nil && found != "" {
 			return renderer.floatingIP(ctx, floatingIP)
+		}
+	} else if err == nil && existing == "" {
+		if _, lookupErr := renderer.requireOwnedRow(ctx, row); lookupErr != nil {
+			return wrapRender("floating IP", floatingIP.ID, lookupErr)
 		}
 	}
 	return wrapRender("floating IP", floatingIP.ID, err)
@@ -1078,7 +1214,11 @@ func (renderer *Renderer) providerSegment(ctx context.Context, segment *model.Pr
 		if network.ProviderNetworkID != segment.ProviderNetworkID {
 			continue
 		}
-		if err := renderer.renderProviderPort(ctx, segment, network); err != nil {
+		switchUUID, err := renderer.requireOwnedRow(ctx, logicalSwitchOwnedRow(network.ID))
+		if err != nil {
+			return wrapRender("provider network logical switch", network.ID, err)
+		}
+		if err := renderer.renderProviderPort(ctx, segment, network, switchUUID); err != nil {
 			return err
 		}
 	}
@@ -1124,7 +1264,7 @@ func (renderer *Renderer) defaultProviderSegment(ctx context.Context, providerID
 	return selected, nil
 }
 
-func (renderer *Renderer) renderProviderPort(ctx context.Context, segment *model.ProviderSegment, network *model.Network) error {
+func (renderer *Renderer) renderProviderPort(ctx context.Context, segment *model.ProviderSegment, network *model.Network, switchUUID string) error {
 	port := "pvn-localnet-" + compact(network.ID)
 	existing, err := renderer.ownedProviderPort(ctx, network.ID, port)
 	if err != nil {
@@ -1133,7 +1273,7 @@ func (renderer *Renderer) renderProviderPort(ctx context.Context, segment *model
 	target := port
 	args := make([]string, 0, 32)
 	if existing == "" {
-		args = append(args, "--", "--may-exist", "lsp-add", logicalSwitchUUID(network.ID), port)
+		args = append(args, "--", "--may-exist", "lsp-add", switchUUID, port)
 	} else {
 		// Address the row by UUID after the ownership probe so a same-name row
 		// cannot be substituted between the read and the update.
@@ -1308,16 +1448,26 @@ func (renderer *Renderer) ensureACL(ctx context.Context, group, owner, direction
 				return nil, fmt.Errorf("control store returned %T while listing security groups", resource)
 			}
 			candidateName := portGroup(candidate.ID)
+			groupUUID, lookupErr := renderer.lookupOwnedRow(ctx, portGroupOwnedRow(candidate.ID))
+			if lookupErr != nil {
+				return nil, lookupErr
+			}
 			if candidateName == group {
 				foundDesired = true
+				if groupUUID == "" {
+					return nil, fmt.Errorf("target port group %q has no PVN-owned OVN row", group)
+				}
+				args = append(args, "--", "add", "Port_Group", groupUUID, "acls", aclUUID)
 				continue
 			}
-			args = append(args, "--", "--if-exists", "remove", "Port_Group", candidateName, "acls", aclUUID)
+			if groupUUID != "" {
+				args = append(args, "--", "--if-exists", "remove", "Port_Group", groupUUID, "acls", aclUUID)
+			}
 		}
 		if !foundDesired {
 			return nil, fmt.Errorf("target port group %q is absent from desired state", group)
 		}
-		return append(args, "--", "add", "Port_Group", group, "acls", aclUUID), nil
+		return args, nil
 	}
 	if existing == "" {
 		args := append([]string{"--", "--id=" + row.deterministicUUID, "create", "ACL"}, assignments...)
@@ -1354,7 +1504,7 @@ func (renderer *Renderer) ensureACL(ctx context.Context, group, owner, direction
 	return wrapRender("security group ACL", owner, err)
 }
 
-func (renderer *Renderer) portGroups(ctx context.Context, port *model.Port) error {
+func (renderer *Renderer) portGroups(ctx context.Context, port *model.Port, portUUID string) error {
 	groups, err := renderer.store.List(ctx, model.KindSecurityGroup, controlstore.ListOptions{})
 	if err != nil {
 		return err
@@ -1371,6 +1521,10 @@ func (renderer *Renderer) portGroups(ctx context.Context, port *model.Port) erro
 		if !ok {
 			return fmt.Errorf("control store returned %T while listing security groups", resource)
 		}
+		groupUUID, lookupErr := renderer.lookupOwnedRow(ctx, portGroupOwnedRow(group.ID))
+		if lookupErr != nil {
+			return lookupErr
+		}
 		command := "remove"
 		if desired[group.ID] {
 			if group.ProjectID != port.ProjectID {
@@ -1379,9 +1533,15 @@ func (renderer *Renderer) portGroups(ctx context.Context, port *model.Port) erro
 			command = "add"
 			delete(desired, group.ID)
 		}
+		if groupUUID == "" {
+			if command == "add" {
+				return fmt.Errorf("port %q references security group %q whose PVN-owned OVN row is absent", port.ID, group.ID)
+			}
+			continue
+		}
 		args := []string{
-			"--", "--id=@lsp", "get", "Logical_Switch_Port", port.LSPName,
-			"--", command, "Port_Group", portGroup(group.ID), "ports", "@lsp",
+			"--", "--id=@lsp", "get", "Logical_Switch_Port", portUUID,
+			"--", command, "Port_Group", groupUUID, "ports", "@lsp",
 		}
 		if _, err := renderer.client.run(ctx, args...); err != nil {
 			return wrapRender("security group membership", port.ID, err)
@@ -1505,6 +1665,16 @@ func dhcpOptionsOwnedRow(subnetID string) ownedRow {
 		"",
 		mapAssignment("external_ids", "pvn-kind", model.KindSubnet.String()),
 		mapAssignment("external_ids", "pvn-id", subnetID),
+	)
+}
+
+func logicalSwitchPortOwnedRow(portID, lspName string) ownedRow {
+	return managedRow(
+		"Logical_Switch_Port",
+		deterministicUUID("logical-switch-port:"+portID),
+		lspName,
+		mapAssignment("external_ids", "pvn-kind", model.KindPort.String()),
+		mapAssignment("external_ids", "pvn-id", portID),
 	)
 }
 

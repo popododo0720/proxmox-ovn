@@ -156,7 +156,7 @@ func (runner *recordingRunner) Run(_ context.Context, _ string, arguments ...str
 	if strings.Contains(joined, "_uuid=") {
 		return nil, errors.New("unsupported _uuid find condition")
 	}
-	if strings.Contains(joined, "find NAT") && strings.Contains(joined, `external_ids:pvn-kind="router-snat"`) {
+	if runner.routerSNATFindOutput != "" && strings.Contains(joined, "find NAT") && strings.Contains(joined, `external_ids:pvn-kind="router-snat"`) {
 		return []byte(runner.routerSNATFindOutput), nil
 	}
 	if strings.Contains(joined, "lrp-get-gateway-chassis") {
@@ -227,6 +227,15 @@ func (runner *recordingRunner) applyCreatesAndSets(arguments []string) {
 				continue
 			}
 			runner.putTestRow(table, uuid, runner.testAssignments(arguments, index+3))
+		case "lsp-add":
+			if index+2 >= len(arguments) {
+				continue
+			}
+			name := arguments[index+2]
+			if runner.resolveTestRow("Logical_Switch_Port", name) == "" {
+				uuid := deterministicUUID("test-logical-switch-port:" + name)
+				runner.putTestRow("Logical_Switch_Port", uuid, []string{stringAssignment("name", name)})
+			}
 		}
 	}
 }
@@ -264,6 +273,19 @@ func (runner *recordingRunner) resolveTestRow(table, target string) string {
 		}
 	}
 	return ""
+}
+
+func (runner *recordingRunner) seedOwnedRow(row ownedRow, uuid string) {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if runner.rows == nil {
+		runner.rows = make(map[string]map[string]map[string]bool)
+	}
+	assignments := append([]string(nil), row.identity...)
+	if row.name != "" {
+		assignments = append(assignments, stringAssignment("name", row.name))
+	}
+	runner.putTestRow(row.table, uuid, assignments)
 }
 
 func (runner *movingGatewayRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, error) {
@@ -483,6 +505,7 @@ func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
 			t.Fatalf("render %s: %v", resource.ResourceKind(), err)
 		}
 	}
+	portUUID := deterministicUUID("test-logical-switch-port:" + port.LSPName)
 
 	for _, expected := range [][]string{
 		{"create Logical_Switch", stringAssignment("name", logicalSwitch(network.ID)), `external_ids:pvn-id="network-1"`},
@@ -490,9 +513,9 @@ func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
 		{"dhcp-options-set-options", "server_id=10.42.0.1", "mtu=1400"},
 		{"create Port_Group", portGroup(group.ID), `external_ids:pvn-id="sg-1"`},
 		{"lsp-add " + logicalSwitchUUID(network.ID) + " pvn-port-1", "lsp-set-enabled pvn-port-1 enabled"},
-		{"lsp-set-options pvn-port-1 requested-chassis=chassis-a"},
-		{"lsp-set-dhcpv4-options pvn-port-1 " + testOVSUUID},
-		{"get Logical_Switch_Port pvn-port-1", "add Port_Group " + portGroup(group.ID) + " ports @lsp"},
+		{"lsp-set-options " + portUUID + " requested-chassis=chassis-a"},
+		{"lsp-set-dhcpv4-options " + portUUID + " " + testOVSUUID},
+		{"get Logical_Switch_Port " + portUUID, "ports @lsp"},
 	} {
 		if !runner.contains(expected...) {
 			t.Errorf("no OVN command contains %v; calls=%v", expected, runner.calls)
@@ -519,6 +542,7 @@ func TestRendererDisablesUnboundPortWithOVNState(t *testing.T) {
 		AdminStateUp: true, BindingStatus: model.PortUnbound,
 	}).(*model.Port)
 	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(network.ID), logicalSwitchUUID(network.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(ctx, port); err != nil {
@@ -771,6 +795,7 @@ func TestRouterRendersCentralizedGatewayDefaultRouteAndSNAT(t *testing.T) {
 	ctx := context.Background()
 	store, fixture := newNorthSouthFixture(t)
 	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), logicalSwitchUUID(fixture.externalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(ctx, fixture.router); err != nil {
@@ -811,6 +836,8 @@ func TestRouterRendersCentralizedGatewayDefaultRouteAndSNAT(t *testing.T) {
 func TestRouterInterfaceReconcilesRouterSNAT(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), logicalRouterUUID(fixture.router.ID))
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.internalNetwork.ID), logicalSwitchUUID(fixture.internalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(context.Background(), fixture.routerInterface); err != nil {
@@ -825,6 +852,8 @@ func TestRouterInterfaceReconcilesRouterSNAT(t *testing.T) {
 func TestRouterInterfaceMovesItsPortsAtomicallyWhenSubnetChanges(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	runner := &movingGatewayRunner{}
+	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), logicalRouterUUID(fixture.router.ID))
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.internalNetwork.ID), logicalSwitchUUID(fixture.internalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(context.Background(), fixture.routerInterface); err != nil {
@@ -841,6 +870,8 @@ func TestRouterInterfaceMovesItsPortsAtomicallyWhenSubnetChanges(t *testing.T) {
 func TestRouterInterfaceDoesNotDeletePortsOnDatabaseFailure(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	runner := &unavailableGatewayRunner{}
+	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), logicalRouterUUID(fixture.router.ID))
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.internalNetwork.ID), logicalSwitchUUID(fixture.internalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(context.Background(), fixture.routerInterface); err == nil || !strings.Contains(err.Error(), "database connection failed") {
@@ -856,6 +887,7 @@ func TestRouterSNATDisableRemovesOnlyManagedRows(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
 	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), logicalSwitchUUID(fixture.externalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	update := *fixture.router
@@ -880,6 +912,7 @@ func TestRouterWithoutExternalGatewayCleansGatewayRouteAndSNAT(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
 	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
+	runner.seedOwnedRow(routerDefaultRouteOwnedRow(fixture.router.ID), routerDefaultRouteUUID(fixture.router.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	update := *fixture.router
@@ -903,6 +936,8 @@ func TestRouterDeleteCleansNorthSouthArtifacts(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
 	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
+	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), logicalRouterUUID(fixture.router.ID))
+	runner.seedOwnedRow(routerDefaultRouteOwnedRow(fixture.router.ID), routerDefaultRouteUUID(fixture.router.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Delete(context.Background(), fixture.router); err != nil {
@@ -918,6 +953,7 @@ func TestRouterInterfaceDeleteRemovesSNATAndReconciles(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	snatUUID := routerSNATUUID(fixture.router.ID, fixture.routerInterface.ID)
 	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
+	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), logicalRouterUUID(fixture.router.ID))
 	renderer := newTestRenderer(t, runner, store)
 	tombstone, _, err := store.BeginDelete(ctx, model.KindRouterInterface, fixture.routerInterface.ID, fixture.routerInterface.Revision, "")
 	if err != nil {
@@ -936,6 +972,7 @@ func TestRouterGatewayChassisIsDeterministicAndRemovesStaleMembers(t *testing.T)
 	store, fixture := newNorthSouthFixture(t)
 	routerPort := gatewayRouterPort(fixture.router.ID)
 	runner := &recordingRunner{gatewayChassisOutput: routerPort + "-chassis-old   100\n"}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), logicalSwitchUUID(fixture.externalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(context.Background(), fixture.router); err != nil {
@@ -952,6 +989,7 @@ func TestRouterGatewayChassisIsDeterministicAndRemovesStaleMembers(t *testing.T)
 func TestRouterGatewayMovesItsSwitchPortAtomicallyWhenExternalNetworkChanges(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	runner := &movingGatewayRunner{}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), logicalSwitchUUID(fixture.externalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(context.Background(), fixture.router); err != nil {
@@ -966,6 +1004,7 @@ func TestRouterGatewayMovesItsSwitchPortAtomicallyWhenExternalNetworkChanges(t *
 func TestRouterGatewayDoesNotDeletePortsOnDatabaseFailure(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	runner := &unavailableGatewayRunner{}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), logicalSwitchUUID(fixture.externalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(context.Background(), fixture.router); err == nil || !strings.Contains(err.Error(), "database connection failed") {
@@ -979,6 +1018,7 @@ func TestRouterGatewayDoesNotDeletePortsOnDatabaseFailure(t *testing.T) {
 func TestNorthSouthRendererUsesOVN2503CompatibleCommands(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), logicalSwitchUUID(fixture.externalNetwork.ID))
 	renderer := newTestRenderer(t, runner, store)
 	if err := renderer.Render(context.Background(), fixture.router); err != nil {
 		t.Fatal(err)
@@ -1015,6 +1055,7 @@ func TestRouterExternalGatewayRequiresEnabledGatewayNode(t *testing.T) {
 		}
 	}
 	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), logicalRouterUUID(fixture.router.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(ctx, fixture.router); err == nil || !strings.Contains(err.Error(), "no enabled gateway chassis") {
@@ -1105,6 +1146,7 @@ func TestFloatingIPOnRouterExternalProviderRendersNAT(t *testing.T) {
 		PortID: port.ID, FixedIPAddress: "10.42.0.10", FloatingStatus: model.FloatingIPActive,
 	}
 	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), logicalRouterUUID(fixture.router.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(context.Background(), floatingIP); err != nil {
@@ -1150,7 +1192,9 @@ func TestActiveActiveNetworkCreateUsesOneDeterministicRow(t *testing.T) {
 
 func TestDeletePortIsIdempotentAndScoped(t *testing.T) {
 	store := controlstore.NewMemory()
+	port := &model.Port{Metadata: model.Metadata{ID: "port-1"}, LSPName: "pvn-port-1"}
 	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalSwitchPortOwnedRow(port.ID, port.LSPName), deterministicUUID("restored-port-row"))
 	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
 	if err != nil {
 		t.Fatal(err)
@@ -1159,11 +1203,10 @@ func TestDeletePortIsIdempotentAndScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := &model.Port{Metadata: model.Metadata{ID: "port-1"}, LSPName: "pvn-port-1"}
 	if err := renderer.Delete(context.Background(), port); err != nil {
 		t.Fatal(err)
 	}
-	if !runner.contains("--if-exists lsp-del pvn-port-1") {
+	if !runner.contains("--if-exists lsp-del " + deterministicUUID("restored-port-row")) {
 		t.Fatalf("scoped idempotent delete missing: %v", runner.calls)
 	}
 }
