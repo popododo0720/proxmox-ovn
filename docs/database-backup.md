@@ -61,8 +61,8 @@ builds a new cluster with new cluster/server identities.
 
 Use one maintenance window and one freshly selected backup set per database.
 Never loop over all three restore commands or reuse a set from another window.
-The clustered example below creates the set on one healthy voter and copies the
-whole set to a different voter that is the selected database's current leader.
+The clustered example below creates the set on the selected database's current
+leader and copies the whole set to a different healthy voter.
 
 1. Record `pvnctl central status` on every voter. Require all three databases
    healthy, every configured voter connected, no membership change, and the
@@ -96,20 +96,22 @@ whole set to a different voter that is the selected database's current leader.
    quiescence cannot be proven, do not restore.
 
    While writers remain frozen, confirm all three database services remain
-   active on every voter. On a healthy voter other than the recorded leader,
-   create a set containing only this window's database and verify it at the
-   source. Copy the whole directory to a new root-only path on the leader and
-   verify the destination copy. Use Proxmox's native cluster identity and the
-   destination node's pinned host-key file; do not accept a new host key.
+   active on every voter. On the recorded leader, create a set containing only
+   this window's database and verify it at the source. Copy the whole directory
+   to a new root-only path on a different healthy voter and verify the
+   destination copy. This preserves the leader-local source used by the restore
+   while proving an independent copy exists. Use Proxmox's native cluster
+   identity and the destination node's pinned host-key file; do not accept a new
+   host key.
 
-   The following clustered example is run on the source voter. Replace the
+   The following clustered example is run on the recorded leader. Replace the
    three uppercase values and set `database` to exactly one table row above.
 
    ```bash
    set -euo pipefail
    database=EXACT_DATABASE_NAME
-   copy_node=EXACT_LEADER_PVE_NODE_NAME
-   copy_ip=EXACT_LEADER_MANAGEMENT_IP
+   copy_node=EXACT_SECOND_PVE_NODE_NAME
+   copy_ip=EXACT_SECOND_NODE_MANAGEMENT_IP
 
    case "$database" in
      PVN_Control) backup_key=pvn-control ;;
@@ -162,25 +164,26 @@ whole set to a different voter that is the selected database's current leader.
        --keep-old-files --no-overwrite-dir -xpf -"
    pve_ssh "test \"\$(stat -Lc '%U:%G:%a' '$copy_root')\" = root:root:700; \
      /usr/sbin/pvn-db-backup verify '$copy_root/$backup_name'"
-   printf 'Verified leader copy: %s:%s/%s\n' \
+   printf 'Verified independent copy: %s:%s/%s\n' \
      "$copy_node" "$copy_root" "$backup_name"
    ```
 
    `copy_root` must not already exist. Never overwrite, merge into, or resume a
    partially copied destination; after an operator audits any failed transfer,
-   use another new path. Keep the verified source set as the independent copy.
-   For a one-voter deployment, use a new root-only path on off-host durable
-   storage instead of pretending the local filesystem is independent. An older
-   set captured before writer quiescence, or a set that exists on only one
-   voter, is not sufficient recovery evidence.
+   use another new path. Keep both the verified leader-local source and the
+   independent destination copy. For a one-voter deployment, use a new
+   root-only path on off-host durable storage instead of pretending the local
+   filesystem is independent. An older set captured before writer quiescence,
+   or a set that exists on only one voter, is not sufficient recovery evidence.
 
 4. On every voter, repeat `pvnctl central status` immediately before the
    restore. Require the same unique leader and term recorded in step 1, 3/3
    connected voters, the expected cluster ID, and no membership change. The
-   verified set must be present on that leader. If leadership or term changed,
-   a status call fails, or any value differs, do not issue the restore and do
-   not retry another node automatically. Restart and validate the frozen
-   services as in step 6, then schedule a new window and fresh backup set.
+   verified source set must remain present on that leader. If leadership or
+   term changed, a status call fails, or any value differs, do not issue the
+   restore and do not retry another node automatically. Restart and validate
+   the frozen services as in step 6, then schedule a new window and fresh
+   backup set.
 
    On that leader, verify the selected set again, obtain the expected digest
    from its manifest, and require an exact typed confirmation. Replace all
