@@ -131,6 +131,35 @@ describe('ApiClient', () => {
     expect((fetcher.mock.calls[0][1] as RequestInit).method).toBe('GET');
   });
 
+  it('plans, dry-runs, and applies the default security-group backfill', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ data: { cluster: 'pve-lab', projects: [], total_legacy_ports: 0 } }))
+      .mockResolvedValueOnce(jsonResponse({ data: { cluster: 'pve-lab', dry_run: true, planned: 2, results: [] } }))
+      .mockResolvedValueOnce(jsonResponse({ data: { cluster: 'pve-lab', dry_run: false, migrated: 2, results: [] } }));
+    const client = new ApiClient('/api/v1', fetcher as unknown as typeof fetch);
+    client.setCSRFToken('csrf-value');
+
+    await client.defaultSecurityGroupBackfillPlan();
+    await client.applyDefaultSecurityGroupBackfill();
+    await client.applyDefaultSecurityGroupBackfill({ dry_run: false, confirm: 'pve-lab' });
+
+    const planURL = fetcher.mock.calls[0][0] as URL;
+    const plan = fetcher.mock.calls[0][1] as RequestInit;
+    expect(planURL.pathname).toBe('/api/v1/admin/default-security-group-backfill/plan');
+    expect(plan.method).toBe('GET');
+
+    const dryRunURL = fetcher.mock.calls[1][0] as URL;
+    const dryRun = fetcher.mock.calls[1][1] as RequestInit;
+    expect(dryRunURL.pathname).toBe('/api/v1/admin/default-security-group-backfill/apply');
+    expect(dryRun.method).toBe('POST');
+    expect(JSON.parse(String(dryRun.body))).toEqual({});
+    expect(new Headers(dryRun.headers).get('X-PVN-CSRF-Token')).toBe('csrf-value');
+
+    const apply = fetcher.mock.calls[2][1] as RequestInit;
+    expect(JSON.parse(String(apply.body))).toEqual({ dry_run: false, confirm: 'pve-lab' });
+    expect(new Headers(apply.headers).get('X-PVN-CSRF-Token')).toBe('csrf-value');
+  });
+
   it('surfaces structured API errors', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({
       error: { code: 'revision_conflict', message: 'resource changed', details: { current: 3 } },

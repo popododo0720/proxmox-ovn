@@ -116,6 +116,70 @@ export interface RuntimePortResolution {
   status: string;
 }
 
+export interface DefaultSecurityGroupBackfillPort {
+  port_id: string;
+  port_name?: string;
+  revision: number;
+  attached: boolean;
+  node_id?: string;
+  node_name?: string;
+  vmid?: number;
+  nic?: string;
+}
+
+export interface DefaultSecurityGroupBackfillProject {
+  project_id: string;
+  project_name?: string;
+  default_security_group_id: string;
+  default_security_group_name?: string;
+  default_ready: boolean;
+  missing_resource_ids?: string[];
+  blocked_reason?: string;
+  detail?: string;
+  legacy_ports: DefaultSecurityGroupBackfillPort[];
+}
+
+export interface DefaultSecurityGroupBackfillPlan {
+  cluster: string;
+  generated_at: string;
+  warning: string;
+  total_legacy_ports: number;
+  total_attached_ports: number;
+  can_apply: boolean;
+  projects: DefaultSecurityGroupBackfillProject[];
+}
+
+export interface DefaultSecurityGroupBackfillInput {
+  dry_run?: boolean;
+  confirm?: string;
+}
+
+export type DefaultSecurityGroupBackfillStatus = 'planned' | 'migrated' | 'skipped' | 'failed';
+
+export interface DefaultSecurityGroupBackfillResult {
+  project_id: string;
+  project_name?: string;
+  port_id: string;
+  port_name?: string;
+  attached: boolean;
+  status: DefaultSecurityGroupBackfillStatus;
+  revision_before: number;
+  revision_after?: number;
+  error?: string;
+  detail?: string;
+}
+
+export interface DefaultSecurityGroupBackfillReport {
+  cluster: string;
+  dry_run: boolean;
+  warning: string;
+  planned: number;
+  migrated: number;
+  skipped: number;
+  failed: number;
+  results: DefaultSecurityGroupBackfillResult[];
+}
+
 export interface PortAttachInput {
   node_id: string;
   vmid: number;

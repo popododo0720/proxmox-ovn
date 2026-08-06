@@ -188,6 +188,28 @@ td strong { color: #edf4f8; font-weight: 650; }
 .port-diagnostic-reason strong { color: #dce6ec; }
 .port-diagnostic-card > .diagnostic-warnings { margin-top: 10px; }
 .diagnostic-scope { margin: 10px 0 0; color: #738692; font-size: 9px; line-height: 1.5; }
+.backfill-panel { padding: 16px; }
+.backfill-summary { display: flex; align-items: center; gap: 24px; padding-bottom: 14px; border-bottom: 1px solid var(--line-soft); }
+.backfill-summary > div { display: grid; gap: 2px; }
+.backfill-summary > div strong { color: #f2f8fb; font-size: 23px; font-weight: 600; }
+.backfill-summary > div span { color: var(--muted); font-size: 9px; }
+.backfill-summary > .status-pill { margin-left: auto; }
+.backfill-traffic-warning { display: grid; gap: 4px; margin-top: 12px; padding: 12px; color: #e8c880; background: #302817; border: 1px solid #65542c; border-radius: 7px; font-size: 10px; line-height: 1.45; }
+.backfill-blockers { display: grid; gap: 7px; margin-top: 12px; }
+.backfill-blockers > span { display: flex; gap: 7px; padding: 9px 11px; color: #ffabb0; background: #2b1d21; border: 1px solid #54343a; border-radius: 7px; font-size: 10px; }
+.backfill-candidates { margin-top: 12px; border: 1px solid var(--line-soft); border-radius: 8px; overflow: hidden; }
+.backfill-candidate { min-height: 54px; display: grid; grid-template-columns: minmax(160px, 1fr) minmax(240px, auto); align-items: center; gap: 16px; padding: 10px 12px; border-top: 1px solid var(--line-soft); }
+.backfill-candidate:first-child { border-top: 0; }
+.backfill-candidate > div:first-child { display: grid; gap: 3px; }
+.backfill-candidate strong { color: var(--text); font-size: 11px; }
+.backfill-candidate > div:first-child span { color: var(--muted); font-size: 9px; }
+.backfill-attachment { display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #c4d0d8; font-size: 9px; }
+.backfill-empty { margin-top: 12px; padding: 18px; color: #9ce7cf; background: #142b25; border: 1px solid #31594d; border-radius: 7px; font-size: 11px; text-align: center; }
+.backfill-report { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 11px 12px; color: #9ce7cf; background: #142b25; border: 1px solid #31594d; border-radius: 7px; font-size: 10px; }
+.backfill-report-warning { align-items: flex-start; flex-wrap: wrap; color: #e8c880; background: #302817; border-color: #65542c; }
+.backfill-failures { width: 100%; display: grid; gap: 3px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.08); }
+.backfill-failures span { color: #ffabb0; }
+.backfill-confirmation { display: grid; grid-template-columns: minmax(240px, 1fr) auto; align-items: end; gap: 12px; margin-top: 12px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
 .copyable-id { display: inline-flex; max-width: 260px; align-items: center; gap: 7px; }
 .copyable-id code { min-width: 0; overflow-wrap: anywhere; color: #a5b5c0; font: inherit; }
 .copyable-id button { flex: none; padding: 2px 5px; border: 1px solid #354551; border-radius: 5px; color: #8194a2; background: #121b22; font-size: 8px; font-weight: 750; cursor: pointer; }
@@ -252,6 +274,8 @@ td strong { color: #edf4f8; font-weight: 650; }
   .attachment-port-field, .attachment-actions { grid-column: 1 / -1; }
   .attachment-actions .button { flex: 1; }
   .port-diagnostic-grid { grid-template-columns: 1fr 1fr; }
+  .backfill-candidate { grid-template-columns: 1fr; gap: 7px; }
+  .backfill-attachment { justify-content: flex-start; }
   .user-chip div { display: none; }
 }
 
@@ -264,6 +288,9 @@ td strong { color: #edf4f8; font-weight: 650; }
   .attachment-workflow { grid-template-columns: 1fr; }
   .attachment-port-field, .attachment-actions { grid-column: auto; }
   .port-diagnostic-grid, .port-diagnostic-reason { grid-template-columns: 1fr; }
+  .backfill-summary { align-items: flex-start; flex-wrap: wrap; gap: 14px 24px; }
+  .backfill-summary > .status-pill { margin-left: 0; }
+  .backfill-confirmation { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -1,6 +1,9 @@
 import type {
   ApiErrorBody,
   BaseResource,
+  DefaultSecurityGroupBackfillInput,
+  DefaultSecurityGroupBackfillPlan,
+  DefaultSecurityGroupBackfillReport,
   FloatingIP,
   HealthStatus,
   ListResult,
@@ -207,6 +210,17 @@ export class ApiClient {
 
   resolveRuntimePort(node: string, vmid: number, nic: string): Promise<RuntimePortResolution> {
     return this.request<RuntimePortResolution>('/runtime/ports/resolve', { query: { node, vmid, nic } });
+  }
+
+  defaultSecurityGroupBackfillPlan(): Promise<DefaultSecurityGroupBackfillPlan> {
+    return this.request<DefaultSecurityGroupBackfillPlan>('/admin/default-security-group-backfill/plan');
+  }
+
+  applyDefaultSecurityGroupBackfill(input: DefaultSecurityGroupBackfillInput = {}): Promise<DefaultSecurityGroupBackfillReport> {
+    return this.request<DefaultSecurityGroupBackfillReport>('/admin/default-security-group-backfill/apply', {
+      method: 'POST',
+      body: input,
+    });
   }
 
   attachPort(id: ResourceID, input: PortAttachInput, revision: number, idempotencyKey: string = crypto.randomUUID()): Promise<Port> {

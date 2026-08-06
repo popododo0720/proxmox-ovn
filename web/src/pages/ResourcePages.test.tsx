@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import type { ApiClient } from '../api/client';
+import { ApiError, type ApiClient } from '../api/client';
 import { ApiProvider } from '../api/context';
 import type { FloatingIP } from '../api/types';
 import {
@@ -59,6 +59,7 @@ describe('resource reference UX', () => {
   });
 
   it('shares port and node endpoint loads across tables, references, and attachment selects', async () => {
+    const defaultSecurityGroupBackfillPlan = vi.fn().mockRejectedValue(new ApiError('not authorized', 403));
     const list = vi.fn(async (endpoint: string) => {
       if (endpoint === '/ports') return { items: [{
         id: 'port-aaaaaaaa',
@@ -81,7 +82,7 @@ describe('resource reference UX', () => {
     });
 
     render(
-      <ApiProvider client={{ list } as unknown as ApiClient}>
+      <ApiProvider client={{ list, defaultSecurityGroupBackfillPlan } as unknown as ApiClient}>
         <PortsPage />
       </ApiProvider>,
     );
@@ -98,6 +99,7 @@ describe('resource reference UX', () => {
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/ports')).toHaveLength(1);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/nodes')).toHaveLength(1);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/networks')).toHaveLength(1);
+    expect(defaultSecurityGroupBackfillPlan).toHaveBeenCalledOnce();
 
     fireEvent.click(screen.getByRole('button', { name: '+ Tenant port' }));
     expect(screen.getByText("Optional. Leave empty to apply the project's reserved default security group automatically. Any selections replace that default.")).toBeInTheDocument();

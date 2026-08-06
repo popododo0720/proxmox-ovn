@@ -15,6 +15,7 @@ import type {
   SecurityGroupRule,
   Subnet,
 } from '../api/types';
+import { DefaultSecurityGroupBackfillPanel } from '../components/DefaultSecurityGroupBackfillPanel';
 import { PortAttachmentPanel } from '../components/PortAttachmentPanel';
 import { PortDiagnosticCell } from '../components/PortDiagnostics';
 import type { FormField } from '../components/CreateDialog';
@@ -251,6 +252,7 @@ export function PortsPage() {
       deleteResource={(port) => api.deprovisionPort(port.id, port.revision || 0)}
       emptyMessage="Provision a tenant port, then attach it to a VM NIC below."
     />
+    <DefaultSecurityGroupBackfillPanel />
     <PortAttachmentPanel />
   </div>;
 }
