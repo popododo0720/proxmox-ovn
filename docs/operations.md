@@ -412,6 +412,12 @@ Applying requires typing the exact PVE cluster name and changes policy for
 attached traffic immediately. Review any required external ingress rules
 before applying.
 
+The same display rule applies throughout the PVN page: normal tables,
+selectors, confirmations, diagnostics, and bounded errors resolve references
+to human names when the referenced object is visible. Unknown UUIDs are
+redacted instead of becoming an operator-facing label. Open **Details** for the
+raw, copyable UUIDs needed to correlate API or database records.
+
 The dry run issues an opaque plan token covering the exact candidate ports and
 their revisions. Apply accepts only that preview: if a port is added or changes
 first, PVN rejects the whole request and the page refreshes the plan for a new
@@ -443,23 +449,32 @@ pvn_bootstrap=$(curl -fsSL https://github.com/popododo0720/proxmox-ovn/releases/
   bash -c "$pvn_bootstrap" pvn-update.sh apply --confirm CLUSTER_NAME
 ```
 
-The updater takes the shared PVE `mutation` lease, pins the exact online
-name/ID/management-IP membership and cluster configuration version, stages and
-hashes the DEB on every pending node, then upgrades nodes sequentially. Before
-and after every node it requires PVE quorum, consistent package state, the PVE
-UI hook, node readiness/`pvnctl doctor` for active transport nodes, and healthy
-mode-specific database status for active central nodes: exact local schema
-identity over all three Unix sockets in standalone mode, or local Raft status
-in clustered mode. Independently of activation markers, package `postinst`
-runs the dedicated persisted/live Corosync doctor before its first possible
-service restart. The updater repeats that exact check after installation and
-on every already-updated node before staging or applying the next node. Thus a
-stale inactive topology-only node also stops a 1-, 3-, 5-, or larger supported
-odd-node rollout before another package mutation. Existing `/etc/pvn`, shared
-PVN configuration, and database paths are preserved; an unexpected
-configuration change fails the rollout. A failed node stops the sequence.
-Nodes already completed remain upgraded, and a later run safely verifies/skips
-them while continuing the one remaining older version.
+The updater takes the shared PVE `mutation` lease and pins the exact online
+name/ID/management-IP membership and cluster configuration version. Before it
+stages any DEB, its own package-independent Corosync verifier checks every
+node; it does not trust the `pvnctl` binary from the package being replaced.
+Clustered nodes must expose one exact Corosync package version plus identical
+persisted and loaded membership, rings, addresses, and `config_version`.
+Standalone mode instead requires both `corosync.conf` and a running Corosync
+daemon to be absent. Helper commands have a 20-second deadline and separate
+4-MiB stdout/stderr limits; timeout, overflow, non-UTF-8 output, or a changed
+root-owned input file fails closed.
+
+The updater repeats that same embedded snapshot immediately before staging,
+before and after every package transaction, and in the final sweep. Package
+`postinst` separately runs the newly installed
+`pvnctl doctor --check corosync-runtime-config` before its first possible
+service restart, and already-updated nodes must keep passing that package gate.
+The remaining rollout checks require PVE quorum, consistent package state, the
+PVE UI hook, node readiness/`pvnctl doctor` for active transport nodes, and
+healthy mode-specific database status for active central nodes: exact local
+schema identity over all three Unix sockets in standalone mode, or local Raft
+status in clustered mode. Thus a stale inactive topology-only node also stops
+a 1-, 3-, 5-, or larger supported odd-node rollout before another package
+mutation. Existing `/etc/pvn`, shared PVN configuration, and database paths are
+preserved; an unexpected configuration change fails the rollout. A failed node
+stops the sequence. Nodes already completed remain upgraded, and a later run
+safely verifies/skips them while continuing the one remaining older version.
 
 Proxmox also exposes a volatile membership-view generation as the top-level
 `version` in `/etc/pve/.members`. It can advance while the durable cluster is

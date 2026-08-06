@@ -22,6 +22,10 @@ even-sized clusters are rejected before topology changes.
 - running VM NIC attach and detach
 - embedded `PVN` page in the Proxmox web interface
 
+Normal PVN tables, selectors, confirmations, and bounded error messages resolve
+known resource references to human names. Unknown UUIDs are redacted there;
+open **Details** when an operator needs the full, copyable internal UUID.
+
 PVE built-in SDN, BGP, IPv6, LXC, load balancing, metadata service, and live
 migration coordination are intentionally outside the first release.
 

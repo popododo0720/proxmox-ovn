@@ -2,6 +2,8 @@ proxmox-ovn (0.2.14) unstable; urgency=medium
 
   * Show resource names in normal views and keep UUIDs in Details.
   * Gate installs and updates on persisted/runtime Corosync consistency.
+  * Bound the updater's package-independent Corosync preflight before staging
+    and around every package transaction.
   * Converge Corosync ring migrations through a live dual-ring handoff.
 
  -- PVN Project <root@localhost>  Thu, 06 Aug 2026 03:14:44 +0000

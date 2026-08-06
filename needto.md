@@ -78,6 +78,14 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
       safety path, exact persisted/runtime gates, resumable stage boundaries,
       and strict recovery of the uniform v0.2.13 stale-runtime shape before any
       host-network mutation
+- [ ] Prove the active topology schema-1 to schema-2 ledger-only migration on
+      both a standalone 1/1 node and an odd clustered deployment; it must
+      preserve host networking and activation state and reject mixed/drifted
+      ledgers
+- [ ] Run the full upgrade order with every central restart marker preserved:
+      uniform package rollout → active topology schema migration → combined
+      topology/package control-plane repin → guarded standalone or one-voter-
+      at-a-time central restart
 
 ---
 
