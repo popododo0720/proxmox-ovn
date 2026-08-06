@@ -548,6 +548,23 @@ else:
         "pre-restore accepted a mismatched selected-database term",
     )
 
+    wrong_leader_report = copy.deepcopy(follower_c_report)
+    wrong_leader_report["databases"][1]["leader"] = "dead"
+    wrong_leader_path = write_status_report(
+        "wrong-leader-status.json", wrong_leader_report
+    )
+    wrong_leader_specs = [
+        f"{source_hostname}={status_paths[source_hostname]}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-c={wrong_leader_path}",
+    ]
+    reset_status()
+    result = invoke(*pre_restore_arguments(specifications=wrong_leader_specs))
+    check(
+        result.returncode != 0 and "reports a different leader" in result.stderr,
+        "pre-restore accepted a follower that reported another leader",
+    )
+
     wrong_port_report = copy.deepcopy(follower_c_report)
     wrong_port_report["databases"][1]["address"] = "ssl:192.0.2.12:9999"
     wrong_port_path = write_status_report("wrong-port-status.json", wrong_port_report)

@@ -954,6 +954,10 @@ def pre_restore_check(
     if len(leaders) != 1:
         fail("selected database must have exactly one leader across voter reports")
     leader_node, leader_identity = leaders[0]
+    leader_nickname = leader_identity.server_id[:4]
+    for node, identity in selected.items():
+        if identity.role == "follower" and identity.leader.lower() != leader_nickname:
+            fail(f"{node} selected database follower reports a different leader")
     source_hostname = manifest["source"]["hostname"]
     if leader_node != source_hostname:
         fail("selected database leader does not match the manifest source hostname")
