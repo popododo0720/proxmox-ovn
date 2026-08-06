@@ -60,7 +60,7 @@ function BackfillReport({ report }: { report: DefaultSecurityGroupBackfillReport
   );
 }
 
-export function DefaultSecurityGroupBackfillPanel() {
+export function DefaultSecurityGroupBackfillPanel({ onApplied }: { onApplied?: () => void }) {
   const api = useApi();
   const [plan, setPlan] = useState<DefaultSecurityGroupBackfillPlan>();
   const [preview, setPreview] = useState<DefaultSecurityGroupBackfillReport>();
@@ -137,6 +137,7 @@ export function DefaultSecurityGroupBackfillPanel() {
       setReport(value);
       setPreview(undefined);
       setConfirmation('');
+      onApplied?.();
       try {
         setPlan(await api.defaultSecurityGroupBackfillPlan());
       } catch (reason) {

@@ -118,10 +118,11 @@ describe('DefaultSecurityGroupBackfillPanel', () => {
     const applyDefaultSecurityGroupBackfill = vi.fn()
       .mockResolvedValueOnce(dryRun)
       .mockResolvedValueOnce(partialApply);
+    const onApplied = vi.fn();
 
     render(
       <ApiProvider client={{ defaultSecurityGroupBackfillPlan, applyDefaultSecurityGroupBackfill } as unknown as ApiClient}>
-        <DefaultSecurityGroupBackfillPanel />
+        <DefaultSecurityGroupBackfillPanel onApplied={onApplied} />
       </ApiProvider>,
     );
 
@@ -156,6 +157,7 @@ describe('DefaultSecurityGroupBackfillPanel', () => {
     expect(within(panel).getByText('database · Unavailable project')).toBeInTheDocument();
     expect(within(panel).getByText('complete')).toBeInTheDocument();
     expect(applyDefaultSecurityGroupBackfill).toHaveBeenNthCalledWith(2, { dry_run: false, confirm: 'pve-lab' });
+    expect(onApplied).toHaveBeenCalledOnce();
     await waitFor(() => expect(defaultSecurityGroupBackfillPlan).toHaveBeenCalledTimes(2));
     expect(panel).not.toHaveTextContent(portID);
     expect(panel).not.toHaveTextContent('failed resource');
@@ -197,10 +199,11 @@ describe('DefaultSecurityGroupBackfillPanel', () => {
     const applyDefaultSecurityGroupBackfill = vi.fn()
       .mockResolvedValueOnce(dryRun)
       .mockRejectedValueOnce(new ApiError(`conflict ${portID}`, 409));
+    const onApplied = vi.fn();
 
     render(
       <ApiProvider client={{ defaultSecurityGroupBackfillPlan, applyDefaultSecurityGroupBackfill } as unknown as ApiClient}>
-        <DefaultSecurityGroupBackfillPanel />
+        <DefaultSecurityGroupBackfillPanel onApplied={onApplied} />
       </ApiProvider>,
     );
 
@@ -213,5 +216,6 @@ describe('DefaultSecurityGroupBackfillPanel', () => {
     expect(await within(panel).findByText('The backfill could not be applied. Run a new dry-run before trying again.')).toBeInTheDocument();
     expect(within(panel).queryByRole('button', { name: 'Apply backfill' })).not.toBeInTheDocument();
     expect(panel).not.toHaveTextContent(portID);
+    expect(onApplied).not.toHaveBeenCalled();
   });
 });

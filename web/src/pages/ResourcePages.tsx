@@ -20,6 +20,7 @@ import { PortAttachmentPanel } from '../components/PortAttachmentPanel';
 import { PortDiagnosticCell } from '../components/PortDiagnostics';
 import type { FormField } from '../components/CreateDialog';
 import { ReferenceLabel } from '../components/ReferenceLabel';
+import { useResourceCatalog } from '../components/ResourceCatalog';
 import { ResourcePage, formatValue, type Column } from '../components/ResourcePage';
 import { StatusPill } from '../components/StatusPill';
 import {
@@ -212,6 +213,7 @@ export function RoutersPage() {
 
 export function PortsPage() {
   const api = useApi();
+  const portCatalog = useResourceCatalog('/ports', false);
 
   return <div className="stacked-pages">
     <ResourcePage<Port>
@@ -252,7 +254,7 @@ export function PortsPage() {
       deleteResource={(port) => api.deprovisionPort(port.id, port.revision || 0)}
       emptyMessage="Provision a tenant port, then attach it to a VM NIC below."
     />
-    <DefaultSecurityGroupBackfillPanel />
+    <DefaultSecurityGroupBackfillPanel onApplied={portCatalog.invalidate} />
     <PortAttachmentPanel />
   </div>;
 }
