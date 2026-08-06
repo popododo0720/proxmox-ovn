@@ -160,7 +160,9 @@ systemctl start pvn-control-db.service \
 
 Do not start `ovn-northd`, do not start `pvn-central.target`, and never use
 `--ignore-dependencies`. On every central voter, prove the exact service
-topology:
+topology. The database units' required read-only
+`pvn-central-preflight.service` may be `active (exited)`; the dedicated
+listener and northd readiness units must remain inactive:
 
 ```bash
 for unit in pvn-control-db.service \
@@ -168,7 +170,8 @@ for unit in pvn-control-db.service \
   [ "$(systemctl show --property=ActiveState --value "$unit")" = active ] || exit 1
 done
 for unit in pvn-node.target pvn-node-ready.service \
-  pvn-central.target ovn-northd.service pvn-manager.service \
+  pvn-central.target ovn-northd.service pvn-ovn-northd-ready.service \
+  pvn-ovn-db-listeners.service pvn-ovn-host-config.service pvn-manager.service \
   pvn-agent.service ovn-controller.service; do
   [ "$(systemctl show --property=ActiveState --value "$unit")" = inactive ] || exit 1
 done
@@ -501,7 +504,7 @@ identity, duplicates, and missing/extra/conflicting parents fail closed. The
 PVN Control snapshot digest must also be unchanged from the beginning to the
 end of the audit. Reconciliation may create or update the current desired
 graph, but the audit itself never creates, updates, deletes, or prunes. In
-v0.2.14 an orphan is reported and left intact because no cluster ownership
+Current releases report an orphan and leave it intact because no cluster ownership
 marker authorizes global cleanup; it is never silently deleted. If either
 reconciliation or audit fails, the command returns nonzero without a success
 JSON result, and the writer freeze must remain in place.

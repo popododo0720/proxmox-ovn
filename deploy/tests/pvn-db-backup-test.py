@@ -134,7 +134,7 @@ try:
         "fi\n"
         "case \"$4\" in\n"
         "  pvn-control-db.service|ovn-ovsdb-server-nb.service|ovn-ovsdb-server-sb.service) echo active ;;\n"
-        "  pvn-node.target|pvn-node-ready.service|pvn-central.target|ovn-northd.service|pvn-manager.service|pvn-agent.service|ovn-controller.service) echo inactive ;;\n"
+        "  pvn-node.target|pvn-node-ready.service|pvn-central.target|ovn-northd.service|pvn-ovn-northd-ready.service|pvn-ovn-db-listeners.service|pvn-ovn-host-config.service|pvn-manager.service|pvn-agent.service|ovn-controller.service) echo inactive ;;\n"
         "  *) exit 2 ;;\n"
         "esac\n",
         encoding="ascii",
@@ -779,7 +779,12 @@ else:
         "live Raft identity drift created a restore receipt",
     )
 
-    for active_node_unit in ("pvn-node.target", "pvn-node-ready.service"):
+    for active_node_unit in (
+        "pvn-node.target",
+        "pvn-node-ready.service",
+        "pvn-ovn-host-config.service",
+        "pvn-ovn-db-listeners.service",
+    ):
         reset_status()
         unit_override.write_text(f"{active_node_unit} active\n", encoding="ascii")
         result = invoke(*pre_restore_arguments())
@@ -1047,6 +1052,28 @@ else:
     check(
         not active_writer_output.exists(),
         "active northd rejection changed the output filesystem",
+    )
+    unit_override.unlink()
+
+    reset_status()
+    unit_override.write_text("pvn-ovn-northd-ready.service active\n", encoding="ascii")
+    active_northd_gate_output = temporary / "active-northd-gate-backups"
+    result = invoke(
+        "create",
+        "--output",
+        str(active_northd_gate_output),
+        "--database",
+        "ovn-nb",
+        "--recovery-window",
+    )
+    check(
+        result.returncode != 0
+        and "pvn-ovn-northd-ready.service inactive" in result.stderr,
+        "recovery window accepted an active northd readiness gate",
+    )
+    check(
+        not active_northd_gate_output.exists(),
+        "active northd readiness rejection changed the output filesystem",
     )
     unit_override.unlink()
 
