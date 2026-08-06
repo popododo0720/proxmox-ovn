@@ -3436,11 +3436,44 @@ def report_ledger_upgrade_proof_sha256(report: dict[str, Any]) -> str:
     return digest_text(canonical_json(proof))
 
 
+def active_journal_bridge_exact(
+    nodes: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+    spec: dict[str, Any],
+    transaction: str,
+    corosync: dict[str, Any],
+) -> bool:
+    if len(nodes) != len(reports) or corosync.get("sha256") is None:
+        return False
+    for node, report in zip(nodes, reports):
+        journal = report.get("journal")
+        if (
+            not isinstance(journal, dict)
+            or journal.get("schema") != 1
+            or journal.get("phase") != "complete"
+            or journal.get("transaction") != transaction
+            or journal.get("spec") != spec
+            or journal.get("node") != node["name"]
+            or journal.get("before_corosync_sha256") != corosync["sha256"]
+            or report.get("corosync_sha256") != corosync["sha256"]
+            or journal.get("desired_interfaces_sha256")
+            != report.get("interfaces_sha256")
+            or report.get("pending_interfaces_sha256") is not None
+            or report.get("network_state") != "desired"
+        ):
+            return False
+    return True
+
+
 def validate_active_control_ledger(
     cluster_name: str,
     nodes: list[dict[str, Any]],
     reports: list[dict[str, Any]],
     membership_guard: dict[str, Any],
+    topology_schema: int,
+    corosync: dict[str, Any],
+    journal_bridge_exact: bool,
+    candidate_corosync_exact: bool,
     expected_legacy: dict[str, Any],
     legacy_sha256: str,
     candidate_sha256: str,
@@ -3510,6 +3543,19 @@ def validate_active_control_ledger(
     }
     if not isinstance(snapshot, dict) or set(snapshot) != snapshot_keys:
         fail("active control-plane snapshot is missing")
+    live_cluster_version = membership_guard.get("cluster_version")
+    pinned_cluster_version = snapshot.get("cluster_version")
+    legacy_version_bridge = (
+        topology_schema in {1, 2}
+        and snapshot.get("topology_sha256") == legacy_sha256
+        and type(pinned_cluster_version) is int
+        and pinned_cluster_version >= 0
+        and type(live_cluster_version) is int
+        and live_cluster_version == pinned_cluster_version + 1
+        and corosync.get("config_version") == live_cluster_version
+        and journal_bridge_exact
+        and candidate_corosync_exact
+    )
     if (
         membership_guard.get("mode") != "cluster"
         or snapshot.get("mode") != "raft"
@@ -3517,7 +3563,10 @@ def validate_active_control_ledger(
         or snapshot.get("cluster_name") != cluster_name
         or type(snapshot.get("members_version")) is not int
         or snapshot["members_version"] < 0
-        or snapshot.get("cluster_version") != membership_guard.get("cluster_version")
+        or (
+            pinned_cluster_version != live_cluster_version
+            and not legacy_version_bridge
+        )
         or snapshot.get("guest_mtu") != expected_legacy["guest_mtu"]
         or snapshot.get("physnet") != expected_legacy["physnet"]
     ):
@@ -3567,6 +3616,7 @@ def validate_active_control_ledger(
         ),
         "package_version": next(iter(package_versions)),
         "db_cluster_ids": dict(db_ids),
+        "legacy_cluster_version_bridge": legacy_version_bridge,
     }
 
 
@@ -3810,9 +3860,13 @@ def build_active_ledger_upgrade_plan(
         previous_text != candidate_text or previous_sha256 != candidate_sha256
     ):
         fail("schema 2 topology ledger is not the exact canonical candidate")
+    journal_bridge_exact = active_journal_bridge_exact(
+        nodes, reports, spec, transaction, corosync,
+    )
     control_state = validate_active_control_ledger(
-        cluster_name, nodes, reports, membership_guard, expected_legacy,
-        legacy_sha256, candidate_sha256,
+        cluster_name, nodes, reports, membership_guard, schema, corosync,
+        journal_bridge_exact, candidate.get("corosync") == corosync,
+        expected_legacy, legacy_sha256, candidate_sha256,
     )
     prerequisite_errors = active_upgrade_readiness_issues(
         nodes, reports, schema, control_state,
@@ -3824,6 +3878,9 @@ def build_active_ledger_upgrade_plan(
         "candidate_text": candidate_text,
         "candidate_sha256": candidate_sha256,
         "corosync": corosync,
+        "legacy_cluster_version_bridge": control_state[
+            "legacy_cluster_version_bridge"
+        ],
         "prerequisite_errors": prerequisite_errors,
         "proofs": {
             report["node"]: report_ledger_upgrade_proof_sha256(report)
@@ -4729,6 +4786,11 @@ def main() -> int:
                     print(f"    - {error}")
             else:
                 print("  Upgrade readiness: READY (package, restart marker, doctor, and Raft N/N)")
+            if active_upgrade["legacy_cluster_version_bridge"]:
+                print(
+                    "  Recovery bridge: control snapshot cluster_version is exactly one "
+                    "behind the journal-proven live Corosync version"
+                )
         elif activation_mode != "inactive":
             fail("PVN activation state is neither uniformly inactive nor active")
         if args.operation == "plan":

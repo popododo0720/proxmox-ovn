@@ -1019,6 +1019,36 @@ with open(path, "w", encoding="utf-8") as stream:
 PY
 }
 
+seed_active_cluster_version_bridge() {
+    seed_active_schema1
+    python3 - "$STATE" "$MEMBERS" <<'PY'
+import hashlib
+import json
+import re
+import sys
+
+state_path, members_path = sys.argv[1:]
+state = json.load(open(state_path, encoding="utf-8"))
+members = json.load(open(members_path, encoding="utf-8"))
+versions = re.findall(
+    r"^\s*config_version:\s*(\d+)\s*$", state["corosync_text"], re.M
+)
+assert len(versions) == 1 and int(versions[0]) > 0
+live_version = int(versions[0])
+members["cluster"]["version"] = live_version
+control = json.loads(state["control_ledger"])
+control["snapshot"]["cluster_version"] = live_version - 1
+state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
+state["control_ledger_sha256"] = hashlib.sha256(
+    state["control_ledger"].encode()
+).hexdigest()
+with open(state_path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream, sort_keys=True)
+with open(members_path, "w", encoding="utf-8") as stream:
+    json.dump(members, stream, sort_keys=True)
+PY
+}
+
 PYTHONDONTWRITEBYTECODE=1 python3 -c \
     "compile(open('$TOPOLOGY', encoding='utf-8').read(), '$TOPOLOGY', 'exec')"
 
@@ -1356,6 +1386,100 @@ fi
 grep -q 'already the exact schema 2 candidate; no-op' \
     "$WORK/active-ledger-consumed-marker-rerun.out" ||
     fail "post-restart consumed-marker schema 2 state was not accepted"
+
+seed_active_cluster_version_bridge
+: > "$LOG"
+PVN_TEST_ACTIVE=yes "$TOPOLOGY" plan \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-cluster-version-bridge-plan.out"
+grep -q 'Recovery bridge: control snapshot cluster_version is exactly one behind' \
+    "$WORK/active-ledger-cluster-version-bridge-plan.out" ||
+    fail "exact legacy one-step cluster_version bridge was not reported"
+grep -q 'Upgrade readiness: READY' \
+    "$WORK/active-ledger-cluster-version-bridge-plan.out" ||
+    fail "exact legacy one-step cluster_version bridge was not ready"
+assert_no_mutation
+
+: > "$LOG"
+PVN_TEST_ACTIVE=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-cluster-version-bridge-apply.out"
+[ "$(grep -c 'action=write-ledger' "$LOG")" -eq 1 ] ||
+    fail "one-step cluster_version bridge did not perform exactly one topology CAS"
+
+: > "$LOG"
+PVN_TEST_ACTIVE=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-cluster-version-bridge-rerun.out"
+if grep -q 'action=write-ledger' "$LOG"; then
+    fail "post-CAS one-step cluster_version bridge repeated the topology CAS"
+fi
+
+python3 - "$STATE" <<'PY'
+import hashlib
+import json
+import sys
+path = sys.argv[1]
+state = json.load(open(path, encoding="utf-8"))
+control = json.loads(state["control_ledger"])
+control["snapshot"]["topology_sha256"] = hashlib.sha256(
+    state["ledger"].encode()
+).hexdigest()
+for node in control["snapshot"]["nodes"]:
+    node["package_version"] = "0.2.14-1"
+state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
+state["control_ledger_sha256"] = hashlib.sha256(
+    state["control_ledger"].encode()
+).hexdigest()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream, sort_keys=True)
+PY
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes "$TOPOLOGY" plan \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-candidate-stale-cluster-version.out" 2>&1
+then
+    fail "candidate-pinned stale cluster_version unexpectedly used the legacy bridge"
+fi
+assert_no_mutation
+
+seed_active_cluster_version_bridge
+python3 - "$STATE" <<'PY'
+import hashlib
+import json
+import sys
+path = sys.argv[1]
+state = json.load(open(path, encoding="utf-8"))
+control = json.loads(state["control_ledger"])
+control["snapshot"]["cluster_version"] -= 1
+state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
+state["control_ledger_sha256"] = hashlib.sha256(
+    state["control_ledger"].encode()
+).hexdigest()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream, sort_keys=True)
+PY
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes "$TOPOLOGY" plan \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-two-step-cluster-version.out" 2>&1
+then
+    fail "two-step stale control cluster_version unexpectedly planned"
+fi
+assert_no_mutation
+
+seed_active_cluster_version_bridge
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes PVN_TEST_ACTIVE_JOURNAL_DRIFT_HOST=prox2 \
+    "$TOPOLOGY" plan --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-cluster-version-journal-drift.out" 2>&1
+then
+    fail "one-step cluster_version bridge accepted incomplete N/N journal proof"
+fi
+assert_no_mutation
+cp "$MEMBERS_GOOD" "$MEMBERS"
 
 seed_active_schema1
 : > "$LOG"
