@@ -105,8 +105,9 @@ func (err *APIError) Error() string {
 }
 
 type apiEnvelope struct {
-	Data   json.RawMessage   `json:"data"`
-	Errors map[string]string `json:"errors,omitempty"`
+	Data    json.RawMessage   `json:"data"`
+	Errors  map[string]string `json:"errors,omitempty"`
+	Message string            `json:"message,omitempty"`
 }
 
 func (client *Client) request(ctx context.Context, method, path string, form url.Values) (json.RawMessage, error) {
@@ -146,7 +147,9 @@ func (client *Client) request(ctx context.Context, method, path string, form url
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		message := strings.TrimSpace(string(payload))
-		if len(envelope.Errors) > 0 {
+		if strings.TrimSpace(envelope.Message) != "" {
+			message = strings.TrimSpace(envelope.Message)
+		} else if len(envelope.Errors) > 0 {
 			parts := make([]string, 0, len(envelope.Errors))
 			for key, value := range envelope.Errors {
 				parts = append(parts, key+": "+value)
@@ -156,6 +159,40 @@ func (client *Client) request(ctx context.Context, method, path string, form url
 		return nil, &APIError{StatusCode: response.StatusCode, Message: message}
 	}
 	return envelope.Data, nil
+}
+
+// PoolExists reports whether poolID identifies an existing Proxmox resource
+// pool. Proxmox returns a server error for an exact lookup of a missing pool,
+// so only that specific response is normalized to false; all other API errors
+// remain visible to callers.
+func (client *Client) PoolExists(ctx context.Context, poolID string) (bool, error) {
+	if strings.TrimSpace(poolID) == "" {
+		return false, errors.New("PVE pool ID is required")
+	}
+	if strings.ContainsAny(poolID, "\x00\r\n") {
+		return false, errors.New("PVE pool ID contains control characters")
+	}
+
+	query := url.Values{"poolid": []string{poolID}}
+	data, err := client.request(ctx, http.MethodGet, "/api2/json/pools?"+query.Encode(), nil)
+	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && strings.TrimSpace(apiErr.Message) == fmt.Sprintf("pool '%s' does not exist", poolID) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var pools []struct {
+		PoolID string `json:"poolid"`
+	}
+	if err := json.Unmarshal(data, &pools); err != nil {
+		return false, fmt.Errorf("decode PVE pool lookup: %w", err)
+	}
+	if len(pools) != 1 || pools[0].PoolID != poolID {
+		return false, fmt.Errorf("PVE pool lookup returned an unexpected result for %q", poolID)
+	}
+	return true, nil
 }
 
 // VMConfig contains only the network-specific portion needed by the agent.

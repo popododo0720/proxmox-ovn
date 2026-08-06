@@ -492,6 +492,87 @@ func TestNewRequiresStore(t *testing.T) {
 	}
 }
 
+func TestProjectWritesRequireExistingPVEPoolAfterAuthorization(t *testing.T) {
+	store := controlstore.NewMemory()
+	var calls []string
+	validator := PoolValidatorFunc(func(_ context.Context, _ *http.Request, poolID string) (bool, error) {
+		calls = append(calls, poolID)
+		switch poolID {
+		case "pool-existing":
+			return true, nil
+		case "pool-error":
+			return false, errors.New("PVE unavailable")
+		default:
+			return false, nil
+		}
+	})
+	authorized := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
+		return Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"SDN.Allocate": true}}}, nil
+	})
+	server, err := New(Options{Store: store, SessionProvider: authorized, PoolValidator: validator})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	createdResponse := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{
+		"name": "tenant", "pool_id": "pool-existing",
+	}, map[string]string{"Idempotency-Key": "project-existing"})
+	if createdResponse.Code != http.StatusCreated {
+		t.Fatalf("existing pool create status=%d body=%s", createdResponse.Code, createdResponse.Body.String())
+	}
+	created := decodeData[model.Project](t, createdResponse)
+
+	missingResponse := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{
+		"name": "missing", "pool_id": "pool-missing",
+	}, map[string]string{"Idempotency-Key": "project-missing"})
+	if missingResponse.Code != http.StatusUnprocessableEntity || !strings.Contains(missingResponse.Body.String(), `"field":"pool_id"`) || !strings.Contains(missingResponse.Body.String(), "does not exist") {
+		t.Fatalf("missing pool create status=%d body=%s", missingResponse.Code, missingResponse.Body.String())
+	}
+
+	created.PoolID = "pool-missing"
+	updateResponse := request(t, server, http.MethodPut, "/api/v1/projects/"+created.ID, created, map[string]string{
+		"Idempotency-Key": "project-update-missing", "If-Match": `"1"`,
+	})
+	if updateResponse.Code != http.StatusUnprocessableEntity || !strings.Contains(updateResponse.Body.String(), "does not exist") {
+		t.Fatalf("missing pool update status=%d body=%s", updateResponse.Code, updateResponse.Body.String())
+	}
+	stored, err := store.Get(context.Background(), model.KindProject, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.(*model.Project).PoolID; got != "pool-existing" {
+		t.Fatalf("stored pool after rejected update = %q", got)
+	}
+
+	dependencyResponse := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{
+		"name": "dependency", "pool_id": "pool-error",
+	}, map[string]string{"Idempotency-Key": "project-pool-error"})
+	if dependencyResponse.Code != http.StatusBadGateway || !strings.Contains(dependencyResponse.Body.String(), "pve_pool_validation_failed") {
+		t.Fatalf("pool lookup error status=%d body=%s", dependencyResponse.Code, dependencyResponse.Body.String())
+	}
+
+	callCount := len(calls)
+	unauthorized, err := New(Options{
+		Store: store,
+		SessionProvider: SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
+			return Session{User: "limited@pam", Permissions: map[string]any{}}, nil
+		}),
+		PoolValidator: validator,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deniedResponse := request(t, unauthorized, http.MethodPost, "/api/v1/projects", map[string]any{
+		"name": "denied", "pool_id": "pool-missing",
+	}, map[string]string{"Idempotency-Key": "project-denied"})
+	if deniedResponse.Code != http.StatusForbidden {
+		t.Fatalf("unauthorized create status=%d body=%s", deniedResponse.Code, deniedResponse.Body.String())
+	}
+	if len(calls) != callCount {
+		t.Fatalf("pool validator called before authorization: calls=%v", calls)
+	}
+}
+
 func TestPermissionEnforcement(t *testing.T) {
 	store := controlstore.NewMemory()
 	projectResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project")
