@@ -62,6 +62,10 @@ type forcedReconciler interface {
 	ReconcileAll(context.Context) error
 }
 
+type managedGraphAuditor interface {
+	AuditManagedGraph(context.Context) error
+}
+
 type recoverySnapshotter interface {
 	Snapshot(context.Context, []model.Kind, controlstore.ListOptions) (controlstore.ResourceSnapshot, error)
 }
@@ -158,6 +162,7 @@ func verifyRecoveryReconcilePass(before, after controlstore.ResourceSnapshot) er
 
 type recoveryRuntime struct {
 	reconciler forcedReconciler
+	auditor    managedGraphAuditor
 	close      func()
 }
 
@@ -226,8 +231,14 @@ func recoveryCommandWith(args []string, dependencies recoveryDependencies) error
 	if runtime.reconciler == nil {
 		return errors.New("recovery reconciler is unavailable")
 	}
+	if runtime.auditor == nil {
+		return errors.New("recovery OVN managed graph auditor is unavailable")
+	}
 	if err := runtime.reconciler.ReconcileAll(ctx); err != nil {
 		return fmt.Errorf("force OVN Northbound reconciliation: %w", err)
+	}
+	if err := runtime.auditor.AuditManagedGraph(ctx); err != nil {
+		return fmt.Errorf("audit reconciled OVN managed graph: %w", err)
 	}
 	return writeJSON(dependencies.output, map[string]string{
 		"action":  "reconcile-ovn",
@@ -269,6 +280,7 @@ func openRecoveryRuntime(ctx context.Context, cfg config.Config) (recoveryRuntim
 	controller := reconcile.NewController(store, renderer, reconcile.WithLeaseDuration(cfg.Cluster.OrphanGrace))
 	return recoveryRuntime{
 		reconciler: verifiedRecoveryReconciler{reconciler: controller, store: store},
+		auditor:    renderer,
 		close:      store.Close,
 	}, nil
 }

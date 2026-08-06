@@ -25,6 +25,15 @@ type recoveryReconcilerStub struct {
 	err         error
 	deadline    time.Time
 	hasDeadline bool
+	events      *[]string
+}
+
+type recoveryAuditorStub struct {
+	calls       int
+	err         error
+	deadline    time.Time
+	hasDeadline bool
+	events      *[]string
 }
 
 type recoverySnapshotterStub struct {
@@ -48,6 +57,18 @@ func (stub *recoverySnapshotterStub) Snapshot(context.Context, []model.Kind, con
 func (stub *recoveryReconcilerStub) ReconcileAll(ctx context.Context) error {
 	stub.calls++
 	stub.deadline, stub.hasDeadline = ctx.Deadline()
+	if stub.events != nil {
+		*stub.events = append(*stub.events, "reconcile")
+	}
+	return stub.err
+}
+
+func (stub *recoveryAuditorStub) AuditManagedGraph(ctx context.Context) error {
+	stub.calls++
+	stub.deadline, stub.hasDeadline = ctx.Deadline()
+	if stub.events != nil {
+		*stub.events = append(*stub.events, "audit")
+	}
 	return stub.err
 }
 
@@ -180,7 +201,9 @@ func TestRecoveryReconcileOVNRequiresExplicitRootGates(t *testing.T) {
 }
 
 func TestRecoveryReconcileOVNRunsOneForcedPassAndCloses(t *testing.T) {
-	reconciler := &recoveryReconcilerStub{}
+	events := make([]string, 0, 2)
+	reconciler := &recoveryReconcilerStub{events: &events}
+	auditor := &recoveryAuditorStub{events: &events}
 	closed := 0
 	var output bytes.Buffer
 	err := recoveryCommandWith(
@@ -197,7 +220,7 @@ func TestRecoveryReconcileOVNRunsOneForcedPassAndCloses(t *testing.T) {
 				if cfg.Cluster.ID != "lab-cluster" {
 					t.Fatalf("config=%+v", cfg)
 				}
-				return recoveryRuntime{reconciler: reconciler, close: func() { closed++ }}, nil
+				return recoveryRuntime{reconciler: reconciler, auditor: auditor, close: func() { closed++ }}, nil
 			},
 			output: &output,
 		},
@@ -205,12 +228,18 @@ func TestRecoveryReconcileOVNRunsOneForcedPassAndCloses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reconciler.calls != 1 || closed != 1 {
-		t.Fatalf("reconcile calls=%d close calls=%d", reconciler.calls, closed)
+	if reconciler.calls != 1 || auditor.calls != 1 || closed != 1 {
+		t.Fatalf("reconcile calls=%d audit calls=%d close calls=%d", reconciler.calls, auditor.calls, closed)
+	}
+	if strings.Join(events, ",") != "reconcile,audit" {
+		t.Fatalf("recovery call order=%v", events)
 	}
 	remaining := time.Until(reconciler.deadline)
 	if !reconciler.hasDeadline || remaining < 90*time.Second || remaining > 2*time.Minute {
 		t.Fatalf("reconcile deadline present=%v remaining=%s", reconciler.hasDeadline, remaining)
+	}
+	if !auditor.hasDeadline || !auditor.deadline.Equal(reconciler.deadline) {
+		t.Fatalf("audit deadline present=%v deadline=%s, reconcile deadline=%s", auditor.hasDeadline, auditor.deadline, reconciler.deadline)
 	}
 	var report map[string]string
 	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
@@ -243,6 +272,7 @@ func TestRecoveryReconcileOVNPropagatesOpenAndReconcileFailures(t *testing.T) {
 	deps.open = func(context.Context, config.Config) (recoveryRuntime, error) {
 		return recoveryRuntime{
 			reconciler: &recoveryReconcilerStub{err: wantReconcile},
+			auditor:    &recoveryAuditorStub{},
 			close:      func() { closed++ },
 		}, nil
 	}
@@ -251,6 +281,62 @@ func TestRecoveryReconcileOVNPropagatesOpenAndReconcileFailures(t *testing.T) {
 	}
 	if closed != 1 {
 		t.Fatalf("close calls=%d", closed)
+	}
+}
+
+func TestRecoveryReconcileOVNFailsClosedWhenManagedGraphAuditFails(t *testing.T) {
+	wantAudit := errors.New("orphaned managed NAT row")
+	reconciler := &recoveryReconcilerStub{}
+	auditor := &recoveryAuditorStub{err: wantAudit}
+	closed := 0
+	var output bytes.Buffer
+	err := recoveryCommandWith(
+		[]string{"reconcile-ovn", "--apply", "--confirm", "lab-cluster"},
+		recoveryDependencies{
+			getEUID: func() int { return 0 },
+			loadConfig: func(string) (config.Config, error) {
+				return config.Config{Cluster: config.ClusterConfig{ID: "lab-cluster"}}, nil
+			},
+			open: func(context.Context, config.Config) (recoveryRuntime, error) {
+				return recoveryRuntime{
+					reconciler: reconciler, auditor: auditor, close: func() { closed++ },
+				}, nil
+			},
+			output: &output,
+		},
+	)
+	if !errors.Is(err, wantAudit) || !strings.Contains(err.Error(), "audit reconciled OVN managed graph") {
+		t.Fatalf("audit error=%v", err)
+	}
+	if reconciler.calls != 1 || auditor.calls != 1 || closed != 1 {
+		t.Fatalf("reconcile calls=%d audit calls=%d close calls=%d", reconciler.calls, auditor.calls, closed)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("failed audit emitted success output: %q", output.String())
+	}
+}
+
+func TestRecoveryReconcileOVNRequiresManagedGraphAuditorBeforeWriting(t *testing.T) {
+	reconciler := &recoveryReconcilerStub{}
+	var output bytes.Buffer
+	err := recoveryCommandWith(
+		[]string{"reconcile-ovn", "--apply", "--confirm", "lab-cluster"},
+		recoveryDependencies{
+			getEUID: func() int { return 0 },
+			loadConfig: func(string) (config.Config, error) {
+				return config.Config{Cluster: config.ClusterConfig{ID: "lab-cluster"}}, nil
+			},
+			open: func(context.Context, config.Config) (recoveryRuntime, error) {
+				return recoveryRuntime{reconciler: reconciler}, nil
+			},
+			output: &output,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "auditor is unavailable") {
+		t.Fatalf("missing auditor error=%v", err)
+	}
+	if reconciler.calls != 0 || output.Len() != 0 {
+		t.Fatalf("missing auditor ran reconcile=%d or wrote output=%q", reconciler.calls, output.String())
 	}
 }
 
