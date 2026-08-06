@@ -117,7 +117,7 @@ export function diagnosePort(port: Port, node?: NodeStatus, observation?: VMObse
   const state = String(port.state || 'unknown').toLowerCase();
   const warnings = port.security_group_ids?.length
     ? []
-    : ['No security groups; traffic is unrestricted by PVN policy.'];
+    : ['Legacy unrestricted port: no security group is attached. Migrate it with the default security-group backfill.'];
 
   const result = (reason: string, tone: DiagnosticTone): PortDiagnostic => ({ chassis, reason, tone, warnings });
   if (port.admin_state_up === false) return result('The port is administratively disabled.', 'bad');

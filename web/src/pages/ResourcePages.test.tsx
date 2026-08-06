@@ -91,13 +91,16 @@ describe('resource reference UX', () => {
     expect(await within(table).findByText('pve-a')).toBeInTheDocument();
     expect(await within(table).findByText('matched')).toBeInTheDocument();
     expect(within(table).getByText('The local agent confirmed the OVN binding.')).toBeInTheDocument();
-    expect(within(table).getByText('No security groups; traffic is unrestricted by PVN policy.')).toBeInTheDocument();
+    expect(within(table).getByText('Legacy unrestricted port: no security group is attached. Migrate it with the default security-group backfill.')).toBeInTheDocument();
     expect(table).not.toHaveTextContent('port-aaaaaaaa');
     expect(table).not.toHaveTextContent('node-aaaaaaaa');
     expect(table).not.toHaveTextContent('chassis-a');
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/ports')).toHaveLength(1);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/nodes')).toHaveLength(1);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/networks')).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('button', { name: '+ Tenant port' }));
+    expect(screen.getByText("Optional. Leave empty to apply the project's reserved default security group automatically. Any selections replace that default.")).toBeInTheDocument();
   });
 });
 
@@ -129,5 +132,60 @@ describe('security group statefulness', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
     expect(screen.queryByRole('checkbox', { name: 'Stateful' })).not.toBeInTheDocument();
+  });
+
+  it('shows reserved default policy and rule references by human name', async () => {
+    const list = vi.fn(async (endpoint: string) => {
+      if (endpoint === '/security-groups') return { items: [{
+        id: 'security-group-default-aaaaaaaa',
+        name: 'default',
+        description: 'PVN managed default security group',
+        project_id: 'project-aaaaaaaa',
+        stateful: true,
+        state: 'ready',
+      }] };
+      if (endpoint === '/security-group-rules') return { items: [
+        {
+          id: 'security-group-rule-aaaaaaaa',
+          security_group_id: 'security-group-default-aaaaaaaa',
+          project_id: 'project-aaaaaaaa',
+          direction: 'egress',
+          ethertype: 'IPv4',
+          action: 'allow',
+          description: 'Allow all IPv4 egress',
+          state: 'ready',
+        },
+        {
+          id: 'security-group-rule-bbbbbbbb',
+          security_group_id: 'security-group-default-aaaaaaaa',
+          project_id: 'project-aaaaaaaa',
+          direction: 'ingress',
+          ethertype: 'IPv4',
+          action: 'allow',
+          description: 'Allow IPv4 ingress from this security group',
+          state: 'ready',
+        },
+      ] };
+      if (endpoint === '/projects') return { items: [{ id: 'project-aaaaaaaa', name: 'Tenant A' }] };
+      return { items: [] };
+    });
+
+    render(
+      <ApiProvider client={{ list } as unknown as ApiClient}>
+        <SecurityGroupsPage />
+      </ApiProvider>,
+    );
+
+    expect(screen.getByText(/reserved default policy appears here/)).toBeInTheDocument();
+    expect(screen.getByText(/reserved default policy also appear here as normal system baseline entries/)).toBeInTheDocument();
+    const tables = await screen.findAllByRole('table');
+    expect(within(tables[0]).getByText('default')).toBeInTheDocument();
+    expect(within(tables[0]).getByText('PVN managed default security group')).toBeInTheDocument();
+    expect(await within(tables[1]).findAllByText('default · PVN managed default security group')).toHaveLength(2);
+    expect(within(tables[1]).getByText('Allow all IPv4 egress')).toBeInTheDocument();
+    expect(within(tables[1]).getByText('Allow IPv4 ingress from this security group')).toBeInTheDocument();
+    expect(tables[0]).not.toHaveTextContent('security-group-default-aaaaaaaa');
+    expect(tables[1]).not.toHaveTextContent('security-group-default-aaaaaaaa');
+    expect(list.mock.calls.filter(([endpoint]) => endpoint === '/security-groups')).toHaveLength(1);
   });
 });

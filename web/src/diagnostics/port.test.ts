@@ -36,9 +36,11 @@ describe('port diagnostics', () => {
     });
   });
 
-  it('warns when no security groups leave policy unrestricted', () => {
+  it('marks an empty security-group list as legacy unrestricted and directs backfill', () => {
     const diagnostic = diagnosePort({ ...port, security_group_ids: undefined }, node);
-    expect(diagnostic.warnings).toEqual(['No security groups; traffic is unrestricted by PVN policy.']);
+    expect(diagnostic.warnings).toEqual([
+      'Legacy unrestricted port: no security group is attached. Migrate it with the default security-group backfill.',
+    ]);
   });
 
   it('distinguishes binding progress from a bound NIC left link-down', () => {

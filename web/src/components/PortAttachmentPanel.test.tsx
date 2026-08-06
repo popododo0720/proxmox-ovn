@@ -87,7 +87,7 @@ describe('firstFreeNIC', () => {
 
     expect(await screen.findByText('frontend (VM 100)')).toBeInTheDocument();
     expect(screen.getByText('OVN reports bound, but the VM NIC remains link-down.')).toBeInTheDocument();
-    expect(screen.getByText('No security groups; traffic is unrestricted by PVN policy.')).toBeInTheDocument();
+    expect(screen.getByText('Legacy unrestricted port: no security group is attached. Migrate it with the default security-group backfill.')).toBeInTheDocument();
     expect(resolveRuntimePort).toHaveBeenCalledWith('pve-a', 100, 'net0');
     expect(screen.queryByText('port-aaaaaaaa')).not.toBeInTheDocument();
     expect(screen.queryByText('node-bbbbbbbb')).not.toBeInTheDocument();

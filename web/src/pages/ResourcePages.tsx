@@ -236,7 +236,7 @@ export function PortsPage() {
         { name: 'subnet_id', label: 'Subnet', type: 'resource-select', reference: projectSubnetReference, help: 'Optional. PVN allocates the next free address when set.' },
         { name: 'fixed_ip_address', label: 'Requested fixed IPv4', help: 'Requires a subnet ID.' },
         { name: 'mac_address', label: 'Requested MAC', help: 'Leave blank for a stable PVN-generated MAC.' },
-        { name: 'security_group_ids', label: 'Security groups', type: 'resource-select', reference: projectSecurityGroupReference, multiple: true, help: 'Optional. Select every policy that should apply to this port.' },
+        { name: 'security_group_ids', label: 'Security groups', type: 'resource-select', reference: projectSecurityGroupReference, multiple: true, help: "Optional. Leave empty to apply the project's reserved default security group automatically. Any selections replace that default." },
       ]}
       createResource={(payload) => {
         const securityGroupIDs = Array.isArray(payload.security_group_ids)
@@ -296,7 +296,7 @@ export function SecurityGroupsPage() {
   return <div className="stacked-pages">
     <ResourcePage<SecurityGroup>
       title="Security groups"
-      description="Stateful-only OVN port-group policies for tenant ingress and egress."
+      description="Stateful-only OVN port-group policies. Each project's reserved default policy appears here and is applied automatically when a new port has no explicit selection."
       endpoint="/security-groups"
       columns={[
         { key: 'name', label: 'Security group', render: (item) => <strong>{item.name || 'Unnamed security group'}</strong> },
@@ -319,7 +319,7 @@ export function SecurityGroupsPage() {
     />
     <ResourcePage<SecurityGroupRule>
       title="Security group rules"
-      description="Ingress and egress matches compiled into OVN ACLs."
+      description="Ingress and egress matches compiled into OVN ACLs. Rules for each project's reserved default policy also appear here as normal system baseline entries."
       endpoint="/security-group-rules"
       columns={[
         { key: 'security_group_id', label: 'Security group', reference: projectSecurityGroupReference },
@@ -328,6 +328,7 @@ export function SecurityGroupsPage() {
         { key: 'port_range_min', label: 'Port from' },
         { key: 'port_range_max', label: 'Port to' },
         { key: 'remote_cidr', label: 'Remote CIDR', className: 'mono-cell' },
+        { key: 'description', label: 'Description' },
         { key: 'action', label: 'Action' },
         { key: 'state', label: 'State' },
       ]}

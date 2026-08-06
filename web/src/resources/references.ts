@@ -49,6 +49,7 @@ export const projectRouterReference: ResourceReference = {
 
 export const projectSecurityGroupReference: ResourceReference = {
   endpoint: '/security-groups',
+  detailKeys: ['description'],
   matches: [{ formField: 'project_id' }],
   emptyLabel: 'No security groups in this project',
 };

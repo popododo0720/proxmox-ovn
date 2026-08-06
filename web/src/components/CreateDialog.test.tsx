@@ -54,4 +54,32 @@ describe('CreateDialog resource references', () => {
       security_group_ids: ['sg-1', 'sg-2'],
     }));
   });
+
+  it('omits an empty optional multi-select so the server can apply its default', async () => {
+    const list = vi.fn(async () => ({ items: [] }));
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ApiProvider client={{ list } as unknown as ApiClient}>
+        <CreateDialog
+          title="Tenant port"
+          fields={[{
+            name: 'security_group_ids',
+            label: 'Security groups',
+            type: 'resource-select',
+            multiple: true,
+            reference: { endpoint: '/security-groups' },
+          }]}
+          open
+          onClose={() => undefined}
+          onSubmit={onSubmit}
+        />
+      </ApiProvider>,
+    );
+
+    await screen.findByRole('listbox', { name: 'Security groups' });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith({}));
+  });
 });
