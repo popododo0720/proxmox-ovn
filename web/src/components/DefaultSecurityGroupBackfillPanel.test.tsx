@@ -6,7 +6,7 @@ import type {
   DefaultSecurityGroupBackfillPlan,
   DefaultSecurityGroupBackfillReport,
 } from '../api/types';
-import { DefaultSecurityGroupBackfillPanel } from './DefaultSecurityGroupBackfillPanel';
+import { backfillDisplayName, DefaultSecurityGroupBackfillPanel } from './DefaultSecurityGroupBackfillPanel';
 
 const projectID = '11111111-1111-4111-8111-111111111111';
 const unavailableProjectID = '22222222-2222-4222-8222-222222222222';
@@ -111,6 +111,15 @@ const partialApply: DefaultSecurityGroupBackfillReport = {
     error: `failed resource ${portID}`,
   }],
 };
+
+describe('backfillDisplayName', () => {
+  it('uses the generic human-label contract for embedded UUIDs and numeric labels', () => {
+    expect(backfillDisplayName(`frontend-${portID}-42`, 'Unavailable port'))
+      .toBe('frontend-[resource]-42');
+    expect(backfillDisplayName(9101, 'Unavailable VM')).toBe('9101');
+    expect(backfillDisplayName(portID, 'Unavailable port')).toBe('Unavailable port');
+  });
+});
 
 describe('DefaultSecurityGroupBackfillPanel', () => {
   it('shows human candidates, warns for attached traffic, and gates apply on dry-run plus exact cluster confirmation', async () => {

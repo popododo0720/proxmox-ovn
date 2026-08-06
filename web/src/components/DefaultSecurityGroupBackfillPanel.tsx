@@ -6,16 +6,14 @@ import type {
   DefaultSecurityGroupBackfillProject,
   DefaultSecurityGroupBackfillReport,
 } from '../api/types';
+import { humanLabel } from '../diagnostics/display';
 import { ErrorState } from './ErrorState';
 import { StatusPill } from './StatusPill';
 
-const uuidPattern = /\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/gi;
 const unavailableStatuses = new Set([403, 404, 405, 501]);
 
 export function backfillDisplayName(value: unknown, fallback: string): string {
-  if (typeof value !== 'string') return fallback;
-  const redacted = value.replace(uuidPattern, '').replace(/\s{2,}/g, ' ').trim();
-  return redacted ? redacted.slice(0, 120) : fallback;
+  return humanLabel(value, fallback).slice(0, 120);
 }
 
 function endpointUnavailable(reason: unknown): boolean {
