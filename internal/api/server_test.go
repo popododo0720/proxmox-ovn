@@ -154,21 +154,35 @@ func TestFloatingIPAPIUsesServerManagedRealizedStatus(t *testing.T) {
 }
 
 func TestHealthAndSession(t *testing.T) {
+	const deploymentName = "human-cluster"
 	provider := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
-		return Session{User: "root@pam", CSRFToken: "csrf", Permissions: map[string]any{"/": map[string]bool{"SDN.Audit": true}}, Cluster: "lab"}, nil
+		return Session{User: "root@pam", CSRFToken: "csrf", Permissions: map[string]any{"/": map[string]bool{"SDN.Audit": true}}, Cluster: deploymentName}, nil
 	})
-	server := testServer(t, controlstore.NewMemory(), provider)
+	server, err := New(Options{Store: controlstore.NewMemory(), SessionProvider: provider, ClusterName: deploymentName})
+	if err != nil {
+		t.Fatal(err)
+	}
 	health := request(t, server, http.MethodGet, "/api/v1/health", nil, nil)
 	if health.Code != http.StatusOK {
 		t.Fatalf("health status=%d", health.Code)
+	}
+	if cluster := decodeData[map[string]any](t, health)["cluster"]; cluster != deploymentName {
+		t.Fatalf("health deployment name=%v", cluster)
 	}
 	session := request(t, server, http.MethodGet, "/api/v1/session", nil, nil)
 	if session.Code != http.StatusOK {
 		t.Fatalf("session status=%d body=%s", session.Code, session.Body.String())
 	}
 	data := decodeData[Session](t, session)
-	if data.User != "root@pam" || data.CSRFToken != "csrf" || data.Cluster != "lab" {
+	if data.User != "root@pam" || data.CSRFToken != "csrf" || data.Cluster != deploymentName {
 		t.Fatalf("session data = %#v", data)
+	}
+	backfill := request(t, server, http.MethodGet, defaultSecurityGroupBackfillPlanPath, nil, nil)
+	if backfill.Code != http.StatusOK {
+		t.Fatalf("backfill status=%d body=%s", backfill.Code, backfill.Body.String())
+	}
+	if plan := decodeData[defaultSecurityGroupBackfillPlanData](t, backfill); plan.Cluster != deploymentName {
+		t.Fatalf("backfill deployment name=%q", plan.Cluster)
 	}
 	unauthenticated := testServer(t, controlstore.NewMemory(), SessionProviderFunc(func(context.Context, *http.Request) (Session, error) { return Session{}, ErrUnauthenticated }))
 	response := request(t, unauthenticated, http.MethodGet, "/api/v1/session", nil, nil)

@@ -34,6 +34,7 @@ type managerConfig struct {
 	tlsKey          string
 	pveAPIURL       string
 	pveCAFile       string
+	pveMembersFile  string
 	clusterName     string
 	webRoot         string
 	frameAncestors  []string
@@ -69,6 +70,7 @@ func run(arguments []string) error {
 		tlsKey:         os.Getenv("PVN_TLS_KEY"),
 		pveAPIURL:      env("PVN_PVE_API_URL", "https://"+hostname+":8006"),
 		pveCAFile:      env("PVN_PVE_CA_FILE", "/etc/pve/pve-root-ca.pem"),
+		pveMembersFile: os.Getenv("PVN_PVE_MEMBERS_FILE"),
 		clusterName:    os.Getenv("PVN_CLUSTER_NAME"),
 		webRoot:        env("PVN_WEB_ROOT", "/usr/share/pvn/web"),
 		insecureNoAuth: envBool("PVN_INSECURE_NO_AUTH", false),
@@ -84,6 +86,7 @@ func run(arguments []string) error {
 	flags.StringVar(&defaults.tlsKey, "tls-key", defaults.tlsKey, "TLS private key file")
 	flags.StringVar(&defaults.pveAPIURL, "pve-api-url", defaults.pveAPIURL, "local Proxmox API base URL")
 	flags.StringVar(&defaults.pveCAFile, "pve-ca-file", defaults.pveCAFile, "Proxmox cluster CA PEM file")
+	flags.StringVar(&defaults.pveMembersFile, "pve-members-file", defaults.pveMembersFile, "PVE pmxcfs membership JSON used for the deployment display name")
 	flags.StringVar(&defaults.clusterName, "cluster-name", defaults.clusterName, "cluster name override")
 	flags.StringVar(&defaults.webRoot, "web-root", defaults.webRoot, "compiled PVN UI directory")
 	flags.BoolVar(&defaults.insecureNoAuth, "insecure-no-auth", defaults.insecureNoAuth, "disable PVE session validation (development only)")
@@ -107,6 +110,9 @@ func run(arguments []string) error {
 	explicit := make(map[string]bool)
 	flags.Visit(func(item *flag.Flag) { explicit[item.Name] = true })
 	applyClusterConfig(&defaults, clusterConfig, explicit)
+	if err := applyPVEDeploymentName(&defaults, explicit["cluster-name"]); err != nil {
+		return err
+	}
 	if (defaults.tlsCert == "") != (defaults.tlsKey == "") {
 		return errors.New("tls-cert and tls-key must be configured together")
 	}

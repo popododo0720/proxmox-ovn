@@ -122,6 +122,10 @@ grep -q '^LoadCredential=pvn-config:/etc/pve/pvn/config.json$' deploy/systemd/pv
     echo "the unprivileged manager must receive pmxcfs config as a credential" >&2
     exit 1
 }
+grep -q '^LoadCredential=pvn-pve-members:/etc/pve/.members$' deploy/systemd/pvn-manager.service || {
+    echo "the unprivileged manager must receive PVE membership as a credential" >&2
+    exit 1
+}
 grep -q '^LoadCredential=pvn-pve-ca:/etc/pve/pve-root-ca.pem$' deploy/systemd/pvn-manager.service || {
     echo "the unprivileged manager must receive the PVE CA as a credential" >&2
     exit 1
@@ -130,13 +134,21 @@ grep -q '^Environment=PVN_PVE_CA_FILE=%d/pvn-pve-ca$' deploy/systemd/pvn-manager
     echo "the manager must validate PVE with its credential CA copy" >&2
     exit 1
 }
+grep -q '^Environment=PVN_PVE_MEMBERS_FILE=%d/pvn-pve-members$' deploy/systemd/pvn-manager.service || {
+    echo "the manager must derive its human deployment name from the membership credential" >&2
+    exit 1
+}
+grep -q '^ExecStartPre=/usr/bin/test -r %d/pvn-pve-members$' deploy/systemd/pvn-manager.service || {
+    echo "the manager must fail closed when its membership credential is unreadable" >&2
+    exit 1
+}
 if [ "$(grep -Fxc 'PIDFile=/run/ovn/ovnsb_db.pid' \
         deploy/systemd/ovn-ovsdb-server-sb.service.d/90-pvn.conf)" -ne 1 ]; then
     echo "the OVN SB drop-in must override the vendor PIDFile with /run/ovn/ovnsb_db.pid" >&2
     exit 1
 fi
-grep -q '^ExecStart=/usr/sbin/pvn-manager --config %d/pvn-config$' deploy/systemd/pvn-manager.service || {
-    echo "the unprivileged manager must read its credential copy" >&2
+grep -q '^ExecStart=/usr/sbin/pvn-manager --config %d/pvn-config --pve-members-file %d/pvn-pve-members$' deploy/systemd/pvn-manager.service || {
+    echo "the unprivileged manager must pin its config and membership credential copies" >&2
     exit 1
 }
 grep -q '^Requires=pvn-guest-gate.service$' deploy/systemd/pve-guests.service.d/90-pvn.conf || {

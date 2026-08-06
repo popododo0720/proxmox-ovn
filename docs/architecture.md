@@ -45,6 +45,17 @@ Ports created before this invariant may
 still have an empty group list and remain unrestricted until the supported
 default-security-group backfill migrates them.
 
+The manager's operator-facing deployment name comes from a systemd credential
+copy of `/etc/pve/.members`: clustered nodes use `cluster.name`, while a
+standalone node uses `standalone-NODENAME`. The UUID in `cluster.id` remains
+the durable PVN installation identity used by configuration and recovery
+tooling; it is not used as the normal display label or confirmation text.
+The production systemd unit pins the credential path directly on the manager
+command line, and the bounded parser pins the current PVE 9 clustered or exact
+standalone `.members` shape. Unknown fields, malformed identity metadata, or a
+non-regular credential file fail manager startup instead of falling back to
+the installation UUID.
+
 PVE pools map to PVN projects. PVN checks the authenticated user's effective
 PVE permissions before each action:
 

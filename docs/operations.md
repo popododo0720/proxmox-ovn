@@ -410,7 +410,9 @@ Ports → Legacy security policy backfill**, refresh the plan, and run the dry
 run. The page lists projects, ports, nodes, and attached VM NICs by human name.
 Applying requires typing the exact PVE cluster name and changes policy for
 attached traffic immediately. Review any required external ingress rules
-before applying.
+before applying. On a standalone host, the exact confirmation is
+`standalone-NODENAME`. The manager reads this name from a protected systemd
+credential copy of `/etc/pve/.members`, not from the PVN installation UUID.
 
 The same display rule applies throughout the PVN page: normal tables,
 selectors, confirmations, diagnostics, and bounded errors resolve references

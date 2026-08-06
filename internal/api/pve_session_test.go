@@ -136,6 +136,53 @@ func TestPVESessionExchangeAndCSRFProtection(t *testing.T) {
 	}
 }
 
+func TestPVESessionUsesConfiguredDeploymentName(t *testing.T) {
+	pve := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api2/json/cluster/status" {
+			t.Error("configured deployment name unexpectedly fell back to the PVE status API")
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if request.URL.Path != "/api2/json/access/permissions" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = writer.Write([]byte(`{"data":{"/":{"SDN.Audit":1}}}`))
+	}))
+	defer pve.Close()
+	provider, err := NewPVESessionProvider(PVESessionProviderOptions{
+		BaseURL: pve.URL, HTTPClient: pve.Client(), ClusterName: "human-cluster", SessionTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
+	request.AddCookie(&http.Cookie{Name: auth.PVECookieName, Value: url.QueryEscape("PVE:root@pam:01234567::signature")})
+	recorder := httptest.NewRecorder()
+	session, err := provider.IssueSession(context.Background(), recorder, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Cluster != "human-cluster" {
+		t.Fatalf("issued session deployment name=%q", session.Cluster)
+	}
+	var sessionCookie *http.Cookie
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == auth.SessionCookieName {
+			sessionCookie = cookie
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("PVN session cookie is missing")
+	}
+	followup := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	followup.AddCookie(sessionCookie)
+	persisted, err := provider.Session(context.Background(), followup)
+	if err != nil || persisted.Cluster != "human-cluster" {
+		t.Fatalf("persisted session deployment name=%q err=%v", persisted.Cluster, err)
+	}
+}
+
 func TestPVESessionRejectsBadTicket(t *testing.T) {
 	pve := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) { writer.WriteHeader(http.StatusUnauthorized) }))
 	defer pve.Close()
