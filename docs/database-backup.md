@@ -59,21 +59,26 @@ builds a new cluster with new cluster/server identities.
 
 ## One-database restore runbook
 
-Use one maintenance window per database. Never loop over all three commands.
-The examples below assume the backup set has already been copied to the voter
-that will receive the restore request.
+Use one maintenance window and one freshly selected backup set per database.
+Never loop over all three restore commands or reuse a set from another window.
+The clustered example below creates the set on one healthy voter and copies the
+whole set to a different voter that is the selected database's current leader.
 
-1. Record `pvnctl central status` from at least two voters. Require all three
-   databases healthy, every configured voter connected, no membership change,
-   and the expected cluster IDs. Stop if any value differs.
+1. Record `pvnctl central status` on every voter. Require all three databases
+   healthy, every configured voter connected, no membership change, and the
+   expected cluster IDs. For the selected database, require exactly one report
+   with `role` equal to `leader`; record that node and the common Raft term from
+   all reports. Stop if a value differs, the terms differ, or there is not
+   exactly one leader.
 
-2. Choose exactly one database and its fixed snapshot/socket pair:
+2. Choose exactly one database and its fixed backup key, snapshot, and local
+   Unix socket:
 
-   | Database | Snapshot | Live Unix socket |
-   | --- | --- | --- |
-   | `PVN_Control` | `pvn-control.ovsdb` | `unix:/run/pvn-control/pvn-control-db.sock` |
-   | `OVN_Northbound` | `ovn-northbound.ovsdb` | `unix:/run/ovn/ovnnb_db.sock` |
-   | `OVN_Southbound` | `ovn-southbound.ovsdb` | `unix:/run/ovn/ovnsb_db.sock` |
+   | Window | Database | Backup key | Snapshot | Live Unix socket |
+   | --- | --- | --- | --- | --- |
+   | 1 | `PVN_Control` | `pvn-control` | `pvn-control.ovsdb` | `unix:/run/pvn-control/pvn-control-db.sock` |
+   | 2 | `OVN_Northbound` | `ovn-nb` | `ovn-northbound.ovsdb` | `unix:/run/ovn/ovnnb_db.sock` |
+   | 3 | `OVN_Southbound` | `ovn-sb` | `ovn-southbound.ovsdb` | `unix:/run/ovn/ovnsb_db.sock` |
 
 3. Freeze control-plane writers cluster-wide. On every PVE node, stop the node
    writers/controllers; on every central voter, also stop northd. Keep all
@@ -90,22 +95,96 @@ that will receive the restore request.
    changes and manual OVN writes for the maintenance window. If cluster-wide
    quiescence cannot be proven, do not restore.
 
-   While writers remain frozen and all three database services remain active,
-   create and verify a fresh backup set for this database's maintenance window.
-   Copy the complete set to a second node or off-host durable storage and verify
-   that copy too. Use this frozen set for the drill; an older set captured
-   before writer quiescence or a set that exists only on its source voter is not
-   sufficient recovery evidence.
+   While writers remain frozen, confirm all three database services remain
+   active on every voter. On a healthy voter other than the recorded leader,
+   create a set containing only this window's database and verify it at the
+   source. Copy the whole directory to a new root-only path on the leader and
+   verify the destination copy. Use Proxmox's native cluster identity and the
+   destination node's pinned host-key file; do not accept a new host key.
 
-   ```sh
-   pvn-db-backup create
-   pvn-db-backup verify /var/backups/pvn/EXACT_FRESH_BACKUP_SET
-   # Copy the whole directory, then verify it at the independent destination.
+   The following clustered example is run on the source voter. Replace the
+   three uppercase values and set `database` to exactly one table row above.
+
+   ```bash
+   set -euo pipefail
+   database=EXACT_DATABASE_NAME
+   copy_node=EXACT_LEADER_PVE_NODE_NAME
+   copy_ip=EXACT_LEADER_MANAGEMENT_IP
+
+   case "$database" in
+     PVN_Control) backup_key=pvn-control ;;
+     OVN_Northbound) backup_key=ovn-nb ;;
+     OVN_Southbound) backup_key=ovn-sb ;;
+     *) exit 1 ;;
+   esac
+
+   source_root=/var/backups/pvn
+   create_report=$(pvn-db-backup create --database "$backup_key")
+   backup_set=$(printf '%s\n' "$create_report" | python3 -c \
+     'import json, sys; print(json.load(sys.stdin)["backup_set"])')
+   backup_name=${backup_set##*/}
+   [ "$backup_set" = "$source_root/$backup_name" ] || exit 1
+   case "$backup_name" in
+     pvn-db-backup-*) ;;
+     *) exit 1 ;;
+   esac
+   case "$backup_name" in
+     *[!A-Za-z0-9._-]*) exit 1 ;;
+   esac
+   pvn-db-backup verify "$backup_set"
+
+   known_hosts=/etc/pve/nodes/$copy_node/ssh_known_hosts
+   copy_root=/var/backups/pvn-independent-$backup_name
+   pve_ssh() {
+     /usr/bin/ssh -F /dev/null -e none -i /root/.ssh/id_rsa \
+       -o BatchMode=yes \
+       -o PasswordAuthentication=no \
+       -o KbdInteractiveAuthentication=no \
+       -o PubkeyAuthentication=yes \
+       -o PreferredAuthentications=publickey \
+       -o IdentitiesOnly=yes \
+       -o NumberOfPasswordPrompts=0 \
+       -o StrictHostKeyChecking=yes \
+       -o CheckHostIP=no \
+       -o VerifyHostKeyDNS=no \
+       -o UpdateHostKeys=no \
+       -o GlobalKnownHostsFile=/dev/null \
+       -o "UserKnownHostsFile=$known_hosts" \
+       -o "HostKeyAlias=$copy_node" \
+       -o ConnectTimeout=10 \
+       -- "root@$copy_ip" "$@"
+   }
+
+   pve_ssh "set -eu; umask 077; test ! -e '$copy_root'; \
+     install -d -o root -g root -m 0700 '$copy_root'"
+   /usr/bin/tar -C "$source_root" -cf - -- "$backup_name" | \
+     pve_ssh "set -eu; /usr/bin/tar -C '$copy_root' \
+       --keep-old-files --no-overwrite-dir -xpf -"
+   pve_ssh "test \"\$(stat -Lc '%U:%G:%a' '$copy_root')\" = root:root:700; \
+     /usr/sbin/pvn-db-backup verify '$copy_root/$backup_name'"
+   printf 'Verified leader copy: %s:%s/%s\n' \
+     "$copy_node" "$copy_root" "$backup_name"
    ```
 
-4. Verify the selected set again, obtain the expected digest from its manifest,
-   and require an exact typed confirmation. Replace all uppercase placeholders;
-   do not use `--force`.
+   `copy_root` must not already exist. Never overwrite, merge into, or resume a
+   partially copied destination; after an operator audits any failed transfer,
+   use another new path. Keep the verified source set as the independent copy.
+   For a one-voter deployment, use a new root-only path on off-host durable
+   storage instead of pretending the local filesystem is independent. An older
+   set captured before writer quiescence, or a set that exists on only one
+   voter, is not sufficient recovery evidence.
+
+4. On every voter, repeat `pvnctl central status` immediately before the
+   restore. Require the same unique leader and term recorded in step 1, 3/3
+   connected voters, the expected cluster ID, and no membership change. The
+   verified set must be present on that leader. If leadership or term changed,
+   a status call fails, or any value differs, do not issue the restore and do
+   not retry another node automatically. Restart and validate the frozen
+   services as in step 6, then schedule a new window and fresh backup set.
+
+   On that leader, verify the selected set again, obtain the expected digest
+   from its manifest, and require an exact typed confirmation. Replace all
+   uppercase placeholders; do not use `--force` or `--no-leader-only`.
 
    ```sh
    set -eu
@@ -148,15 +227,21 @@ that will receive the restore request.
    systemctl is-active --quiet "$db_unit" || exit 1
    ```
 
-5. Confirm the chosen database server is still active on the receiving voter,
-   then submit exactly one atomic database restore transaction:
+5. Confirm the chosen database server is still active and the selected
+   database still reports this voter as the unique leader at the recorded
+   term. Then, on that leader only, submit exactly one atomic database restore
+   transaction through its local Unix socket:
 
    ```sh
    /usr/bin/ovsdb-client --timeout=120 restore \
      "$remote" "$database" < "$backup_set/$snapshot"
    ```
 
-   Stop immediately on any error; do not attempt another database.
+   Stop immediately on any error. Do not attempt another database, retry a
+   different voter, or switch to a comma-separated SSL remote. A lost response
+   can be ambiguous even though the restore transaction itself is atomic;
+   preserve the set and operator log, then recover services and inspect state
+   before deciding whether a later window is needed.
 
 6. Restart northd on every central voter, then the controller and PVN services
    on every transport node:
