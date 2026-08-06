@@ -778,10 +778,14 @@ func TestAttachedPortRequiresUseAndVMNetworkPrivileges(t *testing.T) {
 	}
 	network := networkResource.(*model.Network)
 	ensureAPINode(t, store, "pve01", "chassis-01")
+	groupResource, _, err := store.Create(context.Background(), &model.SecurityGroup{ProjectID: project.ID, Name: "attached-policy"}, "attached-policy")
+	if err != nil {
+		t.Fatal(err)
+	}
 	portResource, _, err := store.Create(context.Background(), &model.Port{
 		ProjectID: project.ID, NetworkID: network.ID, Name: "attached", MACAddress: "02:00:00:00:00:12",
 		AdminStateUp: true, NodeID: "pve01", VMID: 100, NIC: "net0", RequestedChassis: "chassis-01",
-		BindingStatus: model.PortBound, LSPName: "pvn-attached", Generation: 2,
+		BindingStatus: model.PortBound, LSPName: "pvn-attached", Generation: 2, SecurityGroupIDs: []string{groupResource.GetMetadata().ID},
 	}, "port")
 	if err != nil {
 		t.Fatal(err)

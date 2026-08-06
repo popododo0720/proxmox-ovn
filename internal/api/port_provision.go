@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
+	"github.com/popododo0720/proxmox-ovn/internal/defaultsecurity"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
@@ -119,6 +120,15 @@ func (s *Server) provisionPort(writer http.ResponseWriter, request *http.Request
 		}
 		s.writeProvisionedPort(writer, current.(*model.Port), true, false)
 		return
+	}
+	if len(port.SecurityGroupIDs) == 0 {
+		group, ensureErr := s.defaultSecurity.Ensure(request.Context(), port.ProjectID)
+		if ensureErr != nil {
+			s.failPortProvision(request.Context(), operation, ensureErr)
+			s.writeDefaultSecurityError(writer, ensureErr)
+			return
+		}
+		port.SecurityGroupIDs = []string{group.ID}
 	}
 
 	var allocation *model.IPAllocation
@@ -526,10 +536,13 @@ func uint32IPv4(value uint32) netip.Addr {
 func (s *Server) createProvisionPort(ctx context.Context, desired *model.Port) (*model.Port, bool, error) {
 	if existing, err := s.store.Get(ctx, model.KindPort, desired.ID); err == nil {
 		port := existing.(*model.Port)
-		if !sameProvisionedPort(port, desired) {
-			return nil, false, &controlstore.Error{Kind: controlstore.ErrConflict, Message: "the deterministic provisioning port ID contains different desired state"}
+		if sameProvisionedPort(port, desired) {
+			return port, true, nil
 		}
-		return port, true, nil
+		if migrated, migrateErr := s.adoptDefaultSecurityForInterruptedProvision(ctx, port, desired); migrated != nil || migrateErr != nil {
+			return migrated, migrated != nil, migrateErr
+		}
+		return nil, false, &controlstore.Error{Kind: controlstore.ErrConflict, Message: "the deterministic provisioning port ID contains different desired state"}
 	} else if !errors.Is(err, controlstore.ErrNotFound) {
 		return nil, false, err
 	}
@@ -548,20 +561,65 @@ func (s *Server) createProvisionPort(ctx context.Context, desired *model.Port) (
 	return nil, false, err
 }
 
+// adoptDefaultSecurityForInterruptedProvision closes the only upgrade window
+// where an older manager created the deterministic port with SG=[] but died
+// before completing its durable operation. Succeeded operations return before
+// this function, so established legacy ports are never silently backfilled.
+func (s *Server) adoptDefaultSecurityForInterruptedProvision(ctx context.Context, current, desired *model.Port) (*model.Port, error) {
+	if !interruptedProvisionCanAdoptDefault(current, desired) {
+		return nil, nil
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		current.SecurityGroupIDs = append([]string(nil), desired.SecurityGroupIDs...)
+		updated, _, err := s.store.Update(ctx, current, current.Revision, "")
+		if err == nil {
+			return updated.(*model.Port), nil
+		}
+		if !errors.Is(err, controlstore.ErrPrecondition) {
+			return nil, err
+		}
+		latest, getErr := s.store.Get(ctx, model.KindPort, desired.ID)
+		if getErr != nil {
+			return nil, getErr
+		}
+		current = latest.(*model.Port)
+		if sameProvisionedPort(current, desired) {
+			return current, nil
+		}
+		if !interruptedProvisionCanAdoptDefault(current, desired) {
+			return nil, &controlstore.Error{Kind: controlstore.ErrConflict, Message: "the interrupted provisioning port changed concurrently"}
+		}
+	}
+	return nil, &controlstore.Error{Kind: controlstore.ErrConflict, Message: "interrupted port provisioning could not be serialized"}
+}
+
+func interruptedProvisionCanAdoptDefault(current, desired *model.Port) bool {
+	return len(current.SecurityGroupIDs) == 0 && len(desired.SecurityGroupIDs) == 1 &&
+		desired.SecurityGroupIDs[0] == defaultsecurity.DefaultSecurityGroupID(desired.ProjectID) &&
+		current.BindingStatus == model.PortUnbound && current.NodeID == "" && current.VMID == 0 && current.NIC == "" &&
+		current.RequestedChassis == "" && sameProvisionedPortIgnoringSecurityGroups(current, desired)
+}
+
 func sameProvisionedPort(current, desired *model.Port) bool {
+	if !sameProvisionedPortIgnoringSecurityGroups(current, desired) || len(current.SecurityGroupIDs) != len(desired.SecurityGroupIDs) {
+		return false
+	}
+	for index := range current.SecurityGroupIDs {
+		if current.SecurityGroupIDs[index] != desired.SecurityGroupIDs[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameProvisionedPortIgnoringSecurityGroups(current, desired *model.Port) bool {
 	if current.ID != desired.ID || current.ProjectID != desired.ProjectID || current.NetworkID != desired.NetworkID ||
 		current.Name != desired.Name || !strings.EqualFold(current.MACAddress, desired.MACAddress) ||
-		!current.AdminStateUp || len(current.FixedIPs) != len(desired.FixedIPs) ||
-		len(current.SecurityGroupIDs) != len(desired.SecurityGroupIDs) {
+		!current.AdminStateUp || len(current.FixedIPs) != len(desired.FixedIPs) {
 		return false
 	}
 	for index := range current.FixedIPs {
 		if current.FixedIPs[index] != desired.FixedIPs[index] {
-			return false
-		}
-	}
-	for index := range current.SecurityGroupIDs {
-		if current.SecurityGroupIDs[index] != desired.SecurityGroupIDs[index] {
 			return false
 		}
 	}

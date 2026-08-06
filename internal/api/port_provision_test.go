@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
+	"github.com/popododo0720/proxmox-ovn/internal/defaultsecurity"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
@@ -99,10 +100,23 @@ func provisionHeaders(key, csrf string) map[string]string {
 
 type recordingProvisionReconciler struct {
 	mu    sync.Mutex
+	store controlstore.Store
 	calls []string
 }
 
-func (reconciler *recordingProvisionReconciler) Reconcile(_ context.Context, kind model.Kind, id string) error {
+func (reconciler *recordingProvisionReconciler) Reconcile(ctx context.Context, kind model.Kind, id string) error {
+	if reconciler.store != nil {
+		resource, err := reconciler.store.Get(ctx, kind, id)
+		if err != nil {
+			return err
+		}
+		if _, err := reconciler.store.MarkReconciled(ctx, kind, id, resource.GetMetadata().Revision, nil); err != nil {
+			return err
+		}
+	}
+	if kind != model.KindPort {
+		return nil
+	}
 	reconciler.mu.Lock()
 	defer reconciler.mu.Unlock()
 	reconciler.calls = append(reconciler.calls, kind.String()+"/"+id)
@@ -151,7 +165,7 @@ func TestPortProvisionAllocatesAndDurablyReplays(t *testing.T) {
 		csrf:          "csrf",
 		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
 	}
-	reconciler := &recordingProvisionReconciler{}
+	reconciler := &recordingProvisionReconciler{store: store}
 	server, err := New(Options{Store: store, SessionProvider: provider, Reconciler: reconciler})
 	if err != nil {
 		t.Fatal(err)
@@ -173,6 +187,9 @@ func TestPortProvisionAllocatesAndDurablyReplays(t *testing.T) {
 	}
 	if len(created.FixedIPs) != 1 || created.FixedIPs[0].Address != "10.0.0.2" {
 		t.Fatalf("fixed IPs = %#v", created.FixedIPs)
+	}
+	if fmt.Sprint(created.SecurityGroupIDs) != fmt.Sprint([]string{defaultsecurity.DefaultSecurityGroupID(topology.project.ID)}) {
+		t.Fatalf("security groups=%v", created.SecurityGroupIDs)
 	}
 	if createdResponse.Header().Get("Location") != "/api/v1/ports/"+created.ID || createdResponse.Header().Get("ETag") != `"1"` {
 		t.Fatalf("headers=%v", createdResponse.Header())
@@ -491,7 +508,17 @@ type deprovisionTestReconciler struct {
 	deletes   []model.Kind
 }
 
-func (*deprovisionTestReconciler) Reconcile(context.Context, model.Kind, string) error { return nil }
+func (reconciler *deprovisionTestReconciler) Reconcile(ctx context.Context, kind model.Kind, id string) error {
+	if reconciler.store == nil {
+		return nil
+	}
+	resource, err := reconciler.store.Get(ctx, kind, id)
+	if err != nil {
+		return err
+	}
+	_, err = reconciler.store.MarkReconciled(ctx, kind, id, resource.GetMetadata().Revision, nil)
+	return err
+}
 
 func (reconciler *deprovisionTestReconciler) Delete(_ context.Context, resource model.Resource) error {
 	reconciler.mu.Lock()
@@ -543,7 +570,7 @@ func TestPortDeprovisionReleasesAllocationAndDurablyReplays(t *testing.T) {
 		csrf:          "csrf",
 		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
 	}
-	reconciler := &deprovisionTestReconciler{}
+	reconciler := &deprovisionTestReconciler{store: store}
 	server, port := provisionForDelete(t, store, provider, reconciler)
 
 	generic := request(t, server, http.MethodDelete, "/api/v1/ports/"+port.ID, nil, deprovisionHeaders("generic-delete", port.Revision))

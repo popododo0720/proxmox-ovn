@@ -15,6 +15,7 @@ import (
 
 	"github.com/popododo0720/proxmox-ovn/internal/buildinfo"
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
+	"github.com/popododo0720/proxmox-ovn/internal/defaultsecurity"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
@@ -106,6 +107,7 @@ type Options struct {
 type Server struct {
 	store           controlstore.Store
 	reconciler      Reconciler
+	defaultSecurity *defaultsecurity.Manager
 	sessionProvider SessionProvider
 	poolValidator   PoolValidator
 	logger          *slog.Logger
@@ -144,7 +146,7 @@ func New(options Options) (*Server, error) {
 		options.HealthTimeout = defaultHealthTimeout
 	}
 	return &Server{
-		store: options.Store, reconciler: options.Reconciler, sessionProvider: options.SessionProvider, poolValidator: options.PoolValidator,
+		store: options.Store, reconciler: options.Reconciler, defaultSecurity: defaultsecurity.New(options.Store, options.Reconciler), sessionProvider: options.SessionProvider, poolValidator: options.PoolValidator,
 		logger: options.Logger, clusterGate: newClusterCapacityGate(options.RequireAllNodes, options.NodeHeartbeatTTL, options.Clock),
 		guestMTU: options.GuestMTU, physnet: strings.TrimSpace(options.Physnet), clusterName: strings.TrimSpace(options.ClusterName),
 		northboundProbe: options.NorthboundProbe, southboundProbe: options.SouthboundProbe,
@@ -478,10 +480,18 @@ func (s *Server) create(writer http.ResponseWriter, request *http.Request, kind 
 	if kind == model.KindPort && !s.requireClusterCapacity(writer, request) {
 		return
 	}
+	if port, ok := resource.(*model.Port); ok && !s.preparePortSecurityGroups(writer, request.Context(), port, nil) {
+		return
+	}
 	created, replayed, err := s.store.Create(request.Context(), resource, key)
 	if err != nil {
 		s.storeError(writer, err)
 		return
+	}
+	if project, ok := created.(*model.Project); ok {
+		if _, ensured := s.ensureDefaultSecurityGroup(writer, request.Context(), project.ID); !ensured {
+			return
+		}
 	}
 	created = s.reconcileAndReload(request.Context(), created)
 	setETag(writer, created.GetMetadata().Revision)
@@ -522,6 +532,10 @@ func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind 
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error(), nil)
 		return
 	}
+	if defaultsecurity.IsReserved(current) || defaultsecurity.IsReserved(resource) {
+		writeError(writer, http.StatusConflict, "reserved_default_security_policy", "PVN managed default security policy resources cannot be updated", nil)
+		return
+	}
 	expected, parseErr := expectedRevision(request, meta.Revision)
 	if parseErr != nil {
 		writeError(writer, http.StatusPreconditionRequired, "precondition_required", parseErr.Error(), nil)
@@ -549,6 +563,19 @@ func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind 
 	}
 	if !s.requireExistingProjectPool(writer, request, resource) {
 		return
+	}
+	if port, ok := resource.(*model.Port); ok && len(port.SecurityGroupIDs) == 0 {
+		currentPort := current.(*model.Port)
+		if expected == current.GetMetadata().Revision {
+			if !s.preparePortSecurityGroups(writer, request.Context(), port, currentPort) {
+				return
+			}
+		} else if len(currentPort.SecurityGroupIDs) != 0 {
+			// Canonicalize stale/replayed bodies without performing repair side
+			// effects. Store.Update will decide replay versus precondition using
+			// the same fingerprint recorded by the original successful request.
+			port.SecurityGroupIDs = []string{defaultsecurity.DefaultSecurityGroupID(port.ProjectID)}
+		}
 	}
 	updated, replayed, err := s.store.Update(request.Context(), resource, expected, key)
 	if err != nil {
@@ -600,6 +627,20 @@ func (s *Server) delete(writer http.ResponseWriter, request *http.Request, kind 
 		if err := s.authorizeWrite(request.Context(), current, current); err != nil {
 			writeError(writer, http.StatusForbidden, "forbidden", err.Error(), nil)
 			return
+		}
+		if defaultsecurity.IsReserved(current) {
+			writeError(writer, http.StatusConflict, "reserved_default_security_policy", "PVN managed default security policy resources cannot be deleted", nil)
+			return
+		}
+		if kind == model.KindProject {
+			if current.GetMetadata().State != model.ResourceDeleting && expected != current.GetMetadata().Revision {
+				s.storeError(writer, &controlstore.Error{Kind: controlstore.ErrPrecondition, Message: fmt.Sprintf("expected revision %d but current revision is %d", expected, current.GetMetadata().Revision)})
+				return
+			}
+			if err := s.cleanupProjectDefaultSecurity(request.Context(), id); err != nil {
+				s.writeDefaultSecurityError(writer, err)
+				return
+			}
 		}
 	}
 	tombstone, replayed, err := s.store.BeginDelete(request.Context(), kind, id, expected, key)
