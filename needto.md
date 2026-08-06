@@ -38,10 +38,10 @@ These are not new product features so much as **proof the current code works**.
 - [x] `pvnctl doctor` / health green on all members
 - [x] Create project → network → subnet → DHCP works in guest
 - [x] Attach NIC to **running** VM → link up → same-subnet ping
-- [ ] Detach cleanly; no orphan LSP / TAP drift
+- [x] Detach cleanly; no orphan LSP / TAP drift
 - [x] SNAT and/or floating IP path to provider network
-- [ ] Security group allow / deny behaves as expected
-- [ ] Node reboot: agent re-binds; guests recover or fail closed as designed
+- [x] Security group allow / deny behaves as expected
+- [x] Node reboot: agent re-binds; guests recover or fail closed as designed
 - [x] Package upgrade on active node (fail-closed / safe path)
 - [ ] Backup/restore drill: PVN_Control + OVN NB + OVN SB independently, then
       reconcile (no cross-DB transaction assumption)
@@ -68,6 +68,8 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 - [x] Validate that a Project mapping names an existing PVE pool
 - [x] Guide first-use browser trust for the same-node `:8443` manager certificate
 - [x] Keep the stateful-only security-group UI honest (no ineffective toggle)
+- [x] Auto-provision and continuously repair a project default security policy;
+      keep legacy unrestricted ports explicit until preview-token backfill
 
 ---
 
