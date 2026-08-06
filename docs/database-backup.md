@@ -381,27 +381,95 @@ Any leadership or term change after capture invalidates this window. Do not
 automatically retry on another node. Unfreeze services as described in step 7,
 then begin a new window with another fresh backup.
 
-### 5. Submit exactly one restore transaction
+### 5. Reserve, then submit one restore transaction
 
 Immediately after a successful gate, require an exact typed confirmation and
-submit one restore through the selected leader's local Unix socket. If the
-operator pauses or any observable state changes after the gate, recollect the
-reports and run `pre-restore` again before proceeding:
+create the durable local submission reservation. If the operator pauses or any
+observable state changes before this command, recollect the reports and start
+again at `pre-restore`:
 
 ```bash
 printf 'Type RESTORE %s %s: ' "$database" "$expected_sha"
 IFS= read -r confirmation
 [ "$confirmation" = "RESTORE $database $expected_sha" ] || exit 1
 
+reservation_log=$(mktemp "/root/pvn-restore-reservation-$backup_name.XXXXXX.json")
+chmod 0600 "$reservation_log"
+if ! pvn-db-backup reserve-restore "$backup_set" \
+  --database "$backup_key" \
+  --captured-after "$window_started_at" \
+  --expected-sha256 "$expected_sha" \
+  "${voter_options[@]}" \
+  --confirm "$confirmation" > "$reservation_log"; then
+  printf 'Reservation failed or returned no complete success output; stop. Log: %s\n' \
+    "$reservation_log" >&2
+  exit 1
+fi
+
+reservation_receipt=$(python3 - "$reservation_log" "$database" "$backup_key" \
+  "$snapshot" "$remote" "$expected_sha" <<'PY'
+import json, pathlib, stat, sys
+
+log, database, key, snapshot, remote, digest = sys.argv[1:]
+payload = json.loads(pathlib.Path(log).read_text(encoding="utf-8"))
+if (payload.get("restore_reserved") is not True
+        or payload.get("state") != "reserved-before-single-restore"
+        or payload.get("database") != database
+        or payload.get("database_key") != key
+        or payload.get("snapshot") != snapshot
+        or payload.get("restore_remote") != remote
+        or payload.get("snapshot_sha256") != digest):
+    raise SystemExit("reservation success JSON does not match the requested restore")
+receipt = pathlib.Path(payload.get("receipt_path", ""))
+if receipt.parent != pathlib.Path("/var/lib/pvn-restore-receipts"):
+    raise SystemExit("reservation receipt path is outside the fixed ledger")
+metadata = receipt.lstat()
+if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+        or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode))
+        != (0, 0, 0o600)):
+    raise SystemExit("reservation receipt is not a single root:root mode-0600 file")
+if json.loads(receipt.read_text(encoding="utf-8")) != payload:
+    raise SystemExit("reservation output does not exactly match its receipt")
+print(receipt)
+PY
+)
+[ -n "$reservation_receipt" ] || exit 1
+```
+
+`reserve-restore` takes the local backup lock, repeats the complete fresh
+`pre-restore` gate, re-reads the voter evidence immediately before committing,
+and binds the exact database key/name, snapshot and manifest hashes, source
+host, Raft cluster/server/address/term/membership identity, and fixed local
+Unix socket. It atomically creates one root-owned mode-`0600` JSON receipt below
+`/var/lib/pvn-restore-receipts` using create-exclusive semantics. The receipt
+ID is derived from the database key, Raft cluster ID, and term, so a copied,
+renamed, or different snapshot in the same leader epoch cannot reserve another
+submission.
+
+This is a durable **at-most-one submission reservation and retry fence**. It is
+not an exactly-once restore or completion record, and `reserve-restore` does not
+invoke `ovsdb-client restore`. Proceed only after receiving and validating the
+complete success JSON above; preserve both `reservation_log` and its referenced
+receipt. Then immediately submit the following command once through the
+receipt-bound socket:
+
+```bash
 /usr/bin/ovsdb-client --timeout=120 restore \
   "$remote" "$database" < "$backup_set/$snapshot"
 ```
 
-Run that command exactly once. Do not use a comma-separated SSL remote, switch
-voters, add a force/no-leader option, or restore another database. A timeout or
-lost response is ambiguous even if the transaction committed. Preserve all
-files and logs, keep writers frozen, inspect the database, and do not blindly
-retry.
+Run that command exactly once. Never delete, replace, or edit a receipt to make
+a retry possible. A reservation timeout, signal, lost stdout, incomplete or
+invalid success JSON, "receipt may exist", final-verification failure, or
+existing receipt is ambiguous: preserve `reservation_log`, any receipt, and all
+other evidence; do not run `reserve-restore` again and do not proceed to the
+restore. Likewise, a restore timeout, signal, or lost response is ambiguous
+even if the transaction committed, so do not retry it. Do not use a
+comma-separated SSL remote, switch voters, add a force/no-leader option, or
+restore another database. Keep writers frozen and inspect the database. A
+pause or state change after reservation requires aborting this epoch and
+beginning a genuinely new recovery window; it does not authorize receipt
+deletion.
 
 ### 6. Force desired-state reconciliation while writers remain frozen
 
@@ -467,9 +535,10 @@ Before reopening UI/API and guest operations, require all of the following:
 - a deliberate test-port attach/detach, security-policy test, and dataplane
   test pass.
 
-Preserve the pre-restore set, independent copy, status files, gate output, and
-operator log until validation is complete. Another database requires another
-freeze, a new Raft baseline, a new boundary, and a new recovery-window set.
+Preserve the pre-restore set, independent copy, status files, gate output,
+`reservation_log`, its immutable receipt, and the operator log until validation
+is complete. Another database requires another freeze, a new Raft baseline, a
+new boundary, and a new recovery-window set.
 
 If the window is aborted before the restore, start `pvn-central.target` on all
 central voters, start `pvn-node.target` on every node, and complete the same

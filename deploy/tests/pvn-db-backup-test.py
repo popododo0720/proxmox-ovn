@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import datetime
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import pathlib
@@ -38,6 +41,7 @@ try:
     fake_bin = temporary / "bin"
     state = temporary / "state"
     socket_root = temporary / "sockets"
+    receipt_root = temporary / "restore-receipts"
     fake_bin.mkdir(mode=0o700)
     state.mkdir(mode=0o700)
     socket_root.mkdir(mode=0o700)
@@ -50,6 +54,7 @@ try:
     counter_path = state / "status-counter"
     fail_database = state / "fail-database"
     unit_override = state / "unit-override"
+    age_status_marker = state / "age-status-on-central-read.json"
 
     sockets = {
         "PVN_Control": socket_root / "pvn-control.sock",
@@ -137,12 +142,14 @@ try:
     (fake_bin / "pvnctl").write_text(
         f"""#!/usr/bin/python3
 import json
+import os
 import pathlib
 import sys
 
 status = pathlib.Path({str(status_path)!r})
 sequence = pathlib.Path({str(sequence_path)!r})
 counter = pathlib.Path({str(counter_path)!r})
+age_status_marker = pathlib.Path({str(age_status_marker)!r})
 if sys.argv[1:] != ["central", "status"]:
     raise SystemExit(2)
 if sequence.exists():
@@ -152,6 +159,10 @@ if sequence.exists():
     counter.write_text(str(index + 1))
 else:
     report = json.loads(status.read_text())
+if age_status_marker.exists():
+    for raw_path in json.loads(age_status_marker.read_text()):
+        os.utime(raw_path, (1, 1))
+    age_status_marker.unlink()
 print(json.dumps(report))
 """,
         encoding="ascii",
@@ -246,6 +257,11 @@ else:
 
     tested_script = temporary / "pvn-db-backup"
     source = SOURCE.read_text(encoding="utf-8")
+    receipt_root_literal = "/var/lib/pvn-restore-receipts"
+    check(
+        source.count(receipt_root_literal) == 1,
+        "production restore receipt root literal drifted",
+    )
     replacements = {
         "/usr/bin/systemctl": str(fake_bin / "systemctl"),
         "/usr/sbin/pvnctl": str(fake_bin / "pvnctl"),
@@ -253,12 +269,17 @@ else:
         "/usr/bin/ovsdb-tool": str(fake_bin / "ovsdb-tool"),
         "/etc/pvn/central/enabled": str(marker),
         "/run/lock/pvn-db-backup.lock": str(temporary / "backup.lock"),
+        "/var/lib/pvn-restore-receipts": str(receipt_root),
         "/run/pvn-control/pvn-control-db.sock": str(sockets["PVN_Control"]),
         "/run/ovn/ovnnb_db.sock": str(sockets["OVN_Northbound"]),
         "/run/ovn/ovnsb_db.sock": str(sockets["OVN_Southbound"]),
     }
     for old, new in replacements.items():
         source = source.replace(old, new)
+    check(
+        receipt_root_literal not in source,
+        "isolated test did not replace the production restore receipt root",
+    )
     tested_script.write_text(source, encoding="utf-8")
     tested_script.chmod(0o755)
 
@@ -311,7 +332,37 @@ else:
     check(manifest["format"] == "pvn-db-backup/v2", "manifest format was not upgraded")
     check(manifest["purpose"] == "general-backup", "general backup purpose was omitted")
     check(len(manifest["databases"]) == 3, "all create did not capture three databases")
+    expected_database_mapping = {
+        "pvn-control": (
+            "PVN_Control",
+            "pvn-control.ovsdb",
+            f"unix:{sockets['PVN_Control']}",
+        ),
+        "ovn-nb": (
+            "OVN_Northbound",
+            "ovn-northbound.ovsdb",
+            f"unix:{sockets['OVN_Northbound']}",
+        ),
+        "ovn-sb": (
+            "OVN_Southbound",
+            "ovn-southbound.ovsdb",
+            f"unix:{sockets['OVN_Southbound']}",
+        ),
+    }
     for entry in manifest["databases"]:
+        expected_name, expected_file, expected_remote = expected_database_mapping[
+            entry["key"]
+        ]
+        check(
+            (entry["database"], entry["file"])
+            == (expected_name, expected_file),
+            f"{entry['key']} database/snapshot mapping drifted",
+        )
+        check(
+            f"client --timeout=120 backup {expected_remote} {expected_name}"
+            in calls.read_text(encoding="ascii"),
+            f"{entry['key']} fixed local Unix restore mapping drifted",
+        )
         check(
             (entry["role"], entry["leader"]) == roles[entry["database"]],
             "source role and leader identity were not recorded",
@@ -442,6 +493,37 @@ else:
             values.extend(("--voter-status", specification))
         return values
 
+    def reserve_restore_arguments(
+        *,
+        backup_set: str | None = None,
+        expected_sha256: str | None = None,
+        captured_after: str | None = None,
+        specifications: list[str] | None = None,
+        confirmation: str | None = None,
+    ) -> list[str]:
+        digest = expected_sha256 or selected_entry["sha256"]
+        values = [
+            "reserve-restore",
+            backup_set or selected["backup_set"],
+            "--database",
+            "ovn-nb",
+            "--captured-after",
+            captured_after or selected_entry["capture_started_at"],
+            "--expected-sha256",
+            digest,
+        ]
+        for specification in specifications or [
+            f"{node}={path}" for node, path in status_paths.items()
+        ]:
+            values.extend(("--voter-status", specification))
+        values.extend(
+            (
+                "--confirm",
+                confirmation or f"RESTORE OVN_Northbound {digest}",
+            )
+        )
+        return values
+
     reset_status()
     pre_restore = require_success(
         invoke(*pre_restore_arguments()), "pre-restore identity gate"
@@ -454,6 +536,247 @@ else:
     check(
         pre_restore["voters"] == sorted(status_paths),
         "pre-restore did not retain exact voter labels",
+    )
+
+    reset_status()
+    result = invoke(
+        *reserve_restore_arguments(confirmation="RESTORE OVN_Northbound wrong")
+    )
+    check(
+        result.returncode != 0 and "--confirm must exactly match" in result.stderr,
+        "restore reservation accepted a mistyped confirmation",
+    )
+    check(not receipt_root.exists(), "bad confirmation created the receipt ledger")
+
+    reset_status()
+    result = invoke(
+        *reserve_restore_arguments(expected_sha256="A" * 64)
+    )
+    check(
+        result.returncode != 0
+        and "lowercase SHA-256 digest" in result.stderr
+        and "--confirm must" not in result.stderr,
+        "restore reservation built confirmation text before validating the digest",
+    )
+    check(not receipt_root.exists(), "invalid digest created the receipt ledger")
+
+    reset_status()
+    result = invoke(
+        *reserve_restore_arguments(),
+        "--remote",
+        "unix:/tmp/operator-selected.sock",
+    )
+    check(
+        result.returncode == 2 and "unrecognized arguments" in result.stderr,
+        "restore reservation accepted an operator-selected remote",
+    )
+    check(not receipt_root.exists(), "bad remote created the receipt ledger")
+
+    duplicate_status = state / "duplicate-json-status.json"
+    encoded_status = json.dumps(source_report, separators=(",", ":"))
+    duplicate_status.write_text(
+        '{"healthy":true,"healthy":true,' + encoded_status[1:],
+        encoding="utf-8",
+    )
+    duplicate_status.chmod(0o600)
+    duplicate_specs = [
+        f"{source_hostname}={duplicate_status}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-c={status_paths['voter-c']}",
+    ]
+    reset_status()
+    result = invoke(
+        *reserve_restore_arguments(specifications=duplicate_specs)
+    )
+    check(
+        result.returncode != 0 and "duplicate JSON key" in result.stderr,
+        "restore reservation accepted duplicate JSON voter evidence",
+    )
+    check(not receipt_root.exists(), "duplicate JSON created the receipt ledger")
+
+    hardlink_status = state / "hardlink-status.json"
+    os.link(status_paths[source_hostname], hardlink_status)
+    reset_status()
+    result = invoke(*reserve_restore_arguments())
+    check(
+        result.returncode != 0 and "exactly one hard link" in result.stderr,
+        "restore reservation accepted hard-linked voter evidence",
+    )
+    hardlink_status.unlink()
+    check(not receipt_root.exists(), "hard-linked evidence created the receipt ledger")
+
+    age_status_marker.write_text(
+        json.dumps([str(path) for path in status_paths.values()]),
+        encoding="utf-8",
+    )
+    reset_status()
+    result = invoke(*reserve_restore_arguments())
+    check(
+        result.returncode != 0
+        and "voter status" in result.stderr
+        and "older than" in result.stderr,
+        "restore reservation did not recheck voter freshness immediately before receipt creation",
+    )
+    check(not receipt_root.exists(), "aged final voter evidence created a receipt")
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    for path in status_paths.values():
+        os.utime(path, (now, now))
+
+    unsafe_receipt_target = temporary / "unsafe-receipt-target"
+    unsafe_receipt_target.mkdir(mode=0o700)
+    receipt_root.symlink_to(unsafe_receipt_target, target_is_directory=True)
+    reset_status()
+    result = invoke(*reserve_restore_arguments())
+    check(
+        result.returncode != 0 and "real directory" in result.stderr,
+        "restore reservation followed a receipt-root symlink",
+    )
+    check(not list(unsafe_receipt_target.iterdir()), "receipt escaped through symlink")
+    receipt_root.unlink()
+    unsafe_receipt_target.rmdir()
+
+    receipt_root.mkdir(mode=0o700)
+    receipt_root.chmod(0o777)
+    reset_status()
+    result = invoke(*reserve_restore_arguments())
+    check(
+        result.returncode != 0 and "group/world writable" in result.stderr,
+        "restore reservation accepted a writable receipt ledger",
+    )
+    check(not list(receipt_root.iterdir()), "unsafe receipt ledger received a file")
+    receipt_root.rmdir()
+
+    reset_status()
+    calls_before_reservation = calls.read_text(encoding="ascii")
+    reserved = require_success(
+        invoke(*reserve_restore_arguments()), "restore submission reservation"
+    )
+    receipt_path = pathlib.Path(reserved["receipt_path"])
+    check(
+        reserved["restore_reserved"] is True
+        and reserved["format"] == "pvn-restore-reservation/v1"
+        and reserved["state"] == "reserved-before-single-restore",
+        "restore reservation returned the wrong state",
+    )
+    check(
+        reserved["database"] == "OVN_Northbound"
+        and reserved["database_key"] == "ovn-nb"
+        and reserved["snapshot"] == "ovn-northbound.ovsdb"
+        and reserved["restore_remote"] == f"unix:{sockets['OVN_Northbound']}"
+        and reserved["snapshot_sha256"] == selected_entry["sha256"]
+        and reserved["source"] == source_hostname,
+        "restore reservation did not bind the fixed database identity",
+    )
+    expected_reservation_id = hashlib.sha256(
+        json.dumps(
+            {
+                "database_key": "ovn-nb",
+                "cluster_id": selected_entry["cluster_id"],
+                "term": selected_entry["term"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    check(
+        reserved["receipt_id"] == expected_reservation_id,
+        "restore receipt ID is not the canonical database leader epoch",
+    )
+    check(
+        receipt_path.parent == receipt_root
+        and stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
+        and receipt_path.stat().st_nlink == 1,
+        "restore receipt is not a single mode-0600 file in the fixed ledger",
+    )
+    receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    check(receipt_payload == reserved, "persisted receipt differs from command output")
+    reservation_calls = calls.read_text(encoding="ascii")[len(calls_before_reservation) :]
+    check(" restore " not in reservation_calls, "reservation invoked ovsdb-client restore")
+
+    receipt_before = receipt_path.read_bytes()
+    receipt_inode = receipt_path.stat().st_ino
+    reset_status()
+    result = invoke(*reserve_restore_arguments())
+    check(
+        result.returncode != 0
+        and "already exists" in result.stderr
+        and "retry is forbidden" in result.stderr,
+        "restore reservation replay did not fail closed",
+    )
+    check(
+        receipt_path.read_bytes() == receipt_before
+        and receipt_path.stat().st_ino == receipt_inode,
+        "restore reservation replay changed the existing receipt",
+    )
+
+    copied_recovery_set = clone_backup(
+        pathlib.Path(selected["backup_set"]), "renamed-recovery-window"
+    )
+    reset_status()
+    result = invoke(
+        *reserve_restore_arguments(backup_set=str(copied_recovery_set))
+    )
+    check(
+        result.returncode != 0 and "already exists" in result.stderr,
+        "copying or renaming a set created another same-term reservation",
+    )
+    check(
+        receipt_path.read_bytes() == receipt_before,
+        "same-term copied set changed the existing receipt",
+    )
+
+    distinct_snapshot_set = clone_backup(
+        pathlib.Path(selected["backup_set"]), "same-term-distinct-snapshot"
+    )
+    distinct_snapshot_path = distinct_snapshot_set / "ovn-northbound.ovsdb"
+    distinct_snapshot_payload = json.loads(
+        distinct_snapshot_path.read_text(encoding="utf-8")
+    )
+    distinct_snapshot_payload["records"].append({"id": "different-record"})
+    distinct_snapshot_path.write_text(
+        json.dumps(distinct_snapshot_payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    distinct_digest = hashlib.sha256(distinct_snapshot_path.read_bytes()).hexdigest()
+    distinct_manifest_path = distinct_snapshot_set / "manifest.json"
+    distinct_manifest = json.loads(distinct_manifest_path.read_text(encoding="utf-8"))
+    distinct_manifest["databases"][0].update(
+        bytes=distinct_snapshot_path.stat().st_size,
+        sha256=distinct_digest,
+    )
+    distinct_manifest_path.write_text(
+        json.dumps(distinct_manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    reset_status()
+    result = invoke(
+        *reserve_restore_arguments(
+            backup_set=str(distinct_snapshot_set),
+            expected_sha256=distinct_digest,
+        )
+    )
+    check(
+        result.returncode != 0 and "already exists" in result.stderr,
+        "a different snapshot in the same database leader epoch bypassed the receipt",
+    )
+    check(
+        receipt_path.read_bytes() == receipt_before,
+        "same-term distinct snapshot changed the existing receipt",
+    )
+
+    receipt_path.unlink()
+    identity_drifted_status = copy.deepcopy(base_status)
+    identity_drifted_status["databases"][1]["term"] += 1
+    reset_status(identity_drifted_status)
+    result = invoke(*reserve_restore_arguments())
+    check(
+        result.returncode != 0
+        and "local live Raft identity differs" in result.stderr,
+        "restore reservation accepted live Raft identity drift",
+    )
+    check(
+        not list(receipt_root.iterdir()),
+        "live Raft identity drift created a restore receipt",
     )
 
     for active_node_unit in ("pvn-node.target", "pvn-node-ready.service"):
@@ -904,6 +1227,244 @@ else:
     check(
         not list(server_drift_output.iterdir()),
         "server identity drift left a backup set behind",
+    )
+
+    module_name = "pvn_db_backup_atomic_test"
+    loader = importlib.machinery.SourceFileLoader(module_name, str(SOURCE))
+    specification = importlib.util.spec_from_loader(module_name, loader)
+    check(specification is not None, "cannot load pvn-db-backup for atomic tests")
+    backup_module = importlib.util.module_from_spec(specification)
+    sys.modules[module_name] = backup_module
+    previous_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader.exec_module(backup_module)
+    finally:
+        sys.dont_write_bytecode = previous_dont_write_bytecode
+    atomic_root = temporary / "atomic-receipts"
+    atomic_root.mkdir(mode=0o700)
+    backup_module.RESTORE_RECEIPT_ROOT = atomic_root
+    atomic_payload = {
+        "format": "pvn-restore-reservation/v1",
+        "restore_reserved": True,
+        "database_key": "ovn-nb",
+    }
+
+    def atomic_path(digit: str) -> pathlib.Path:
+        return atomic_root / f"pvn-restore-ovn-nb-{digit * 64}.json"
+
+    def expect_receipt_failure(
+        path: pathlib.Path, expected: str, label: str
+    ) -> str:
+        try:
+            backup_module.write_restore_receipt(path, atomic_payload)
+        except backup_module.BackupError as error:
+            message = str(error)
+            check(expected in message, f"{label} returned the wrong error: {message}")
+            return message
+        raise AssertionError(f"{label} unexpectedly succeeded")
+
+    regular_receipt = atomic_path("a")
+    regular_receipt.write_bytes(b"partial receipt")
+    regular_receipt.chmod(0o600)
+    regular_before = (regular_receipt.stat().st_ino, regular_receipt.read_bytes())
+    expect_receipt_failure(regular_receipt, "already exists", "regular receipt replay")
+    check(
+        (regular_receipt.stat().st_ino, regular_receipt.read_bytes()) == regular_before,
+        "preexisting regular receipt was changed",
+    )
+
+    symlink_target = temporary / "receipt-symlink-target"
+    symlink_target.write_bytes(b"outside")
+    symlink_receipt = atomic_path("b")
+    symlink_receipt.symlink_to(symlink_target)
+    symlink_inode = symlink_receipt.lstat().st_ino
+    expect_receipt_failure(symlink_receipt, "already exists", "symlink receipt replay")
+    check(
+        symlink_receipt.is_symlink()
+        and symlink_receipt.lstat().st_ino == symlink_inode
+        and symlink_target.read_bytes() == b"outside",
+        "preexisting receipt symlink or its target was changed",
+    )
+
+    fifo_receipt = atomic_path("c")
+    os.mkfifo(fifo_receipt, 0o600)
+    fifo_inode = fifo_receipt.lstat().st_ino
+    expect_receipt_failure(fifo_receipt, "already exists", "FIFO receipt replay")
+    check(
+        stat.S_ISFIFO(fifo_receipt.lstat().st_mode)
+        and fifo_receipt.lstat().st_ino == fifo_inode,
+        "preexisting receipt FIFO was changed",
+    )
+
+    directory_receipt = atomic_path("d")
+    directory_receipt.mkdir(mode=0o700)
+    directory_inode = directory_receipt.stat().st_ino
+    expect_receipt_failure(directory_receipt, "already exists", "directory receipt replay")
+    check(
+        directory_receipt.is_dir()
+        and directory_receipt.stat().st_ino == directory_inode
+        and not list(directory_receipt.iterdir()),
+        "preexisting receipt directory was changed",
+    )
+
+    concurrent_receipt = atomic_path("e")
+
+    def concurrent_reservation() -> str:
+        try:
+            backup_module.write_restore_receipt(concurrent_receipt, atomic_payload)
+            return "success"
+        except backup_module.BackupError as error:
+            return str(error)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _: concurrent_reservation(), range(2)))
+    check(
+        outcomes.count("success") == 1
+        and sum("already exists" in outcome for outcome in outcomes) == 1,
+        f"concurrent O_EXCL reservation was not one-success: {outcomes}",
+    )
+    check(
+        stat.S_IMODE(concurrent_receipt.stat().st_mode) == 0o600
+        and json.loads(concurrent_receipt.read_text(encoding="utf-8"))
+        == atomic_payload,
+        "concurrent reservation did not persist one valid mode-0600 receipt",
+    )
+
+    partial_receipt = atomic_path("f")
+    original_write = backup_module.os.write
+    write_count = [0]
+
+    def partial_then_zero(descriptor: int, payload: bytes) -> int:
+        write_count[0] += 1
+        if write_count[0] == 1:
+            return original_write(descriptor, payload[:7])
+        return 0
+
+    backup_module.os.write = partial_then_zero
+    try:
+        expect_receipt_failure(
+            partial_receipt, "do not retry", "short receipt write"
+        )
+    finally:
+        backup_module.os.write = original_write
+    check(
+        partial_receipt.exists() and partial_receipt.stat().st_size == 7,
+        "short-write receipt was deleted or overwritten",
+    )
+    expect_receipt_failure(
+        partial_receipt, "already exists", "short-write receipt retry"
+    )
+
+    file_fsync_receipt = atomic_path("1")
+    original_fsync = backup_module.os.fsync
+
+    def fail_file_fsync(descriptor: int) -> None:
+        if stat.S_ISREG(backup_module.os.fstat(descriptor).st_mode):
+            raise OSError("injected receipt file fsync failure")
+        original_fsync(descriptor)
+
+    backup_module.os.fsync = fail_file_fsync
+    try:
+        expect_receipt_failure(
+            file_fsync_receipt, "do not retry", "receipt file fsync failure"
+        )
+    finally:
+        backup_module.os.fsync = original_fsync
+    check(file_fsync_receipt.exists(), "file-fsync failure deleted the receipt")
+    expect_receipt_failure(
+        file_fsync_receipt, "already exists", "file-fsync receipt retry"
+    )
+
+    directory_fsync_receipt = atomic_path("2")
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(backup_module.os.fstat(descriptor).st_mode):
+            raise OSError("injected receipt directory fsync failure")
+        original_fsync(descriptor)
+
+    backup_module.os.fsync = fail_directory_fsync
+    try:
+        expect_receipt_failure(
+            directory_fsync_receipt,
+            "do not retry",
+            "receipt directory fsync failure",
+        )
+    finally:
+        backup_module.os.fsync = original_fsync
+    check(
+        directory_fsync_receipt.exists(),
+        "directory-fsync failure deleted the receipt",
+    )
+    expect_receipt_failure(
+        directory_fsync_receipt,
+        "already exists",
+        "directory-fsync receipt retry",
+    )
+
+    hardlink_race_receipt = atomic_path("3")
+    hardlink_race_alias = atomic_root / "hardlink-race-alias"
+
+    def add_hardlink_after_file_fsync(descriptor: int) -> None:
+        original_fsync(descriptor)
+        if (
+            stat.S_ISREG(backup_module.os.fstat(descriptor).st_mode)
+            and not hardlink_race_alias.exists()
+        ):
+            os.link(hardlink_race_receipt, hardlink_race_alias)
+
+    backup_module.os.fsync = add_hardlink_after_file_fsync
+    try:
+        expect_receipt_failure(
+            hardlink_race_receipt,
+            "do not retry",
+            "receipt hardlink race",
+        )
+    finally:
+        backup_module.os.fsync = original_fsync
+    check(
+        hardlink_race_receipt.exists()
+        and hardlink_race_alias.exists()
+        and hardlink_race_receipt.stat().st_ino == hardlink_race_alias.stat().st_ino
+        and hardlink_race_receipt.stat().st_nlink == 2,
+        "hardlink-race receipt was deleted or replaced",
+    )
+    expect_receipt_failure(
+        hardlink_race_receipt,
+        "already exists",
+        "hardlink-race receipt retry",
+    )
+
+    close_failure_receipt = atomic_path("4")
+    original_close = backup_module.os.close
+    unclosed_descriptor: list[int] = []
+
+    def fail_receipt_close(descriptor: int) -> None:
+        try:
+            is_regular = stat.S_ISREG(backup_module.os.fstat(descriptor).st_mode)
+        except OSError:
+            is_regular = False
+        if is_regular and not unclosed_descriptor:
+            unclosed_descriptor.append(descriptor)
+            raise OSError("injected receipt close failure")
+        original_close(descriptor)
+
+    backup_module.os.close = fail_receipt_close
+    try:
+        expect_receipt_failure(
+            close_failure_receipt,
+            "do not retry",
+            "receipt close failure",
+        )
+    finally:
+        backup_module.os.close = original_close
+        for descriptor in unclosed_descriptor:
+            original_close(descriptor)
+    check(close_failure_receipt.exists(), "close failure deleted the receipt")
+    expect_receipt_failure(
+        close_failure_receipt,
+        "already exists",
+        "close-failure receipt retry",
     )
 
     result = invoke("restore", str(backup_set))

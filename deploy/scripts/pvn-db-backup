@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
+import errno
 import fcntl
 import hashlib
 import ipaddress
@@ -27,6 +28,7 @@ from typing import Any
 PROGRAM = "pvn-db-backup"
 FORMAT = "pvn-db-backup/v2"
 LEGACY_FORMAT = "pvn-db-backup/v1"
+RESTORE_RECEIPT_FORMAT = "pvn-restore-reservation/v1"
 CONSISTENCY = "independent-per-database"
 SYSTEMCTL = "/usr/bin/systemctl"
 PVNCTL = "/usr/sbin/pvnctl"
@@ -35,6 +37,7 @@ OVSDB_TOOL = "/usr/bin/ovsdb-tool"
 CENTRAL_MARKER = pathlib.Path("/etc/pvn/central/enabled")
 LOCK_PATH = pathlib.Path("/run/lock/pvn-db-backup.lock")
 DEFAULT_OUTPUT = pathlib.Path("/var/backups/pvn")
+RESTORE_RECEIPT_ROOT = pathlib.Path("/var/lib/pvn-restore-receipts")
 COMMAND_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
     "LC_ALL": "C",
@@ -49,6 +52,7 @@ TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 SAFE_HOSTNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 MAX_MANIFEST = 1024 * 1024
 MAX_TEXT_OUTPUT = 1024 * 1024
+MAX_RECEIPT = 64 * 1024
 MAX_RECOVERY_WINDOW_AGE = 60 * 60
 MAX_STATUS_AGE = 10 * 60
 DEFAULT_STATUS_AGE = 120
@@ -56,6 +60,10 @@ FUTURE_CLOCK_SKEW = 5
 
 
 class BackupError(RuntimeError):
+    pass
+
+
+class DuplicateJSONKey(ValueError):
     pass
 
 
@@ -152,6 +160,22 @@ def utc_now() -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def decode_json(raw: bytes | str, label: str) -> Any:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise DuplicateJSONKey(f"duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        return json.loads(text, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateJSONKey) as error:
+        fail(f"{label} is invalid JSON: {error}")
 
 
 def clean_absolute(path: pathlib.Path, label: str) -> pathlib.Path:
@@ -428,10 +452,7 @@ def parse_central_status(report: Any) -> dict[str, RaftIdentity]:
 
 def central_status() -> dict[str, RaftIdentity]:
     raw = command([PVNCTL, "central", "status"], timeout=30)
-    try:
-        report = json.loads(raw)
-    except json.JSONDecodeError as error:
-        fail(f"pvnctl central status returned invalid JSON: {error}")
+    report = decode_json(raw, "pvnctl central status")
     return parse_central_status(report)
 
 
@@ -604,6 +625,16 @@ def read_manifest(backup_set: pathlib.Path) -> dict[str, Any]:
     except OSError as error:
         fail(f"cannot open backup manifest: {error}")
     try:
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or opened.st_size != metadata.st_size
+            or opened.st_mtime_ns != metadata.st_mtime_ns
+            or opened.st_nlink != 1
+            or (opened.st_uid, opened.st_gid, stat.S_IMODE(opened.st_mode))
+            != (0, 0, 0o600)
+        ):
+            fail("backup manifest changed while it was being opened")
         raw = b""
         while len(raw) <= MAX_MANIFEST:
             block = os.read(descriptor, 65536)
@@ -612,12 +643,19 @@ def read_manifest(backup_set: pathlib.Path) -> dict[str, Any]:
             raw += block
         if len(raw) > MAX_MANIFEST:
             fail("backup manifest is too large")
+        final = os.fstat(descriptor)
+        if (
+            (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino)
+            or final.st_size != opened.st_size
+            or final.st_mtime_ns != opened.st_mtime_ns
+            or final.st_nlink != 1
+            or (final.st_uid, final.st_gid, stat.S_IMODE(final.st_mode))
+            != (0, 0, 0o600)
+        ):
+            fail("backup manifest changed while it was being read")
     finally:
         os.close(descriptor)
-    try:
-        manifest = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail(f"backup manifest is invalid JSON: {error}")
+    manifest = decode_json(raw, "backup manifest")
     if not isinstance(manifest, dict):
         fail("backup manifest root must be an object")
     return manifest
@@ -652,6 +690,9 @@ def read_secure_json_file(
             (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
             or opened.st_size != metadata.st_size
             or opened.st_mtime_ns != metadata.st_mtime_ns
+            or opened.st_nlink != 1
+            or (opened.st_uid, opened.st_gid, stat.S_IMODE(opened.st_mode))
+            != (0, 0, 0o600)
         ):
             fail(f"{label} changed while it was being opened")
         raw = b""
@@ -664,16 +705,17 @@ def read_secure_json_file(
             fail(f"{label} is too large")
         final = os.fstat(descriptor)
         if (
-            final.st_size != opened.st_size
+            (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino)
+            or final.st_size != opened.st_size
             or final.st_mtime_ns != opened.st_mtime_ns
+            or final.st_nlink != 1
+            or (final.st_uid, final.st_gid, stat.S_IMODE(final.st_mode))
+            != (0, 0, 0o600)
         ):
             fail(f"{label} changed while it was being read")
     finally:
         os.close(descriptor)
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail(f"{label} is invalid JSON: {error}")
+    payload = decode_json(raw, label)
     return payload, (opened.st_dev, opened.st_ino), opened.st_mtime
 
 
@@ -997,9 +1039,280 @@ def pre_restore_check(
         "capture_completed_at": entry["capture_completed_at"],
         "sha256": entry["sha256"],
         "voters": sorted(statuses),
+        "voter_identities": {
+            node: dataclasses.asdict(statuses[node][entry["database"]])
+            for node in sorted(statuses)
+        },
         "live_identity_verified": True,
         "restore_ready": True,
     }
+
+
+def ensure_restore_receipt_root() -> None:
+    parent = RESTORE_RECEIPT_ROOT.parent
+    parent_metadata = inspect_directory_chain(parent, "restore receipt parent")
+    if (
+        parent_metadata.st_uid,
+        parent_metadata.st_gid,
+    ) != (0, 0):
+        fail("restore receipt parent must be owned by root:root")
+    if os.path.lexists(RESTORE_RECEIPT_ROOT):
+        metadata = inspect_directory_chain(
+            RESTORE_RECEIPT_ROOT, "restore receipt root"
+        )
+        if (
+            metadata.st_uid,
+            metadata.st_gid,
+            stat.S_IMODE(metadata.st_mode),
+        ) != (0, 0, 0o700):
+            fail("restore receipt root must be root:root mode 0700")
+        return
+    try:
+        os.mkdir(RESTORE_RECEIPT_ROOT, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        fail(f"cannot create restore receipt root: {error}")
+    metadata = inspect_directory_chain(RESTORE_RECEIPT_ROOT, "restore receipt root")
+    if (
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+    ) != (0, 0, 0o700):
+        fail("new restore receipt root is not root:root mode 0700")
+    fsync_directory(parent)
+
+
+def write_restore_receipt(path: pathlib.Path, receipt: dict[str, Any]) -> None:
+    if path.parent != RESTORE_RECEIPT_ROOT or not re.fullmatch(
+        r"pvn-restore-[A-Za-z0-9._-]+-[0-9a-f]{64}\.json", path.name
+    ):
+        fail("generated restore receipt path is unsafe")
+    payload = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if not payload or len(payload) > MAX_RECEIPT:
+        fail("generated restore receipt size is invalid")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            fail(
+                "restore submission receipt already exists; restore retry is forbidden"
+            )
+        fail(f"cannot reserve restore submission receipt: {error}")
+
+    problem: BaseException | None = None
+    opened: os.stat_result | None = None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_uid, opened.st_gid, stat.S_IMODE(opened.st_mode))
+            != (0, 0, 0o600)
+        ):
+            fail("new restore submission receipt is not a single root:root mode 0600 file")
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("short write while reserving restore submission")
+            written += count
+        os.fsync(descriptor)
+        final = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+        ) != (
+            final.st_dev,
+            final.st_ino,
+            final.st_uid,
+            final.st_gid,
+            stat.S_IMODE(final.st_mode),
+        ) or final.st_nlink != 1 or final.st_size != len(payload):
+            fail("restore submission receipt changed while it was written")
+    except BaseException as error:
+        problem = error
+    finally:
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            if problem is None:
+                problem = error
+    if problem is not None:
+        fail(
+            "restore submission receipt may exist after an incomplete reservation; "
+            f"do not retry: {problem}"
+        )
+    try:
+        fsync_directory(RESTORE_RECEIPT_ROOT)
+        persisted, _, _ = read_secure_json_file(
+            path, "restore submission receipt"
+        )
+        if persisted != receipt:
+            fail("persisted restore submission receipt differs from the reservation")
+    except BaseException as error:
+        fail(
+            "restore submission receipt exists but final verification failed; "
+            f"do not retry: {error}"
+        )
+
+
+def reserve_restore_submission(
+    backup_set: pathlib.Path,
+    database_key: str,
+    captured_after: str,
+    expected_sha256: str,
+    voter_status_specs: list[str],
+    status_max_age: int,
+    confirmation: str,
+) -> dict[str, Any]:
+    database = DATABASE_BY_KEY[database_key]
+    if not isinstance(expected_sha256, str) or not SHA256.fullmatch(expected_sha256):
+        fail("--expected-sha256 must be one lowercase SHA-256 digest")
+    expected_confirmation = f"RESTORE {database.name} {expected_sha256}"
+    if confirmation != expected_confirmation:
+        fail(f"--confirm must exactly match {expected_confirmation!r}")
+
+    gate = pre_restore_check(
+        backup_set,
+        database_key,
+        captured_after,
+        expected_sha256,
+        voter_status_specs,
+        status_max_age,
+    )
+    try:
+        canonical_backup_set = backup_set.resolve(strict=True)
+    except OSError as error:
+        fail(f"cannot resolve verified backup set: {error}")
+    if canonical_backup_set != backup_set:
+        fail("backup set must be provided through its canonical absolute path")
+
+    manifest = read_manifest(backup_set)
+    entries = validate_manifest(manifest)
+    if len(entries) != 1 or entries[0]["key"] != database_key:
+        fail("restore reservation database does not exactly match the backup set")
+    entry = entries[0]
+    if any(
+        (
+            gate.get("database_key") != database.key,
+            gate.get("database") != database.name,
+            gate.get("backup_set") != str(canonical_backup_set),
+            gate.get("source") != manifest["source"]["hostname"],
+            gate.get("cluster_id") != entry["cluster_id"],
+            gate.get("server_id") != entry["server_id"],
+            gate.get("address") != entry["address"],
+            gate.get("term") != entry["term"],
+            gate.get("member_count") != entry["member_count"],
+            gate.get("capture_started_at") != entry["capture_started_at"],
+            gate.get("capture_completed_at") != entry["capture_completed_at"],
+            gate.get("sha256") != entry["sha256"],
+            gate.get("restore_ready") is not True,
+            gate.get("live_identity_verified") is not True,
+            gate.get("verified") is not True,
+        )
+    ):
+        fail("fresh pre-restore gate differs from the verified backup identity")
+
+    snapshot_path = backup_set / database.filename
+    snapshot_digest, snapshot_size = hash_file(snapshot_path)
+    if snapshot_digest != expected_sha256 or snapshot_size != entry["bytes"]:
+        fail("recovery snapshot changed after the fresh pre-restore gate")
+    manifest_digest, manifest_size = hash_file(backup_set / "manifest.json")
+    if manifest_size <= 0 or manifest_size > MAX_MANIFEST:
+        fail("backup manifest size changed after the fresh pre-restore gate")
+
+    require_central_marker()
+    require_recovery_service_state()
+    live_version, live_checksum = live_schema(database)
+    if (
+        live_version != entry["schema_version"]
+        or live_checksum != entry["schema_checksum"]
+    ):
+        fail("selected live database schema changed after the fresh pre-restore gate")
+
+    final_statuses, final_status_modification_times = load_voter_statuses(
+        voter_status_specs, status_max_age
+    )
+    capture_completed = timestamp_datetime(
+        entry["capture_completed_at"], "recovery capture completion"
+    ).timestamp()
+    for node, modification_time in final_status_modification_times.items():
+        if modification_time < capture_completed:
+            fail(f"{node} final voter status predates the completed recovery capture")
+    final_voter_identities = {
+        node: dataclasses.asdict(final_statuses[node][database.name])
+        for node in sorted(final_statuses)
+    }
+    if final_voter_identities != gate.get("voter_identities"):
+        fail("voter Raft identity changed after the fresh pre-restore gate")
+
+    live_identity = central_status()[database.name]
+    if (
+        live_identity.role != "leader"
+        or live_identity.leader != "self"
+        or live_identity.cluster_id != entry["cluster_id"]
+        or live_identity.server_id != entry["server_id"]
+        or live_identity.address != entry["address"]
+        or live_identity.term != entry["term"]
+        or live_identity.member_count != entry["member_count"]
+    ):
+        fail("local Raft identity changed after the fresh pre-restore gate")
+
+    # One reservation is allowed for one selected database Raft leader epoch.
+    # Deliberately omit backup paths, capture names, and snapshot digests from
+    # this ID: copying/renaming a set or capturing another snapshot in the same
+    # term must not create a second submission opportunity.
+    reservation_identity = {
+        "database_key": database.key,
+        "cluster_id": entry["cluster_id"],
+        "term": entry["term"],
+    }
+    reservation_id = hashlib.sha256(
+        json.dumps(
+            reservation_identity, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    ensure_restore_receipt_root()
+    receipt_path = RESTORE_RECEIPT_ROOT / (
+        f"pvn-restore-{database.key}-{reservation_id}.json"
+    )
+    receipt = {
+        "format": RESTORE_RECEIPT_FORMAT,
+        "state": "reserved-before-single-restore",
+        "restore_reserved": True,
+        "reserved_at": utc_now(),
+        "receipt_id": reservation_id,
+        "receipt_path": str(receipt_path),
+        "database": database.name,
+        "database_key": database.key,
+        "backup_set": str(canonical_backup_set),
+        "manifest_sha256": manifest_digest,
+        "snapshot": database.filename,
+        "snapshot_sha256": entry["sha256"],
+        "restore_remote": database.remote,
+        "source": manifest["source"]["hostname"],
+        "raft": {
+            "cluster_id": entry["cluster_id"],
+            "server_id": entry["server_id"],
+            "address": entry["address"],
+            "term": entry["term"],
+            "member_count": entry["member_count"],
+        },
+        "gate": gate,
+    }
+    write_restore_receipt(receipt_path, receipt)
+    return receipt
 
 
 def safe_hostname() -> str:
@@ -1207,6 +1520,45 @@ def parser() -> argparse.ArgumentParser:
         default=DEFAULT_STATUS_AGE,
         help=f"maximum voter status file age in seconds (default: {DEFAULT_STATUS_AGE})",
     )
+    reserve_restore = subcommands.add_parser(
+        "reserve-restore",
+        help="repeat the fresh pre-restore gate and reserve one restore submission",
+    )
+    reserve_restore.add_argument("backup_set", type=pathlib.Path)
+    reserve_restore.add_argument(
+        "--database",
+        required=True,
+        choices=[database.key for database in DATABASES],
+        help="exact recovery-window database key",
+    )
+    reserve_restore.add_argument(
+        "--captured-after",
+        required=True,
+        help="UTC maintenance-window boundary in YYYY-MM-DDTHH:MM:SSZ form",
+    )
+    reserve_restore.add_argument(
+        "--expected-sha256",
+        required=True,
+        help="exact snapshot SHA-256 recorded from create output",
+    )
+    reserve_restore.add_argument(
+        "--voter-status",
+        action="append",
+        required=True,
+        metavar="NODE=/SECURE/ABSOLUTE/PATH",
+        help="fresh root-only pvnctl central status JSON; repeat for every voter",
+    )
+    reserve_restore.add_argument(
+        "--status-max-age",
+        type=int,
+        default=DEFAULT_STATUS_AGE,
+        help=f"maximum voter status file age in seconds (default: {DEFAULT_STATUS_AGE})",
+    )
+    reserve_restore.add_argument(
+        "--confirm",
+        required=True,
+        help="exact RESTORE DATABASE_NAME SHA256 operator confirmation",
+    )
     return result
 
 
@@ -1232,7 +1584,7 @@ def main() -> int:
             os.close(lock_descriptor)
     elif arguments.action == "verify":
         report = verify_backup_set(clean_absolute(arguments.backup_set, "backup set"))
-    else:
+    elif arguments.action == "pre-restore":
         report = pre_restore_check(
             clean_absolute(arguments.backup_set, "backup set"),
             arguments.database,
@@ -1241,6 +1593,20 @@ def main() -> int:
             arguments.voter_status,
             arguments.status_max_age,
         )
+    else:
+        lock_descriptor = acquire_lock()
+        try:
+            report = reserve_restore_submission(
+                clean_absolute(arguments.backup_set, "backup set"),
+                arguments.database,
+                arguments.captured_after,
+                arguments.expected_sha256,
+                arguments.voter_status,
+                arguments.status_max_age,
+                arguments.confirm,
+            )
+        finally:
+            os.close(lock_descriptor)
     print(json.dumps(report, sort_keys=True))
     return 0
 
