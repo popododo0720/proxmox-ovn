@@ -865,13 +865,43 @@ control = {
             for name in names
         },
     },
-    "control_db_cluster_id": "control-cid",
+    "control_db_cluster_id": "22222222-2222-4222-8222-222222222222",
     "db_cluster_ids": {
-        "PVN_Control": "control-cid",
-        "OVN_Northbound": "nb-cid",
-        "OVN_Southbound": "sb-cid",
+        "PVN_Control": "22222222-2222-4222-8222-222222222222",
+        "OVN_Northbound": "33333333-3333-4333-8333-333333333333",
+        "OVN_Southbound": "44444444-4444-4444-8444-444444444444",
     },
 }
+state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
+state["control_ledger_sha256"] = hashlib.sha256(
+    state["control_ledger"].encode()
+).hexdigest()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream, sort_keys=True)
+PY
+}
+
+mutate_active_control_ledger() {
+    python3 - "$STATE" "$1" <<'PY'
+import hashlib
+import json
+import sys
+
+path, mutation = sys.argv[1:]
+state = json.load(open(path, encoding="utf-8"))
+control = json.loads(state["control_ledger"])
+if mutation == "cluster-uuid":
+    control["cluster_uuid"] = "not-a-canonical-uuid"
+elif mutation == "cluster-version":
+    control["snapshot"]["cluster_version"] += 1
+elif mutation == "snapshot-extra-key":
+    control["snapshot"]["unexpected"] = True
+elif mutation == "node-extra-key":
+    control["snapshot"]["nodes"][0]["unexpected"] = True
+elif mutation == "database-uuid":
+    control["db_cluster_ids"]["OVN_Northbound"] = "not-a-canonical-uuid"
+else:
+    raise AssertionError("unknown active control-ledger mutation: %s" % mutation)
 state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
 state["control_ledger_sha256"] = hashlib.sha256(
     state["control_ledger"].encode()
@@ -1244,6 +1274,19 @@ PY
 if grep -q 'action=restore-ledger' "$LOG"; then
     fail "external ledger drift was overwritten by rollback"
 fi
+
+for mutation in cluster-uuid cluster-version snapshot-extra-key node-extra-key database-uuid; do
+    seed_active_schema1
+    mutate_active_control_ledger "$mutation"
+    : > "$LOG"
+    if PVN_TEST_ACTIVE=yes "$TOPOLOGY" plan \
+        --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+        > "$WORK/active-ledger-$mutation.out" 2>&1
+    then
+        fail "malformed active control-plane $mutation unexpectedly planned"
+    fi
+    assert_no_mutation
+done
 
 seed_active_schema1
 : > "$LOG"

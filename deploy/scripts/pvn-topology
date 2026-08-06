@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 from typing import Any
+import uuid
 
 
 PROGRAM = Path(sys.argv[0]).name
@@ -77,6 +78,16 @@ def canonical_json(value: Any) -> str:
 
 def digest_text(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def canonical_uuid(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return str(parsed) == value
 
 
 def read_limited(path: Path, limit: int, root_only: bool = True) -> str:
@@ -3304,6 +3315,7 @@ def validate_active_control_ledger(
     cluster_name: str,
     nodes: list[dict[str, Any]],
     reports: list[dict[str, Any]],
+    membership_guard: dict[str, Any],
     expected_legacy: dict[str, Any],
     legacy_sha256: str,
     candidate_sha256: str,
@@ -3331,6 +3343,7 @@ def validate_active_control_ledger(
         not isinstance(ledger, dict)
         or set(ledger) != required
         or ledger.get("version") != 1
+        or not canonical_uuid(ledger.get("cluster_uuid"))
         or ledger.get("phase") != "complete"
         or ledger.get("central_complete") != count
         or ledger.get("nodes_complete") != count
@@ -3358,21 +3371,28 @@ def validate_active_control_ledger(
     db_ids = ledger.get("db_cluster_ids")
     expected_dbs = {"PVN_Control", "OVN_Northbound", "OVN_Southbound"}
     if (
-        not isinstance(control_id, str)
-        or not control_id
+        not canonical_uuid(control_id)
         or not isinstance(db_ids, dict)
         or set(db_ids) != expected_dbs
         or db_ids.get("PVN_Control") != control_id
-        or any(not isinstance(value, str) or not value for value in db_ids.values())
+        or any(not canonical_uuid(value) for value in db_ids.values())
     ):
         fail("active control-plane database identities are incomplete")
     snapshot = ledger.get("snapshot")
-    if not isinstance(snapshot, dict):
+    snapshot_keys = {
+        "mode", "confirmation", "cluster_name", "members_version",
+        "cluster_version", "topology_sha256", "guest_mtu", "physnet", "nodes",
+    }
+    if not isinstance(snapshot, dict) or set(snapshot) != snapshot_keys:
         fail("active control-plane snapshot is missing")
     if (
-        snapshot.get("mode") != "raft"
+        membership_guard.get("mode") != "cluster"
+        or snapshot.get("mode") != "raft"
         or snapshot.get("confirmation") != cluster_name
         or snapshot.get("cluster_name") != cluster_name
+        or type(snapshot.get("members_version")) is not int
+        or snapshot["members_version"] < 0
+        or snapshot.get("cluster_version") != membership_guard.get("cluster_version")
         or snapshot.get("guest_mtu") != expected_legacy["guest_mtu"]
         or snapshot.get("physnet") != expected_legacy["physnet"]
     ):
@@ -3381,11 +3401,18 @@ def validate_active_control_ledger(
         fail("active control-plane snapshot does not pin the legacy/candidate topology")
     snapshot_nodes = snapshot.get("nodes")
     expected_rows = {row["name"]: row for row in expected_legacy["nodes"]}
+    node_keys = {
+        "name", "node_id", "control_ip", "geneve_ip", "geneve_interface",
+        "provider_interface", "provider_bridge", "package_version", "geneve_mtu",
+    }
     if (
         not isinstance(snapshot_nodes, list)
         or len(snapshot_nodes) != count
         or any(not isinstance(row, dict) for row in snapshot_nodes)
+        or any(set(row) != node_keys for row in snapshot_nodes)
         or {row.get("name") for row in snapshot_nodes} != set(expected_rows)
+        or [row.get("name") for row in snapshot_nodes]
+        != [node["name"] for node in nodes]
     ):
         fail("active control-plane snapshot node set is not N/N")
     package_versions = set()
@@ -3416,6 +3443,7 @@ def build_active_ledger_upgrade_plan(
     spec: dict[str, Any],
     transaction: str,
     topology_plan: dict[str, Any],
+    membership_guard: dict[str, Any],
 ) -> dict[str, Any]:
     if any(activation_report_mode(report.get("activation")) != "active" for report in reports):
         fail("ledger-only upgrade requires exact active PVN state on every node")
@@ -3490,7 +3518,7 @@ def build_active_ledger_upgrade_plan(
     ):
         fail("schema 2 topology ledger is not the exact canonical candidate")
     validate_active_control_ledger(
-        cluster_name, nodes, reports, expected_legacy,
+        cluster_name, nodes, reports, membership_guard, expected_legacy,
         legacy_sha256, candidate_sha256,
     )
     return {
@@ -3569,7 +3597,8 @@ def apply_active_ledger_upgrade(
     )
     topology_plan = build_plan(cluster_name, nodes, reports, spec)
     upgrade = build_active_ledger_upgrade_plan(
-        cluster_name, nodes, reports, spec, transaction, topology_plan
+        cluster_name, nodes, reports, spec, transaction, topology_plan,
+        membership_guard,
     )
     if (
         upgrade["candidate_sha256"] != initial_upgrade["candidate_sha256"]
@@ -3610,7 +3639,8 @@ def apply_active_ledger_upgrade(
         )
         post_topology = build_plan(cluster_name, nodes, post_reports, spec)
         post = build_active_ledger_upgrade_plan(
-            cluster_name, nodes, post_reports, spec, transaction, post_topology
+            cluster_name, nodes, post_reports, spec, transaction, post_topology,
+            membership_guard,
         )
     except TopologyError as post_error:
         fail(
@@ -4375,7 +4405,8 @@ def main() -> int:
         active_upgrade = None
         if activation_mode == "active":
             active_upgrade = build_active_ledger_upgrade_plan(
-                cluster_name, nodes, reports, spec, transaction, plan
+                cluster_name, nodes, reports, spec, transaction, plan,
+                membership_snapshot,
             )
             state = "required" if active_upgrade["upgrade_required"] else "already complete"
             print(
