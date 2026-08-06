@@ -32,6 +32,7 @@ CURL_BIN=${PVN_CURL_BIN:-curl}
 TOPOLOGY_BIN=${PVN_TOPOLOGY_BIN:-/usr/lib/pvn/pvn-topology}
 CONTROL_PLANE_BIN=${PVN_CONTROL_PLANE_BIN:-/usr/lib/pvn/pvn-control-plane}
 CONTROL_PLANE_MEMBERS=${PVN_CP_MEMBERS:-/etc/pve/.members}
+PVECM_BIN=${PVN_INSTALL_PVECM:-/usr/bin/pvecm}
 PYTHON_BIN=${PVN_INSTALL_PYTHON:-python3}
 WORK=
 
@@ -347,17 +348,21 @@ run_topology() {
 
 preflight_control_plane() {
     pvn_setup_cluster=$1
-    "$PYTHON_BIN" - "$CONTROL_PLANE_MEMBERS" "$pvn_setup_cluster" "$PROGRAM" <<'PY'
+    "$PYTHON_BIN" - "$CONTROL_PLANE_MEMBERS" "$pvn_setup_cluster" "$PROGRAM" \
+        "$PVECM_BIN" <<'PY'
 import ipaddress
 import json
+import os
 import pathlib
 import re
 import stat
+import subprocess
 import sys
 
 members_path = pathlib.Path(sys.argv[1])
 confirmation = sys.argv[2]
 program = sys.argv[3]
+pvecm_path = pathlib.Path(sys.argv[4])
 safe_name = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
 
 
@@ -382,37 +387,40 @@ if not isinstance(members, dict):
     fail("PVE membership root must be an object")
 
 local_name = members.get("nodename")
-nodelist = members.get("nodelist")
 if not isinstance(local_name, str) or not safe_name.fullmatch(local_name):
     fail("PVE local node name is unsafe or empty")
-if not isinstance(nodelist, dict) or local_name not in nodelist:
-    fail("PVE membership is missing the local node")
+members_version = members.get("version")
+if type(members_version) is not int or members_version < 0:
+    fail("PVE membership version is invalid")
 
-node_ids = set()
-node_ips = set()
-for name, node in nodelist.items():
-    if not isinstance(name, str) or not safe_name.fullmatch(name) or not isinstance(node, dict):
-        fail("PVE membership contains a malformed node")
-    node_id = node.get("id")
-    if type(node_id) is not int or node_id <= 0 or node_id in node_ids:
-        fail(f"PVE node {name} has an invalid or duplicate node id")
-    node_ids.add(node_id)
-    if node.get("online") != 1:
-        fail(f"PVE node {name} is offline")
-    try:
-        address = ipaddress.ip_address(node.get("ip"))
-    except ValueError:
-        fail(f"PVE node {name} has an invalid management IP")
-    if address.version != 4 or address.is_unspecified or address.is_multicast:
-        fail(f"PVE node {name} has an unusable management IPv4 address")
-    address_text = str(address)
-    if address_text in node_ips:
-        fail(f"PVE node {name} repeats a management IP")
-    node_ips.add(address_text)
-
-node_count = len(nodelist)
 cluster = members.get("cluster")
 if isinstance(cluster, dict) and cluster.get("name"):
+    nodelist = members.get("nodelist")
+    if not isinstance(nodelist, dict) or local_name not in nodelist:
+        fail("PVE membership is missing the local node")
+    node_ids = set()
+    node_ips = set()
+    for name, node in nodelist.items():
+        if not isinstance(name, str) or not safe_name.fullmatch(name) or \
+                not isinstance(node, dict):
+            fail("PVE membership contains a malformed node")
+        node_id = node.get("id")
+        if type(node_id) is not int or node_id <= 0 or node_id in node_ids:
+            fail(f"PVE node {name} has an invalid or duplicate node id")
+        node_ids.add(node_id)
+        if node.get("online") != 1:
+            fail(f"PVE node {name} is offline")
+        try:
+            address = ipaddress.ip_address(node.get("ip"))
+        except ValueError:
+            fail(f"PVE node {name} has an invalid management IP")
+        if address.version != 4 or address.is_unspecified or address.is_multicast:
+            fail(f"PVE node {name} has an unusable management IPv4 address")
+        address_text = str(address)
+        if address_text in node_ips:
+            fail(f"PVE node {name} repeats a management IP")
+        node_ips.add(address_text)
+    node_count = len(nodelist)
     cluster_name = cluster.get("name")
     if not isinstance(cluster_name, str) or not safe_name.fullmatch(cluster_name):
         fail("PVE cluster name is unsafe or empty")
@@ -427,8 +435,46 @@ if isinstance(cluster, dict) and cluster.get("name"):
         )
     deployment = cluster_name
 else:
-    if node_count != 1:
-        fail("standalone PVE membership contains multiple nodes")
+    if set(members) != {"nodename", "version"}:
+        fail(
+            "standalone PVE membership must contain only nodename/version and "
+            "no cluster/nodelist state"
+        )
+    if not pvecm_path.is_absolute():
+        fail("standalone pvecm path must be absolute")
+    try:
+        pvecm_metadata = pvecm_path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect standalone pvecm: {error}")
+    if stat.S_ISLNK(pvecm_metadata.st_mode) or \
+            not stat.S_ISREG(pvecm_metadata.st_mode) or \
+            pvecm_metadata.st_uid != 0 or pvecm_metadata.st_nlink != 1 or \
+            stat.S_IMODE(pvecm_metadata.st_mode) & 0o022 or \
+            not (stat.S_IMODE(pvecm_metadata.st_mode) & 0o111) or \
+            not os.access(pvecm_path, os.X_OK):
+        fail("standalone pvecm must be a root-owned executable non-symlink file")
+    try:
+        status = subprocess.run(
+            [str(pvecm_path), "status"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=False,
+            env={"LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+        )
+    except subprocess.TimeoutExpired:
+        fail("standalone pvecm status timed out")
+    except OSError as error:
+        fail(f"cannot run standalone pvecm status: {error}")
+    expected_error = (
+        "Error: Corosync config '/etc/pve/corosync.conf' does not exist - "
+        "is this node part of a cluster?\n"
+    )
+    if status.returncode == 0 or status.stdout != "" or status.stderr != expected_error:
+        fail("pvecm status did not report the exact non-cluster condition")
+    node_count = 1
     deployment = f"standalone-{local_name}"
 
 if confirmation != deployment:

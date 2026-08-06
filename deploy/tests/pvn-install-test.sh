@@ -19,11 +19,15 @@ CURL_LOG=$WORK/curl.log
 INSTALLER_LOG=$WORK/installer.log
 DEB_LOG=$WORK/deb-path.log
 SETUP_LOG=$WORK/setup.log
+PVECM_LOG=$WORK/pvecm.log
+PVECM_MODE=$WORK/pvecm.mode
 mkdir "$BIN" "$ASSETS"
 : > "$CURL_LOG"
 : > "$INSTALLER_LOG"
 : > "$DEB_LOG"
 : > "$SETUP_LOG"
+: > "$PVECM_LOG"
+printf '%s\n' standalone > "$PVECM_MODE"
 
 cat > "$BIN/curl" <<'EOF'
 #!/bin/sh
@@ -101,6 +105,30 @@ printf 'control %s\n' "$*" >> "$PVN_TEST_SETUP_LOG"
 EOF
 chmod 0755 "$BIN/pvn-control-plane"
 
+cat > "$BIN/pvecm" <<EOF
+#!/bin/sh
+set -eu
+[ "\$#" -eq 1 ] && [ "\$1" = status ] || exit 9
+printf '%s\n' "\$*" >> "$PVECM_LOG"
+case "\$(cat "$PVECM_MODE")" in
+    standalone)
+        printf '%s\n' \
+            "Error: Corosync config '/etc/pve/corosync.conf' does not exist - is this node part of a cluster?" \
+            >&2
+        exit 255
+        ;;
+    clustered)
+        printf '%s\n' 'Cluster information' '-------------------' 'Name: lab-cluster'
+        ;;
+    error)
+        echo 'cannot contact pmxcfs' >&2
+        exit 1
+        ;;
+    *) exit 8 ;;
+esac
+EOF
+chmod 0755 "$BIN/pvecm"
+
 printf 'test deb payload\n' > "$ASSETS/pvn-node_${RELEASE_VERSION}_amd64.deb"
 make_manifest() {
     (
@@ -123,7 +151,7 @@ write_members() {
     case "$pvn_member_count" in
         1)
             cat > "$MEMBERS" <<'EOF'
-{"nodename":"node-a","version":7,"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"}}}
+{"nodename":"node-a","version":7}
 EOF
             ;;
         2|3|4|5|6|7)
@@ -160,6 +188,7 @@ export PVN_TEST_CURL_LOG=$CURL_LOG
 export PVN_TEST_INSTALLER_LOG=$INSTALLER_LOG
 export PVN_TEST_DEB_LOG=$DEB_LOG
 export PVN_TEST_SETUP_LOG=$SETUP_LOG
+export PVN_TEST_PVECM_LOG=$PVECM_LOG
 export PVN_TEST_PUBLIC_BOOTSTRAP=$BOOTSTRAP
 export PVN_TEST_PUBLIC_BOOTSTRAP_RAN=$WORK/public-bootstrap-ran
 
@@ -173,6 +202,7 @@ reset_logs() {
     : > "$INSTALLER_LOG"
     : > "$DEB_LOG"
     : > "$SETUP_LOG"
+    : > "$PVECM_LOG"
 }
 
 run_bootstrap() {
@@ -181,8 +211,10 @@ run_bootstrap() {
 }
 
 run_local_bootstrap() {
+    pvn_test_pvecm=${PVN_INSTALL_PVECM:-$BIN/pvecm}
     PVN_RELEASE_BASE_URL=https://releases.example.invalid/v$RELEASE_VERSION \
     PVN_CP_MEMBERS=$MEMBERS \
+    PVN_INSTALL_PVECM=$pvn_test_pvecm \
     "$BOOTSTRAP" "$@"
 }
 
@@ -247,6 +279,8 @@ control apply --confirm lab-cluster
 EOF
 cmp "$WORK/expected-setup.log" "$SETUP_LOG" ||
     fail "full install did not run the topology/control-plane sequence"
+[ ! -s "$PVECM_LOG" ] ||
+    fail "clustered full install unexpectedly used standalone pvecm detection"
 assert_temp_cleaned
 
 # A standalone node remains a supported full-setup placement.
@@ -267,6 +301,80 @@ control apply --confirm standalone-node-a
 EOF
 cmp "$WORK/expected-standalone-setup.log" "$SETUP_LOG" ||
     fail "standalone full install did not preserve the setup sequence"
+[ "$(cat "$PVECM_LOG")" = status ] ||
+    fail "standalone full install did not run exact pvecm status detection"
+assert_temp_cleaned
+
+# A minimal standalone .members is accepted only when pvecm returns Proxmox's
+# exact no-corosync/non-cluster condition. Clustered or unrelated failures stop
+# before topology planning.
+for pvn_pvecm_mode in clustered error; do
+    write_members 1
+    reset_logs
+    printf '%s\n' "$pvn_pvecm_mode" > "$PVECM_MODE"
+    if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=standalone-node-a PVN_FULL=1 \
+        PVN_GENEVE_CIDR=192.168.100.0/24 \
+        PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+        PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+        PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+        PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+        run_local_bootstrap > "$WORK/standalone-$pvn_pvecm_mode.out" 2>&1
+    then
+        fail "standalone accepted pvecm mode $pvn_pvecm_mode"
+    fi
+    grep -q 'pvecm status did not report the exact non-cluster condition' \
+        "$WORK/standalone-$pvn_pvecm_mode.out" ||
+        fail "standalone pvecm $pvn_pvecm_mode failure was unclear"
+    [ "$(cat "$PVECM_LOG")" = status ] ||
+        fail "standalone pvecm $pvn_pvecm_mode check was not exact"
+    [ ! -s "$SETUP_LOG" ] ||
+        fail "standalone pvecm $pvn_pvecm_mode failure reached setup"
+    assert_temp_cleaned
+done
+printf '%s\n' standalone > "$PVECM_MODE"
+
+# A legacy synthetic one-node nodelist is ambiguous: current standalone PVE
+# publishes only nodename/version, while a cluster must carry cluster+nodelist.
+cat > "$MEMBERS" <<'EOF'
+{"nodename":"node-a","version":7,"nodelist":{"node-a":{"id":1,"online":1,"ip":"192.0.2.11"}}}
+EOF
+chmod 0600 "$MEMBERS"
+reset_logs
+if PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=standalone-node-a PVN_FULL=1 \
+    PVN_GENEVE_CIDR=192.168.100.0/24 \
+    PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+    PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+    PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+    PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+    run_local_bootstrap > "$WORK/standalone-ambiguous-members.out" 2>&1
+then
+    fail "ambiguous standalone nodelist reached full setup"
+fi
+grep -q 'must contain only nodename/version' "$WORK/standalone-ambiguous-members.out" ||
+    fail "ambiguous standalone membership failure was unclear"
+[ ! -s "$PVECM_LOG" ] || fail "ambiguous standalone membership invoked pvecm"
+[ ! -s "$SETUP_LOG" ] || fail "ambiguous standalone membership invoked setup"
+assert_temp_cleaned
+
+# The pvecm identity itself is pinned to a root-owned executable regular file.
+write_members 1
+ln -s "$BIN/pvecm" "$WORK/pvecm-link"
+reset_logs
+if PVN_INSTALL_PVECM=$WORK/pvecm-link \
+    PVN_PHASE=install PVN_APPLY=1 PVN_CONFIRM=standalone-node-a PVN_FULL=1 \
+    PVN_GENEVE_CIDR=192.168.100.0/24 \
+    PVN_PROVIDER_CIDR=192.168.200.0/24 PVN_GUEST_MTU=1300 \
+    PVN_PROVIDER_PORT_READY=OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+    PVN_TOPOLOGY_BIN=$BIN/pvn-topology \
+    PVN_CONTROL_PLANE_BIN=$BIN/pvn-control-plane \
+    run_local_bootstrap > "$WORK/standalone-symlink-pvecm.out" 2>&1
+then
+    fail "standalone accepted a symlinked pvecm"
+fi
+grep -q 'root-owned executable non-symlink' "$WORK/standalone-symlink-pvecm.out" ||
+    fail "standalone unsafe pvecm failure was unclear"
+[ ! -s "$PVECM_LOG" ] || fail "unsafe standalone pvecm was executed"
+[ ! -s "$SETUP_LOG" ] || fail "unsafe standalone pvecm reached setup"
 assert_temp_cleaned
 
 # Every member of every supported odd-sized cluster becomes a central voter.
