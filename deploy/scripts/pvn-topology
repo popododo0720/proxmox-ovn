@@ -61,6 +61,7 @@ LEDGER_UPGRADE_PROOF_KEYS = (
     "corosync_runtime", "management", "geneve", "provider",
     "network_state", "journal", "journal_phase", "activation",
     "control_ledger_text", "control_ledger_sha256",
+    "active_readiness",
 )
 
 
@@ -390,6 +391,9 @@ STATE_FILE = STATE_DIR / "state.json"
 LEDGER_DIR = Path("/etc/pve/priv/pvn")
 LEDGER_FILE = LEDGER_DIR / "topology.json"
 CONTROL_LEDGER_FILE = LEDGER_DIR / "control-plane.json"
+CENTRAL_RESTART_DIR = Path("/var/lib/pvn-node")
+CENTRAL_RESTART_MARKER = CENTRAL_RESTART_DIR / "central-restart-pending"
+PVNCTL = "/usr/sbin/pvnctl"
 MARKERS = (Path("/etc/pvn/node-enabled"), Path("/etc/pvn/central/enabled"))
 ACTIVATION_UNITS = (
     "pvn-node.target", "pvn-central.target", "pvn-node-ready.service",
@@ -1362,6 +1366,92 @@ def installed_package_version(package):
     return match.group(1)
 
 
+def central_restart_pending():
+    directory = CENTRAL_RESTART_DIR
+    marker = CENTRAL_RESTART_MARKER
+    if not os.path.lexists(str(directory)):
+        return None
+    try:
+        directory_before = directory.lstat()
+    except OSError as exc:
+        abort("cannot inspect central restart state directory: %s" % exc)
+    if (
+        stat.S_ISLNK(directory_before.st_mode)
+        or not stat.S_ISDIR(directory_before.st_mode)
+        or directory_before.st_uid != 0
+        or directory_before.st_gid != 0
+        or stat.S_IMODE(directory_before.st_mode) != 0o700
+    ):
+        abort("central restart state directory must be root:root mode 0700")
+    if not os.path.lexists(str(marker)):
+        return None
+    try:
+        marker_before = marker.lstat()
+    except OSError as exc:
+        abort("cannot inspect central restart-required marker: %s" % exc)
+    marker_identity = (marker_before.st_dev, marker_before.st_ino)
+    if (
+        stat.S_ISLNK(marker_before.st_mode)
+        or not stat.S_ISREG(marker_before.st_mode)
+        or marker_before.st_nlink != 1
+        or marker_before.st_uid != 0
+        or marker_before.st_gid != 0
+        or stat.S_IMODE(marker_before.st_mode) != 0o600
+    ):
+        abort("central restart-required marker must be root:root mode 0600 with one link")
+    raw = read_regular(marker, 512)
+    try:
+        marker_after = marker.lstat()
+        directory_after = directory.lstat()
+    except OSError as exc:
+        abort("central restart state changed while being read: %s" % exc)
+    if (
+        (marker_after.st_dev, marker_after.st_ino) != marker_identity
+        or stat.S_ISLNK(marker_after.st_mode)
+        or not stat.S_ISREG(marker_after.st_mode)
+        or marker_after.st_nlink != 1
+        or marker_after.st_uid != 0
+        or marker_after.st_gid != 0
+        or stat.S_IMODE(marker_after.st_mode) != 0o600
+        or (directory_after.st_dev, directory_after.st_ino)
+        != (directory_before.st_dev, directory_before.st_ino)
+        or stat.S_ISLNK(directory_after.st_mode)
+        or not stat.S_ISDIR(directory_after.st_mode)
+        or directory_after.st_uid != 0
+        or directory_after.st_gid != 0
+        or stat.S_IMODE(directory_after.st_mode) != 0o700
+    ):
+        abort("central restart state changed identity or safety metadata while being read")
+    lines = raw.splitlines()
+    if (
+        len(lines) != 1
+        or raw != lines[0] + "\n"
+        or not re.fullmatch(r"[A-Za-z0-9.+:~_-]{1,200}", lines[0])
+    ):
+        abort("central restart-required marker has invalid content")
+    return lines[0]
+
+
+def active_pvn_readiness():
+    package_version = installed_package_version("pvn-node")
+    restart_pending = central_restart_pending()
+    doctor = run([PVNCTL, "doctor"], timeout=30, check=False)
+    central = run([PVNCTL, "central", "status"], timeout=30, check=False)
+    try:
+        central_status = json.loads(central.stdout)
+    except json.JSONDecodeError:
+        central_status = None
+    if central_status is not None and not isinstance(central_status, dict):
+        central_status = None
+    return {
+        "package_version": package_version,
+        "central_restart_pending": restart_pending,
+        "doctor": doctor.returncode == 0,
+        "central_status_ok": central.returncode == 0 and central_status is not None,
+        "central_status": central_status,
+    }
+
+
 def validate_journal_for_request(journal, request):
     if journal is None:
         return
@@ -1440,6 +1530,9 @@ def resolve_effective_underlay_mtu(request, journal, ledger_text):
 
 def build_probe(request):
     activation = activation_state()
+    active_readiness = (
+        active_pvn_readiness() if activation_mode(activation) == "active" else None
+    )
     require_commands(("ip", "pvecm", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "corosync", "corosync-cfgtool", "corosync-cmapctl", "perl"))
     check_pve_packages()
     corosync_package_version = installed_package_version("corosync")
@@ -1614,6 +1707,7 @@ def build_probe(request):
         "ledger_sha256": ledger_sha,
         "control_ledger_text": control_ledger_text,
         "control_ledger_sha256": control_ledger_sha,
+        "active_readiness": active_readiness,
         "activation": activation,
         "activation_safe": activation_mode(activation) == "inactive",
     }
@@ -2117,6 +2211,7 @@ LEDGER_UPGRADE_PROOF_KEYS = (
     "corosync_runtime", "management", "geneve", "provider",
     "network_state", "journal", "journal_phase", "activation",
     "control_ledger_text", "control_ledger_sha256",
+    "active_readiness",
 )
 
 
@@ -2449,6 +2544,36 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
         fail(f"mixed or malformed PVN activation state on {node['name']}")
     if report.get("activation_safe") is not (activation_mode == "inactive"):
         fail(f"inconsistent PVN activation report from {node['name']}")
+    active_readiness = report.get("active_readiness")
+    if activation_mode == "active":
+        readiness_keys = {
+            "package_version", "central_restart_pending", "doctor",
+            "central_status_ok", "central_status",
+        }
+        if not isinstance(active_readiness, dict) or set(active_readiness) != readiness_keys:
+            fail(f"malformed active PVN readiness report from {node['name']}")
+        version = active_readiness.get("package_version")
+        marker = active_readiness.get("central_restart_pending")
+        if (
+            not isinstance(version, str)
+            or not re.fullmatch(r"[A-Za-z0-9.+:~_-]{1,200}", version)
+            or (
+                marker is not None
+                and (
+                    not isinstance(marker, str)
+                    or not re.fullmatch(r"[A-Za-z0-9.+:~_-]{1,200}", marker)
+                )
+            )
+            or type(active_readiness.get("doctor")) is not bool
+            or type(active_readiness.get("central_status_ok")) is not bool
+            or (
+                active_readiness.get("central_status") is not None
+                and not isinstance(active_readiness.get("central_status"), dict)
+            )
+        ):
+            fail(f"invalid active PVN readiness report from {node['name']}")
+    elif active_readiness is not None:
+        fail(f"inactive node {node['name']} unexpectedly reported active PVN readiness")
     journal = report.get("journal")
     if journal is not None:
         if (
@@ -3319,7 +3444,7 @@ def validate_active_control_ledger(
     expected_legacy: dict[str, Any],
     legacy_sha256: str,
     candidate_sha256: str,
-) -> None:
+) -> dict[str, Any]:
     states = {
         (report.get("control_ledger_sha256"), report.get("control_ledger_text"))
         for report in reports
@@ -3434,6 +3559,174 @@ def validate_active_control_ledger(
         package_versions.add(row["package_version"])
     if len(package_versions) != 1:
         fail("active control-plane snapshot package versions are not uniform")
+    return {
+        "topology_pin": (
+            "legacy"
+            if snapshot["topology_sha256"] == legacy_sha256
+            else "candidate"
+        ),
+        "package_version": next(iter(package_versions)),
+        "db_cluster_ids": dict(db_ids),
+    }
+
+
+def debian_version_greater(candidate: str, pinned: str) -> bool:
+    compared = run_bounded_process(
+        ["/usr/bin/dpkg", "--compare-versions", candidate, "gt", pinned],
+        "", 10, 64 * 1024,
+    )
+    if compared.returncode not in {0, 1}:
+        detail = compared.stderr.strip().replace("\n", "; ")
+        fail(f"cannot compare pvn-node package versions: {detail[:500]}")
+    return compared.returncode == 0
+
+
+ACTIVE_DATABASE_PORTS = {
+    "PVN_Control": 6646,
+    "OVN_Northbound": 6643,
+    "OVN_Southbound": 6644,
+}
+
+
+def active_upgrade_readiness_issues(
+    nodes: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+    topology_schema: int,
+    control_state: dict[str, Any],
+) -> list[str]:
+    issues: list[str] = []
+    readiness = [report["active_readiness"] for report in reports]
+    observed_rows: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {
+        database: [] for database in ACTIVE_DATABASE_PORTS
+    }
+    live_versions = {item["package_version"] for item in readiness}
+    live_version = next(iter(live_versions)) if len(live_versions) == 1 else None
+    if live_version is None:
+        issues.append("installed pvn-node versions are not uniform across every node")
+
+    for node, item in zip(nodes, readiness):
+        if item["doctor"] is not True:
+            issues.append(f"fresh pvnctl doctor failed on {node['name']}")
+        status = item["central_status"]
+        if (
+            item["central_status_ok"] is not True
+            or not isinstance(status, dict)
+            or set(status) != {"healthy", "databases"}
+            or status.get("healthy") is not True
+        ):
+            issues.append(f"fresh pvnctl central status is unhealthy on {node['name']}")
+            continue
+        rows = status.get("databases")
+        if (
+            not isinstance(rows, list)
+            or len(rows) != len(ACTIVE_DATABASE_PORTS)
+            or any(not isinstance(row, dict) for row in rows)
+        ):
+            issues.append(f"central status does not contain three database rows on {node['name']}")
+            continue
+        names = [row.get("database") for row in rows]
+        if len(set(names)) != len(names) or set(names) != set(ACTIVE_DATABASE_PORTS):
+            issues.append(f"central status database names drifted on {node['name']}")
+            continue
+        by_name = {row["database"]: row for row in rows}
+        for database, port in ACTIVE_DATABASE_PORTS.items():
+            row = by_name[database]
+            observed_rows[database].append((node, row))
+            required = {
+                "database", "name", "available", "healthy", "cluster_id",
+                "server_id", "address", "member_count", "connected_members",
+                "quorum_size", "membership_change", "membership_status",
+                "role", "term", "leader",
+            }
+            if not required.issubset(row):
+                issues.append(
+                    f"{database} status is incomplete on {node['name']}"
+                )
+                continue
+            count = len(nodes)
+            if (
+                row.get("database") != database
+                or row.get("name") != database
+                or row.get("available") is not True
+                or row.get("healthy") is not True
+                or row.get("membership_change") is not False
+                or row.get("membership_status") != "cluster member"
+                or row.get("role") not in {"leader", "follower"}
+                or type(row.get("term")) is not int
+                or row["term"] <= 0
+                or not isinstance(row.get("leader"), str)
+                or row["leader"] in {"", "unknown"}
+                or type(row.get("member_count")) is not int
+                or row["member_count"] != count
+                or type(row.get("connected_members")) is not int
+                or row["connected_members"] != count
+                or type(row.get("quorum_size")) is not int
+                or row["quorum_size"] != count // 2 + 1
+                or row.get("cluster_id")
+                != control_state["db_cluster_ids"][database]
+                or not canonical_uuid(row.get("server_id"))
+                or row.get("address") != f"ssl:{node['ip']}:{port}"
+            ):
+                issues.append(
+                    f"{database} is not exact healthy {count}/{count} on {node['name']}"
+                )
+
+    for database, rows in observed_rows.items():
+        if len(rows) != len(nodes):
+            continue
+        server_ids = [row.get("server_id") for _node, row in rows]
+        if all(canonical_uuid(value) for value in server_ids) and \
+                len(set(server_ids)) != len(nodes):
+            issues.append(f"{database} repeats a Raft server ID across nodes")
+        terms = [row.get("term") for _node, row in rows]
+        if all(type(term) is int and term > 0 for term in terms) and len(set(terms)) != 1:
+            issues.append(f"{database} voters do not report one identical Raft term")
+        leaders = [(node, row) for node, row in rows if row.get("role") == "leader"]
+        followers = [(node, row) for node, row in rows if row.get("role") == "follower"]
+        if len(leaders) != 1 or len(followers) != len(nodes) - 1:
+            issues.append(f"{database} does not have exactly one leader and N-1 followers")
+            continue
+        leader_node, leader_row = leaders[0]
+        leader_server_id = leader_row.get("server_id")
+        if not canonical_uuid(leader_server_id) or leader_row.get("leader") != "self":
+            issues.append(f"{database} leader identity is inconsistent on {leader_node['name']}")
+            continue
+        leader_nickname = leader_server_id[:4]
+        for follower_node, follower_row in followers:
+            if follower_row.get("leader") != leader_nickname:
+                issues.append(
+                    f"{database} follower {follower_node['name']} reports a different leader"
+                )
+
+    pinned_version = control_state["package_version"]
+    topology_pin = control_state["topology_pin"]
+    markers = [item["central_restart_pending"] for item in readiness]
+    markers_pending = live_version is not None and all(
+        marker == live_version for marker in markers
+    )
+    markers_consumed = all(marker is None for marker in markers)
+    live_is_newer = (
+        live_version is not None
+        and debian_version_greater(live_version, pinned_version)
+    )
+    if topology_schema == 1:
+        if topology_pin != "legacy":
+            issues.append("schema 1 topology is not pinned as the legacy control snapshot")
+        if not live_is_newer:
+            issues.append("installed pvn-node is not uniformly newer than the control snapshot")
+        if not markers_pending:
+            issues.append("every central restart marker must pin the installed newer package")
+    elif topology_pin == "legacy":
+        if not live_is_newer:
+            issues.append("pre-repin schema 2 requires one uniformly newer pvn-node package")
+        if not markers_pending:
+            issues.append("pre-repin schema 2 requires every central restart marker")
+    else:
+        if live_version != pinned_version:
+            issues.append("post-repin control snapshot does not pin the installed package")
+        if not (markers_pending or markers_consumed):
+            issues.append("post-repin restart markers are neither all pending nor all consumed")
+    return issues
 
 
 def build_active_ledger_upgrade_plan(
@@ -3517,9 +3810,12 @@ def build_active_ledger_upgrade_plan(
         previous_text != candidate_text or previous_sha256 != candidate_sha256
     ):
         fail("schema 2 topology ledger is not the exact canonical candidate")
-    validate_active_control_ledger(
+    control_state = validate_active_control_ledger(
         cluster_name, nodes, reports, membership_guard, expected_legacy,
         legacy_sha256, candidate_sha256,
+    )
+    prerequisite_errors = active_upgrade_readiness_issues(
+        nodes, reports, schema, control_state,
     )
     return {
         "upgrade_required": upgrade_required,
@@ -3528,6 +3824,7 @@ def build_active_ledger_upgrade_plan(
         "candidate_text": candidate_text,
         "candidate_sha256": candidate_sha256,
         "corosync": corosync,
+        "prerequisite_errors": prerequisite_errors,
         "proofs": {
             report["node"]: report_ledger_upgrade_proof_sha256(report)
             for report in reports
@@ -3600,6 +3897,11 @@ def apply_active_ledger_upgrade(
         cluster_name, nodes, reports, spec, transaction, topology_plan,
         membership_guard,
     )
+    if upgrade["prerequisite_errors"]:
+        fail(
+            "active topology ledger upgrade prerequisites are not ready: "
+            + "; ".join(upgrade["prerequisite_errors"])
+        )
     if (
         upgrade["candidate_sha256"] != initial_upgrade["candidate_sha256"]
         or upgrade["previous_sha256"] != initial_upgrade["previous_sha256"]
@@ -3642,6 +3944,11 @@ def apply_active_ledger_upgrade(
             cluster_name, nodes, post_reports, spec, transaction, post_topology,
             membership_guard,
         )
+        if post["prerequisite_errors"]:
+            fail(
+                "active topology ledger post-CAS prerequisites are not ready: "
+                + "; ".join(post["prerequisite_errors"])
+            )
     except TopologyError as post_error:
         fail(
             f"active ledger CAS outcome requires a resumable exact-state recheck: "
@@ -4416,6 +4723,12 @@ def main() -> int:
                 "  Mutations allowed: one shared topology-ledger CAS only; "
                 "network, Corosync, journals, services, and markers stay untouched"
             )
+            if active_upgrade["prerequisite_errors"]:
+                print("  Upgrade readiness: NOT READY")
+                for error in active_upgrade["prerequisite_errors"]:
+                    print(f"    - {error}")
+            else:
+                print("  Upgrade readiness: READY (package, restart marker, doctor, and Raft N/N)")
         elif activation_mode != "inactive":
             fail("PVN activation state is neither uniformly inactive nor active")
         if args.operation == "plan":

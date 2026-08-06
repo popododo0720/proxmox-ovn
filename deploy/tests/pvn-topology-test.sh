@@ -115,6 +115,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
+import uuid
 
 
 def stop(message):
@@ -444,6 +445,96 @@ def report():
         and json.loads(state["ledger"]).get("schema") == 2
     ):
         unit_state = False
+    active_readiness = None
+    if active:
+        package_version = "0.2.14-1"
+        if os.environ.get("PVN_TEST_PVN_VERSION_MISMATCH_HOST") == node:
+            package_version = "0.2.15-1"
+        if os.environ.get("PVN_TEST_PVN_VERSION_NOT_NEWER") == "yes":
+            package_version = "0.2.13-1"
+        restart_pending = package_version
+        if (
+            os.environ.get("PVN_TEST_RESTART_MARKERS_CONSUMED") == "yes"
+            or os.environ.get("PVN_TEST_RESTART_MARKER_MISSING_HOST") == node
+        ):
+            restart_pending = None
+        if os.environ.get("PVN_TEST_RESTART_MARKER_WRONG_HOST") == node:
+            restart_pending = "0.2.99-1"
+        database_ids = {
+            "PVN_Control": "22222222-2222-4222-8222-222222222222",
+            "OVN_Northbound": "33333333-3333-4333-8333-333333333333",
+            "OVN_Southbound": "44444444-4444-4444-8444-444444444444",
+        }
+        database_ports = {
+            "PVN_Control": 6646,
+            "OVN_Northbound": 6643,
+            "OVN_Southbound": 6644,
+        }
+        rows = []
+        for database, port in database_ports.items():
+            cluster_id = database_ids[database]
+            if (
+                os.environ.get("PVN_TEST_DB_CID_DRIFT_HOST") == node
+                and database == "OVN_Northbound"
+            ):
+                cluster_id = "55555555-5555-4555-8555-555555555555"
+            member_count = 3
+            if (
+                os.environ.get("PVN_TEST_DB_MEMBERSHIP_DRIFT_HOST") == node
+                and database == "OVN_Northbound"
+            ):
+                member_count = 2
+            server_seed = "%s:%s" % (node, database)
+            if os.environ.get("PVN_TEST_DUPLICATE_SERVER_ID_DATABASE") == database:
+                server_seed = "duplicate:%s" % database
+            server_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, server_seed))
+            leader_id = str(uuid.uuid5(
+                uuid.NAMESPACE_DNS, "prox1:%s" % database
+            ))
+            role = "leader" if node == "prox1" else "follower"
+            leader = "self" if role == "leader" else leader_id[:4]
+            term = 7
+            if (
+                os.environ.get("PVN_TEST_DB_TERM_DRIFT_HOST") == node
+                and database == "OVN_Northbound"
+            ):
+                term = 8
+            if (
+                os.environ.get("PVN_TEST_DB_ROLE_DRIFT_HOST") == node
+                and database == "OVN_Northbound"
+            ):
+                role = "leader"
+                leader = "self"
+            if (
+                os.environ.get("PVN_TEST_DB_LEADER_DRIFT_HOST") == node
+                and database == "OVN_Northbound"
+            ):
+                leader = "dead"
+            rows.append({
+                "database": database,
+                "name": database,
+                "available": True,
+                "healthy": True,
+                "membership_status": "cluster member",
+                "cluster_id": cluster_id,
+                "server_id": server_id,
+                "address": "ssl:%s:%d" % (management[node], port),
+                "role": role,
+                "term": term,
+                "leader": leader,
+                "member_count": member_count,
+                "connected_members": member_count,
+                "quorum_size": 2,
+                "membership_change": False,
+            })
+        central_ok = os.environ.get("PVN_TEST_CENTRAL_STATUS_FAIL_HOST") != node
+        active_readiness = {
+            "package_version": package_version,
+            "central_restart_pending": restart_pending,
+            "doctor": os.environ.get("PVN_TEST_DOCTOR_FAIL_HOST") != node,
+            "central_status_ok": central_ok,
+            "central_status": {"healthy": central_ok, "databases": rows},
+        }
     activation_units = (
         "pvn-node.target", "pvn-central.target", "pvn-node-ready.service",
         "pvn-manager.service", "pvn-agent.service", "pvn-control-db.service",
@@ -489,6 +580,7 @@ def report():
         "ledger_sha256": state["ledger_sha256"],
         "control_ledger_text": state.get("control_ledger"),
         "control_ledger_sha256": state.get("control_ledger_sha256"),
+        "active_readiness": active_readiness,
         "activation": {
             "markers": {
                 "/etc/pvn/node-enabled": marker_state,
@@ -498,6 +590,18 @@ def report():
         },
         "activation_safe": not marker_state and not unit_state,
     }
+
+
+def ledger_upgrade_proof_sha256(value):
+    keys = (
+        "node", "interfaces_sha256", "pending_interfaces_sha256",
+        "corosync_sha256", "corosync_text", "corosync_package_version",
+        "corosync_runtime", "management", "geneve", "provider",
+        "network_state", "journal", "journal_phase", "activation",
+        "control_ledger_text", "control_ledger_sha256", "active_readiness",
+    )
+    proof = {key: value.get(key) for key in keys}
+    return sha(json.dumps(proof, sort_keys=True, separators=(",", ":")))
 
 
 def emit(**values):
@@ -718,6 +822,8 @@ elif action == "write-ledger":
             stop("active ledger write lacks its upgrade-only fence")
         if not isinstance(request.get("upgrade_proof_sha256"), str):
             stop("active ledger write lacks its exact local proof")
+        if request["upgrade_proof_sha256"] != ledger_upgrade_proof_sha256(report()):
+            stop("active ledger write readiness/topology proof changed before CAS")
     if os.environ.get("PVN_TEST_FAIL_LEDGER_UPGRADE_BEFORE_WRITE") == "yes":
         stop("simulated active ledger failure before CAS")
     if os.environ.get("PVN_TEST_LEDGER_UPGRADE_EXTERNAL_DRIFT") == "yes":
@@ -941,6 +1047,12 @@ grep -Fq "cfs_lock_file('corosync.conf', 10" "$REMOTE_HELPER" ||
     fail "Corosync CAS does not use its native pmxcfs file lock"
 grep -Fq 'sys.stdin.buffer.read(REMOTE_REQUEST_LIMIT + 1)' "$REMOTE_HELPER" ||
     fail "remote request stdin is not bounded"
+grep -Fq '[PVNCTL, "doctor"], timeout=30, check=False' "$REMOTE_HELPER" ||
+    fail "active readiness does not run a bounded fresh pvnctl doctor"
+grep -Fq '[PVNCTL, "central", "status"], timeout=30, check=False' "$REMOTE_HELPER" ||
+    fail "active readiness does not run a bounded fresh central status"
+grep -Fq 'central restart-required marker must be root:root mode 0600 with one link' \
+    "$REMOTE_HELPER" || fail "active readiness does not securely verify the restart marker"
 if grep -Fq 'sys.argv[2]' "$REMOTE_HELPER" || grep -Fq 'bytes.fromhex' "$REMOTE_HELPER"; then
     fail "remote request metadata is still decoded from process argv"
 fi
@@ -1192,6 +1304,8 @@ control = json.loads(state["control_ledger"])
 control["snapshot"]["topology_sha256"] = hashlib.sha256(
     state["ledger"].encode()
 ).hexdigest()
+for node in control["snapshot"]["nodes"]:
+    node["package_version"] = "0.2.14-1"
 state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
 state["control_ledger_sha256"] = hashlib.sha256(
     state["control_ledger"].encode()
@@ -1207,6 +1321,18 @@ PVN_TEST_ACTIVE=yes "$TOPOLOGY" apply \
 if grep -q 'action=write-ledger' "$LOG"; then
     fail "control-plane candidate raw pin repeated the topology ledger CAS"
 fi
+
+: > "$LOG"
+PVN_TEST_ACTIVE=yes PVN_TEST_RESTART_MARKERS_CONSUMED=yes \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-consumed-marker-rerun.out"
+if grep -q 'action=write-ledger' "$LOG"; then
+    fail "post-restart consumed-marker schema 2 rerun repeated the topology CAS"
+fi
+grep -q 'already the exact schema 2 candidate; no-op' \
+    "$WORK/active-ledger-consumed-marker-rerun.out" ||
+    fail "post-restart consumed-marker schema 2 state was not accepted"
 
 seed_active_schema1
 : > "$LOG"
@@ -1274,6 +1400,40 @@ PY
 if grep -q 'action=restore-ledger' "$LOG"; then
     fail "external ledger drift was overwritten by rollback"
 fi
+
+for readiness_case in \
+    version-mixed:PVN_TEST_PVN_VERSION_MISMATCH_HOST=prox2 \
+    version-not-newer:PVN_TEST_PVN_VERSION_NOT_NEWER=yes \
+    marker-missing:PVN_TEST_RESTART_MARKER_MISSING_HOST=prox2 \
+    marker-wrong:PVN_TEST_RESTART_MARKER_WRONG_HOST=prox2 \
+    doctor:PVN_TEST_DOCTOR_FAIL_HOST=prox2 \
+    database-cid:PVN_TEST_DB_CID_DRIFT_HOST=prox2 \
+    database-membership:PVN_TEST_DB_MEMBERSHIP_DRIFT_HOST=prox2 \
+    database-term:PVN_TEST_DB_TERM_DRIFT_HOST=prox2 \
+    database-role:PVN_TEST_DB_ROLE_DRIFT_HOST=prox2 \
+    database-leader:PVN_TEST_DB_LEADER_DRIFT_HOST=prox2
+do
+    readiness_name=${readiness_case%%:*}
+    readiness_env=${readiness_case#*:}
+    seed_active_schema1
+    : > "$LOG"
+    env PVN_TEST_ACTIVE=yes "$readiness_env" "$TOPOLOGY" plan \
+        --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+        > "$WORK/active-readiness-$readiness_name-plan.out"
+    grep -q 'Upgrade readiness: NOT READY' \
+        "$WORK/active-readiness-$readiness_name-plan.out" ||
+        fail "$readiness_name plan did not report the read-only readiness blocker"
+    assert_no_mutation
+    : > "$LOG"
+    if env PVN_TEST_ACTIVE=yes "$readiness_env" "$TOPOLOGY" apply \
+        --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+        --provider-port-ready "$ACK" --confirm lab-cluster \
+        > "$WORK/active-readiness-$readiness_name-apply.out" 2>&1
+    then
+        fail "$readiness_name active upgrade unexpectedly applied"
+    fi
+    assert_no_mutation
+done
 
 for mutation in cluster-uuid cluster-version snapshot-extra-key node-extra-key database-uuid; do
     seed_active_schema1
