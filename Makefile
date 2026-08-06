@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 VERSION ?= dev
-DEB_VERSION ?= 0.2.16
+DEB_VERSION ?= 0.2.17
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w \

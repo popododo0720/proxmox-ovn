@@ -1,3 +1,12 @@
+proxmox-ovn (0.2.17) unstable; urgency=medium
+
+  * Allow full-voter startup reachability checks while keeping strict OVN
+    synchronization fences on writes and recovery reconciliation.
+  * Bound package-driven node transitions with durable restart intent, exact
+    central PID pinning, and fail-closed readiness proof.
+
+ -- PVN Project <root@localhost>  Thu, 06 Aug 2026 15:04:09 +0000
+
 proxmox-ovn (0.2.16) unstable; urgency=medium
 
   * Terminalize canceled or expired reconciliation operations with bounded,
