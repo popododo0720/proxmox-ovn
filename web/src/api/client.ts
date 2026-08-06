@@ -83,7 +83,7 @@ export class ApiClient {
 
   constructor(baseURL = '/api/v1', fetcher: Fetcher = fetch) {
     this.baseURL = baseURL.replace(/\/$/, '');
-    this.fetcher = fetcher;
+    this.fetcher = fetcher.bind(window);
   }
 
   setCSRFToken(token: string): void {

@@ -9,6 +9,17 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('ApiClient', () => {
+  it('calls fetch with the browser window as its receiver', async () => {
+    const fetcher = vi.fn(function (this: Window) {
+      if (this !== window) throw new TypeError('Illegal invocation');
+      return Promise.resolve(jsonResponse({ data: [] }));
+    });
+    const client = new ApiClient('/api/v1', fetcher as unknown as typeof fetch);
+
+    await expect(client.networks()).resolves.toEqual({ items: [], total: 0 });
+    expect(fetcher.mock.contexts[0]).toBe(window);
+  });
+
   it('unwraps data lists from the v1 API envelope', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: [{ id: 'net-1', name: 'app' }] }));
     const client = new ApiClient('/api/v1', fetcher as unknown as typeof fetch);
