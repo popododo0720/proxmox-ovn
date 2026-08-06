@@ -22,15 +22,16 @@ type Renderer interface {
 }
 
 type Controller struct {
-	store     controlstore.Store
-	renderer  Renderer
-	locksMu   sync.Mutex
-	locks     map[string]*sync.Mutex
-	lease     time.Duration
-	heartbeat time.Duration
-	now       func() time.Time
-	newOwner  func() string
-	retention operationRetention
+	store             controlstore.Store
+	renderer          Renderer
+	locksMu           sync.Mutex
+	locks             map[string]*sync.Mutex
+	lease             time.Duration
+	heartbeat         time.Duration
+	completionTimeout time.Duration
+	now               func() time.Time
+	newOwner          func() string
+	retention         operationRetention
 }
 
 // ErrReconcileLeaseActive means deletion was durably recorded but cleanup must
@@ -39,12 +40,13 @@ type Controller struct {
 var ErrReconcileLeaseActive = errors.New("target has an active reconcile lease")
 
 const (
-	operationLease         = 5 * time.Minute
-	maxConvergencePasses   = 8
-	maxHeartbeatInterval   = 30 * time.Second
-	defaultOperationKeep   = 1000
-	defaultOperationAge    = 24 * time.Hour
-	operationRecoveryBatch = 256
+	operationLease             = 5 * time.Minute
+	operationCompletionTimeout = 5 * time.Second
+	maxConvergencePasses       = 8
+	maxHeartbeatInterval       = 30 * time.Second
+	defaultOperationKeep       = 1000
+	defaultOperationAge        = 24 * time.Hour
+	operationRecoveryBatch     = 256
 )
 
 type operationRetention struct {
@@ -78,7 +80,8 @@ func WithOperationRetention(keep int, age time.Duration) Option {
 func NewController(store controlstore.Store, renderer Renderer, options ...Option) *Controller {
 	controller := &Controller{
 		store: store, renderer: renderer, locks: make(map[string]*sync.Mutex),
-		lease: operationLease, heartbeat: heartbeatInterval(operationLease), now: time.Now, newOwner: randomLeaseOwner,
+		lease: operationLease, heartbeat: heartbeatInterval(operationLease), completionTimeout: operationCompletionTimeout,
+		now: time.Now, newOwner: randomLeaseOwner,
 		retention: operationRetention{keep: defaultOperationKeep, age: defaultOperationAge},
 	}
 	for _, option := range options {
@@ -170,36 +173,31 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 
 	renderContext, heartbeat := c.startHeartbeat(ctx, op)
 	renderErr, markErr := c.renderUntilStable(renderContext, resource)
-	op, leaseErr := heartbeat.stop()
-	if leaseErr != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	op, leaseErr, leaseStoppedByParent := heartbeat.stop()
+	parentErr := ctx.Err()
+	if leaseErr != nil && (!leaseStoppedByParent || parentErr == nil || !errors.Is(leaseErr, parentErr)) {
 		return fmt.Errorf("reconcile %s %q lost its writer lease: %w", kind, id, leaseErr)
 	}
-	completed := c.now().UTC()
-	op.CompletedAt = &completed
+	workErr := renderErr
+	if workErr == nil {
+		workErr = markErr
+	}
+	operationErr := c.completeOperation(ctx, op, workErr)
+	if parentErr == nil {
+		parentErr = ctx.Err()
+	}
+	var resultErr error
 	if renderErr != nil {
-		op.OperationStatus = model.OperationFailed
-		op.Error = renderErr.Error()
+		resultErr = fmt.Errorf("render %s %q revision %d: %w", kind, id, meta.Revision, renderErr)
 	} else if markErr != nil {
-		op.OperationStatus = model.OperationFailed
-		op.Error = markErr.Error()
-	} else {
-		op.OperationStatus = model.OperationSucceeded
-		op.Error = ""
-	}
-	_, _, operationErr := c.store.Update(ctx, op, op.Revision, "")
-	if renderErr != nil {
-		return fmt.Errorf("render %s %q revision %d: %w", kind, id, meta.Revision, renderErr)
-	}
-	if markErr != nil {
-		return fmt.Errorf("mark %s %q reconciled: %w", kind, id, markErr)
+		resultErr = fmt.Errorf("mark %s %q reconciled: %w", kind, id, markErr)
+	} else if parentErr != nil {
+		resultErr = parentErr
 	}
 	if operationErr != nil {
-		return fmt.Errorf("complete reconcile operation: %w", operationErr)
+		resultErr = errors.Join(resultErr, fmt.Errorf("complete reconcile operation: %w", operationErr))
 	}
-	return nil
+	return resultErr
 }
 
 // ReconcileAll is an explicit forced drift audit. Manager startup uses the
@@ -389,28 +387,51 @@ func (c *Controller) Delete(ctx context.Context, resource model.Resource) error 
 	op = claimed
 	deleteContext, heartbeat := c.startHeartbeat(ctx, op)
 	renderErr := c.renderer.Delete(deleteContext, resource)
-	op, leaseErr := heartbeat.stop()
-	if leaseErr != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	op, leaseErr, leaseStoppedByParent := heartbeat.stop()
+	parentErr := ctx.Err()
+	if leaseErr != nil && (!leaseStoppedByParent || parentErr == nil || !errors.Is(leaseErr, parentErr)) {
 		return fmt.Errorf("delete %s %q lost its writer lease: %w", kind, id, leaseErr)
 	}
-	completed := c.now().UTC()
-	op.CompletedAt = &completed
-	if renderErr != nil {
-		op.OperationStatus, op.Error = model.OperationFailed, renderErr.Error()
-	} else {
-		op.OperationStatus, op.Error = model.OperationSucceeded, ""
+	operationErr := c.completeOperation(ctx, op, renderErr)
+	if parentErr == nil {
+		parentErr = ctx.Err()
 	}
-	_, _, operationErr := c.store.Update(ctx, op, op.Revision, "")
+	var resultErr error
 	if renderErr != nil {
-		return fmt.Errorf("delete rendered %s %q revision %d: %w", kind, id, revision, renderErr)
+		resultErr = fmt.Errorf("delete rendered %s %q revision %d: %w", kind, id, revision, renderErr)
+	} else if parentErr != nil {
+		resultErr = parentErr
 	}
 	if operationErr != nil {
-		return fmt.Errorf("complete delete operation: %w", operationErr)
+		resultErr = errors.Join(resultErr, fmt.Errorf("complete delete operation: %w", operationErr))
 	}
-	return nil
+	return resultErr
+}
+
+// completeOperation persists only terminal bookkeeping after this writer has
+// stopped issuing external writes and its heartbeat has stopped. Request
+// cancellation must not strand a claim until orphan recovery, but the detached
+// store transaction is bounded so shutdown and a failed control database do
+// not block indefinitely. The operation revision and lease owner still fence
+// this update against a different manager.
+func (c *Controller) completeOperation(parent context.Context, operation *model.Operation, workErr error) error {
+	completed := c.now().UTC()
+	operation.CompletedAt = &completed
+	if workErr != nil {
+		operation.OperationStatus = model.OperationFailed
+		operation.Error = workErr.Error()
+	} else {
+		operation.OperationStatus = model.OperationSucceeded
+		operation.Error = ""
+	}
+	timeout := c.completionTimeout
+	if timeout <= 0 {
+		timeout = operationCompletionTimeout
+	}
+	completionContext, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	defer cancel()
+	_, _, err := c.store.Update(completionContext, operation, operation.Revision, "")
+	return err
 }
 
 func (c *Controller) resourceLock(kind model.Kind, id string) *sync.Mutex {
@@ -432,13 +453,14 @@ func deleteOperationKey(kind model.Kind, id string, revision int64) string {
 }
 
 type operationHeartbeat struct {
-	cancel    context.CancelFunc
-	stopOnce  sync.Once
-	stopCh    chan struct{}
-	done      chan struct{}
-	mu        sync.Mutex
-	operation *model.Operation
-	err       error
+	cancel        context.CancelFunc
+	stopOnce      sync.Once
+	stopCh        chan struct{}
+	done          chan struct{}
+	mu            sync.Mutex
+	operation     *model.Operation
+	err           error
+	parentStopped bool
 }
 
 func (c *Controller) startHeartbeat(parent context.Context, operation *model.Operation) (context.Context, *operationHeartbeat) {
@@ -455,13 +477,13 @@ func (c *Controller) startHeartbeat(parent context.Context, operation *model.Ope
 			case <-heartbeat.stopCh:
 				return
 			case <-workContext.Done():
-				heartbeat.fail(workContext.Err())
+				heartbeat.fail(workContext.Err(), true)
 				return
 			case <-ticker.C:
 				current := heartbeat.current()
 				renewed, err := c.store.RenewOperationLease(workContext, current.ID, current.Revision, current.LeaseOwner, c.now().UTC())
 				if err != nil {
-					heartbeat.fail(err)
+					heartbeat.fail(err, false)
 					cancel()
 					return
 				}
@@ -484,21 +506,22 @@ func (heartbeat *operationHeartbeat) setOperation(operation *model.Operation) {
 	heartbeat.mu.Unlock()
 }
 
-func (heartbeat *operationHeartbeat) fail(err error) {
+func (heartbeat *operationHeartbeat) fail(err error, parentStopped bool) {
 	heartbeat.mu.Lock()
 	if heartbeat.err == nil {
 		heartbeat.err = err
+		heartbeat.parentStopped = parentStopped
 	}
 	heartbeat.mu.Unlock()
 }
 
-func (heartbeat *operationHeartbeat) stop() (*model.Operation, error) {
+func (heartbeat *operationHeartbeat) stop() (*model.Operation, error, bool) {
 	heartbeat.stopOnce.Do(func() { close(heartbeat.stopCh) })
 	<-heartbeat.done
 	heartbeat.cancel()
 	heartbeat.mu.Lock()
 	defer heartbeat.mu.Unlock()
-	return heartbeat.operation, heartbeat.err
+	return heartbeat.operation, heartbeat.err, heartbeat.parentStopped
 }
 
 func heartbeatInterval(lease time.Duration) time.Duration {

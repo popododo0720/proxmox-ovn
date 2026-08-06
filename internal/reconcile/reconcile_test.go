@@ -56,8 +56,21 @@ func (renderer *blockingDeleteRenderer) Delete(ctx context.Context, resource mod
 
 type renewalObservingStore struct {
 	controlstore.Store
-	renewed chan time.Time
-	fail    error
+	renewed         chan time.Time
+	fail            error
+	cancelOnFailure context.CancelFunc
+}
+
+type cancelingOperationUpdateStore struct {
+	controlstore.Store
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+type blockingOperationUpdateStore struct {
+	controlstore.Store
+	started chan struct{}
+	once    sync.Once
 }
 
 type retentionObservingStore struct {
@@ -121,6 +134,9 @@ func (store *retentionObservingStore) PruneOperations(ctx context.Context, befor
 
 func (store *renewalObservingStore) RenewOperationLease(ctx context.Context, operationID string, expectedRevision int64, leaseOwner string, renewedAt time.Time) (*model.Operation, error) {
 	if store.fail != nil {
+		if store.cancelOnFailure != nil {
+			store.cancelOnFailure()
+		}
 		select {
 		case store.renewed <- renewedAt:
 		default:
@@ -135,6 +151,22 @@ func (store *renewalObservingStore) RenewOperationLease(ctx context.Context, ope
 		}
 	}
 	return operation, err
+}
+
+func (store *cancelingOperationUpdateStore) Update(ctx context.Context, resource model.Resource, expectedRevision int64, key string) (model.Resource, bool, error) {
+	if operation, ok := resource.(*model.Operation); ok && (operation.OperationStatus == model.OperationSucceeded || operation.OperationStatus == model.OperationFailed) {
+		store.once.Do(store.cancel)
+	}
+	return store.Store.Update(ctx, resource, expectedRevision, key)
+}
+
+func (store *blockingOperationUpdateStore) Update(ctx context.Context, resource model.Resource, expectedRevision int64, key string) (model.Resource, bool, error) {
+	if operation, ok := resource.(*model.Operation); ok && (operation.OperationStatus == model.OperationSucceeded || operation.OperationStatus == model.OperationFailed) {
+		store.once.Do(func() { close(store.started) })
+		<-ctx.Done()
+		return nil, false, ctx.Err()
+	}
+	return store.Store.Update(ctx, resource, expectedRevision, key)
 }
 
 func (r *blockingRenderer) Render(ctx context.Context, resource model.Resource) error {
@@ -1116,6 +1148,31 @@ func TestHeartbeatLossCancelsBlockedRendererWithoutCompletingOperation(t *testin
 	}
 }
 
+func TestForeignCancellationLeaseFailureRemainsRunning(t *testing.T) {
+	baseStore := controlstore.NewMemory()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &renewalObservingStore{
+		Store: baseStore, renewed: make(chan time.Time, 1), fail: context.Canceled,
+		cancelOnFailure: cancel,
+	}
+	project := createProject(t, store)
+	renderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
+	controller := NewController(store, renderer, WithLeaseDuration(30*time.Millisecond))
+
+	err := controller.Reconcile(ctx, model.KindProject, project.ID)
+	if err == nil || !strings.Contains(err.Error(), "lost its writer lease") {
+		t.Fatalf("Reconcile() error=%v, want foreign lease loss", err)
+	}
+	operations, listErr := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(operations) != 1 || operations[0].(*model.Operation).OperationStatus != model.OperationRunning {
+		t.Fatalf("operation was completed after foreign cancellation: %#v", operations)
+	}
+}
+
 func TestParentCancellationStopsHeartbeatAndReturnsContextError(t *testing.T) {
 	store := controlstore.NewMemory()
 	project := createProject(t, store)
@@ -1128,5 +1185,186 @@ func TestParentCancellationStopsHeartbeatAndReturnsContextError(t *testing.T) {
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Reconcile() error=%v, want context canceled", err)
+	}
+	operations, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 {
+		t.Fatalf("operations=%d, want one durable operation", len(operations))
+	}
+	failed := operations[0].(*model.Operation)
+	if failed.OperationStatus != model.OperationFailed || failed.CompletedAt == nil || !strings.Contains(failed.Error, context.Canceled.Error()) {
+		t.Fatalf("canceled operation=%#v, want immediate terminal failure", failed)
+	}
+	operationID := failed.ID
+
+	close(renderer.release)
+	if err := controller.ReconcilePeriodic(context.Background(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	readyResource, err := store.Get(context.Background(), model.KindProject, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := readyResource.(*model.Project)
+	if ready.State != model.ResourceReady || ready.AppliedRevision != ready.Revision {
+		t.Fatalf("project after periodic retry=%#v", ready)
+	}
+	operations, err = store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 {
+		t.Fatalf("operations after retry=%d, want idempotent reuse", len(operations))
+	}
+	succeeded := operations[0].(*model.Operation)
+	if succeeded.ID != operationID || succeeded.OperationStatus != model.OperationSucceeded || succeeded.CompletedAt == nil {
+		t.Fatalf("retried operation=%#v, want same successful operation", succeeded)
+	}
+}
+
+func TestLateParentCancellationStillPersistsSuccessfulOperation(t *testing.T) {
+	baseStore := controlstore.NewMemory()
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &cancelingOperationUpdateStore{Store: baseStore, cancel: cancel}
+	project := createProject(t, store)
+	controller := NewController(store, NewFakeRenderer())
+
+	if err := controller.Reconcile(ctx, model.KindProject, project.ID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Reconcile() error=%v, want late context cancellation", err)
+	}
+	resource, err := store.Get(context.Background(), model.KindProject, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := resource.(*model.Project)
+	if ready.State != model.ResourceReady || ready.AppliedRevision != ready.Revision {
+		t.Fatalf("project=%#v, want realized revision preserved", ready)
+	}
+	operations, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 || operations[0].(*model.Operation).OperationStatus != model.OperationSucceeded {
+		t.Fatalf("operations=%#v, want successful terminal bookkeeping", operations)
+	}
+}
+
+func TestParentDeadlineImmediatelyTerminalizesOperation(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	renderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
+	controller := NewController(store, renderer)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := controller.Reconcile(ctx, model.KindProject, project.ID)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile() error=%v, want parent deadline", err)
+	}
+	operations, listErr := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(operations) != 1 {
+		t.Fatalf("operations=%d, want one", len(operations))
+	}
+	failed := operations[0].(*model.Operation)
+	if failed.OperationStatus != model.OperationFailed || failed.CompletedAt == nil || !strings.Contains(failed.Error, context.DeadlineExceeded.Error()) {
+		t.Fatalf("deadline operation=%#v, want terminal failure", failed)
+	}
+}
+
+func TestOperationCompletionTimeoutIsBounded(t *testing.T) {
+	baseStore := controlstore.NewMemory()
+	store := &blockingOperationUpdateStore{Store: baseStore, started: make(chan struct{})}
+	project := createProject(t, store)
+	controller := NewController(store, NewFakeRenderer())
+	controller.completionTimeout = 20 * time.Millisecond
+
+	started := time.Now()
+	err := controller.Reconcile(context.Background(), model.KindProject, project.ID)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile() error=%v, want bounded completion deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("operation completion took %v, want bounded return", elapsed)
+	}
+	select {
+	case <-store.started:
+	default:
+		t.Fatal("terminal operation update was not attempted")
+	}
+	operations, listErr := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(operations) != 1 || operations[0].(*model.Operation).OperationStatus != model.OperationRunning {
+		t.Fatalf("operations=%#v, want lease-protected fallback for failed bookkeeping", operations)
+	}
+}
+
+func TestRenderAndOperationCompletionErrorsAreBothReturned(t *testing.T) {
+	baseStore := controlstore.NewMemory()
+	store := &blockingOperationUpdateStore{Store: baseStore, started: make(chan struct{})}
+	project := createProject(t, store)
+	renderErr := errors.New("render rejected")
+	renderer := NewFakeRenderer()
+	renderer.SetFailure(model.KindProject, project.ID, renderErr)
+	controller := NewController(store, renderer)
+	controller.completionTimeout = 20 * time.Millisecond
+
+	err := controller.Reconcile(context.Background(), model.KindProject, project.ID)
+	if !errors.Is(err, renderErr) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile() error=%v, want render and completion errors", err)
+	}
+}
+
+func TestDeleteCancellationImmediatelyTerminalizesAndRetriesSameOperation(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := createProject(t, store)
+	tombstoneResource, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone := tombstoneResource.(*model.Project)
+	renderer := &blockingDeleteRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
+	controller := NewController(store, renderer, WithLeaseDuration(30*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- controller.Delete(ctx, tombstone) }()
+	<-renderer.started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Delete() error=%v, want context canceled", err)
+	}
+	operations, err := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 {
+		t.Fatalf("delete operations=%d, want one", len(operations))
+	}
+	failed := operations[0].(*model.Operation)
+	if failed.OperationStatus != model.OperationFailed || failed.CompletedAt == nil || !strings.Contains(failed.Error, context.Canceled.Error()) {
+		t.Fatalf("canceled delete operation=%#v", failed)
+	}
+	operationID := failed.ID
+
+	close(renderer.release)
+	if err := controller.Delete(context.Background(), tombstone); err != nil {
+		t.Fatal(err)
+	}
+	operations, err = store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 {
+		t.Fatalf("delete operations after retry=%d, want idempotent reuse", len(operations))
+	}
+	succeeded := operations[0].(*model.Operation)
+	if succeeded.ID != operationID || succeeded.OperationStatus != model.OperationSucceeded || succeeded.CompletedAt == nil {
+		t.Fatalf("retried delete operation=%#v", succeeded)
 	}
 }
