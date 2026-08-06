@@ -111,6 +111,9 @@ PVN_DEB=dist/pvn-node_VERSION_amd64.deb
   --inventory "$PVN_INVENTORY" --identity "$PVN_IDENTITY"
 ```
 
+This locally built DEB is for controlled staging and validation only. It is
+not a canonical public artifact and must not be uploaded to GitHub Releases.
+
 Preflight is always read-only. It connects to every inventory node and rejects
 missing quorum, a non-PVE-9 node, inconsistent cluster names or architectures,
 an incomplete inventory, active PVN/OVN services, enabled PVN targets,

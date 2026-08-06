@@ -30,3 +30,28 @@ the archive, and verifies that the manager, agent, UI, schema, examples,
 scripts, targets, and OVN drop-ins are present. CI performs these builds in a
 Debian 13 container. Static unit verification is not a substitute for a staged
 PVE 9 host test.
+
+## Canonical releases
+
+`make deb` builds a local development/test package. It may be used for staged
+PVE validation, but it is not a canonical public artifact and must not be
+uploaded to GitHub Releases. `make release` is reserved for the tag-triggered
+GitHub Actions workflow and fails outside GitHub Actions.
+
+Public releases use the pinned Debian image
+`docker.io/library/debian@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958`,
+Go 1.24.13, Node 24.18.0, npm 11.16.0, and dpkg 1.22.22. The DEB uses
+deterministic xz level 6 with one compressor thread; commit ID, build date, and
+`SOURCE_DATE_EPOCH` come from the tagged commit.
+
+After updating every version field and the Debian changelog, commit the clean
+tree and push the new annotated `vVERSION` tag. Do not create, upload, edit,
+delete, or publish a release manually. GitHub Actions claims the bot-authored
+draft before building, verifies the exact seven assets and their SHA-256
+values, and publishes it. Retry the same workflow against its existing draft;
+never move or replace a release tag or published asset.
+
+Enable GitHub's **Immutable releases** repository setting before publishing
+and keep it enabled. The workflow also treats every published release as
+immutable and accepts a rerun only when the bot-authored assets exactly match
+the rebuild.
