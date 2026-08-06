@@ -9,15 +9,20 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('ApiClient', () => {
-  it('calls fetch with the browser window as its receiver', async () => {
+  it('calls the default fetch with the browser window as its receiver', async () => {
     const fetcher = vi.fn(function (this: Window) {
       if (this !== window) throw new TypeError('Illegal invocation');
       return Promise.resolve(jsonResponse({ data: [] }));
     });
-    const client = new ApiClient('/api/v1', fetcher as unknown as typeof fetch);
+    vi.stubGlobal('fetch', fetcher);
+    const client = new ApiClient('/api/v1');
 
-    await expect(client.networks()).resolves.toEqual({ items: [], total: 0 });
-    expect(fetcher.mock.contexts[0]).toBe(window);
+    try {
+      await expect(client.networks()).resolves.toEqual({ items: [], total: 0 });
+      expect(fetcher.mock.contexts[0]).toBe(window);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('unwraps data lists from the v1 API envelope', async () => {

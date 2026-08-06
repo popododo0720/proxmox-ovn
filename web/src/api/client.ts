@@ -26,6 +26,8 @@ import type {
 type Fetcher = typeof fetch;
 type QueryValue = string | number | boolean | undefined;
 
+const browserFetch: Fetcher = (input, init) => window.fetch(input, init);
+
 interface RequestOptions extends Omit<RequestInit, 'body'> {
   body?: unknown;
   query?: Record<string, QueryValue>;
@@ -81,9 +83,9 @@ export class ApiClient {
   private readonly fetcher: Fetcher;
   private csrfToken = '';
 
-  constructor(baseURL = '/api/v1', fetcher: Fetcher = fetch) {
+  constructor(baseURL = '/api/v1', fetcher: Fetcher = browserFetch) {
     this.baseURL = baseURL.replace(/\/$/, '');
-    this.fetcher = fetcher.bind(window);
+    this.fetcher = fetcher;
   }
 
   setCSRFToken(token: string): void {
