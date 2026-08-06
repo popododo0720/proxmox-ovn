@@ -41,6 +41,12 @@ type unavailableGatewayRunner struct {
 	recordingRunner
 }
 
+type syncFailRunner struct {
+	recordingRunner
+	failSync bool
+	syncs    int
+}
+
 type providerPortRunner struct {
 	recordingRunner
 	uuid   string
@@ -177,6 +183,17 @@ func (runner *recordingRunner) Run(_ context.Context, _ string, arguments ...str
 		return []byte(testOVSUUID + "\n"), nil
 	}
 	return nil, nil
+}
+
+func (runner *syncFailRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, error) {
+	output, err := runner.recordingRunner.Run(ctx, binary, arguments...)
+	if len(arguments) != 0 && arguments[len(arguments)-1] == "sync" {
+		runner.syncs++
+		if runner.failSync {
+			return []byte("Southbound has not converged"), errors.New("timed out")
+		}
+	}
+	return output, err
 }
 
 func (runner *recordingRunner) readRows(arguments []string) ([]byte, bool) {
@@ -747,6 +764,86 @@ func TestSecurityGroupDefaultDropHasOwnedDHCPv4Exceptions(t *testing.T) {
 			mapAssignment("external_ids", "pvn-owner", owner)) {
 			t.Errorf("arbitrary IPv4 traffic is not default-dropped for %s: %v", direction, runner.calls)
 		}
+	}
+}
+
+func TestSecurityGroupExplicitDropDeterministicallyPrecedesAllow(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{
+		Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1",
+	}).(*model.Project)
+	group := mustCreate(t, store, &model.SecurityGroup{
+		Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "policy",
+	}).(*model.SecurityGroup)
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+	if err := renderer.Render(context.Background(), group); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, rule := range []*model.SecurityGroupRule{
+		{
+			Metadata: model.Metadata{ID: "allow-rule"}, ProjectID: project.ID,
+			SecurityGroupID: group.ID, Direction: model.DirectionIngress,
+			EtherType: model.EtherTypeIPv4, Protocol: "tcp", PortRangeMin: 443,
+			PortRangeMax: 443, RemoteCIDR: "192.0.2.0/24", Action: model.ActionAllow,
+		},
+		{
+			Metadata: model.Metadata{ID: "drop-rule"}, ProjectID: project.ID,
+			SecurityGroupID: group.ID, Direction: model.DirectionIngress,
+			EtherType: model.EtherTypeIPv4, Protocol: "tcp", PortRangeMin: 443,
+			PortRangeMax: 443, RemoteCIDR: "192.0.2.0/24", Action: model.ActionDrop,
+		},
+	} {
+		if err := renderer.Render(context.Background(), rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !runner.contains("create ACL", "priority=2000", mapAssignment("external_ids", "pvn-owner", "allow-rule")) {
+		t.Fatalf("allow rule priority drift: %v", runner.calls)
+	}
+	if !runner.contains("create ACL", "priority=2500", mapAssignment("external_ids", "pvn-owner", "drop-rule")) {
+		t.Fatalf("drop rule does not precede overlapping allow: %v", runner.calls)
+	}
+}
+
+func TestRendererExplicitSyncFencesIdempotentRetryAndDelete(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{
+		Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1",
+	}).(*model.Project)
+	network := mustCreate(t, store, &model.Network{
+		Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private",
+	}).(*model.Network)
+	runner := &syncFailRunner{failSync: true}
+	client, err := NewClient(ClientConfig{
+		Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}, WaitForSync: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer, err := NewRenderer(client, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		err := renderer.Render(context.Background(), network)
+		if err == nil || !strings.Contains(err.Error(), "sync OVN Northbound to Southbound") {
+			t.Fatalf("render attempt %d bypassed failed sync: %v", attempt, err)
+		}
+	}
+	if runner.syncs != 2 {
+		t.Fatalf("idempotent retry sync count=%d, want 2", runner.syncs)
+	}
+
+	runner.failSync = false
+	if err := renderer.Render(context.Background(), network); err != nil {
+		t.Fatalf("render after convergence: %v", err)
+	}
+	runner.failSync = true
+	if err := renderer.Delete(context.Background(), network); err == nil || !strings.Contains(err.Error(), "sync OVN Northbound to Southbound") {
+		t.Fatalf("delete bypassed failed sync: %v", err)
 	}
 }
 

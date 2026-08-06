@@ -39,9 +39,10 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	runner Runner
-	binary string
-	base   []string
+	runner      Runner
+	binary      string
+	base        []string
+	waitForSync bool
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -104,7 +105,9 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if runner == nil {
 		runner = ExecRunner{}
 	}
-	return &Client{runner: runner, binary: binary, base: base}, nil
+	return &Client{
+		runner: runner, binary: binary, base: base, waitForSync: config.WaitForSync,
+	}, nil
 }
 
 func (client *Client) run(ctx context.Context, arguments ...string) ([]byte, error) {
@@ -120,11 +123,31 @@ func (client *Client) run(ctx context.Context, arguments ...string) ([]byte, err
 	return output, nil
 }
 
+// sync fences even an idempotent/no-op retry on ovn-northd convergence.
+// ovn-nbctl's ordinary --wait=sb handling does not wait when a transaction is
+// unchanged, so relying on it alone can mark desired state ready while the
+// Southbound database still lacks an earlier Northbound change.
+func (client *Client) sync(ctx context.Context) error {
+	if client == nil {
+		return errors.New("OVN Northbound client is nil")
+	}
+	if !client.waitForSync {
+		return nil
+	}
+	if _, err := client.run(ctx, "sync"); err != nil {
+		return fmt.Errorf("sync OVN Northbound to Southbound: %w", err)
+	}
+	return nil
+}
+
 // Probe verifies that the configured Northbound cluster is reachable. When
 // WaitForSync is enabled this also waits for northd to report Southbound sync.
 func (client *Client) Probe(ctx context.Context) error {
 	if client == nil {
 		return errors.New("OVN Northbound client is nil")
+	}
+	if err := client.sync(ctx); err != nil {
+		return fmt.Errorf("probe OVN Northbound: %w", err)
 	}
 	if _, err := client.run(ctx, "--bare", "--columns=name", "list", "NB_Global"); err != nil {
 		return fmt.Errorf("probe OVN Northbound: %w", err)

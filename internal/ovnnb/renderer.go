@@ -40,30 +40,35 @@ func (renderer *Renderer) Render(ctx context.Context, resource model.Resource) e
 	if err := resource.Validate(); err != nil {
 		return fmt.Errorf("invalid %s %q: %w", resource.ResourceKind(), resource.GetMetadata().ID, err)
 	}
+	var renderErr error
 	switch value := resource.(type) {
 	case *model.Network:
-		return renderer.network(ctx, value)
+		renderErr = renderer.network(ctx, value)
 	case *model.Subnet:
-		return renderer.subnet(ctx, value)
+		renderErr = renderer.subnet(ctx, value)
 	case *model.Port:
-		return renderer.port(ctx, value)
+		renderErr = renderer.port(ctx, value)
 	case *model.Router:
-		return renderer.router(ctx, value)
+		renderErr = renderer.router(ctx, value)
 	case *model.RouterInterface:
-		return renderer.routerInterface(ctx, value)
+		renderErr = renderer.routerInterface(ctx, value)
 	case *model.FloatingIP:
-		return renderer.floatingIP(ctx, value)
+		renderErr = renderer.floatingIP(ctx, value)
 	case *model.ProviderSegment:
-		return renderer.providerSegment(ctx, value)
+		renderErr = renderer.providerSegment(ctx, value)
 	case *model.SecurityGroup:
-		return renderer.securityGroup(ctx, value)
+		renderErr = renderer.securityGroup(ctx, value)
 	case *model.SecurityGroupRule:
-		return renderer.securityGroupRule(ctx, value)
+		renderErr = renderer.securityGroupRule(ctx, value)
 	case *model.Project, *model.ProviderNetwork, *model.IPAllocation, *model.Node, *model.Operation:
 		return nil
 	default:
 		return fmt.Errorf("unsupported resource type %T", resource)
 	}
+	if renderErr != nil {
+		return renderErr
+	}
+	return renderer.client.sync(ctx)
 }
 
 // Delete removes only OVN rows whose names or deterministic UUIDs are owned by
@@ -76,62 +81,71 @@ func (renderer *Renderer) Delete(ctx context.Context, resource model.Resource) e
 	if err := safeID(resource.GetMetadata().ID); err != nil {
 		return err
 	}
+	var deleteErr error
 	switch value := resource.(type) {
 	case *model.Network:
 		uuid, err := renderer.lookupOwnedRow(ctx, logicalSwitchOwnedRow(value.ID))
 		if err != nil || uuid == "" {
-			return wrapRender("delete network", value.ID, err)
+			deleteErr = wrapRender("delete network", value.ID, err)
+			break
 		}
 		_, err = renderer.client.run(ctx, "--", "--if-exists", "ls-del", uuid)
-		return wrapRender("delete network", value.ID, err)
+		deleteErr = wrapRender("delete network", value.ID, err)
 	case *model.Subnet:
 		uuid, err := renderer.lookupOwnedRow(ctx, dhcpOptionsOwnedRow(value.ID))
 		if err != nil {
-			return wrapRender("delete subnet", value.ID, err)
+			deleteErr = wrapRender("delete subnet", value.ID, err)
+			break
 		}
 		// Resolve the DHCP row before changing any port references. A duplicate
 		// restored identity is ambiguous and must fail closed without partially
 		// clearing DHCP from otherwise healthy logical switch ports.
 		if err := renderer.attachDHCPToPorts(ctx, value, ""); err != nil {
-			return err
+			deleteErr = err
+			break
 		}
-		if uuid == "" {
-			return nil
+		if uuid != "" {
+			_, err = renderer.client.run(ctx, "--", "--if-exists", "destroy", "DHCP_Options", uuid)
+			deleteErr = wrapRender("delete subnet", value.ID, err)
 		}
-		_, err = renderer.client.run(ctx, "--", "--if-exists", "destroy", "DHCP_Options", uuid)
-		return wrapRender("delete subnet", value.ID, err)
 	case *model.Port:
 		if err := safeID(value.LSPName); err != nil {
 			return fmt.Errorf("invalid LSP name: %w", err)
 		}
 		uuid, err := renderer.lookupOwnedRow(ctx, logicalSwitchPortOwnedRow(value.ID, value.LSPName))
 		if err != nil || uuid == "" {
-			return wrapRender("delete port", value.ID, err)
+			deleteErr = wrapRender("delete port", value.ID, err)
+			break
 		}
 		_, err = renderer.client.run(ctx, "--", "--if-exists", "lsp-del", uuid)
-		return wrapRender("delete port", value.ID, err)
+		deleteErr = wrapRender("delete port", value.ID, err)
 	case *model.Router:
-		return renderer.deleteRouter(ctx, value)
+		deleteErr = renderer.deleteRouter(ctx, value)
 	case *model.RouterInterface:
-		return renderer.deleteRouterInterface(ctx, value)
+		deleteErr = renderer.deleteRouterInterface(ctx, value)
 	case *model.FloatingIP:
-		return renderer.deleteFloatingIP(ctx, value)
+		deleteErr = renderer.deleteFloatingIP(ctx, value)
 	case *model.ProviderSegment:
-		return renderer.deleteProviderSegment(ctx, value)
+		deleteErr = renderer.deleteProviderSegment(ctx, value)
 	case *model.SecurityGroup:
 		uuid, err := renderer.lookupOwnedRow(ctx, portGroupOwnedRow(value.ID))
 		if err != nil || uuid == "" {
-			return wrapRender("delete security group", value.ID, err)
+			deleteErr = wrapRender("delete security group", value.ID, err)
+			break
 		}
 		_, err = renderer.client.run(ctx, "--", "--if-exists", "destroy", "Port_Group", uuid)
-		return wrapRender("delete security group", value.ID, err)
+		deleteErr = wrapRender("delete security group", value.ID, err)
 	case *model.SecurityGroupRule:
-		return renderer.deleteACL(ctx, value.ID)
+		deleteErr = renderer.deleteACL(ctx, value.ID)
 	case *model.Project, *model.ProviderNetwork, *model.IPAllocation, *model.Node, *model.Operation:
 		return nil
 	default:
 		return fmt.Errorf("unsupported resource type %T", resource)
 	}
+	if deleteErr != nil {
+		return deleteErr
+	}
+	return renderer.client.sync(ctx)
 }
 
 func (renderer *Renderer) deleteFloatingIP(ctx context.Context, floatingIP *model.FloatingIP) error {
@@ -1386,6 +1400,36 @@ func (renderer *Renderer) securityGroupRule(ctx context.Context, rule *model.Sec
 	if group.ProjectID != rule.ProjectID {
 		return fmt.Errorf("security group rule %q crosses project boundaries", rule.ID)
 	}
+	if rule.RemoteGroupID != "" {
+		if err := safeID(rule.RemoteGroupID); err != nil {
+			return fmt.Errorf("invalid remote group ID: %w", err)
+		}
+		remote, getErr := getResource[*model.SecurityGroup](ctx, renderer.store, model.KindSecurityGroup, rule.RemoteGroupID)
+		if getErr != nil {
+			return getErr
+		}
+		if remote.ProjectID != rule.ProjectID {
+			return fmt.Errorf("security group rule %q references a remote group in another project", rule.ID)
+		}
+	}
+	spec, err := securityGroupRuleACLSpec(rule)
+	if err != nil {
+		return err
+	}
+	return renderer.ensureACL(ctx, portGroup(group.ID), rule.ID, spec.direction, spec.priority, spec.match, spec.action, rule.Revision)
+}
+
+type securityGroupACLSpec struct {
+	direction string
+	priority  int
+	match     string
+	action    string
+}
+
+func securityGroupRuleACLSpec(rule *model.SecurityGroupRule) (securityGroupACLSpec, error) {
+	if rule == nil {
+		return securityGroupACLSpec{}, errors.New("security group rule is nil")
+	}
 	direction := "to-lport"
 	remoteField := "ip4.src"
 	if rule.Direction == model.DirectionEgress {
@@ -1404,14 +1448,7 @@ func (renderer *Renderer) securityGroupRule(ctx context.Context, rule *model.Sec
 		match = append(match, remoteField+" == "+rule.RemoteCIDR)
 	} else if rule.RemoteGroupID != "" {
 		if err := safeID(rule.RemoteGroupID); err != nil {
-			return fmt.Errorf("invalid remote group ID: %w", err)
-		}
-		remote, getErr := getResource[*model.SecurityGroup](ctx, renderer.store, model.KindSecurityGroup, rule.RemoteGroupID)
-		if getErr != nil {
-			return getErr
-		}
-		if remote.ProjectID != rule.ProjectID {
-			return fmt.Errorf("security group rule %q references a remote group in another project", rule.ID)
+			return securityGroupACLSpec{}, fmt.Errorf("invalid remote group ID: %w", err)
 		}
 		match = append(match, remoteField+" == $"+portGroup(rule.RemoteGroupID)+"_ip4")
 	}
@@ -1426,10 +1463,15 @@ func (renderer *Renderer) securityGroupRule(ctx context.Context, rule *model.Sec
 		}
 	}
 	action := "drop"
+	priority := 2500
 	if rule.Action == model.ActionAllow {
 		action = "allow-related"
+		priority = 2000
 	}
-	return renderer.ensureACL(ctx, portGroup(group.ID), rule.ID, direction, 2000, strings.Join(match, " && "), action, rule.Revision)
+	return securityGroupACLSpec{
+		direction: direction, priority: priority,
+		match: strings.Join(match, " && "), action: action,
+	}, nil
 }
 
 func (renderer *Renderer) ensureACL(ctx context.Context, group, owner, direction string, priority int, match, action string, revision int64) error {

@@ -13,11 +13,13 @@ import (
 
 type probeRunner struct {
 	arguments []string
+	calls     [][]string
 	err       error
 }
 
 func (runner *probeRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
 	runner.arguments = append([]string(nil), arguments...)
+	runner.calls = append(runner.calls, append([]string(nil), arguments...))
 	return nil, runner.err
 }
 
@@ -95,6 +97,9 @@ func TestClientProbeUsesConfiguredClusterAndWaitsForSync(t *testing.T) {
 	if err := client.Probe(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if len(runner.calls) != 2 || runner.calls[0][len(runner.calls[0])-1] != "sync" {
+		t.Fatalf("probe did not issue an explicit sync fence first: %v", runner.calls)
+	}
 	joined := strings.Join(runner.arguments, " ")
 	if !strings.Contains(joined, "--no-syslog --verbose=syslog:warn --verbose=console:warn") ||
 		!strings.Contains(joined, "--db=unix:/run/ovn/ovnnb_db.sock") ||
@@ -104,6 +109,22 @@ func TestClientProbeUsesConfiguredClusterAndWaitsForSync(t *testing.T) {
 	runner.err = errors.New("unreachable")
 	if err := client.Probe(context.Background()); err == nil || !strings.Contains(err.Error(), "probe OVN Northbound") {
 		t.Fatalf("probe error = %v", err)
+	}
+}
+
+func TestClientWithoutWaitForSyncDoesNotIssueSync(t *testing.T) {
+	runner := &probeRunner{}
+	client, err := NewClient(ClientConfig{
+		Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 1 || slices.Contains(runner.calls[0], "sync") {
+		t.Fatalf("non-waiting probe unexpectedly synchronized: %v", runner.calls)
 	}
 }
 
