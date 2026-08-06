@@ -3716,16 +3716,16 @@ def active_upgrade_readiness_issues(
             issues.append("installed pvn-node is not uniformly newer than the control snapshot")
         if not markers_pending:
             issues.append("every central restart marker must pin the installed newer package")
-    elif topology_pin == "legacy":
-        if not live_is_newer:
-            issues.append("pre-repin schema 2 requires one uniformly newer pvn-node package")
+    elif live_is_newer:
         if not markers_pending:
-            issues.append("pre-repin schema 2 requires every central restart marker")
-    else:
-        if live_version != pinned_version:
-            issues.append("post-repin control snapshot does not pin the installed package")
+            issues.append("schema 2 package rollout requires every central restart marker")
+    elif live_version == pinned_version:
+        if topology_pin != "candidate":
+            issues.append("equal-package schema 2 requires the candidate control snapshot pin")
         if not (markers_pending or markers_consumed):
             issues.append("post-repin restart markers are neither all pending nor all consumed")
+    else:
+        issues.append("schema 2 installed package is mixed, older, or unrelated to its control pin")
     return issues
 
 

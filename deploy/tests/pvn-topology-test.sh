@@ -450,6 +450,8 @@ def report():
         package_version = "0.2.14-1"
         if os.environ.get("PVN_TEST_PVN_VERSION_MISMATCH_HOST") == node:
             package_version = "0.2.15-1"
+        if os.environ.get("PVN_TEST_PVN_VERSION_NEXT") == "yes":
+            package_version = "0.2.15-1"
         if os.environ.get("PVN_TEST_PVN_VERSION_NOT_NEWER") == "yes":
             package_version = "0.2.13-1"
         restart_pending = package_version
@@ -1321,6 +1323,27 @@ PVN_TEST_ACTIVE=yes "$TOPOLOGY" apply \
 if grep -q 'action=write-ledger' "$LOG"; then
     fail "control-plane candidate raw pin repeated the topology ledger CAS"
 fi
+
+: > "$LOG"
+PVN_TEST_ACTIVE=yes PVN_TEST_PVN_VERSION_NEXT=yes \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-next-package-rerun.out"
+if grep -q 'action=write-ledger' "$LOG"; then
+    fail "next rolling package on schema 2 repeated the topology ledger CAS"
+fi
+grep -q 'Upgrade readiness: READY' "$WORK/active-ledger-next-package-rerun.out" ||
+    fail "schema 2 candidate pin blocked the next uniform package rollout"
+
+: > "$LOG"
+PVN_TEST_ACTIVE=yes PVN_TEST_PVN_VERSION_NEXT=yes \
+    PVN_TEST_RESTART_MARKER_MISSING_HOST=prox2 \
+    "$TOPOLOGY" plan --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-next-package-missing-marker.out"
+grep -q 'Upgrade readiness: NOT READY' \
+    "$WORK/active-ledger-next-package-missing-marker.out" ||
+    fail "schema 2 next package rollout accepted a missing restart marker"
+assert_no_mutation
 
 : > "$LOG"
 PVN_TEST_ACTIVE=yes PVN_TEST_RESTART_MARKERS_CONSUMED=yes \
