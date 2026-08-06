@@ -33,6 +33,7 @@ if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
         pvn-node.target pvn-node-ready.service pvn-central.target \
         pvn-manager.service pvn-agent.service pvn-ovn-host-config.service \
         pvn-control-db.service pvn-ovn-db-listeners.service \
+        pvn-ovn-northd-ready.service \
         ovn-controller.service ovn-ovsdb-server-nb.service \
         ovn-ovsdb-server-sb.service ovn-northd.service
     do
@@ -58,7 +59,7 @@ if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
         /usr/lib/pvn/pvn-ui-inject remove || true
     fi
     systemctl disable --now pvn-central.target pvn-node.target >/dev/null 2>&1 || true
-    systemctl stop pvn-node-ready.service pvn-agent.service pvn-manager.service pvn-ovn-host-config.service pvn-control-db.service pvn-ovn-db-listeners.service ovn-controller.service >/dev/null 2>&1 || true
+    systemctl stop pvn-node-ready.service pvn-agent.service pvn-manager.service pvn-ovn-host-config.service pvn-control-db.service pvn-ovn-db-listeners.service pvn-ovn-northd-ready.service ovn-controller.service >/dev/null 2>&1 || true
 fi
 
 exit 0

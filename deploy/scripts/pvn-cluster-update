@@ -134,6 +134,7 @@ class Probe:
     central_mode: str
     central_pids: str
     central_pending: str
+    northd_role: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -650,6 +651,26 @@ active_central_health() {
             ;;
         *) remote_fail "unsupported active central mode: $pvn_central_mode" ;;
     esac
+    pvn_northd_status=$(/usr/bin/timeout 10 /usr/bin/ovn-appctl -t ovn-northd status) ||
+        remote_fail "cannot read the local northd active/standby role"
+    case "$pvn_northd_status" in
+        'Status: active') pvn_northd_role=active ;;
+        'Status: standby') pvn_northd_role=standby ;;
+        *) remote_fail "local northd returned an invalid active/standby role" ;;
+    esac
+    # A newly unpacked helper must not force an implicit northd restart before
+    # the package/schema repin.  While the durable marker is present the old
+    # central PIDs are deliberately preserved; the quorum-safe restart runs
+    # the systemd readiness gate.  Once no restart is pending, every probe
+    # requires clustered NB/SB connectivity and exact cfg synchronization.
+    if [ -x /usr/lib/pvn/pvn-ovn-northd ]; then
+        pvn_northd_pending=$(central_restart_marker) ||
+            remote_fail "central restart marker is unsafe"
+        if [ "$pvn_northd_pending" = none ]; then
+            /usr/lib/pvn/pvn-ovn-northd status >/dev/null ||
+                remote_fail "northd clustered endpoint health check failed"
+        fi
+    fi
 }
 
 embedded_corosync_snapshot() {
@@ -1313,10 +1334,12 @@ EOF
         pvn_central_state=inactive
         pvn_central_mode=inactive
         pvn_central_pids=none
+        pvn_northd_role=inactive
         require_inactive pvn-central.target
         require_disabled pvn-central.target
         for pvn_unit in pvn-central-preflight.service pvn-control-db.service \
-            pvn-ovn-db-listeners.service ovn-ovsdb-server-nb.service \
+            pvn-ovn-db-listeners.service pvn-ovn-northd-ready.service \
+            ovn-ovsdb-server-nb.service \
             ovn-ovsdb-server-sb.service ovn-northd.service
         do
             require_inactive "$pvn_unit"
@@ -1328,11 +1351,11 @@ EOF
 
 emit_probe() {
     collect_state
-    printf 'PVN_UPDATE mode=%s cluster=%s config=%s fingerprint=%s nodes=%s pve=%s arch=%s version=%s hostname=%s nodeid=%s node=%s central=%s centralmode=%s centralpids=%s centralpending=%s\n' \
+    printf 'PVN_UPDATE mode=%s cluster=%s config=%s fingerprint=%s nodes=%s pve=%s arch=%s version=%s hostname=%s nodeid=%s node=%s central=%s centralmode=%s centralpids=%s centralpending=%s northdrole=%s\n' \
         "$pvn_mode" "$pvn_cluster" "$pvn_config_version" "$pvn_fingerprint" \
         "$pvn_nodes" "$pvn_pve" "$pvn_arch" "$pvn_version" "$pvn_hostname" \
         "$pvn_node_id" "$pvn_node_state" "$pvn_central_state" "$pvn_central_mode" "$pvn_central_pids" \
-        "$pvn_central_pending"
+        "$pvn_central_pending" "$pvn_northd_role"
 }
 
 pvn_action=${1:-}
@@ -1501,7 +1524,7 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
     if len(lines) != 1:
         fail(f"unexpected health response from {node.name}")
     fields = lines[0].split()
-    if len(fields) != 16 or fields[0] != "PVN_UPDATE":
+    if len(fields) != 17 or fields[0] != "PVN_UPDATE":
         fail(f"malformed health response from {node.name}")
     values: dict[str, str] = {}
     for field in fields[1:]:
@@ -1514,7 +1537,7 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
     required = {
         "mode", "cluster", "config", "fingerprint", "nodes", "pve", "arch",
         "version", "hostname", "nodeid", "node", "central", "centralmode", "centralpids",
-        "centralpending",
+        "centralpending", "northdrole",
     }
     if set(values) != required:
         fail(f"unexpected health fields from {node.name}")
@@ -1539,6 +1562,10 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
         fail(f"{node.name} reports a central mode while inactive")
     if values["central"] == "inactive" and values["centralpids"] != "none":
         fail(f"{node.name} reports central PIDs while inactive")
+    if values["central"] == "active" and values["northdrole"] not in {"active", "standby"}:
+        fail(f"{node.name} reports an invalid active northd role")
+    if values["central"] == "inactive" and values["northdrole"] != "inactive":
+        fail(f"{node.name} reports a northd role while central is inactive")
     if values["central"] == "active" and not re.fullmatch(r"[1-9][0-9]*(?:,[1-9][0-9]*){3}", values["centralpids"]):
         fail(f"{node.name} reports invalid central process identities")
     if values["centralpending"] != "none" and not SAFE_VERSION.fullmatch(values["centralpending"]):
@@ -1546,7 +1573,25 @@ def parse_probe(node: Node, raw: str, snapshot: Snapshot) -> Probe:
     return Probe(
         node, values["version"], values["arch"], values["node"],
         values["central"], values["centralmode"], values["centralpids"], values["centralpending"],
+        values["northdrole"],
     )
+
+
+def gate_northd_roles(probes: dict[str, Probe]) -> None:
+    active = [probe for probe in probes.values() if probe.central_state == "active"]
+    if not active:
+        return
+    # Package unpack deliberately leaves old central PIDs and a restart marker.
+    # Do not make the required package/schema repin depend on a new northd
+    # process that is forbidden to start until after that repin.
+    if any(probe.central_pending != "none" for probe in active):
+        return
+    leaders = [probe.node.name for probe in active if probe.northd_role == "active"]
+    if len(leaders) != 1:
+        fail(
+            "northd cluster must report exactly one active role when no central restart is pending; "
+            f"found {len(leaders)}: {' '.join(leaders) or 'none'}"
+        )
 
 
 def probe_all(transport: Transport, snapshot: Snapshot, announce: bool) -> dict[str, Probe]:
@@ -1567,6 +1612,7 @@ def probe_all(transport: Transport, snapshot: Snapshot, announce: bool) -> dict[
                 f"[{node.name}] healthy: pvn-node={probe.version} "
                 f"node={probe.node_state} central={probe.central_state}"
             )
+    gate_northd_roles(probes)
     return probes
 
 

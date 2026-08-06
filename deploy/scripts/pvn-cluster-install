@@ -571,6 +571,7 @@ check_inactive() {
         pvn-node.target pvn-central.target pvn-node-ready.service \
         pvn-manager.service pvn-agent.service pvn-ovn-host-config.service \
         pvn-control-db.service pvn-ovn-db-listeners.service \
+        pvn-ovn-northd-ready.service \
         ovn-host.service ovn-central.service ovn-controller.service \
         ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service \
         ovn-northd.service

@@ -1,8 +1,8 @@
 [Unit]
 Description=PVN central database and OVN northd role
 Documentation=file:/usr/share/doc/pvn-node/operations.md
-Requires=pvn-central-preflight.service pvn-control-db.service pvn-ovn-db-listeners.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service ovn-northd.service
-After=network-online.target pve-cluster.service pvn-central-preflight.service pvn-control-db.service pvn-ovn-db-listeners.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service ovn-northd.service
+Requires=pvn-central-preflight.service pvn-control-db.service pvn-ovn-db-listeners.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service ovn-northd.service pvn-ovn-northd-ready.service
+After=network-online.target pve-cluster.service pvn-central-preflight.service pvn-control-db.service pvn-ovn-db-listeners.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service ovn-northd.service pvn-ovn-northd-ready.service
 ConditionPathExists=/etc/pvn/central/enabled
 AllowIsolate=no
 

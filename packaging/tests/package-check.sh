@@ -31,6 +31,7 @@ python3 deploy/tests/pvn-cluster-update-test.py
 deploy/tests/pvn-update-test.sh
 deploy/tests/pvn-cluster-lease-test.sh
 deploy/tests/pvn-ovn-db-listeners-test.sh
+python3 -B deploy/tests/pvn-ovn-northd-test.py
 deploy/tests/pvn-topology-test.sh
 python3 -B deploy/tests/pvn-topology-standalone-test.py
 python3 -B deploy/tests/pvn-topology-corosync-test.py
@@ -163,6 +164,30 @@ grep -q 'curl' packaging/pvn-node.control || {
     echo "the runtime package must depend on the readiness HTTP client" >&2
     exit 1
 }
+grep -q '^ExecStart=/usr/lib/pvn/pvn-ovn-northd start$' deploy/systemd/ovn-northd.service.d/90-pvn.conf || {
+    echo "OVN northd must start through the clustered PVN endpoint launcher" >&2
+    exit 1
+}
+grep -q '^ExecStart=/usr/lib/pvn/pvn-ovn-northd wait$' deploy/systemd/pvn-ovn-northd-ready.service || {
+    echo "PVN central readiness must wait for northd connectivity and cfg sync" >&2
+    exit 1
+}
+grep -q 'pvn-ovn-northd-ready.service' deploy/systemd/pvn-central.target || {
+    echo "PVN central target must require the northd readiness gate" >&2
+    exit 1
+}
+grep -q '/usr/lib/pvn/pvn-ovn-northd status' deploy/scripts/pvn-cluster-update || {
+    echo "rolling-update health must verify clustered northd state" >&2
+    exit 1
+}
+grep -q '\[ -x /usr/lib/pvn/pvn-ovn-northd \]' packaging/debian/pvn-node.postinst || {
+    echo "package configuration must fail if the northd launcher is missing" >&2
+    exit 1
+}
+grep -q 'pvn-ovn-northd-ready.service' packaging/debian/pvn-node.prerm || {
+    echo "package removal must account for the northd readiness gate" >&2
+    exit 1
+}
 
 verify_root=$(mktemp -d)
 cleanup() {
@@ -267,6 +292,7 @@ for executable in \
     /usr/lib/pvn/pvn-central-preflight \
     /usr/lib/pvn/pvn-ovn-host-preflight \
     /usr/lib/pvn/pvn-ovn-db-listeners \
+    /usr/lib/pvn/pvn-ovn-northd \
     /usr/lib/pvn/pvn-node-ready \
     /usr/lib/pvn/pvn-guest-gate \
     /usr/lib/pvn/pvn-ui-verify \
@@ -303,6 +329,7 @@ for path in \
     usr/lib/pvn/pvn-central-preflight \
     usr/lib/pvn/pvn-ovn-host-preflight \
     usr/lib/pvn/pvn-ovn-db-listeners \
+    usr/lib/pvn/pvn-ovn-northd \
     usr/lib/pvn/pvn-node-ready \
     usr/lib/pvn/pvn-guest-gate \
     usr/lib/pvn/pvn-ui-verify \
@@ -315,6 +342,7 @@ for path in \
     usr/lib/systemd/system/pvn-node-ready.service \
     usr/lib/systemd/system/pvn-guest-gate.service \
     usr/lib/systemd/system/pvn-central.target \
+    usr/lib/systemd/system/pvn-ovn-northd-ready.service \
     usr/lib/systemd/system/ovn-controller.service.d/90-pvn.conf \
     usr/lib/systemd/system/ovn-ovsdb-server-nb.service.d/90-pvn.conf \
     usr/lib/systemd/system/ovn-ovsdb-server-sb.service.d/90-pvn.conf \

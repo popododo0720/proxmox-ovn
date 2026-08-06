@@ -1,0 +1,14 @@
+[Unit]
+Description=Wait for clustered OVN northd connectivity and configuration sync
+Documentation=file:/usr/share/doc/pvn-node/operations.md
+Requires=ovn-northd.service
+After=ovn-northd.service
+Before=pvn-central.target
+PartOf=pvn-central.target
+ConditionPathExists=/etc/pvn/central/enabled
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/pvn/pvn-ovn-northd wait
+RemainAfterExit=yes
+TimeoutStartSec=150

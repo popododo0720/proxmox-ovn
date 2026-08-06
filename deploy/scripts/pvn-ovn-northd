@@ -1,0 +1,496 @@
+#!/usr/bin/python3
+"""Start and verify ovn-northd against every configured PVN DB endpoint."""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import pathlib
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+
+MAX_CONFIG_BYTES = 1024 * 1024
+MAX_COMMAND_OUTPUT = 64 * 1024
+COMMAND_TIMEOUT_SECONDS = 10
+WAIT_SECONDS = 120
+WAIT_INTERVAL_SECONDS = 1
+MAX_ENDPOINTS = 31
+MAX_CFG = (1 << 63) - 1
+
+CONFIG = pathlib.Path(
+    os.environ.get("PVN_NORTHD_CONFIG", "/etc/pve/pvn/config.json")
+)
+OVN_CTL = os.environ.get(
+    "PVN_NORTHD_OVN_CTL", "/usr/share/ovn/scripts/ovn-ctl"
+)
+OVN_APPCTL = os.environ.get("PVN_NORTHD_OVN_APPCTL", "/usr/bin/ovn-appctl")
+OVN_NBCTL = os.environ.get("PVN_NORTHD_OVN_NBCTL", "/usr/bin/ovn-nbctl")
+OVN_SBCTL = os.environ.get("PVN_NORTHD_OVN_SBCTL", "/usr/bin/ovn-sbctl")
+SYSTEMCTL = os.environ.get("PVN_NORTHD_SYSTEMCTL", "/usr/bin/systemctl")
+NORTHD_DB_PARAMS = pathlib.Path(
+    os.environ.get(
+        "PVN_NORTHD_DB_PARAMS", "/etc/ovn/ovn-northd-db-params.conf"
+    )
+)
+
+
+class NorthdError(RuntimeError):
+    pass
+
+
+def fail(message: str) -> "NoReturn":
+    raise NorthdError(message)
+
+
+def duplicate_safe_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            fail(f"duplicate JSON key in {CONFIG}: {key}")
+        result[key] = value
+    return result
+
+
+def safe_regular_file(
+    path: pathlib.Path,
+    label: str,
+    *,
+    size_limit: int | None = None,
+) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect {label} {path}: {error}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fail(f"{label} must be a regular non-symlink file: {path}")
+    if metadata.st_nlink != 1:
+        fail(f"{label} must have exactly one hard link: {path}")
+    if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        fail(f"{label} must be root-owned and not group/world writable: {path}")
+    if size_limit is not None and metadata.st_size > size_limit:
+        fail(f"{label} exceeds {size_limit} bytes: {path}")
+    return metadata
+
+
+def read_config() -> dict[str, Any]:
+    before = safe_regular_file(CONFIG, "PVN configuration", size_limit=MAX_CONFIG_BYTES)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(CONFIG, flags)
+    except OSError as error:
+        fail(f"cannot open PVN configuration {CONFIG}: {error}")
+    try:
+        opened = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        if (
+            (opened.st_dev, opened.st_ino) != identity
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != 0
+            or opened.st_mode & 0o022
+        ):
+            fail(f"PVN configuration changed identity or safety metadata: {CONFIG}")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, MAX_CONFIG_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_CONFIG_BYTES:
+                fail(f"PVN configuration exceeds {MAX_CONFIG_BYTES} bytes: {CONFIG}")
+        after = CONFIG.lstat()
+        if (
+            (after.st_dev, after.st_ino) != identity
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or after.st_uid != 0
+            or after.st_mode & 0o022
+        ):
+            fail(f"PVN configuration changed while being read: {CONFIG}")
+    except OSError as error:
+        fail(f"cannot read PVN configuration {CONFIG}: {error}")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(
+            b"".join(chunks).decode("utf-8"),
+            object_pairs_hook=duplicate_safe_object,
+        )
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"cannot parse PVN configuration {CONFIG}: {error}")
+    if not isinstance(value, dict):
+        fail("PVN configuration root must be an object")
+    return value
+
+
+def tls_path(value: Any, label: str) -> pathlib.Path:
+    if not isinstance(value, str) or not value or "\x00" in value or "\n" in value:
+        fail(f"ovn.{label} must be a non-empty absolute path")
+    path = pathlib.Path(value)
+    if not path.is_absolute() or path != pathlib.Path(os.path.normpath(value)):
+        fail(f"ovn.{label} must be a normalized absolute path")
+    safe_regular_file(path, f"ovn.{label}")
+    return path
+
+
+def endpoint_list(value: Any, label: str, expected_port: int) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        fail(f"ovn.{label} must be an endpoint array")
+    count = len(value)
+    if count != 1 and (count < 3 or count > MAX_ENDPOINTS or count % 2 == 0):
+        fail(f"ovn.{label} must contain one standalone or 3..{MAX_ENDPOINTS} odd Raft endpoints")
+    result: list[str] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"ssl:([^,:]+):([0-9]+)")
+    for index, raw in enumerate(value):
+        if not isinstance(raw, str):
+            fail(f"ovn.{label}[{index}] must be a TLS endpoint string")
+        match = pattern.fullmatch(raw)
+        if match is None:
+            fail(f"ovn.{label}[{index}] must use ssl:canonical-IPv4:{expected_port}")
+        host, raw_port = match.groups()
+        try:
+            address = ipaddress.IPv4Address(host)
+        except ipaddress.AddressValueError:
+            fail(f"ovn.{label}[{index}] must use canonical IPv4")
+        if (
+            str(address) != host
+            or address.is_unspecified
+            or address.is_multicast
+            or address.is_loopback
+        ):
+            fail(f"ovn.{label}[{index}] contains an unusable or non-canonical IPv4 address")
+        if raw_port != str(expected_port):
+            fail(f"ovn.{label}[{index}] must use TLS port {expected_port}")
+        if raw in seen:
+            fail(f"ovn.{label} contains a duplicate endpoint: {raw}")
+        seen.add(raw)
+        result.append(raw)
+    return tuple(result)
+
+
+@dataclass(frozen=True)
+class Connections:
+    northbound: tuple[str, ...]
+    southbound: tuple[str, ...]
+    ca: pathlib.Path
+    cert: pathlib.Path
+    key: pathlib.Path
+
+    @property
+    def northbound_db(self) -> str:
+        return ",".join(self.northbound)
+
+    @property
+    def southbound_db(self) -> str:
+        return ",".join(self.southbound)
+
+    @property
+    def tls_options(self) -> tuple[str, ...]:
+        return (
+            f"--private-key={self.key}",
+            f"--certificate={self.cert}",
+            f"--ca-cert={self.ca}",
+            "--ssl-protocols=TLSv1.2,TLSv1.3",
+        )
+
+
+def connections() -> Connections:
+    config = read_config()
+    ovn = config.get("ovn")
+    expected = {
+        "control_db",
+        "northbound",
+        "southbound",
+        "tls_ca",
+        "tls_cert",
+        "tls_key",
+    }
+    if not isinstance(ovn, dict) or set(ovn) != expected:
+        fail("ovn configuration must contain exactly control_db, northbound, southbound, tls_ca, tls_cert, and tls_key")
+    control = endpoint_list(ovn.get("control_db"), "control_db", 6645)
+    northbound = endpoint_list(ovn.get("northbound"), "northbound", 6641)
+    southbound = endpoint_list(ovn.get("southbound"), "southbound", 6642)
+    if len(control) != len(northbound) or len(northbound) != len(southbound):
+        fail("ovn.control_db, ovn.northbound, and ovn.southbound endpoint counts differ")
+    control_hosts = tuple(item.removeprefix("ssl:").rsplit(":", 1)[0] for item in control)
+    northbound_hosts = tuple(item.removeprefix("ssl:").rsplit(":", 1)[0] for item in northbound)
+    southbound_hosts = tuple(item.removeprefix("ssl:").rsplit(":", 1)[0] for item in southbound)
+    if control_hosts != northbound_hosts or northbound_hosts != southbound_hosts:
+        fail("ovn.control_db, ovn.northbound, and ovn.southbound must use the same ordered voter set")
+    return Connections(
+        northbound=northbound,
+        southbound=southbound,
+        ca=tls_path(ovn.get("tls_ca"), "tls_ca"),
+        cert=tls_path(ovn.get("tls_cert"), "tls_cert"),
+        key=tls_path(ovn.get("tls_key"), "tls_key"),
+    )
+
+
+def terminate(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def run_bounded(
+    arguments: list[str], timeout: float = COMMAND_TIMEOUT_SECONDS
+) -> str:
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    for key in (
+        "OVN_NB_DB",
+        "OVN_NBCTL_OPTIONS",
+        "OVN_NB_DAEMON",
+        "OVN_SB_DB",
+        "OVN_SBCTL_OPTIONS",
+        "OVN_SB_DAEMON",
+    ):
+        environment.pop(key, None)
+    try:
+        process = subprocess.Popen(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            start_new_session=True,
+        )
+    except OSError as error:
+        fail(f"cannot execute {arguments[0]}: {error}")
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector = selectors.DefaultSelector()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout
+    try:
+        for label, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, label)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail(f"command timed out after {timeout}s: {arguments[0]}")
+            for key, _events in selector.select(min(remaining, 0.25)):
+                label = key.data
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                buffers[label].extend(chunk)
+                if len(buffers["stdout"]) + len(buffers["stderr"]) > MAX_COMMAND_OUTPUT:
+                    fail(f"command output exceeds {MAX_COMMAND_OUTPUT} bytes: {arguments[0]}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail(f"command timed out after {timeout}s: {arguments[0]}")
+        returncode = process.wait(timeout=remaining)
+        try:
+            stdout = buffers["stdout"].decode("utf-8")
+            stderr = buffers["stderr"].decode("utf-8")
+        except UnicodeError:
+            fail(f"command returned invalid UTF-8: {arguments[0]}")
+        if returncode != 0:
+            detail = stderr.strip() or stdout.strip() or f"exit {returncode}"
+            fail(f"command failed: {arguments[0]}: {detail}")
+        return stdout
+    except subprocess.TimeoutExpired:
+        fail(f"command timed out after {timeout}s: {arguments[0]}")
+    finally:
+        terminate(process)
+        selector.close()
+
+
+def command_timeout(deadline: float | None) -> float:
+    if deadline is None:
+        return COMMAND_TIMEOUT_SECONDS
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        fail("northd readiness deadline expired")
+    return min(COMMAND_TIMEOUT_SECONDS, remaining)
+
+
+def one_line(
+    arguments: list[str], label: str, deadline: float | None = None
+) -> str:
+    output = run_bounded(arguments, command_timeout(deadline))
+    lines = output.splitlines()
+    if len(lines) != 1 or output != lines[0] + "\n":
+        fail(f"{label} returned a malformed response")
+    return lines[0]
+
+
+def cfg_value(
+    arguments: list[str], label: str, deadline: float | None = None
+) -> int:
+    value = one_line(arguments, label, deadline)
+    if not re.fullmatch(r"0|[1-9][0-9]*", value):
+        fail(f"{label} is not a canonical non-negative integer")
+    parsed = int(value)
+    if parsed > MAX_CFG:
+        fail(f"{label} exceeds signed 64-bit range")
+    return parsed
+
+
+@dataclass(frozen=True)
+class Status:
+    role: str
+    nb_cfg: int
+    nb_sb_cfg: int
+    sb_nb_cfg: int
+
+
+def check_status(
+    config: Connections, deadline: float | None = None
+) -> Status:
+    run_bounded(
+        [SYSTEMCTL, "is-active", "--quiet", "ovn-northd.service"],
+        command_timeout(deadline),
+    )
+    nb_connection = one_line(
+        [OVN_APPCTL, "-t", "ovn-northd", "nb-connection-status"],
+        "northd NB connection status",
+        deadline,
+    )
+    sb_connection = one_line(
+        [OVN_APPCTL, "-t", "ovn-northd", "sb-connection-status"],
+        "northd SB connection status",
+        deadline,
+    )
+    if nb_connection != "connected" or sb_connection != "connected":
+        fail(
+            "northd database connection is incomplete: "
+            f"NB={nb_connection!r} SB={sb_connection!r}"
+        )
+    raw_status = one_line(
+        [OVN_APPCTL, "-t", "ovn-northd", "status"],
+        "northd role status",
+        deadline,
+    )
+    if raw_status not in {"Status: active", "Status: standby"}:
+        fail(f"northd reported an invalid active/standby status: {raw_status!r}")
+    role = raw_status.removeprefix("Status: ")
+    nb_base = [
+        OVN_NBCTL,
+        "--timeout=10",
+        f"--db={config.northbound_db}",
+        *config.tls_options,
+    ]
+    sb_base = [
+        OVN_SBCTL,
+        "--timeout=10",
+        f"--db={config.southbound_db}",
+        *config.tls_options,
+    ]
+    nb_cfg = cfg_value(
+        [*nb_base, "get", "NB_Global", ".", "nb_cfg"],
+        "NB_Global.nb_cfg",
+        deadline,
+    )
+    nb_sb_cfg = cfg_value(
+        [*nb_base, "get", "NB_Global", ".", "sb_cfg"],
+        "NB_Global.sb_cfg",
+        deadline,
+    )
+    sb_nb_cfg = cfg_value(
+        [*sb_base, "get", "SB_Global", ".", "nb_cfg"],
+        "SB_Global.nb_cfg",
+        deadline,
+    )
+    if nb_cfg != nb_sb_cfg or nb_cfg != sb_nb_cfg:
+        fail(
+            "northd configuration synchronization is incomplete: "
+            f"NB_Global.nb_cfg={nb_cfg} NB_Global.sb_cfg={nb_sb_cfg} "
+            f"SB_Global.nb_cfg={sb_nb_cfg}"
+        )
+    return Status(role=role, nb_cfg=nb_cfg, nb_sb_cfg=nb_sb_cfg, sb_nb_cfg=sb_nb_cfg)
+
+
+def start(config: Connections) -> "NoReturn":
+    if NORTHD_DB_PARAMS.exists() or NORTHD_DB_PARAMS.is_symlink():
+        fail(
+            f"unsupported ovn-northd DB parameter override exists: {NORTHD_DB_PARAMS}"
+        )
+    arguments = [
+        OVN_CTL,
+        "start_northd",
+        "--ovn-manage-ovsdb=no",
+        "--no-monitor",
+        f"--ovn-northd-nb-db={config.northbound_db}",
+        f"--ovn-northd-sb-db={config.southbound_db}",
+        f"--ovn-northd-ssl-key={config.key}",
+        f"--ovn-northd-ssl-cert={config.cert}",
+        f"--ovn-northd-ssl-ca-cert={config.ca}",
+        "--ovn-northd-ssl-protocols=TLSv1.2,TLSv1.3",
+    ]
+    try:
+        os.execv(OVN_CTL, arguments)
+    except OSError as error:
+        fail(f"cannot execute {OVN_CTL}: {error}")
+
+
+def emit_status(status: Status) -> None:
+    print(
+        "PVN_NORTHD "
+        f"role={status.role} nb=connected sb=connected cfg={status.nb_cfg}"
+    )
+
+
+def wait_ready(config: Connections) -> None:
+    deadline = time.monotonic() + WAIT_SECONDS
+    last_error = "northd readiness has not been checked"
+    while True:
+        try:
+            status = check_status(config, deadline)
+            emit_status(status)
+            return
+        except NorthdError as error:
+            last_error = str(error)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail(f"northd did not converge within {WAIT_SECONDS}s: {last_error}")
+        time.sleep(min(WAIT_INTERVAL_SECONDS, remaining))
+
+
+def main(arguments: list[str]) -> int:
+    if os.geteuid() != 0:
+        fail("pvn-ovn-northd must run as root")
+    if len(arguments) != 1 or arguments[0] not in {"start", "status", "wait"}:
+        fail("usage: pvn-ovn-northd {start|status|wait}")
+    config = connections()
+    if arguments[0] == "start":
+        start(config)
+    if arguments[0] == "status":
+        emit_status(check_status(config))
+        return 0
+    wait_ready(config)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except NorthdError as error:
+        print(f"pvn-ovn-northd: {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -21,6 +21,11 @@ verify_corosync_runtime() {
     fi
 }
 
+[ -x /usr/lib/pvn/pvn-ovn-northd ] || {
+    echo "PVN clustered northd launcher is missing or not executable" >&2
+    exit 1
+}
+
 mark_central_restart_pending() {
     state_dir=/var/lib/pvn-node
     marker=$state_dir/central-restart-pending

@@ -52,10 +52,13 @@ def probe_line(
     central="inactive",
     central_mode=None,
     central_pending="none",
+    northd_role=None,
 ) -> str:
     pids = "101,102,103,104" if central == "active" else "none"
     if central_mode is None:
         central_mode = "raft" if central == "active" else "inactive"
+    if northd_role is None:
+        northd_role = "active" if central == "active" else "inactive"
     return (
         "PVN_UPDATE "
         f"mode={snapshot.mode} cluster={snapshot.deployment} "
@@ -63,7 +66,7 @@ def probe_line(
         f"nodes={len(snapshot.nodes)} pve=9.2.2 arch=amd64 version={version} "
         f"hostname={node.name} nodeid={node.node_id} node={node_state} "
         f"central={central} centralmode={central_mode} centralpids={pids} "
-        f"centralpending={central_pending}\n"
+        f"centralpending={central_pending} northdrole={northd_role}\n"
     )
 
 
@@ -161,6 +164,54 @@ standalone = module.parse_probe(
     standalone_snapshot,
 )
 check(standalone.central_mode == "standalone", "standalone active central was not parsed")
+
+active_probe = module.parse_probe(
+    nodes[0],
+    probe_line(snapshot, nodes[0], "0.1.0", central="active", northd_role="active"),
+    snapshot,
+)
+standby_probe = module.parse_probe(
+    nodes[1],
+    probe_line(snapshot, nodes[1], "0.1.0", central="active", northd_role="standby"),
+    snapshot,
+)
+module.gate_northd_roles({nodes[0].name: active_probe, nodes[1].name: standby_probe})
+second_active = module.parse_probe(
+    nodes[1],
+    probe_line(snapshot, nodes[1], "0.1.0", central="active", northd_role="active"),
+    snapshot,
+)
+try:
+    module.gate_northd_roles({nodes[0].name: active_probe, nodes[1].name: second_active})
+except module.UpdateError:
+    pass
+else:
+    raise AssertionError("all-node health accepted two active northd roles")
+pending_active = module.parse_probe(
+    nodes[0],
+    probe_line(
+        snapshot,
+        nodes[0],
+        "0.2.1",
+        central="active",
+        central_pending="0.2.1",
+        northd_role="active",
+    ),
+    snapshot,
+)
+pending_second = module.parse_probe(
+    nodes[1],
+    probe_line(
+        snapshot,
+        nodes[1],
+        "0.2.1",
+        central="active",
+        central_pending="0.2.1",
+        northd_role="active",
+    ),
+    snapshot,
+)
+module.gate_northd_roles({nodes[0].name: pending_active, nodes[1].name: pending_second})
 
 
 def exercise_embedded_remote(
@@ -385,6 +436,8 @@ def exercise_remote_central_health(
     *,
     database_modes: tuple[str, str, str] | None = None,
     schema_drift: bool = False,
+    restart_pending: bool = False,
+    helper_failure: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     if database_modes is None:
         database_modes = (configured_mode, configured_mode, configured_mode)
@@ -410,6 +463,12 @@ def exercise_remote_central_health(
             path.write_text(f"{name}|{mode}\n", encoding="ascii")
 
         calls = root / "calls"
+        restart_directory = root / "pvn-node"
+        restart_directory.mkdir(mode=0o700)
+        if restart_pending:
+            marker = restart_directory / "central-restart-pending"
+            marker.write_text("0.2.1\n", encoding="ascii")
+            marker.chmod(0o600)
         tool = root / "ovsdb-tool"
         tool.write_text(
             """#!/bin/sh
@@ -452,6 +511,21 @@ printf '{{"name":"%s","tables":{{}}}}\\n' "$name"
         )
         pvnctl.chmod(0o755)
 
+        appctl = root / "ovn-appctl"
+        appctl.write_text(
+            f"#!/bin/sh\nprintf 'northd-role\\n' >> '{calls}'\n[ \"$1 $2 $3\" = '-t ovn-northd status' ]\nprintf 'Status: active\\n'\n",
+            encoding="ascii",
+        )
+        appctl.chmod(0o755)
+
+        northd_helper = root / "pvn-ovn-northd"
+        northd_helper.write_text(
+            f"#!/bin/sh\nprintf 'northd-helper\\n' >> '{calls}'\n[ \"$1\" = status ]\n"
+            + ("exit 1\n" if helper_failure else "exit 0\n"),
+            encoding="ascii",
+        )
+        northd_helper.chmod(0o755)
+
         socket_paths = (root / "control.sock", root / "northbound.sock", root / "southbound.sock")
         sockets = []
         try:
@@ -475,6 +549,9 @@ printf '{{"name":"%s","tables":{{}}}}\\n' "$name"
                 "/usr/bin/ovsdb-tool": str(tool),
                 "/usr/bin/ovsdb-client": str(client),
                 "/usr/sbin/pvnctl": str(pvnctl),
+                "/usr/bin/ovn-appctl": str(appctl),
+                "/usr/lib/pvn/pvn-ovn-northd": str(northd_helper),
+                "/var/lib/pvn-node": str(restart_directory),
                 'pvn_gid = grp.getgrnam("pvn").gr_gid': f"pvn_gid = {os.getgid()}",
                 "metadata.st_uid != 0": f"metadata.st_uid != {os.getuid()}",
             }
@@ -499,6 +576,15 @@ mode_drift = exercise_remote_central_health(
 check(mode_drift.returncode != 0, "standalone configuration accepted a clustered database")
 identity_drift = exercise_remote_central_health("standalone", schema_drift=True)
 check(identity_drift.returncode != 0, "standalone socket accepted the wrong database schema")
+helper_drift = exercise_remote_central_health("raft", helper_failure=True)
+check(helper_drift.returncode != 0, "updater accepted failed clustered northd health")
+pending_helper = exercise_remote_central_health(
+    "raft", restart_pending=True, helper_failure=True
+)
+check(
+    pending_helper.returncode == 0,
+    "pending package/schema repin was made dependent on restarting northd",
+)
 try:
     module.parse_probe(
         nodes[0],

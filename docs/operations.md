@@ -313,6 +313,20 @@ after every database-process restart. PVN removes only the packaged replicated
 any other unexpected remote; node-local listener addresses are never written
 to replicated `NB_Global` or `SB_Global` rows.
 
+Every `ovn-northd` process reads the complete ordered NB/SB TLS endpoint set
+and certificate paths directly from `/etc/pve/pvn/config.json`; it never uses
+the node-local NB/SB Unix sockets. The launcher rejects non-TLS, duplicate,
+even-sized, differently ordered Control/NB/SB voter sets and the vendor
+`ovn-northd-db-params.conf` bypass. `pvn-ovn-northd-ready.service` blocks
+`pvn-central.target` readiness until local northd reports both IDLs connected,
+an `active` or `standby` role, and exact equality of `NB_Global.nb_cfg`,
+`NB_Global.sb_cfg`, and `SB_Global.nb_cfg`. The same bounded read-only check is
+available for diagnosis:
+
+```sh
+/usr/lib/pvn/pvn-ovn-northd status
+```
+
 The Debian 13 SB vendor unit spells its PID path as `%t/run/ovn/ovnsb_db.pid`,
 which expands to `/run/run/ovn/ovnsb_db.pid`. The PVN drop-in pins the actual
 process path, `/run/ovn/ovnsb_db.pid`, so systemd can track SB startup exactly.
@@ -537,6 +551,13 @@ after verifying that voter. Never activate a previously inactive target or
 restart enough voters concurrently to lose quorum. Mixed-version compatibility
 is required for the duration of this rolling window; use a maintenance window
 for releases that declare a breaking database or wire-protocol change.
+
+While a restart marker exists, updater probes deliberately preserve and inspect
+the old central PID instead of requiring the newly installed northd launcher;
+this keeps the package/schema repin prerequisite acyclic. The subsequent
+central restart must pass `pvn-ovn-northd-ready.service`. Once no active voter
+has a restart marker, the all-node updater health sweep additionally requires
+exactly one `active` northd role and every remaining northd in `standby`.
 
 For an already `complete` schema-2 ledger, run `pvn-control-plane plan` and its
 confirmed `apply` immediately after the package rollout, while every restart
