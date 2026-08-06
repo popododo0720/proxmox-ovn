@@ -21,7 +21,7 @@ jobs:
         run: >-
           apt-get update &&
           apt-get install -y --no-install-recommends
-          ca-certificates file gh git make python3 systemd
+          ca-certificates file gcc gh git libc6-dev make python3 systemd
 
       - uses: actions/checkout@v4
         with:
@@ -52,11 +52,55 @@ jobs:
           grep -Fx "DEB_VERSION ?= $release_version" Makefile
           head -n 1 packaging/debian/changelog | \
             grep -Fx "proxmox-ovn ($release_version) unstable; urgency=medium"
+          grep -Fx "RELEASE_VERSION=$release_version" deploy/tests/pvn-install-test.sh
+          grep -Fx "RELEASE_VERSION=$release_version" deploy/tests/pvn-update-test.sh
+          node --input-type=commonjs - "$release_version" <<'NODE'
+          const fs = require("node:fs");
+
+          const expected = process.argv[2];
+          const packageJson = JSON.parse(fs.readFileSync("web/package.json", "utf8"));
+          const packageLock = JSON.parse(fs.readFileSync("web/package-lock.json", "utf8"));
+          const versions = [
+            ["web/package.json version", packageJson.version],
+            ["web/package-lock.json root version", packageLock.version],
+            ["web/package-lock.json package root version", packageLock.packages?.[""]?.version],
+          ];
+          for (const [location, actual] of versions) {
+            if (actual !== expected) {
+              console.error(`${location} is ${JSON.stringify(actual)}, expected ${expected}`);
+              process.exit(1);
+            }
+          }
+          NODE
+          release_commit=$(git rev-parse --verify "${GITHUB_REF_NAME}^{commit}")
+          if [[ $(git rev-parse HEAD) != "$release_commit" ]]; then
+            printf 'checked-out commit does not match release tag: %s\n' \
+              "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          source_date_epoch=$(git show -s --format=%ct "$release_commit")
+          if [[ ! $source_date_epoch =~ ^[0-9]+$ ]]; then
+            printf 'release commit has an invalid timestamp\n' >&2
+            exit 1
+          fi
           printf 'PVN_RELEASE_VERSION=%s\n' "$release_version" >> "$GITHUB_ENV"
           printf 'PVN_RELEASE_ARCH=%s\n' "$(dpkg --print-architecture)" >> "$GITHUB_ENV"
+          printf 'PVN_RELEASE_COMMIT_SHA=%s\n' "$release_commit" >> "$GITHUB_ENV"
+          printf 'PVN_RELEASE_COMMIT=%s\n' "${release_commit:0:12}" >> "$GITHUB_ENV"
+          printf 'PVN_RELEASE_BUILD_DATE=%s\n' \
+            "$(date -u -d "@$source_date_epoch" +%Y-%m-%dT%H:%M:%SZ)" \
+            >> "$GITHUB_ENV"
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+
+      - name: Run release source gates
+        run: make fmt-check vet test test-race web-test ui-test package-check
 
       - name: Build and verify release
-        run: make release DEB_VERSION="$PVN_RELEASE_VERSION"
+        run: >-
+          make release
+          DEB_VERSION="$PVN_RELEASE_VERSION"
+          COMMIT="$PVN_RELEASE_COMMIT"
+          BUILD_DATE="$PVN_RELEASE_BUILD_DATE"
 
       - name: Validate release assets
         shell: bash
@@ -130,15 +174,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          assets=(
-            dist/SHA256SUMS
-            dist/pvn-cluster-install
-            dist/pvn-cluster-lease
-            dist/pvn-cluster-update
-            dist/pvn-install.sh
-            "dist/pvn-node_${PVN_RELEASE_VERSION}_${PVN_RELEASE_ARCH}.deb"
-            dist/pvn-update.sh
-          )
           expected_names=(
             SHA256SUMS
             pvn-cluster-install
@@ -155,42 +190,164 @@ jobs:
             done
             return 1
           }
-          if gh release view "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            existing_output=$(gh release view "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
-            existing_names=()
-            if [[ -n $existing_output ]]; then
-              mapfile -t existing_names <<< "$existing_output"
+          verify_remote_tag() {
+            local remote_commit
+            remote_commit=$(gh api \
+              "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq '.sha')
+            if [[ $remote_commit != "$PVN_RELEASE_COMMIT_SHA" ]]; then
+              printf 'remote release tag moved from build commit: %s != %s\n' \
+                "$remote_commit" "$PVN_RELEASE_COMMIT_SHA" >&2
+              exit 1
             fi
-            for existing in "${existing_names[@]}"; do
-              if ! is_expected_name "$existing"; then
-                printf 'existing release has unexpected asset: %s\n' "$existing" >&2
+          }
+
+          verify_remote_tag
+          if release_state=$(gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,isPrerelease,tagName \
+              --jq '[.isDraft, .isPrerelease, .tagName] | @tsv' \
+              2>/dev/null); then
+            IFS=$'\t' read -r release_is_draft release_is_prerelease \
+              release_tag_name <<< "$release_state"
+            if [[ $release_is_draft != true && $release_is_draft != false ]]; then
+              printf 'existing release has invalid draft state: %s\n' \
+                "$release_is_draft" >&2
+              exit 1
+            fi
+            if [[ $release_is_prerelease != false ]]; then
+              printf 'existing release unexpectedly is a prerelease\n' >&2
+              exit 1
+            fi
+            if [[ $release_tag_name != "$GITHUB_REF_NAME" ]]; then
+              printf 'existing release has wrong tag: %s\n' \
+                "$release_tag_name" >&2
+              exit 1
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes \
+              --title "PVN $GITHUB_REF_NAME"
+            release_is_draft=true
+          fi
+
+          existing_output=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | [.name, .state] | @tsv')
+          existing_names=()
+          declare -A existing_assets=()
+          if [[ -n $existing_output ]]; then
+            while IFS=$'\t' read -r existing_name existing_state; do
+              if ! is_expected_name "$existing_name"; then
+                printf 'existing release has unexpected asset: %s\n' \
+                  "$existing_name" >&2
                 exit 1
               fi
-            done
-            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber \
-              --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
-              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
-              --title "PVN $GITHUB_REF_NAME"
+              if [[ $existing_state != uploaded ]]; then
+                printf 'existing release asset is not uploaded: %s (%s)\n' \
+                  "$existing_name" "$existing_state" >&2
+                exit 1
+              fi
+              if [[ ${existing_assets["$existing_name"]+present} ]]; then
+                printf 'existing release has duplicate asset: %s\n' \
+                  "$existing_name" >&2
+                exit 1
+              fi
+              existing_names+=("$existing_name")
+              existing_assets["$existing_name"]=1
+            done <<< "$existing_output"
           fi
+          if [[ $release_is_draft == false ]] && \
+              (( ${#existing_names[@]} != ${#expected_names[@]} )); then
+            printf 'published release is incomplete and cannot be mutated\n' >&2
+            exit 1
+          fi
+
+          existing_dir=$(mktemp -d)
+          final_dir=$(mktemp -d)
+          cleanup() {
+            rm -rf "$existing_dir" "$final_dir"
+          }
+          trap cleanup EXIT HUP INT TERM
+
+          for existing_name in "${existing_names[@]}"; do
+            gh release download "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --pattern "$existing_name" \
+              --dir "$existing_dir"
+            if ! cmp -s "dist/$existing_name" "$existing_dir/$existing_name"; then
+              printf 'existing release asset does not match build: %s\n' \
+                "$existing_name" >&2
+              exit 1
+            fi
+          done
+
+          for expected_name in "${expected_names[@]}"; do
+            if [[ ${existing_assets["$expected_name"]+present} ]]; then
+              continue
+            fi
+            if [[ $release_is_draft != true ]]; then
+              printf 'published release is missing immutable asset: %s\n' \
+                "$expected_name" >&2
+              exit 1
+            fi
+            gh release upload "$GITHUB_REF_NAME" "dist/$expected_name" \
+              --repo "$GITHUB_REPOSITORY"
+          done
+
           final_output=$(gh release view "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | [.name, .state] | @tsv')
           final_names=()
           if [[ -n $final_output ]]; then
-            mapfile -t final_names <<< "$final_output"
+            while IFS=$'\t' read -r final_name final_state; do
+              if [[ $final_state != uploaded ]]; then
+                printf 'release asset is not uploaded: %s (%s)\n' \
+                  "$final_name" "$final_state" >&2
+                exit 1
+              fi
+              final_names+=("$final_name")
+            done <<< "$final_output"
           fi
-          mapfile -t final_names < <(printf '%s\n' "${final_names[@]}" | LC_ALL=C sort)
-          mapfile -t expected_names < <(printf '%s\n' "${expected_names[@]}" | LC_ALL=C sort)
-          if (( ${#final_names[@]} != ${#expected_names[@]} )); then
-            printf 'published release does not contain exactly seven assets\n' >&2
+          mapfile -t final_names < <(
+            printf '%s\n' "${final_names[@]}" | LC_ALL=C sort
+          )
+          mapfile -t expected_names < <(
+            printf '%s\n' "${expected_names[@]}" | LC_ALL=C sort
+          )
+          if (( ${#final_names[@]} != 7 )); then
+            printf 'release does not contain exactly seven assets\n' >&2
             exit 1
           fi
           for index in "${!expected_names[@]}"; do
             if [[ ${final_names[$index]} != "${expected_names[$index]}" ]]; then
-              printf 'published release asset set is not exact\n' >&2
+              printf 'release asset set is not exact\n' >&2
               exit 1
             fi
           done
+
+          for expected_name in "${expected_names[@]}"; do
+            gh release download "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --pattern "$expected_name" \
+              --dir "$final_dir"
+            if ! cmp -s "dist/$expected_name" "$final_dir/$expected_name"; then
+              printf 'release asset does not match build: %s\n' \
+                "$expected_name" >&2
+              exit 1
+            fi
+          done
+
+          if [[ $release_is_draft == true ]]; then
+            verify_remote_tag
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --draft=false
+          fi
+          final_state=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,tagName \
+            --jq '[.isDraft, .isPrerelease, .tagName] | @tsv')
+          IFS=$'\t' read -r final_is_draft final_is_prerelease \
+            final_tag_name <<< "$final_state"
+          if [[ $final_is_draft != false || $final_is_prerelease != false || \
+              $final_tag_name != "$GITHUB_REF_NAME" ]]; then
+            printf 'release was not published after validation\n' >&2
+            exit 1
+          fi

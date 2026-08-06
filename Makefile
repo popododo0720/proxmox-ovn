@@ -61,7 +61,8 @@ deb: package-check web-build ui-test
 	install -m 0755 packaging/debian/pvn-node.postrm "$$pvn_root/DEBIAN/postrm"; \
 	install -m 0644 packaging/debian/triggers "$$pvn_root/DEBIAN/triggers"; \
 	install -m 0755 bin/pvn-manager bin/pvn-agent bin/pvnctl "$$pvn_root/usr/sbin/"; \
-	install -m 0755 deploy/scripts/* "$$pvn_root/usr/lib/pvn/"; \
+	find deploy/scripts -mindepth 1 -maxdepth 1 -type f -name 'pvn-*' \
+		-exec install -m 0755 -t "$$pvn_root/usr/lib/pvn/" -- {} +; \
 	install -m 0755 deploy/scripts/pvn-db-backup "$$pvn_root/usr/sbin/pvn-db-backup"; \
 	install -m 0755 pve-ui/inject.sh "$$pvn_root/usr/lib/pvn/pvn-ui-inject"; \
 	install -m 0644 pve-ui/pvn-loader.js "$$pvn_root/usr/lib/pvn/"; \
@@ -84,7 +85,8 @@ deb: package-check web-build ui-test
 	dpkg-deb --root-owner-group --build "$$pvn_root" "$$pvn_deb"; \
 	packaging/tests/package-check.sh "$$pvn_deb"
 
-release: deb
+release: clean
+	+$(MAKE) deb DEB_VERSION=$(DEB_VERSION)
 	@set -eu; \
 	pvn_arch=$$(dpkg --print-architecture); \
 	pvn_deb="pvn-node_$(DEB_VERSION)_$${pvn_arch}.deb"; \

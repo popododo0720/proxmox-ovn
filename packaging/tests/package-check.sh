@@ -4,8 +4,8 @@ set -eu
 repo=$(CDPATH= cd -P "$(dirname "$0")/../.." && pwd)
 cd "$repo"
 
-for script in deploy/scripts/*; do
-    [ -f "$script" ] || continue
+for script in deploy/scripts/pvn-*; do
+    [ -f "$script" ] && [ ! -L "$script" ] || continue
     case "$(sed -n '1p' "$script")" in
         *python3*)
             python3 - "$script" <<'PY'
