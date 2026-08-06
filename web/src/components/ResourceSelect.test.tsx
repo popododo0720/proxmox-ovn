@@ -110,4 +110,23 @@ describe('ResourceSelect', () => {
     expect(list).toHaveBeenCalledTimes(1);
     expect(list).toHaveBeenCalledWith('/projects');
   });
+
+  it('keeps numeric details such as VLAN IDs in human option labels', async () => {
+    const list = vi.fn().mockResolvedValue({
+      items: [{ id: 'segment-1', name: 'public-vlan', network_type: 'vlan', vlan_id: 200 }],
+    });
+
+    render(
+      <ApiProvider client={{ list } as unknown as ApiClient}>
+        <ResourceSelect
+          id="segment"
+          name="segment_id"
+          active
+          source={{ endpoint: '/provider-segments', detailKeys: ['network_type', 'vlan_id'] }}
+        />
+      </ApiProvider>,
+    );
+
+    expect(await screen.findByRole('option', { name: 'public-vlan · vlan · 200' })).toBeInTheDocument();
+  });
 });

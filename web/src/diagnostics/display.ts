@@ -25,7 +25,10 @@ export function redactResourceIDs(value: unknown, aliases: ResourceAlias[] = [])
 }
 
 export function humanLabel(value: unknown, fallback: string): string {
-  const label = redactResourceIDs(value);
+  const candidate = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+    ? String(value)
+    : '';
+  const label = redactResourceIDs(candidate);
   const humanContent = label
     .replaceAll('[resource]', '')
     .replace(/[\s._:/-]+/g, '');

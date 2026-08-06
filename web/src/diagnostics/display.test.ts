@@ -19,6 +19,8 @@ describe('human-readable display text', () => {
 
   it('uses a meaningful non-UUID candidate or an explicit fallback for human labels', () => {
     expect(humanLabel(resourceID, 'Unavailable')).toBe('Unavailable');
+    expect(humanLabel(100, 'Unavailable')).toBe('100');
+    expect(humanLabel(false, 'Unavailable')).toBe('false');
     expect(humanLabel(`application-${resourceID}`, 'Unavailable')).toBe('application-[resource]');
     expect(humanResourceLabel(
       { name: resourceID, management_address: '192.0.2.10' },
