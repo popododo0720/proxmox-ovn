@@ -11,6 +11,7 @@ describe('OverviewPage operational health', () => {
         status: 'degraded', cluster: 'lab', version: 'test',
         database: 'ready', ovn_northbound: 'degraded',
         ovn_southbound: 'ready', reconciler: 'unavailable',
+        default_security_policy: 'degraded',
         capacity: { ready: true },
       }),
       projects: vi.fn().mockResolvedValue({ items: [] }),
@@ -29,6 +30,7 @@ describe('OverviewPage operational health', () => {
     expect(screen.getByText('OVN northbound').parentElement).toHaveTextContent('degraded');
     expect(screen.getByText('OVN southbound').parentElement).toHaveTextContent('ready');
     expect(screen.getByText('Reconciler').parentElement).toHaveTextContent('unavailable');
+    expect(screen.getByText('Default security policy').parentElement).toHaveTextContent('degraded');
     expect(screen.queryByText('unknown')).not.toBeInTheDocument();
   });
 
@@ -41,6 +43,7 @@ describe('OverviewPage operational health', () => {
         status: 'ready', cluster: 'lab', version: 'test',
         database: 'ready', ovn_northbound: 'ready',
         ovn_southbound: 'ready', reconciler: 'ready',
+        default_security_policy: 'ready',
         capacity: { ready: true },
       }),
       projects: vi.fn().mockResolvedValue({ items: [] }),

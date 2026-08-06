@@ -349,6 +349,8 @@ explicit security-group selection receive it automatically. Its baseline
 allows IPv4 egress and ingress from other ports in the same default group;
 other IPv4 ingress is dropped. The group and its two managed rules are visible
 by name in the Proxmox PVN page, but cannot be edited or deleted independently.
+Authorized tenants may add separate rules to extend the group without changing
+the managed baseline.
 
 Ports created by older PVN releases with no security-group assignment remain
 unrestricted until an administrator migrates them. Open **Datacenter → PVN →

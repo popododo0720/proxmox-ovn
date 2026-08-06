@@ -39,7 +39,9 @@ Every project has a reserved default security group. A newly provisioned port
 receives that group when the request omits `security_group_ids`; an explicit
 selection replaces the default. The reserved group and its baseline rules are
 ordinary list results in the manager API, so operators should expect to see
-them alongside tenant-created policy. Ports created before this invariant may
+them alongside tenant-created policy. The managed baseline cannot be weakened,
+while authorized tenants may add separate rules to extend the default group.
+Ports created before this invariant may
 still have an empty group list and remain unrestricted until the supported
 default-security-group backfill migrates them.
 

@@ -42,6 +42,7 @@ export interface HealthStatus {
   ovn_northbound: OperationalHealth;
   ovn_southbound: OperationalHealth;
   reconciler: OperationalHealth;
+  default_security_policy: OperationalHealth;
   capacity?: {
     ready: boolean;
     reason?: string;

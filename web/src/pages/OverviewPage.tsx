@@ -71,6 +71,7 @@ export function OverviewPage() {
               <HealthRow label="OVN northbound" value={data.health.ovn_northbound} />
               <HealthRow label="OVN southbound" value={data.health.ovn_southbound} />
               <HealthRow label="Reconciler" value={data.health.reconciler} />
+              <HealthRow label="Default security policy" value={data.health.default_security_policy} />
               <HealthRow label="All online PVE nodes" value={data.health.capacity?.ready ? 'ready' : 'degraded'} />
               {data.health.capacity?.reason && <p className="muted">{data.health.capacity.reason}</p>}
             </section>
