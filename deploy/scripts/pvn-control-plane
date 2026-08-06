@@ -2494,10 +2494,11 @@ class ControlPlane:
         pinned_package: str,
         live_package: str,
     ) -> bool:
-        # v0.2.14's schema-2 topology migration advanced the already-running
-        # Corosync configuration exactly once before the complete control
-        # snapshot could be atomically repinned.  Accept only that released
-        # one-step boundary; this is not a general config-version relaxation.
+        # v0.2.13's completed topology migration advanced Corosync exactly
+        # once but left the complete control snapshot at the preceding
+        # cluster version.  v0.2.14 may bridge only that released boundary
+        # while atomically repinning the schema-2 topology and package; this
+        # is not a general config-version relaxation.
         return (
             discovery.mode == "raft"
             and pinned_package == LEGACY_SCHEMA2_PINNED_PACKAGE

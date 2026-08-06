@@ -2534,10 +2534,10 @@ combined_repin = ControlPlane._verify_ledger(
 )
 assert combined_repin.topology_schema and combined_repin.package
 
-# The released v0.2.13 -> v0.2.14 schema migration has one exact additional
-# boundary: Corosync and the completed schema-2 topology are already at
-# config_version 4 while the complete control snapshot still pins version 3.
-# Only the combined package/schema repin may bridge that single stale field.
+# The released v0.2.13 topology migration left one exact upgrade boundary:
+# Corosync is already at config_version 4 while the complete control snapshot
+# still pins version 3.  After the v0.2.14 schema-2 projection, only the
+# combined package/schema repin may bridge that single stale field.
 legacy_bridge_pinned, legacy_bridge_live = schema_projection_pair(
     live_package="0.2.14", pinned_package="0.2.13"
 )
