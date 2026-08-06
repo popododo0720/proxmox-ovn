@@ -660,9 +660,11 @@ import json
 import os
 import pathlib
 import re
+import selectors
 import stat
 import subprocess
 import sys
+import time
 
 MAX_FILE = 4 * 1024 * 1024
 MAX_OUTPUT = 4 * 1024 * 1024
@@ -693,23 +695,89 @@ def run(arguments, *, check=True, timeout=20):
     environment = os.environ.copy()
     environment["LC_ALL"] = "C"
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             arguments,
-            text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
             env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except OSError as error:
         stop("cannot execute %s: %s" % (arguments[0], error))
-    if len(result.stdout) > MAX_OUTPUT or len(result.stderr) > MAX_OUTPUT:
-        stop("%s returned unbounded output" % arguments[0])
-    if check and result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
-        stop("%s failed: %s" % (arguments[0], detail[-800:] or result.returncode))
-    return result
+
+    selector = selectors.DefaultSelector()
+    buffers = {"stdout": [], "stderr": []}
+    sizes = {"stdout": 0, "stderr": 0}
+    deadline = time.monotonic() + timeout
+    failure = None
+    try:
+        for label, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+            if pipe is None:
+                stop("cannot capture %s from %s" % (label, arguments[0]))
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, label)
+
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = "%s timed out" % arguments[0]
+                break
+            for key, _ in selector.select(min(remaining, 0.25)):
+                label = key.data
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                sizes[label] += len(chunk)
+                if sizes[label] > MAX_OUTPUT:
+                    failure = "%s returned unbounded %s" % (arguments[0], label)
+                    break
+                buffers[label].append(chunk)
+            if failure is not None:
+                break
+
+        if failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = "%s timed out" % arguments[0]
+            else:
+                try:
+                    returncode = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    failure = "%s timed out" % arguments[0]
+
+        if failure is not None:
+            if process.poll() is None:
+                process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            stop(failure)
+
+        try:
+            stdout = b"".join(buffers["stdout"]).decode("utf-8")
+            stderr = b"".join(buffers["stderr"]).decode("utf-8")
+        except UnicodeDecodeError:
+            stop("%s returned non-UTF-8 output" % arguments[0])
+        result = subprocess.CompletedProcess(arguments, returncode, stdout, stderr)
+        if check and result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
+            stop("%s failed: %s" % (arguments[0], detail[-800:] or result.returncode))
+        return result
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 def secure_read(path, label, *, optional=False):
@@ -723,7 +791,8 @@ def secure_read(path, label, *, optional=False):
         stop("cannot inspect %s: %s" % (label, error))
     if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(path_metadata.st_mode):
         stop("%s must be a regular non-symlink file" % label)
-    if path_metadata.st_uid != 0 or stat.S_IMODE(path_metadata.st_mode) & 0o022:
+    if path_metadata.st_uid != 0 or stat.S_IMODE(path_metadata.st_mode) & 0o022 or \
+            path_metadata.st_nlink != 1:
         stop("%s has unsafe ownership or permissions" % label)
     if path_metadata.st_size < 0 or path_metadata.st_size > MAX_FILE:
         stop("%s exceeds the bounded size" % label)
@@ -736,6 +805,9 @@ def secure_read(path, label, *, optional=False):
         stop("cannot securely open %s: %s" % (label, error))
     try:
         before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or \
+                stat.S_IMODE(before.st_mode) & 0o022 or before.st_nlink != 1:
+            stop("%s changed to an unsafe opened file" % label)
         chunks = []
         total = 0
         while True:
@@ -754,7 +826,10 @@ def secure_read(path, label, *, optional=False):
         value.st_ino,
         value.st_size,
         value.st_mtime_ns,
+        value.st_ctime_ns,
         value.st_uid,
+        value.st_gid,
+        value.st_nlink,
         stat.S_IMODE(value.st_mode),
     )
     if identity(before) != identity(after) or before.st_dev != path_metadata.st_dev or \

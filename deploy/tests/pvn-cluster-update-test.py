@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -162,7 +163,14 @@ standalone = module.parse_probe(
 check(standalone.central_mode == "standalone", "standalone active central was not parsed")
 
 
-def exercise_embedded_remote(*, standalone_mode: bool, stale_runtime: bool = False):
+def exercise_embedded_remote(
+    *,
+    standalone_mode: bool,
+    stale_runtime: bool = False,
+    unbounded_runtime: str | None = None,
+    timed_out_runtime: bool = False,
+    hardlinked_members: bool = False,
+):
     with tempfile.TemporaryDirectory() as temporary:
         root = pathlib.Path(temporary)
         members_path = root / "members"
@@ -196,6 +204,8 @@ def exercise_embedded_remote(*, standalone_mode: bool, stale_runtime: bool = Fal
                 "}\n",
                 encoding="utf-8",
             )
+        if hardlinked_members:
+            os.link(members_path, root / "members-hardlink")
 
         dpkg_query = command_dir / "dpkg-query"
         dpkg_query.write_text(
@@ -218,6 +228,14 @@ def exercise_embedded_remote(*, standalone_mode: bool, stale_runtime: bool = Fal
         cmapctl = command_dir / "corosync-cmapctl"
         if standalone_mode:
             cmapctl.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+        elif timed_out_runtime:
+            cmapctl.write_text("#!/bin/sh\nexec sleep 5\n", encoding="ascii")
+        elif unbounded_runtime:
+            redirect = " >&2" if unbounded_runtime == "stderr" else ""
+            cmapctl.write_text(
+                f"#!/bin/sh\nwhile :; do printf '%065536d' 0{redirect}; done\n",
+                encoding="ascii",
+            )
         else:
             cmap_lines = [
                 "totem.cluster_name (str) = lab-cluster",
@@ -262,7 +280,12 @@ def exercise_embedded_remote(*, standalone_mode: bool, stale_runtime: bool = Fal
         function = module.REMOTE_SCRIPT[
             module.REMOTE_SCRIPT.index("embedded_corosync_snapshot()"):
             module.REMOTE_SCRIPT.index("\ncorosync_doctor_gate()")
-        ].replace("path_metadata.st_uid != 0", f"path_metadata.st_uid != {os.getuid()}")
+        ].replace("st_uid != 0", f"st_uid != {os.getuid()}")
+        if timed_out_runtime:
+            function = function.replace(
+                "def run(arguments, *, check=True, timeout=20):",
+                "def run(arguments, *, check=True, timeout=0.2):",
+            )
         environment = os.environ.copy()
         environment.update({
             "PVN_PVE_MEMBERS_FILE": str(members_path),
@@ -295,6 +318,35 @@ check(
 )
 embedded_stale = exercise_embedded_remote(standalone_mode=False, stale_runtime=True)
 check(embedded_stale.returncode != 0, "embedded checker accepted stale clustered runtime")
+for overflow_stream in ("stdout", "stderr"):
+    overflow_started = time.monotonic()
+    embedded_overflow = exercise_embedded_remote(
+        standalone_mode=False, unbounded_runtime=overflow_stream
+    )
+    check(
+        embedded_overflow.returncode != 0
+        and f"returned unbounded {overflow_stream}" in embedded_overflow.stderr
+        and time.monotonic() - overflow_started < 5,
+        f"embedded checker did not terminate live {overflow_stream} overflow at its bound",
+    )
+timeout_started = time.monotonic()
+embedded_timeout = exercise_embedded_remote(
+    standalone_mode=False, timed_out_runtime=True
+)
+check(
+    embedded_timeout.returncode != 0
+    and "timed out" in embedded_timeout.stderr
+    and time.monotonic() - timeout_started < 2,
+    "embedded checker did not terminate and reap a timed-out command",
+)
+embedded_hardlink = exercise_embedded_remote(
+    standalone_mode=True, hardlinked_members=True
+)
+check(
+    embedded_hardlink.returncode != 0
+    and "unsafe ownership or permissions" in embedded_hardlink.stderr,
+    "embedded checker accepted a hardlinked PVE membership file",
+)
 try:
     module.parse_probe(
         nodes[0],
