@@ -1,3 +1,13 @@
+proxmox-ovn (0.2.15) unstable; urgency=medium
+
+  * Derive the operator-facing clustered or standalone deployment name from a
+    protected PVE membership credential instead of exposing the installation
+    UUID in manager sessions, health, and security-policy confirmations.
+  * Accept the exact standalone PVE membership shape in node heartbeats while
+    preserving fail-closed clustered membership validation.
+
+ -- PVN Project <root@localhost>  Thu, 06 Aug 2026 07:49:15 +0000
+
 proxmox-ovn (0.2.14) unstable; urgency=medium
 
   * Show human resource and PVE VM names in normal UI surfaces while retaining

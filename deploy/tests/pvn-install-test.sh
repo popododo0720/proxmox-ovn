@@ -5,7 +5,7 @@ TEST_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
 REPO=$(CDPATH= cd -P "$TEST_DIR/../.." && pwd)
 BOOTSTRAP=$REPO/deploy/scripts/pvn-install.sh
 # Pin the fixture to the bootstrap DEFAULT_VERSION so its default asset URL is tested.
-RELEASE_VERSION=0.2.14
+RELEASE_VERSION=0.2.15
 WORK=$(mktemp -d)
 
 cleanup() {
