@@ -2145,8 +2145,8 @@ class ControlPlane:
             repin = self._verify_ledger(
                 discovery, ledger, allow_package_repin=True
             )
-            if repin.package:
-                self._assert_package_repin_safe(discovery, ledger)
+            if repin.required:
+                self._assert_repin_safe(discovery, ledger, repin)
         actions = [
             "freeze membership/topology/package in the private pmxcfs ledger",
             "render shared config and preserve a seed-local private cluster CA",
@@ -2215,13 +2215,10 @@ class ControlPlane:
                 repin = self._verify_ledger(
                     discovery, ledger, allow_package_repin=True
                 )
-                if repin.package:
-                    self._assert_package_repin_safe(discovery, ledger)
                 if repin.required:
-                    ledger = copy.deepcopy(ledger)
-                    ledger["snapshot"] = discovery.snapshot()
-                    self.store.update(ledger)
-                    self._verify_ledger(discovery, ledger)
+                    discovery, ledger = self._commit_repin(
+                        discovery, ledger, repin
+                    )
 
             config = self._render_config(discovery, ledger["cluster_uuid"])
             self.backend.ensure_shared_config(config)
@@ -2349,6 +2346,58 @@ class ControlPlane:
             )
         self._verify_ledger(live, persisted)
 
+    def _commit_repin(
+        self, expected: Discovery, ledger: dict[str, Any], repin: LedgerRepin
+    ) -> tuple[Discovery, dict[str, Any]]:
+        """Re-prove a repin and commit only its fresh live snapshot."""
+        live = self.backend.discover()
+        if not self._durable_snapshot_matches(
+                expected.snapshot(), live.snapshot()):
+            raise ControlPlaneError(
+                "membership/topology/package changed before snapshot repin"
+            )
+        live_repin = self._verify_ledger(
+            live, ledger, allow_package_repin=True
+        )
+        if live_repin != repin:
+            raise ControlPlaneError("snapshot repin eligibility changed before commit")
+        self._assert_repin_safe(live, ledger, live_repin)
+
+        updated = copy.deepcopy(ledger)
+        updated["snapshot"] = live.snapshot()
+        if self.store.load() != ledger:
+            raise ControlPlaneError("control-plane ledger changed before snapshot repin")
+        self.store.update(updated)
+        self._verify_ledger(live, updated)
+        return live, updated
+
+    def _assert_repin_safe(
+        self, discovery: Discovery, ledger: dict[str, Any], repin: LedgerRepin
+    ) -> None:
+        if repin.topology_schema:
+            if ledger.get("phase") != "complete":
+                raise ControlPlaneError(
+                    "topology schema repin requires a complete control-plane ledger"
+                )
+            self._assert_complete_repin_safe(discovery, ledger)
+            return
+        if repin.package:
+            self._assert_package_repin_safe(discovery, ledger)
+
+    def _assert_complete_repin_safe(
+        self, discovery: Discovery, ledger: dict[str, Any]
+    ) -> None:
+        prefix = "complete ledger package repin refused"
+        reports = self.backend.assert_complete_package_repin_safe(
+            discovery, ledger
+        )
+        try:
+            self._verify_reports(
+                discovery, reports, len(discovery.nodes), ledger["db_cluster_ids"]
+            )
+        except ControlPlaneError as error:
+            raise ControlPlaneError(f"{prefix}: {error}") from error
+
     def _assert_package_repin_safe(
         self, discovery: Discovery, ledger: dict[str, Any]
     ) -> None:
@@ -2378,16 +2427,7 @@ class ControlPlane:
                 )
             return
         if ledger.get("phase") == "complete":
-            prefix = "complete ledger package repin refused"
-            reports = self.backend.assert_complete_package_repin_safe(
-                discovery, ledger
-            )
-            try:
-                self._verify_reports(
-                    discovery, reports, len(discovery.nodes), ledger["db_cluster_ids"]
-                )
-            except ControlPlaneError as error:
-                raise ControlPlaneError(f"{prefix}: {error}") from error
+            self._assert_complete_repin_safe(discovery, ledger)
             return
         complete = ledger.get("central_complete")
         if ledger.get("phase") == f"central-{complete}":
@@ -2441,6 +2481,8 @@ class ControlPlane:
     def _topology_schema_snapshot_repin_allowed(
         cls, discovery: Discovery, ledger: dict[str, Any]
     ) -> bool:
+        if not cls._complete_repin_ledger_valid(discovery, ledger):
+            return False
         pinned = cls._normalized_durable_snapshot(ledger.get("snapshot"))
         live = cls._normalized_durable_snapshot(discovery.snapshot())
         if pinned is None or live is None or not cls._schema2_projection_transition(
@@ -2453,7 +2495,8 @@ class ControlPlane:
 
     @classmethod
     def _package_snapshot_repin_allowed(
-        cls, discovery: Discovery, ledger: dict[str, Any]
+        cls, discovery: Discovery, ledger: dict[str, Any],
+        allow_topology_schema: bool = False,
     ) -> bool:
         pinned = cls._normalized_durable_snapshot(ledger.get("snapshot"))
         live = cls._normalized_durable_snapshot(discovery.snapshot())
@@ -2483,9 +2526,12 @@ class ControlPlane:
         for snapshot in (pinned_without_versions, live_without_versions):
             for node in snapshot["nodes"]:
                 node["package_version"] = None
-        if cls._schema2_projection_transition(
+        topology_transition = cls._schema2_projection_transition(
             discovery, pinned_without_versions, live_without_versions
-        ):
+        )
+        if topology_transition and not allow_topology_schema:
+            return False
+        if topology_transition:
             pinned_without_versions["topology_sha256"] = \
                 live_without_versions["topology_sha256"]
         return pinned_without_versions == live_without_versions
@@ -2583,12 +2629,24 @@ class ControlPlane:
     def _complete_package_repin_allowed(
         cls, discovery: Discovery, ledger: dict[str, Any]
     ) -> bool:
+        if not cls._complete_repin_ledger_valid(discovery, ledger):
+            return False
+        return cls._package_snapshot_repin_allowed(
+            discovery, ledger, allow_topology_schema=True
+        )
+
+    @classmethod
+    def _complete_repin_ledger_valid(
+        cls, discovery: Discovery, ledger: dict[str, Any]
+    ) -> bool:
         count = len(discovery.nodes)
+        central_complete = ledger.get("central_complete")
+        nodes_complete = ledger.get("nodes_complete")
         control_cid = ledger.get("control_db_cluster_id")
         db_cids = ledger.get("db_cluster_ids")
         if ledger.get("phase") != "complete" or \
-                ledger.get("central_complete") != count or \
-                ledger.get("nodes_complete") != count or \
+                type(central_complete) is not int or central_complete != count or \
+                type(nodes_complete) is not int or nodes_complete != count or \
                 not cls._cert_fingerprint_set_valid(
                     discovery, ledger.get("cert_fingerprints")
                 ) or not isinstance(db_cids, dict):
@@ -2601,7 +2659,7 @@ class ControlPlane:
                 return False
         elif control_cid is not None or db_cids:
             return False
-        return cls._package_snapshot_repin_allowed(discovery, ledger)
+        return True
 
     @classmethod
     def _verify_ledger(

@@ -37,6 +37,7 @@ module = loaded.__dict__
 ControlPlane = module["ControlPlane"]
 ControlPlaneError = module["ControlPlaneError"]
 Discovery = module["Discovery"]
+LedgerRepin = module["LedgerRepin"]
 LedgerStore = module["LedgerStore"]
 Node = module["Node"]
 SystemBackend = module["SystemBackend"]
@@ -91,6 +92,7 @@ class FakeBackend:
         self.discover_hook = None
         self.staged_report_hook = None
         self.complete_report_hook = None
+        self.complete_proofs = 0
         self.doctor_fail = set()
 
     def discover(self):
@@ -172,6 +174,7 @@ class FakeBackend:
                 for node in found.nodes[:complete]]
 
     def assert_complete_package_repin_safe(self, found, ledger):
+        self.complete_proofs += 1
         names = [node.name for node in found.nodes]
         expected_restart = {
             node.name: node.package_version for node in found.nodes
@@ -1273,7 +1276,11 @@ with tempfile.TemporaryDirectory() as temporary:
     backend, found, ledger, _, _ = complete_system_backend_state(
         pathlib.Path(temporary)
     )
-    ControlPlane(backend, None)._assert_package_repin_safe(found, ledger)
+    control = ControlPlane(backend, None)
+    control._assert_package_repin_safe(found, ledger)
+    control._assert_repin_safe(
+        found, ledger, LedgerRepin(topology_schema=True)
+    )
 
 
 def production_complete_repin_rejected(case):
@@ -1316,7 +1323,9 @@ def production_complete_repin_rejected(case):
             raise AssertionError(case)
         control = ControlPlane(backend, None)
         expect_error(
-            lambda: control._assert_package_repin_safe(found, ledger),
+            lambda: control._assert_repin_safe(
+                found, ledger, LedgerRepin(topology_schema=True)
+            ),
             "repin refused",
         )
 
@@ -2479,34 +2488,60 @@ topology_drift = Discovery(**{
 expect_package_repin_rejected(pinned, topology_drift)
 
 # A schema 2 topology can replace the previously pinned schema 1 digest only
-# through its exact canonical projection. This composes with the existing
-# package repin, but no other durable field may change.
+# through its exact canonical projection from a fully converged ledger. The
+# same complete proof is mandatory whether or not the package also advances.
 legacy_topology_digest = "1" * 64
 schema2_topology_digest = "2" * 64
-schema1_pinned = Discovery(**{
-    **discovery(package="0.1.1").__dict__,
-    "topology_sha256": legacy_topology_digest,
-    "legacy_topology_sha256": None,
-})
-schema2_same_package = Discovery(**{
-    **schema1_pinned.__dict__,
-    "topology_sha256": schema2_topology_digest,
-    "legacy_topology_sha256": legacy_topology_digest,
-})
-schema2_new_package = Discovery(**{
-    **discovery(package="0.1.2").__dict__,
-    "topology_sha256": schema2_topology_digest,
-    "legacy_topology_sha256": legacy_topology_digest,
-})
-schema1_ledger = planned_ledger(schema1_pinned)
+
+
+def schema_projection_pair(count=3, live_package="0.1.1"):
+    pinned = discovery(count, package="0.1.1")
+    pinned = Discovery(**{
+        **pinned.__dict__,
+        "topology_sha256": legacy_topology_digest,
+        "legacy_topology_sha256": None,
+    })
+    live = discovery(count, package=live_package)
+    live = Discovery(**{
+        **live.__dict__,
+        "topology_sha256": schema2_topology_digest,
+        "legacy_topology_sha256": legacy_topology_digest,
+    })
+    return pinned, live
+
+
+schema1_pinned, schema2_same_package = schema_projection_pair()
+_, schema2_new_package = schema_projection_pair(live_package="0.1.2")
+schema_cids = {name: f"cid-{index}" for index, name in enumerate(DATABASES, 1)}
+schema1_complete_ledger = complete_ledger(schema1_pinned, schema_cids)
 schema_only_repin = ControlPlane._verify_ledger(
-    schema2_same_package, schema1_ledger, allow_package_repin=True
+    schema2_same_package, schema1_complete_ledger, allow_package_repin=True
 )
 assert schema_only_repin.topology_schema and not schema_only_repin.package
 combined_repin = ControlPlane._verify_ledger(
-    schema2_new_package, schema1_ledger, allow_package_repin=True
+    schema2_new_package, schema1_complete_ledger, allow_package_repin=True
 )
 assert combined_repin.topology_schema and combined_repin.package
+
+# A projection never bootstraps trust from planned, staged, central-N, or
+# nodes-N progress. Combined package/schema drift is rejected there as well.
+incomplete_schema_ledgers = (
+    planned_ledger(schema1_pinned),
+    staged_seed_ledger(schema1_pinned, schema_cids["PVN_Control"]),
+    partial_central_ledger(schema1_pinned, schema_cids),
+    complete_ledger(
+        schema1_pinned, schema_cids, phase="nodes-2", nodes_complete=2
+    ),
+)
+for incomplete_schema_ledger in incomplete_schema_ledgers:
+    for schema_live in (schema2_same_package, schema2_new_package):
+        expect_error(
+            lambda ledger=incomplete_schema_ledger, live=schema_live: \
+                ControlPlane._verify_ledger(
+                    live, ledger, allow_package_repin=True
+                ),
+            "drift",
+        )
 
 for unsafe_schema2 in (
     Discovery(**{
@@ -2528,24 +2563,82 @@ for unsafe_schema2 in (
 ):
     expect_error(
         lambda unsafe=unsafe_schema2: ControlPlane._verify_ledger(
-            unsafe, schema1_ledger, allow_package_repin=True
+            unsafe, schema1_complete_ledger, allow_package_repin=True
         ),
         "drift",
     )
 
+# Both standalone and clustered complete ledgers use the exact live proof. Plan
+# is read-only; apply repeats discovery/proof under the lease immediately before
+# the one snapshot update.
+for count in (1, 3):
+    for live_package in ("0.1.1", "0.1.2"):
+        with tempfile.TemporaryDirectory() as temporary:
+            pinned_schema, live_schema = schema_projection_pair(
+                count, live_package=live_package
+            )
+            store = LedgerStore(pathlib.Path(temporary) / "private")
+            backend = FakeBackend(live_schema)
+            enter_complete_update(backend)
+            store.create(complete_ledger(pinned_schema, backend.cids))
+            control = ControlPlane(backend, store, timeout=0.01, interval=0)
+            before = copy.deepcopy(store.load())
+            plan = control.plan()
+            assert plan["topology_schema_repin_required"] is True
+            assert plan["package_repin_required"] is (live_package == "0.1.2")
+            assert backend.complete_proofs == 1
+            assert store.load() == before
+
+            original_update = store.update
+            repin_was_leased = []
+
+            def observe_schema_update(value):
+                previous = store.load()
+                if previous["snapshot"] != value["snapshot"]:
+                    assert lease_state.exists(), "schema snapshot repin escaped the lease"
+                    repin_was_leased.append(True)
+                original_update(value)
+
+            store.update = observe_schema_update
+            result = control.apply(live_schema.confirmation)
+            assert result["complete"] is True and repin_was_leased == [True]
+            assert backend.complete_proofs == 2
+            assert store.load()["snapshot"]["topology_sha256"] == \
+                schema2_topology_digest
+            assert ControlPlane._verify_ledger(live_schema, store.load()) == \
+                LedgerRepin()
+            assert not any(entry.startswith(("init:", "central:", "node:"))
+                           for entry in backend.log)
+
+# A crash before the atomic snapshot write leaves the legacy pin intact and a
+# rerun performs the same complete proof before committing it once.
 with tempfile.TemporaryDirectory() as temporary:
+    pinned_schema, live_schema = schema_projection_pair()
     store = LedgerStore(pathlib.Path(temporary) / "private")
-    store.create(copy.deepcopy(schema1_ledger))
-    backend = FakeBackend(schema2_same_package)
+    backend = FakeBackend(live_schema)
+    enter_complete_update(backend)
+    store.create(complete_ledger(pinned_schema, backend.cids))
     control = ControlPlane(backend, store, timeout=0.01, interval=0)
-    plan = control.plan()
-    assert plan["topology_schema_repin_required"] is True
-    assert plan["package_repin_required"] is False
-    result = control.apply(schema2_same_package.confirmation)
-    assert result["complete"] is True
+    original_update = store.update
+    injected = []
+
+    def crash_before_schema_update(value):
+        if not injected and value["snapshot"] != store.load()["snapshot"]:
+            injected.append(True)
+            raise ControlPlaneError("injected schema repin crash")
+        original_update(value)
+
+    store.update = crash_before_schema_update
+    expect_error(
+        lambda: control.apply(live_schema.confirmation),
+        "injected schema repin crash",
+    )
+    assert store.load()["snapshot"]["topology_sha256"] == legacy_topology_digest
+    store.update = original_update
+    result = control.apply(live_schema.confirmation)
+    assert result["complete"] is True and injected == [True]
+    assert backend.complete_proofs == 2
     assert store.load()["snapshot"]["topology_sha256"] == schema2_topology_digest
-    assert ControlPlane._verify_ledger(schema2_same_package, store.load()) == \
-        module["LedgerRepin"]()
 
 durable_snapshot = pinned.snapshot()
 epoch_only = copy.deepcopy(durable_snapshot)
