@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import { useApi } from '../api/context';
 import type {
   FloatingIP,
@@ -18,76 +17,23 @@ import type {
 } from '../api/types';
 import { PortAttachmentPanel } from '../components/PortAttachmentPanel';
 import type { FormField } from '../components/CreateDialog';
+import { ReferenceLabel } from '../components/ReferenceLabel';
 import { ResourcePage, formatValue, type Column } from '../components/ResourcePage';
-import type { ResourceReference } from '../components/ResourceSelect';
 import { StatusPill } from '../components/StatusPill';
-
-const projectReference: ResourceReference = {
-  endpoint: '/projects',
-  detailKeys: ['pool_id'],
-  emptyLabel: 'No project mappings available',
-};
-
-const providerNetworkReference: ResourceReference = {
-  endpoint: '/provider-networks',
-  emptyLabel: 'No provider networks available',
-};
-
-const projectNetworkReference: ResourceReference = {
-  endpoint: '/networks',
-  matches: [{ formField: 'project_id' }],
-  emptyLabel: 'No networks in this project',
-};
-
-const projectSubnetReference: ResourceReference = {
-  endpoint: '/subnets',
-  detailKeys: ['cidr'],
-  matches: [
-    { formField: 'project_id' },
-    { formField: 'network_id' },
-  ],
-  emptyLabel: 'No subnets on this network',
-};
-
-const externalNetworkReference: ResourceReference = {
-  endpoint: '/networks',
-  where: { external: true },
-  emptyLabel: 'No external networks available',
-};
-
-const externalSubnetReference: ResourceReference = {
-  endpoint: '/subnets',
-  detailKeys: ['cidr'],
-  matches: [{ formField: 'external_network_id', resourceField: 'network_id' }],
-  emptyLabel: 'No subnets on this external network',
-};
-
-const projectRouterReference: ResourceReference = {
-  endpoint: '/routers',
-  detailKeys: ['external_ip_address'],
-  matches: [{ formField: 'project_id' }],
-  emptyLabel: 'No routers in this project',
-};
-
-const projectSecurityGroupReference: ResourceReference = {
-  endpoint: '/security-groups',
-  matches: [{ formField: 'project_id' }],
-  emptyLabel: 'No security groups in this project',
-};
-
-const projectPortReference: ResourceReference = {
-  endpoint: '/ports',
-  detailKeys: ['mac_address'],
-  matches: [{ formField: 'project_id' }],
-  emptyLabel: 'No ports in this project',
-};
-
-const currentProviderSegmentReference: ResourceReference = {
-  endpoint: '/provider-segments',
-  detailKeys: ['network_type', 'physical_network', 'vlan_id'],
-  matches: [{ formField: 'id', resourceField: 'provider_network_id' }],
-  emptyLabel: 'Create a segment for this provider network first',
-};
+import {
+  currentProviderSegmentReference,
+  externalNetworkReference,
+  externalSubnetReference,
+  nodeReference,
+  operationTargetReference,
+  projectNetworkReference,
+  projectPortReference,
+  projectReference,
+  projectRouterReference,
+  projectSecurityGroupReference,
+  projectSubnetReference,
+  providerNetworkReference,
+} from '../resources/references';
 
 const projectField: FormField = {
   name: 'project_id',
@@ -98,10 +44,9 @@ const projectField: FormField = {
 };
 
 const projectColumns: Column<Project>[] = [
-  { key: 'name', label: 'Project', render: (item) => <strong>{item.name || item.id}</strong> },
+  { key: 'name', label: 'Project', render: (item) => <strong>{item.name || 'Unnamed project'}</strong> },
   { key: 'pool_id', label: 'PVE pool' },
   { key: 'state', label: 'State' },
-  { key: 'id', label: 'ID', className: 'mono-cell' },
 ];
 
 const networkFields = [
@@ -112,6 +57,20 @@ const networkFields = [
   { name: 'provider_network_id', label: 'Provider network', type: 'resource-select' as const, reference: providerNetworkReference, help: 'Required only for an external network.' },
   { name: 'description', label: 'Description' },
 ];
+
+function FixedIPList({ fixedIPs }: { fixedIPs: Port['fixed_ips'] }) {
+  if (!fixedIPs?.length) return <>{formatValue(undefined)}</>;
+  return (
+    <span className="reference-label">
+      {fixedIPs.map((fixedIP, index) => (
+        <span key={`${fixedIP.address || 'address'}-${index}`}>
+          {fixedIP.address || 'Unavailable address'}
+          {fixedIP.subnet_id && <> · <ReferenceLabel value={fixedIP.subnet_id} source={projectSubnetReference} /></>}
+        </span>
+      ))}
+    </span>
+  );
+}
 
 export function ProjectsPage() {
   return <ResourcePage<Project>
@@ -141,11 +100,11 @@ export function NetworksPage() {
       description="Tenant logical switches backed by Geneve overlays."
       endpoint="/networks"
       columns={[
-        { key: 'name', label: 'Network', render: (item) => <strong>{item.name || item.id}</strong> },
-        { key: 'project_id', label: 'Project', className: 'mono-cell' },
+        { key: 'name', label: 'Network', render: (item) => <strong>{item.name || 'Unnamed network'}</strong> },
+        { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'external', label: 'External' },
         { key: 'mtu', label: 'MTU' },
-        { key: 'provider_network_id', label: 'Provider network', className: 'mono-cell' },
+        { key: 'provider_network_id', label: 'Provider network', reference: providerNetworkReference },
         { key: 'state', label: 'State' },
       ]}
       createLabel="Network"
@@ -164,8 +123,8 @@ export function NetworksPage() {
       description="IPv4 address pools, gateways, and OVN-native DHCP options."
       endpoint="/subnets"
       columns={[
-        { key: 'name', label: 'Subnet', render: (item) => <strong>{item.name || item.id}</strong> },
-        { key: 'network_id', label: 'Network', className: 'mono-cell' },
+        { key: 'name', label: 'Subnet', render: (item) => <strong>{item.name || item.cidr || 'Unnamed subnet'}</strong> },
+        { key: 'network_id', label: 'Network', reference: projectNetworkReference },
         { key: 'cidr', label: 'CIDR', className: 'mono-cell' },
         { key: 'gateway_ip', label: 'Gateway', className: 'mono-cell' },
         { key: 'enable_dhcp', label: 'DHCP' },
@@ -198,10 +157,10 @@ export function RoutersPage() {
       description="Distributed east-west routing with optional centralized north-south SNAT."
       endpoint="/routers"
       columns={[
-        { key: 'name', label: 'Router', render: (item) => <strong>{item.name || item.id}</strong> },
-        { key: 'project_id', label: 'Project', className: 'mono-cell' },
-        { key: 'external_network_id', label: 'External network', className: 'mono-cell' },
-        { key: 'external_subnet_id', label: 'External subnet', className: 'mono-cell' },
+        { key: 'name', label: 'Router', render: (item) => <strong>{item.name || 'Unnamed router'}</strong> },
+        { key: 'project_id', label: 'Project', reference: projectReference },
+        { key: 'external_network_id', label: 'External network', reference: externalNetworkReference },
+        { key: 'external_subnet_id', label: 'External subnet', reference: externalSubnetReference },
         { key: 'external_ip_address', label: 'Gateway IP', className: 'mono-cell' },
         { key: 'enable_snat', label: 'SNAT' },
         { key: 'state', label: 'State' },
@@ -231,10 +190,10 @@ export function RoutersPage() {
       description="Subnet attachments rendered as logical router ports."
       endpoint="/router-interfaces"
       columns={[
-        { key: 'router_id', label: 'Router', className: 'mono-cell' },
-        { key: 'subnet_id', label: 'Subnet', className: 'mono-cell' },
-        { key: 'port_id', label: 'Logical port', className: 'mono-cell' },
-        { key: 'project_id', label: 'Project', className: 'mono-cell' },
+        { key: 'router_id', label: 'Router', reference: projectRouterReference },
+        { key: 'subnet_id', label: 'Subnet', reference: projectSubnetReference },
+        { key: 'port_id', label: 'Logical port', reference: projectPortReference },
+        { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'state', label: 'State' },
       ]}
       createLabel="Router interface"
@@ -251,20 +210,20 @@ export function RoutersPage() {
 
 export function PortsPage() {
   const api = useApi();
-  const [tableKey, setTableKey] = useState(0);
 
   return <div className="stacked-pages">
     <ResourcePage<Port>
-      key={tableKey}
       title="Ports & VM attachments"
       description="Logical switch ports, fixed IP allocations, and chassis bindings."
       endpoint="/ports"
       columns={[
-        { key: 'name', label: 'Port', render: (item) => <strong>{item.name || item.id}</strong> },
-        { key: 'network_id', label: 'Network', className: 'mono-cell' },
+        { key: 'name', label: 'Port', render: (item) => <strong>{item.name || item.mac_address || 'Unnamed port'}</strong> },
+        { key: 'network_id', label: 'Network', reference: projectNetworkReference },
         { key: 'mac_address', label: 'MAC address', className: 'mono-cell' },
-        { key: 'fixed_ips', label: 'Fixed IPs' },
-        { key: 'vmid', label: 'Attachment', render: (item) => formatValue(item.vmid ? `${item.node_id}/${item.vmid}/${item.nic || '?'}` : undefined) },
+        { key: 'fixed_ips', label: 'Fixed IPs', render: (item) => <FixedIPList fixedIPs={item.fixed_ips} /> },
+        { key: 'vmid', label: 'Attachment', render: (item) => item.vmid
+          ? <span className="reference-label"><ReferenceLabel value={item.node_id} source={nodeReference} /><span>{item.vmid}/{item.nic || '?'}</span></span>
+          : formatValue(undefined) },
         { key: 'binding_status', label: 'Binding', render: (item) => <StatusPill value={item.binding_status || item.state} /> },
       ]}
       createLabel="Tenant port"
@@ -290,7 +249,7 @@ export function PortsPage() {
       deleteResource={(port) => api.deprovisionPort(port.id, port.revision || 0)}
       emptyMessage="Provision a tenant port, then attach it to a VM NIC below."
     />
-    <PortAttachmentPanel onChanged={() => setTableKey((value) => value + 1)} />
+    <PortAttachmentPanel />
   </div>;
 }
 
@@ -306,11 +265,11 @@ export function FloatingIPsPage() {
     description="North-south addresses are pending while OVN applies them, active when associated NAT is realized, and down while reserved."
     endpoint="/floating-ips"
     columns={[
-      { key: 'address', label: 'Floating IP', className: 'mono-cell', render: (item) => <strong>{item.address || item.name || item.id}</strong> },
+      { key: 'address', label: 'Floating IP', className: 'mono-cell', render: (item) => <strong>{item.address || item.name || 'Unavailable address'}</strong> },
       { key: 'fixed_ip_address', label: 'Fixed IP', className: 'mono-cell' },
-      { key: 'port_id', label: 'Port', className: 'mono-cell' },
-      { key: 'router_id', label: 'Router', className: 'mono-cell' },
-      { key: 'project_id', label: 'Project', className: 'mono-cell' },
+      { key: 'port_id', label: 'Port', reference: projectPortReference },
+      { key: 'router_id', label: 'Router', reference: projectRouterReference },
+      { key: 'project_id', label: 'Project', reference: projectReference },
       { key: 'status', label: 'State', render: (item) => <StatusPill value={floatingIPDisplayStatus(item)} /> },
     ]}
     createLabel="Floating IP"
@@ -335,11 +294,11 @@ export function SecurityGroupsPage() {
   return <div className="stacked-pages">
     <ResourcePage<SecurityGroup>
       title="Security groups"
-      description="Stateful OVN port-group policies for tenant ingress and egress."
+      description="Stateful-only OVN port-group policies for tenant ingress and egress."
       endpoint="/security-groups"
       columns={[
-        { key: 'name', label: 'Security group', render: (item) => <strong>{item.name || item.id}</strong> },
-        { key: 'project_id', label: 'Project', className: 'mono-cell' },
+        { key: 'name', label: 'Security group', render: (item) => <strong>{item.name || 'Unnamed security group'}</strong> },
+        { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'description', label: 'Description' },
         { key: 'stateful', label: 'Stateful' },
         { key: 'state', label: 'State' },
@@ -349,12 +308,10 @@ export function SecurityGroupsPage() {
         { name: 'name', label: 'Name', required: true, placeholder: 'web-servers' },
         projectField,
         { name: 'description', label: 'Description' },
-        { name: 'stateful', label: 'Stateful', type: 'checkbox', defaultValue: true },
       ]}
       editFields={[
         { name: 'name', label: 'Name', required: true },
         { name: 'description', label: 'Description' },
-        { name: 'stateful', label: 'Stateful', type: 'checkbox' },
       ]}
       allowDelete
     />
@@ -363,7 +320,7 @@ export function SecurityGroupsPage() {
       description="Ingress and egress matches compiled into OVN ACLs."
       endpoint="/security-group-rules"
       columns={[
-        { key: 'security_group_id', label: 'Security group', className: 'mono-cell' },
+        { key: 'security_group_id', label: 'Security group', reference: projectSecurityGroupReference },
         { key: 'direction', label: 'Direction' },
         { key: 'protocol', label: 'Protocol' },
         { key: 'port_range_min', label: 'Port from' },
@@ -410,9 +367,9 @@ export function ProviderNetworksPage() {
       description="Shared external network containers exposed to tenant routers."
       endpoint="/provider-networks"
       columns={[
-        { key: 'name', label: 'Network', render: (item) => <strong>{item.name || item.id}</strong> },
+        { key: 'name', label: 'Network', render: (item) => <strong>{item.name || 'Unnamed provider network'}</strong> },
         { key: 'shared', label: 'Shared' },
-        { key: 'default_segment_id', label: 'Default segment', className: 'mono-cell' },
+        { key: 'default_segment_id', label: 'Default segment', reference: currentProviderSegmentReference },
         { key: 'description', label: 'Description' },
         { key: 'state', label: 'State' },
       ]}
@@ -435,8 +392,8 @@ export function ProviderNetworksPage() {
       description="Flat or VLAN bridge mappings consumed by gateway chassis."
       endpoint="/provider-segments"
       columns={[
-        { key: 'name', label: 'Segment', render: (item) => <strong>{item.name || item.id}</strong> },
-        { key: 'provider_network_id', label: 'Provider network', className: 'mono-cell' },
+        { key: 'name', label: 'Segment', render: (item) => <strong>{item.name || 'Unnamed provider segment'}</strong> },
+        { key: 'provider_network_id', label: 'Provider network', reference: providerNetworkReference },
         { key: 'network_type', label: 'Type' },
         { key: 'physical_network', label: 'Bridge mapping' },
         { key: 'vlan_id', label: 'VLAN' },
@@ -468,9 +425,8 @@ export function NodesPage() {
     description="PVN installation health, OVSDB membership, and north-south gateway placement."
     endpoint="/nodes"
     columns={[
-      { key: 'name', label: 'Node', render: (item) => <strong>{item.name || item.id}</strong> },
+      { key: 'name', label: 'Node', render: (item) => <strong>{item.name || item.management_address || 'Unnamed node'}</strong> },
       { key: 'management_address', label: 'Management IP', className: 'mono-cell' },
-      { key: 'chassis_id', label: 'Chassis ID', className: 'mono-cell' },
       { key: 'roles', label: 'Roles' },
       { key: 'enabled', label: 'Enabled', render: (item) => <StatusPill value={item.enabled ? 'enabled' : 'disabled'} /> },
       { key: 'state', label: 'Control state' },
@@ -486,9 +442,9 @@ export function OperationsPage() {
     description="Asynchronous reconciler work and the cluster-wide audit trail."
     endpoint="/operations"
     columns={[
-      { key: 'action', label: 'Action', render: (item) => <strong>{item.action || item.kind || item.id}</strong> },
+      { key: 'action', label: 'Action', render: (item) => <strong>{item.action || item.kind || 'Operation'}</strong> },
       { key: 'target_kind', label: 'Resource' },
-      { key: 'target_id', label: 'Resource ID', className: 'mono-cell' },
+      { key: 'target_id', label: 'Resource name', reference: (item) => operationTargetReference(item.target_kind) },
       { key: 'target_revision', label: 'Revision' },
       { key: 'status', label: 'State' },
       { key: 'started_at', label: 'Started' },

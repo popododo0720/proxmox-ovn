@@ -3,7 +3,9 @@ import { useApi } from '../api/context';
 import type { HealthStatus, NodeStatus, Operation, Project } from '../api/types';
 import { ErrorState } from '../components/ErrorState';
 import { LoadingState } from '../components/LoadingState';
+import { ReferenceLabel } from '../components/ReferenceLabel';
 import { StatusPill } from '../components/StatusPill';
+import { operationTargetReference } from '../resources/references';
 
 interface OverviewData {
   health: HealthStatus;
@@ -81,7 +83,10 @@ export function OverviewPage() {
                   <span className="activity-mark" aria-hidden="true" />
                   <div>
                     <strong>{operation.action || operation.kind || 'Operation'}</strong>
-                    <p>{operation.target_kind || 'resource'} · {operation.target_id || 'control plane'}</p>
+                    <p>
+                      {operation.target_kind || 'resource'} ·{' '}
+                      <OperationTarget operation={operation} />
+                    </p>
                   </div>
                   <StatusPill value={operation.status} />
                 </div>
@@ -92,6 +97,14 @@ export function OverviewPage() {
       )}
     </section>
   );
+}
+
+function OperationTarget({ operation }: { operation: Operation }) {
+  if (!operation.target_id) return <>control plane</>;
+  const source = operationTargetReference(operation.target_kind);
+  return source
+    ? <ReferenceLabel value={operation.target_id} source={source} />
+    : <span className="muted">Unavailable</span>;
 }
 
 function Metric({ label, value, detail }: { label: string; value: number; detail: string }) {

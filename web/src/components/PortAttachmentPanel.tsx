@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useApi } from '../api/context';
 import type { NodeStatus, Port } from '../api/types';
 import { pveBridge } from '../pve/bridge';
 import { attachVMPort, detachVMPort, type PortLifecycleStep, type VMPortTarget } from '../pve/portLifecycle';
 import { ErrorState } from './ErrorState';
+import { useResourceCatalog } from './ResourceCatalog';
 import { StatusPill } from './StatusPill';
 
 const stepLabels: Record<PortLifecycleStep, string> = {
@@ -33,36 +34,29 @@ function validNIC(value: string): value is `net${number}` {
 
 export function PortAttachmentPanel({ onChanged }: { onChanged?: () => void }) {
   const api = useApi();
-  const [ports, setPorts] = useState<Port[]>([]);
-  const [nodes, setNodes] = useState<NodeStatus[]>([]);
+  const portCatalog = useResourceCatalog('/ports');
+  const nodeCatalog = useResourceCatalog('/nodes');
+  const ports = portCatalog.items as unknown as Port[];
+  const nodes = nodeCatalog.items as unknown as NodeStatus[];
   const [portID, setPortID] = useState('');
   const [nodeID, setNodeID] = useState('');
   const [vmid, setVMID] = useState('');
   const [nic, setNIC] = useState('net0');
   const [vmConfig, setVMConfig] = useState<Record<string, unknown> | null>(null);
   const [vmStatus, setVMStatus] = useState('');
-  const [loading, setLoading] = useState(true);
   const [reading, setReading] = useState(false);
   const [busyStep, setBusyStep] = useState<PortLifecycleStep | null>(null);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  function refresh() {
     setError('');
-    try {
-      const [portResult, nodeResult] = await Promise.all([api.ports(), api.nodes()]);
-      setPorts(portResult.items);
-      setNodes(nodeResult.items);
-      setPortID((current) => current && portResult.items.some((port) => port.id === current) ? current : (portResult.items[0]?.id || ''));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not load PVN ports and nodes');
-    } finally {
-      setLoading(false);
-    }
-  }, [api]);
+    void Promise.allSettled([portCatalog.retry(), nodeCatalog.retry()]);
+  }
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    setPortID((current) => current && ports.some((port) => port.id === current) ? current : (ports[0]?.id || ''));
+  }, [ports]);
 
   const selectedPort = useMemo(() => ports.find((port) => port.id === portID), [ports, portID]);
   const selectedNode = useMemo(() => nodes.find((node) => node.id === nodeID), [nodes, nodeID]);
@@ -120,14 +114,14 @@ export function PortAttachmentPanel({ onChanged }: { onChanged?: () => void }) {
         ? await attachVMPort(api, pveBridge, selectedPort, selection, { onStep: setBusyStep })
         : await detachVMPort(api, pveBridge, selectedPort, selection, { onStep: setBusyStep });
       setMessage(action === 'attach'
-        ? `${result.name || result.id} is bound and the VM NIC is enabled.`
-        : `${result.name || result.id} is unbound and the VM NIC was removed.`);
+        ? `${result.name || result.mac_address || 'Port'} is bound and the VM NIC is enabled.`
+        : `${result.name || result.mac_address || 'Port'} is unbound and the VM NIC was removed.`);
       setVMConfig(null);
       setVMStatus('');
-      await load();
+      portCatalog.invalidate();
       onChanged?.();
     } catch (reason) {
-      await load();
+      portCatalog.invalidate();
       setError(reason instanceof Error ? reason.message : `Could not ${action} the VM port`);
       onChanged?.();
     } finally {
@@ -135,6 +129,8 @@ export function PortAttachmentPanel({ onChanged }: { onChanged?: () => void }) {
     }
   }
 
+  const loading = portCatalog.loading || nodeCatalog.loading;
+  const catalogError = portCatalog.error || nodeCatalog.error;
   const actionable = selectedPort && selectedNode && vmid && validNIC(nic) && pveBridge.available && !loading && !reading && !busyStep;
   const canAttach = Boolean(actionable && selectedPort?.binding_status === 'unbound' && selectedPort.admin_state_up !== false && selectedNode?.enabled !== false);
   const canDetach = Boolean(actionable && ['binding', 'bound', 'error'].includes(selectedPort?.binding_status || ''));
@@ -149,7 +145,7 @@ export function PortAttachmentPanel({ onChanged }: { onChanged?: () => void }) {
         </div>
         <div className="heading-actions">
           <StatusPill value={pveBridge.available ? 'connected' : 'unavailable'} />
-          <button className="button button-secondary" disabled={loading || Boolean(busyStep)} onClick={() => void load()}>Refresh</button>
+          <button className="button button-secondary" disabled={loading || Boolean(busyStep)} onClick={refresh}>Refresh</button>
         </div>
       </div>
 
@@ -158,14 +154,14 @@ export function PortAttachmentPanel({ onChanged }: { onChanged?: () => void }) {
           <span>PVN port</span>
           <select value={portID} onChange={(event) => { setPortID(event.target.value); setVMConfig(null); setMessage(''); }} disabled={loading || Boolean(busyStep)}>
             {!ports.length && <option value="">No ports available</option>}
-            {ports.map((port) => <option value={port.id} key={port.id}>{port.name || port.id} · {port.mac_address || 'no MAC'} · {port.binding_status || 'unknown'}</option>)}
+            {ports.map((port) => <option value={port.id} key={port.id}>{port.name || port.mac_address || 'Unnamed port'} · {port.mac_address || 'no MAC'} · {port.binding_status || 'unknown'}</option>)}
           </select>
         </label>
         <label className="form-field">
           <span>PVE node</span>
           <select value={nodeID} onChange={(event) => { setNodeID(event.target.value); setVMConfig(null); }} disabled={attached || Boolean(busyStep)}>
             <option value="" disabled>Select node…</option>
-            {nodes.map((node) => <option value={node.id} key={node.id}>{node.name || node.id}{node.enabled === false ? ' (disabled)' : ''}</option>)}
+            {nodes.map((node) => <option value={node.id} key={node.id}>{node.name || node.management_address || 'Unavailable node'}{node.enabled === false ? ' (disabled)' : ''}</option>)}
           </select>
         </label>
         <label className="form-field">
@@ -187,7 +183,7 @@ export function PortAttachmentPanel({ onChanged }: { onChanged?: () => void }) {
       </div>
 
       {!pveBridge.available && <ErrorState title="Open PVN inside Proxmox" message="VM configuration writes are accepted only through the authenticated PVN Datacenter menu." />}
-      {error && <ErrorState title="VM port operation failed" message={error} onRetry={() => void load()} />}
+      {(error || catalogError) && <ErrorState title="VM port operation failed" message={error || catalogError} onRetry={refresh} />}
       {message && <div className="inline-success" role="status">{message}</div>}
       {busyStep && <div className="workflow-progress" role="status"><span className="spinner" /><strong>{stepLabels[busyStep]}</strong><span>The VM NIC remains fail-closed during this step.</span></div>}
       {vmConfig && <div className="nic-list">
