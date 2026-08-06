@@ -102,7 +102,7 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 - [ ] Metrics / alerting hooks (Prometheus or equivalent)
 - [ ] Safer automated Raft membership changes (today: careful manual procedures;
       leave/kick not exposed as casual CLI for good reason)
-- [ ] One-button or scripted backup verification
+- [x] One-button or scripted backup verification (`pvn-db-backup create/verify`)
 
 ---
 

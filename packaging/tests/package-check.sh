@@ -33,6 +33,7 @@ deploy/tests/pvn-cluster-lease-test.sh
 deploy/tests/pvn-ovn-db-listeners-test.sh
 deploy/tests/pvn-topology-test.sh
 deploy/tests/pvn-control-plane-test.sh
+python3 deploy/tests/pvn-db-backup-test.py
 
 if grep -R -n -E '(^|[[:space:]])(ovs-vsctl|ip)[[:space:]].*(add-br|add-port).*br-provider' deploy packaging; then
     echo "package must never create or attach a physical provider bridge" >&2
@@ -282,6 +283,7 @@ for path in \
     usr/sbin/pvn-manager \
     usr/sbin/pvn-agent \
     usr/sbin/pvnctl \
+    usr/sbin/pvn-db-backup \
     usr/lib/pvn/pvn-ui-inject \
     usr/lib/pvn/pvn-control-db-run \
     usr/lib/pvn/pvn-central-preflight \

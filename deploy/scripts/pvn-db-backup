@@ -1,0 +1,761 @@
+#!/usr/bin/python3
+"""Create and verify independent, offline-readable PVN/OVN database backups."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import secrets
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+
+PROGRAM = "pvn-db-backup"
+FORMAT = "pvn-db-backup/v1"
+CONSISTENCY = "independent-per-database"
+SYSTEMCTL = "/usr/bin/systemctl"
+PVNCTL = "/usr/sbin/pvnctl"
+OVSDB_CLIENT = "/usr/bin/ovsdb-client"
+OVSDB_TOOL = "/usr/bin/ovsdb-tool"
+CENTRAL_MARKER = pathlib.Path("/etc/pvn/central/enabled")
+LOCK_PATH = pathlib.Path("/run/lock/pvn-db-backup.lock")
+DEFAULT_OUTPUT = pathlib.Path("/var/backups/pvn")
+COMMAND_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LC_ALL": "C",
+    "LANG": "C",
+}
+SHA256 = re.compile(r"[0-9a-f]{64}")
+UUID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+SAFE_HOSTNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+MAX_MANIFEST = 1024 * 1024
+MAX_TEXT_OUTPUT = 1024 * 1024
+
+
+class BackupError(RuntimeError):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class Database:
+    key: str
+    name: str
+    socket_path: pathlib.Path
+    filename: str
+
+    @property
+    def remote(self) -> str:
+        return f"unix:{self.socket_path}"
+
+
+DATABASES = (
+    Database(
+        "pvn-control",
+        "PVN_Control",
+        pathlib.Path("/run/pvn-control/pvn-control-db.sock"),
+        "pvn-control.ovsdb",
+    ),
+    Database(
+        "ovn-nb",
+        "OVN_Northbound",
+        pathlib.Path("/run/ovn/ovnnb_db.sock"),
+        "ovn-northbound.ovsdb",
+    ),
+    Database(
+        "ovn-sb",
+        "OVN_Southbound",
+        pathlib.Path("/run/ovn/ovnsb_db.sock"),
+        "ovn-southbound.ovsdb",
+    ),
+)
+DATABASE_BY_KEY = {database.key: database for database in DATABASES}
+DATABASE_BY_NAME = {database.name: database for database in DATABASES}
+
+
+def fail(message: str) -> None:
+    raise BackupError(message)
+
+
+def utc_now() -> str:
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def clean_absolute(path: pathlib.Path, label: str) -> pathlib.Path:
+    raw = str(path)
+    if not path.is_absolute() or raw != os.path.normpath(raw) or raw == "/":
+        fail(f"{label} must be a clean absolute path other than /")
+    return path
+
+
+def inspect_directory_chain(path: pathlib.Path, label: str) -> os.stat_result:
+    clean_absolute(path, label)
+    current = pathlib.Path("/")
+    metadata: os.stat_result | None = None
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            fail(f"cannot inspect {label} component {current}: {error}")
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            fail(f"{label} component must be a real directory: {current}")
+        if metadata.st_uid != 0:
+            fail(f"{label} component must be owned by root: {current}")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            fail(f"{label} component must not be group/world writable: {current}")
+    assert metadata is not None
+    return metadata
+
+
+def fsync_directory(path: pathlib.Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open directory for sync {path}: {error}")
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        fail(f"cannot sync directory {path}: {error}")
+    finally:
+        os.close(descriptor)
+
+
+def ensure_output_root(path: pathlib.Path) -> None:
+    clean_absolute(path, "backup output root")
+    if os.path.lexists(path):
+        metadata = inspect_directory_chain(path, "backup output root")
+        if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (
+            0,
+            0,
+            0o700,
+        ):
+            fail("backup output root must be root:root mode 0700")
+        return
+    parent = path.parent
+    inspect_directory_chain(parent, "backup output parent")
+    try:
+        os.mkdir(path, 0o700)
+    except OSError as error:
+        fail(f"cannot create backup output root {path}: {error}")
+    metadata = inspect_directory_chain(path, "backup output root")
+    if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, 0, 0o700):
+        fail("new backup output root is not root:root mode 0700")
+    fsync_directory(parent)
+
+
+def secure_file(path: pathlib.Path, label: str, exact_mode: int) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect {label}: {error}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fail(f"{label} must be a regular non-symlink file")
+    if metadata.st_nlink != 1:
+        fail(f"{label} must have exactly one hard link")
+    if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (
+        0,
+        0,
+        exact_mode,
+    ):
+        fail(f"{label} must be root:root mode {exact_mode:04o}")
+    return metadata
+
+
+def require_central_marker() -> None:
+    try:
+        metadata = CENTRAL_MARKER.lstat()
+    except OSError as error:
+        fail(f"central activation marker is unavailable: {error}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fail("central activation marker must be a regular non-symlink file")
+    if (metadata.st_uid, metadata.st_gid) != (0, 0) or metadata.st_nlink != 1:
+        fail("central activation marker must be a single root:root-owned file")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        fail("central activation marker must not be group/world writable")
+
+
+def command(
+    arguments: list[str],
+    *,
+    timeout: int,
+    quiet_stdout: bool = False,
+) -> str:
+    try:
+        result = subprocess.run(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL if quiet_stdout else subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+            env=COMMAND_ENV,
+        )
+    except subprocess.TimeoutExpired:
+        fail(f"command timed out: {arguments[0]}")
+    except OSError as error:
+        fail(f"cannot execute {arguments[0]}: {error}")
+    if result.returncode != 0:
+        detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+        if not detail and not quiet_stdout:
+            detail = (result.stdout or b"").decode("utf-8", "replace").strip()
+        if len(detail) > 4096:
+            detail = detail[-4096:]
+        fail(f"command failed ({arguments[0]}): {detail or f'exit {result.returncode}'}")
+    if quiet_stdout:
+        return ""
+    output = result.stdout or b""
+    if len(output) > MAX_TEXT_OUTPUT:
+        fail(f"command returned excessive output: {arguments[0]}")
+    try:
+        return output.decode("utf-8", "strict").strip()
+    except UnicodeDecodeError:
+        fail(f"command returned non-UTF-8 output: {arguments[0]}")
+
+
+def acquire_lock() -> int:
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(LOCK_PATH, flags, 0o600)
+    except OSError as error:
+        fail(f"cannot open local backup lock {LOCK_PATH}: {error}")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or (
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+    ) != (0, 0, 0o600):
+        os.close(descriptor)
+        fail("local backup lock must be a single root:root mode 0600 file")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(descriptor)
+        fail("another local PVN database backup is running")
+    return descriptor
+
+
+def positive_integer(value: Any, label: str) -> int:
+    if type(value) is not int or value <= 0:
+        fail(f"{label} must be a positive integer")
+    return value
+
+
+def central_status() -> dict[str, dict[str, Any]]:
+    raw = command([PVNCTL, "central", "status"], timeout=30)
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError as error:
+        fail(f"pvnctl central status returned invalid JSON: {error}")
+    if not isinstance(report, dict) or report.get("healthy") is not True:
+        fail("all three local Raft databases must report healthy")
+    rows = report.get("databases")
+    if not isinstance(rows, list) or len(rows) != len(DATABASES):
+        fail("central status must contain exactly three database rows")
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            fail("central status database row is not an object")
+        name = row.get("database")
+        if not isinstance(name, str) or name not in DATABASE_BY_NAME or name in result:
+            fail("central status has an unknown or duplicate database row")
+        if row.get("available") is not True or row.get("healthy") is not True:
+            fail(f"{name} is unavailable or unhealthy")
+        if row.get("membership_change") is not False:
+            fail(f"{name} has a membership change in progress")
+        members = positive_integer(row.get("member_count"), f"{name} member_count")
+        connected = positive_integer(
+            row.get("connected_members"), f"{name} connected_members"
+        )
+        quorum = positive_integer(row.get("quorum_size"), f"{name} quorum_size")
+        if members % 2 != 1:
+            fail(f"{name} voter count must be odd, got {members}")
+        if connected != members:
+            fail(f"{name} does not have every voter connected ({connected}/{members})")
+        if quorum != members // 2 + 1:
+            fail(f"{name} reports an invalid quorum size")
+        cluster_id = row.get("cluster_id")
+        if not isinstance(cluster_id, str) or not UUID.fullmatch(cluster_id):
+            fail(f"{name} has no valid Raft cluster ID")
+        result[name] = {
+            "cluster_id": cluster_id.lower(),
+            "member_count": members,
+            "quorum_size": quorum,
+        }
+    if set(result) != set(DATABASE_BY_NAME):
+        fail("central status is missing an expected database")
+    return result
+
+
+def require_socket(database: Database) -> None:
+    try:
+        metadata = database.socket_path.lstat()
+    except OSError as error:
+        fail(f"{database.name} socket is unavailable: {error}")
+    if not stat.S_ISSOCK(metadata.st_mode):
+        fail(f"{database.name} endpoint is not a real Unix socket")
+
+
+def live_schema(database: Database) -> tuple[str, str]:
+    require_socket(database)
+    listed = command(
+        [OVSDB_CLIENT, "--timeout=10", "list-dbs", database.remote], timeout=15
+    ).splitlines()
+    if database.name not in {line.strip() for line in listed if line.strip()}:
+        fail(f"{database.name} is not served by {database.socket_path}")
+    version = command(
+        [
+            OVSDB_CLIENT,
+            "--timeout=10",
+            "get-schema-version",
+            database.remote,
+            database.name,
+        ],
+        timeout=15,
+    )
+    checksum = command(
+        [
+            OVSDB_CLIENT,
+            "--timeout=10",
+            "get-schema-cksum",
+            database.remote,
+            database.name,
+        ],
+        timeout=15,
+    )
+    if len(version) > 256 or len(checksum) > 256 or "\n" in version or "\n" in checksum:
+        fail(f"{database.name} returned invalid schema metadata")
+    return version, checksum
+
+
+def backup_database(database: Database, destination: pathlib.Path) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+    except OSError as error:
+        fail(f"cannot create snapshot {destination.name}: {error}")
+    try:
+        with os.fdopen(descriptor, "wb", buffering=0, closefd=False) as output:
+            try:
+                result = subprocess.run(
+                    [
+                        OVSDB_CLIENT,
+                        "--timeout=120",
+                        "backup",
+                        database.remote,
+                        database.name,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=130,
+                    env=COMMAND_ENV,
+                )
+            except subprocess.TimeoutExpired:
+                fail(f"backup timed out for {database.name}")
+            except OSError as error:
+                fail(f"cannot execute {OVSDB_CLIENT}: {error}")
+            if result.returncode != 0:
+                detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+                fail(f"backup failed for {database.name}: {detail[-4096:] or result.returncode}")
+            os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    metadata = secure_file(destination, f"{database.name} snapshot", 0o600)
+    if metadata.st_size <= 0:
+        fail(f"{database.name} snapshot is empty")
+    digest, size = hash_file(destination)
+    return size, digest
+
+
+def hash_file(path: pathlib.Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open {path.name}: {error}")
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                size += len(block)
+                digest.update(block)
+    except OSError as error:
+        fail(f"cannot read {path.name}: {error}")
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest(), size
+
+
+def write_manifest(path: pathlib.Path, manifest: dict[str, Any]) -> None:
+    payload = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if len(payload) > MAX_MANIFEST:
+        fail("generated manifest is unexpectedly large")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        fail(f"cannot create backup manifest: {error}")
+    try:
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                fail("short write while creating backup manifest")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def parse_timestamp(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not TIMESTAMP.fullmatch(value):
+        fail(f"{label} is not a UTC second-resolution timestamp")
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        fail(f"{label} is not a valid timestamp")
+    return value
+
+
+def parse_short_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or len(value) > 256 or "\n" in value or "\r" in value:
+        fail(f"{label} is invalid")
+    return value
+
+
+def read_manifest(backup_set: pathlib.Path) -> dict[str, Any]:
+    path = backup_set / "manifest.json"
+    metadata = secure_file(path, "backup manifest", 0o600)
+    if metadata.st_size <= 0 or metadata.st_size > MAX_MANIFEST:
+        fail("backup manifest size is invalid")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open backup manifest: {error}")
+    try:
+        raw = b""
+        while len(raw) <= MAX_MANIFEST:
+            block = os.read(descriptor, 65536)
+            if not block:
+                break
+            raw += block
+        if len(raw) > MAX_MANIFEST:
+            fail("backup manifest is too large")
+    finally:
+        os.close(descriptor)
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"backup manifest is invalid JSON: {error}")
+    if not isinstance(manifest, dict):
+        fail("backup manifest root must be an object")
+    return manifest
+
+
+def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    top_keys = {"format", "consistency", "created_at", "source", "databases"}
+    if set(manifest) != top_keys:
+        fail("backup manifest has unknown or missing top-level fields")
+    if manifest.get("format") != FORMAT or manifest.get("consistency") != CONSISTENCY:
+        fail("backup manifest format or consistency model is unsupported")
+    parse_timestamp(manifest.get("created_at"), "manifest created_at")
+    source = manifest.get("source")
+    if not isinstance(source, dict) or set(source) != {"hostname"}:
+        fail("backup manifest source is invalid")
+    hostname = source.get("hostname")
+    if not isinstance(hostname, str) or not SAFE_HOSTNAME.fullmatch(hostname):
+        fail("backup manifest hostname is invalid")
+    entries = manifest.get("databases")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= len(DATABASES):
+        fail("backup manifest must contain one to three databases")
+    entry_keys = {
+        "key",
+        "database",
+        "file",
+        "capture_started_at",
+        "capture_completed_at",
+        "sha256",
+        "bytes",
+        "schema_version",
+        "schema_checksum",
+        "cluster_id",
+        "member_count",
+        "source_service_model",
+        "snapshot_service_model",
+    }
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != entry_keys:
+            fail("backup manifest database entry has unknown or missing fields")
+        key = entry.get("key")
+        if not isinstance(key, str) or key not in DATABASE_BY_KEY or key in seen:
+            fail("backup manifest has an unknown or duplicate database key")
+        seen.add(key)
+        database = DATABASE_BY_KEY[key]
+        if entry.get("database") != database.name or entry.get("file") != database.filename:
+            fail(f"backup manifest identity mismatch for {key}")
+        started = parse_timestamp(entry.get("capture_started_at"), f"{key} capture start")
+        completed = parse_timestamp(entry.get("capture_completed_at"), f"{key} capture end")
+        if completed < started:
+            fail(f"backup manifest capture interval is reversed for {key}")
+        digest = entry.get("sha256")
+        if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+            fail(f"backup manifest SHA-256 is invalid for {key}")
+        positive_integer(entry.get("bytes"), f"{key} bytes")
+        parse_short_string(entry.get("schema_version"), f"{key} schema version")
+        parse_short_string(entry.get("schema_checksum"), f"{key} schema checksum")
+        cluster_id = entry.get("cluster_id")
+        if not isinstance(cluster_id, str) or not UUID.fullmatch(cluster_id):
+            fail(f"backup manifest cluster ID is invalid for {key}")
+        members = positive_integer(entry.get("member_count"), f"{key} member_count")
+        if members % 2 != 1:
+            fail(f"backup manifest member count is not odd for {key}")
+        if entry.get("source_service_model") != "clustered":
+            fail(f"backup source service model is unsupported for {key}")
+        if entry.get("snapshot_service_model") != "standalone":
+            fail(f"backup snapshot service model is unsupported for {key}")
+    expected_order = [database.key for database in DATABASES if database.key in seen]
+    if [entry["key"] for entry in entries] != expected_order:
+        fail("backup manifest database entries are not in canonical order")
+    return entries
+
+
+def offline_database_metadata(path: pathlib.Path, database: Database) -> tuple[str, str]:
+    command([OVSDB_TOOL, "db-is-standalone", str(path)], timeout=30, quiet_stdout=True)
+    name = command([OVSDB_TOOL, "db-name", str(path)], timeout=30)
+    if name != database.name:
+        fail(f"snapshot {path.name} contains {name!r}, expected {database.name!r}")
+    version = command([OVSDB_TOOL, "db-version", str(path)], timeout=30)
+    checksum = command([OVSDB_TOOL, "db-cksum", str(path)], timeout=30)
+    command([OVSDB_TOOL, "show-log", str(path)], timeout=120, quiet_stdout=True)
+    return version, checksum
+
+
+def verify_snapshot(
+    backup_set: pathlib.Path, entry: dict[str, Any], temporary_root: pathlib.Path
+) -> None:
+    database = DATABASE_BY_KEY[entry["key"]]
+    path = backup_set / database.filename
+    metadata = secure_file(path, f"{database.name} snapshot", 0o600)
+    if metadata.st_size != entry["bytes"]:
+        fail(f"snapshot byte count mismatch for {database.name}")
+    digest, size = hash_file(path)
+    if size != entry["bytes"] or digest != entry["sha256"]:
+        fail(f"snapshot SHA-256 mismatch for {database.name}")
+    version, checksum = offline_database_metadata(path, database)
+    if version != entry["schema_version"] or checksum != entry["schema_checksum"]:
+        fail(f"snapshot schema metadata mismatch for {database.name}")
+    compact = temporary_root / database.filename
+    command([OVSDB_TOOL, "compact", str(path), str(compact)], timeout=120, quiet_stdout=True)
+    compact_version, compact_checksum = offline_database_metadata(compact, database)
+    if compact_version != version or compact_checksum != checksum:
+        fail(f"compacted verification copy changed schema metadata for {database.name}")
+
+
+def verify_backup_set(backup_set: pathlib.Path) -> dict[str, Any]:
+    metadata = inspect_directory_chain(backup_set, "backup set")
+    if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, 0, 0o700):
+        fail("backup set must be root:root mode 0700")
+    manifest = read_manifest(backup_set)
+    entries = validate_manifest(manifest)
+    expected_names = {"manifest.json", *(entry["file"] for entry in entries)}
+    try:
+        actual_names = {entry.name for entry in backup_set.iterdir()}
+    except OSError as error:
+        fail(f"cannot enumerate backup set: {error}")
+    if actual_names != expected_names:
+        fail("backup set contains unknown or missing files")
+    temporary_path: pathlib.Path | None = None
+    try:
+        temporary_path = pathlib.Path(
+            tempfile.mkdtemp(prefix=".pvn-db-verify-", dir=backup_set.parent)
+        )
+        os.chmod(temporary_path, 0o700)
+        for entry in entries:
+            verify_snapshot(backup_set, entry, temporary_path)
+    finally:
+        if temporary_path is not None and os.path.lexists(temporary_path):
+            shutil.rmtree(temporary_path)
+    return {
+        "backup_set": str(backup_set),
+        "consistency": CONSISTENCY,
+        "databases": [entry["database"] for entry in entries],
+        "verified": True,
+    }
+
+
+def safe_hostname() -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname()).strip("._-")
+    return (value or "unknown")[:63]
+
+
+def remove_partial(path: pathlib.Path, output_root: pathlib.Path) -> None:
+    if path.parent != output_root or not path.name.startswith(".pvn-db-backup-"):
+        fail("refusing to clean an unexpected partial backup path")
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        fail(f"cannot inspect partial backup during cleanup: {error}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0:
+        fail("refusing to clean an unsafe partial backup path")
+    shutil.rmtree(path)
+
+
+def select_databases(values: list[str] | None) -> tuple[Database, ...]:
+    if not values or values == ["all"]:
+        return DATABASES
+    if "all" in values:
+        fail("--database all cannot be combined with another database")
+    if len(values) != len(set(values)):
+        fail("--database cannot repeat a database")
+    selected = set(values)
+    return tuple(database for database in DATABASES if database.key in selected)
+
+
+def create_backup(output_root: pathlib.Path, selected: tuple[Database, ...]) -> dict[str, Any]:
+    require_central_marker()
+    command([SYSTEMCTL, "is-active", "--quiet", "pvn-central.target"], timeout=20)
+    before = central_status()
+    ensure_output_root(output_root)
+    stamp = utc_now().replace("-", "").replace(":", "")
+    base = f"pvn-db-backup-{stamp}-{safe_hostname()}-{secrets.token_hex(4)}"
+    partial = output_root / f".{base}.partial"
+    final = output_root / base
+    try:
+        os.mkdir(partial, 0o700)
+    except OSError as error:
+        fail(f"cannot create partial backup set: {error}")
+    committed = False
+    try:
+        entries: list[dict[str, Any]] = []
+        for database in selected:
+            started = utc_now()
+            version, checksum = live_schema(database)
+            size, digest = backup_database(database, partial / database.filename)
+            completed = utc_now()
+            health = before[database.name]
+            entries.append(
+                {
+                    "key": database.key,
+                    "database": database.name,
+                    "file": database.filename,
+                    "capture_started_at": started,
+                    "capture_completed_at": completed,
+                    "sha256": digest,
+                    "bytes": size,
+                    "schema_version": version,
+                    "schema_checksum": checksum,
+                    "cluster_id": health["cluster_id"],
+                    "member_count": health["member_count"],
+                    "source_service_model": "clustered",
+                    "snapshot_service_model": "standalone",
+                }
+            )
+        after = central_status()
+        for database in selected:
+            if after[database.name] != before[database.name]:
+                fail(f"{database.name} Raft identity or membership changed during backup")
+        manifest = {
+            "format": FORMAT,
+            "consistency": CONSISTENCY,
+            "created_at": utc_now(),
+            "source": {"hostname": safe_hostname()},
+            "databases": entries,
+        }
+        write_manifest(partial / "manifest.json", manifest)
+        fsync_directory(partial)
+        verify_backup_set(partial)
+        if os.path.lexists(final):
+            fail("generated backup set name unexpectedly already exists")
+        os.rename(partial, final)
+        fsync_directory(output_root)
+        committed = True
+        return {
+            "backup_set": str(final),
+            "consistency": CONSISTENCY,
+            "databases": [database.name for database in selected],
+            "verified": True,
+        }
+    finally:
+        if not committed and os.path.lexists(partial):
+            remove_partial(partial, output_root)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Create or verify independent PVN/OVN OVSDB backups.",
+    )
+    subcommands = result.add_subparsers(dest="action", required=True)
+    create = subcommands.add_parser("create", help="create an independently consistent backup set")
+    create.add_argument(
+        "--output",
+        type=pathlib.Path,
+        default=DEFAULT_OUTPUT,
+        help=f"secure backup root (default: {DEFAULT_OUTPUT})",
+    )
+    create.add_argument(
+        "--database",
+        action="append",
+        choices=["all", *(database.key for database in DATABASES)],
+        help="database to capture; repeat for multiple databases (default: all)",
+    )
+    verify = subcommands.add_parser("verify", help="verify a backup set offline")
+    verify.add_argument("backup_set", type=pathlib.Path)
+    return result
+
+
+def main() -> int:
+    os.umask(0o077)
+    arguments = parser().parse_args()
+    if os.geteuid() != 0:
+        fail("must run as root")
+    if arguments.action == "create":
+        selected = select_databases(arguments.database)
+        lock_descriptor = acquire_lock()
+        try:
+            report = create_backup(clean_absolute(arguments.output, "backup output root"), selected)
+        finally:
+            os.close(lock_descriptor)
+    else:
+        report = verify_backup_set(clean_absolute(arguments.backup_set, "backup set"))
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BackupError as error:
+        print(f"{PROGRAM}: {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -62,6 +62,7 @@ deb: package-check web-build ui-test
 	install -m 0644 packaging/debian/triggers "$$pvn_root/DEBIAN/triggers"; \
 	install -m 0755 bin/pvn-manager bin/pvn-agent bin/pvnctl "$$pvn_root/usr/sbin/"; \
 	install -m 0755 deploy/scripts/* "$$pvn_root/usr/lib/pvn/"; \
+	install -m 0755 deploy/scripts/pvn-db-backup "$$pvn_root/usr/sbin/pvn-db-backup"; \
 	install -m 0755 pve-ui/inject.sh "$$pvn_root/usr/lib/pvn/pvn-ui-inject"; \
 	install -m 0644 pve-ui/pvn-loader.js "$$pvn_root/usr/lib/pvn/"; \
 	install -d "$$pvn_root/usr/share/pvn" "$$pvn_root/usr/share/doc/pvn-node/examples" "$$pvn_root/usr/share/doc/pvn-node/inventory"; \

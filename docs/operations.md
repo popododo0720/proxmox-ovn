@@ -529,6 +529,10 @@ independently. Never restore only one database and assume cross-database state
 is transactional. Restore desired state first, then let reconciliation rebuild
 OVN state while attachments remain fail-closed.
 
+Use [`database-backup.md`](database-backup.md) for the packaged create/verify
+commands and the deliberately manual, one-database-at-a-time restore runbook.
+There is no automatic restore subcommand.
+
 If an activated node blocks `pve-guests` during boot, inspect
 `pvn-node-ready.service` and fix its reported local or control-plane failure.
 Then restart `pvn-node.target` and `pve-guests.service`. To deliberately return
