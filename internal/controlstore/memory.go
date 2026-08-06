@@ -769,6 +769,9 @@ func (s *Memory) Purge(ctx context.Context, kind model.Kind, id string, deletion
 	if meta.State != model.ResourceDeleting && meta.State != model.ResourceError {
 		return storeError(ErrConflict, "%s %q is not marked for deletion", kind, id)
 	}
+	if referrer := s.firstReferenceLocked(kind, id); referrer != "" {
+		return storeError(ErrConflict, "%s %q is still referenced by %s", kind, id, referrer)
+	}
 	for _, resource := range s.resources[model.KindOperation] {
 		operation := resource.(*model.Operation)
 		if operation.TargetKind == kind && operation.TargetID == id && operation.OperationStatus == model.OperationRunning {

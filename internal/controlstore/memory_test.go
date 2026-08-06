@@ -500,6 +500,25 @@ func TestMemoryDeleteTombstoneMustBePurged(t *testing.T) {
 	}
 }
 
+func TestMemoryPurgeRejectsReferenceCreatedAfterBeginDelete(t *testing.T) {
+	store := deterministicStore()
+	project := mustCreate(t, store, &model.Project{Name: "tenant-race", PoolID: "pool-race"}, "create-race").(*model.Project)
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := mustCreate(t, store, &model.SecurityGroup{ProjectID: project.ID, Name: "late-reference"}, "late-reference").(*model.SecurityGroup)
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Purge() error=%v want late-reference conflict", err)
+	}
+	if _, err := store.Delete(context.Background(), model.KindSecurityGroup, group.ID, group.Revision, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMemoryReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 	store := deterministicStore()
 	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool"}, "create-fenced-project").(*model.Project)

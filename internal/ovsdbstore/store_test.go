@@ -674,6 +674,25 @@ func TestStoreReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 	}
 }
 
+func TestStorePurgeRejectsReferenceCreatedAfterBeginDelete(t *testing.T) {
+	store := deterministicStore(newFakeDatabase())
+	project := mustCreate(t, store, &model.Project{Name: "tenant-race", PoolID: "pool-race"}, "create-race").(*model.Project)
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := mustCreate(t, store, &model.SecurityGroup{ProjectID: project.ID, Name: "late-reference"}, "late-reference").(*model.SecurityGroup)
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("Purge() error=%v want late-reference conflict", err)
+	}
+	if _, err := store.Delete(context.Background(), model.KindSecurityGroup, group.ID, group.Revision, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStoreRecoverExpiredOperationsIsBoundedAndIncludesSupersededTargets(t *testing.T) {
 	store := deterministicStore(newFakeDatabase())
 	base := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
