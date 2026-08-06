@@ -342,6 +342,29 @@ systemctl restart pvn-ovn-host-config ovn-controller \
   pvn-manager pvn-agent pvn-node-ready
 ```
 
+## Default security policy and legacy backfill
+
+Each project owns a reserved `default` security group. New ports that omit an
+explicit security-group selection receive it automatically. Its baseline
+allows IPv4 egress and ingress from other ports in the same default group;
+other IPv4 ingress is dropped. The group and its two managed rules are visible
+by name in the Proxmox PVN page, but cannot be edited or deleted independently.
+
+Ports created by older PVN releases with no security-group assignment remain
+unrestricted until an administrator migrates them. Open **Datacenter → PVN →
+Ports → Legacy security policy backfill**, refresh the plan, and run the dry
+run. The page lists projects, ports, nodes, and attached VM NICs by human name.
+Applying requires typing the exact PVE cluster name and changes policy for
+attached traffic immediately. Review any required external ingress rules
+before applying.
+
+The operation is revision-fenced and rerunnable. It repairs the reserved
+baseline first, migrates only ports whose security-group list is still empty,
+and reports concurrent or blocked ports separately for a later retry. Planning
+requires global `SDN.Audit`; applying requires global `SDN.Allocate` and
+`Sys.Modify`. The normal Proxmox session and PVN CSRF protection apply, with no
+second login.
+
 ## Upgrades
 
 Run the hosted rolling updater on any online PVE node. With no arguments it

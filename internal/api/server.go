@@ -185,6 +185,14 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.health(writer, request)
 		return
 	}
+	if request.URL.Path == defaultSecurityGroupBackfillPlanPath {
+		s.defaultSecurityGroupBackfillPlan(writer, request)
+		return
+	}
+	if request.URL.Path == defaultSecurityGroupBackfillApplyPath {
+		s.defaultSecurityGroupBackfillApply(writer, request)
+		return
+	}
 	if request.URL.Path == "/api/v1/runtime/ports/resolve" {
 		s.resolvePort(writer, request)
 		return

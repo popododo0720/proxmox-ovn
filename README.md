@@ -18,7 +18,7 @@ even-sized clusters are rejected before topology changes.
 - OVN native DHCP
 - logical routers, centralized SNAT, and floating IPs
 - flat and VLAN provider networks
-- stateful security groups
+- stateful security groups with a reserved Neutron-style project default
 - running VM NIC attach and detach
 - embedded `PVN` page in the Proxmox web interface
 

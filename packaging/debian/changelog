@@ -5,6 +5,8 @@ proxmox-ovn (0.2.13) unstable; urgency=medium
   * Validate project mappings against real Proxmox pools.
   * Guide first-use browser trust for the embedded PVN manager certificate.
   * Add independently verified PVN Control and OVN database backups.
+  * Apply a reserved Neutron-style default policy to new project ports.
+  * Add a revision-safe UI backfill for legacy unrestricted ports.
 
  -- PVN Project <root@localhost>  Thu, 06 Aug 2026 01:34:37 +0000
 
