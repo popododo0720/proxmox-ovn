@@ -4,6 +4,7 @@
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import hashlib
+import json
 import re
 import types
 
@@ -13,6 +14,40 @@ MODULE_PATH = REPO / "deploy" / "scripts" / "pvn-topology"
 loader = SourceFileLoader("pvn_topology_test_module", str(MODULE_PATH))
 module = types.ModuleType(loader.name)
 loader.exec_module(module)
+
+
+def production_remote_namespace():
+    """Execute the shipped helper body without invoking its stdin dispatcher."""
+    marker = "\ntry:\n    main()\nexcept RemoteFailure as exc:"
+    assert module.REMOTE_HELPER.count(marker) == 1
+    source = module.REMOTE_HELPER.split(marker, 1)[0]
+    namespace = {"__name__": "pvn_topology_remote_helper_contract_test"}
+    exec(compile(source, "<pvn-topology-remote-helper>", "exec"), namespace)
+    return namespace
+
+
+remote = production_remote_namespace()
+remote_members = {
+    "nodename": "prox2",
+    "version": 71,
+    "cluster": {"name": "lab-cluster", "version": 3, "nodes": 3, "quorate": 1},
+    "nodelist": {
+        "prox2": {"id": 1, "online": 1, "ip": "192.168.0.126"},
+        "prox1": {"id": 2, "online": 1, "ip": "192.168.0.80"},
+        "prox3": {"id": 3, "online": 1, "ip": "192.168.0.78"},
+    },
+}
+remote["read_regular"] = lambda _path, _limit=None: json.dumps(remote_members)
+remote["verify_membership_snapshot"]({
+    "mode": "cluster",
+    "cluster_name": "lab-cluster",
+    "cluster_version": 3,
+    "nodes": [
+        {"name": "prox2", "node_id": 1, "management_ip": "192.168.0.126"},
+        {"name": "prox1", "node_id": 2, "management_ip": "192.168.0.80"},
+        {"name": "prox3", "node_id": 3, "management_ip": "192.168.0.78"},
+    ],
+})
 
 
 def expect_failure(call, message):

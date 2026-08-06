@@ -163,6 +163,7 @@ members_path = Path(os.environ["PVN_TOPOLOGY_MEMBERS_FILE"])
 members = json.loads(members_path.read_text(encoding="utf-8"))
 members["version"] = node_members_version
 actual_membership = {
+    "mode": "cluster",
     "cluster_name": members["cluster"]["name"],
     "cluster_version": members["cluster"]["version"],
     "nodes": sorted((

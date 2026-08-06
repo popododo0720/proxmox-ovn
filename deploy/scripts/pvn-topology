@@ -154,6 +154,7 @@ def discover_members() -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
         fail("not every declared PVE member is online")
     nodes.sort(key=lambda item: (item["id"], item["name"]))
     membership_snapshot = {
+        "mode": "cluster",
         "cluster_name": cluster_name,
         "cluster_version": cluster_version,
         "nodes": [
@@ -576,6 +577,7 @@ def verify_membership_snapshot(expected):
         nodes.append({"name": name, "node_id": node_id, "management_ip": str(address)})
     nodes.sort(key=lambda item: (item["node_id"], item["name"]))
     actual = {
+        "mode": "cluster",
         "cluster_name": cluster.get("name"),
         "cluster_version": cluster_version,
         "nodes": nodes,
