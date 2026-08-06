@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import secrets
 import shlex
 import stat
@@ -40,6 +41,7 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 PROVIDER_ACK = "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP"
 REMOTE_REQUEST_LIMIT = 8 * 1024 * 1024
+PROCESS_OUTPUT_LIMIT = 4 * 1024 * 1024
 TEST_FAST = os.environ.get("PVN_TOPOLOGY_TEST_FAST") == "1"
 COROSYNC_SETTLE_ATTEMPTS = 1 if TEST_FAST else 5
 COROSYNC_FINAL_ATTEMPTS = 1 if TEST_FAST else 30
@@ -77,19 +79,155 @@ def digest_text(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def read_limited(path: Path, limit: int) -> str:
+def read_limited(path: Path, limit: int, root_only: bool = True) -> str:
     try:
-        info = path.lstat()
+        before = path.lstat()
     except OSError as exc:
         fail(f"cannot inspect {path}: {exc}")
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         fail(f"{path} must be a regular, non-symlink file")
-    if info.st_size > limit:
+    if before.st_nlink != 1:
+        fail(f"{path} must have exactly one hard link")
+    if root_only and (before.st_uid != 0 or before.st_mode & 0o022):
+        fail(f"{path} has unsafe ownership or mode")
+    if before.st_size > limit:
         fail(f"{path} is unexpectedly large")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        return path.read_text(encoding="utf-8")
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open {path}: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        if (
+            (opened.st_dev, opened.st_ino) != identity
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (root_only and (opened.st_uid != 0 or opened.st_mode & 0o022))
+        ):
+            fail(f"{path} changed identity or safety metadata while opening")
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > limit:
+                fail(f"{path} is unexpectedly large")
+        after = path.lstat()
+        if (
+            (after.st_dev, after.st_ino) != identity
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or (root_only and (after.st_uid != 0 or after.st_mode & 0o022))
+        ):
+            fail(f"{path} changed identity while being read")
+        return b"".join(chunks).decode("utf-8")
     except (OSError, UnicodeError) as exc:
         fail(f"cannot read {path}: {exc}")
+    finally:
+        os.close(descriptor)
+
+
+def run_bounded_process(
+    argv: list[str], input_text: str, timeout: int,
+    output_limit: int = PROCESS_OUTPUT_LIMIT,
+) -> subprocess.CompletedProcess[str]:
+    payload = input_text.encode("utf-8")
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        fail(f"command could not start: {argv[0]}: {exc}")
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector = selectors.DefaultSelector()
+    streams = {
+        process.stdin.fileno(): ("stdin", process.stdin),
+        process.stdout.fileno(): ("stdout", process.stdout),
+        process.stderr.fileno(): ("stderr", process.stderr),
+    }
+    for descriptor, (kind, stream) in streams.items():
+        os.set_blocking(descriptor, False)
+        selector.register(
+            descriptor,
+            selectors.EVENT_WRITE if kind == "stdin" else selectors.EVENT_READ,
+            (kind, stream),
+        )
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    written = 0
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail(f"command timed out after {timeout}s: {argv[0]}")
+            for key, _events in selector.select(min(remaining, 0.25)):
+                kind, stream = key.data
+                descriptor = key.fd
+                if kind == "stdin":
+                    try:
+                        count = os.write(descriptor, payload[written:written + 65536])
+                    except BrokenPipeError:
+                        count = 0
+                        written = len(payload)
+                    except BlockingIOError:
+                        continue
+                    written += count
+                    if written >= len(payload):
+                        selector.unregister(descriptor)
+                        stream.close()
+                    continue
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(descriptor)
+                    stream.close()
+                    continue
+                buffers[kind].extend(chunk)
+                if len(buffers["stdout"]) + len(buffers["stderr"]) > output_limit:
+                    fail(
+                        f"command output exceeds {output_limit} bytes: {argv[0]}"
+                    )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail(f"command timed out after {timeout}s: {argv[0]}")
+        returncode = process.wait(timeout=remaining)
+        try:
+            stdout = buffers["stdout"].decode("utf-8")
+            stderr = buffers["stderr"].decode("utf-8")
+        except UnicodeError as exc:
+            fail(f"command returned invalid UTF-8: {argv[0]}: {exc}")
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"command failed: {argv[0]}: {exc}")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for key in list(selector.get_map().values()):
+            try:
+                selector.unregister(key.fd)
+            except Exception:
+                pass
+            try:
+                key.data[1].close()
+            except Exception:
+                pass
+        selector.close()
 
 
 def parse_cidr(value: str, option: str) -> ipaddress.IPv4Network:
@@ -226,6 +364,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import stat
 import subprocess
 import sys
@@ -251,6 +390,7 @@ ACTIVATION_UNITS = (
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 REMOTE_REQUEST_LIMIT = 8 * 1024 * 1024
+PROCESS_OUTPUT_LIMIT = 4 * 1024 * 1024
 
 
 class RemoteFailure(RuntimeError):
@@ -266,14 +406,93 @@ def emit(**values):
     print(json.dumps(values, sort_keys=True, separators=(",", ":")))
 
 
-def run(argv, timeout=30, check=True, input_text=None):
+def run_bounded_process(argv, input_text, timeout, output_limit=PROCESS_OUTPUT_LIMIT):
+    payload = input_text.encode("utf-8")
     try:
-        result = subprocess.run(
-            argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            input=input_text, timeout=timeout, check=False,
+        process = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+    except OSError as exc:
+        abort("command could not start: %s: %s" % (argv[0], exc))
+    selector = selectors.DefaultSelector()
+    streams = {
+        process.stdin.fileno(): ("stdin", process.stdin),
+        process.stdout.fileno(): ("stdout", process.stdout),
+        process.stderr.fileno(): ("stderr", process.stderr),
+    }
+    for descriptor, (kind, stream) in streams.items():
+        os.set_blocking(descriptor, False)
+        selector.register(
+            descriptor,
+            selectors.EVENT_WRITE if kind == "stdin" else selectors.EVENT_READ,
+            (kind, stream),
+        )
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    written = 0
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                abort("command timed out after %ss: %s" % (timeout, argv[0]))
+            for key, _events in selector.select(min(remaining, 0.25)):
+                kind, stream = key.data
+                descriptor = key.fd
+                if kind == "stdin":
+                    try:
+                        count = os.write(descriptor, payload[written:written + 65536])
+                    except BrokenPipeError:
+                        count = 0
+                        written = len(payload)
+                    except BlockingIOError:
+                        continue
+                    written += count
+                    if written >= len(payload):
+                        selector.unregister(descriptor)
+                        stream.close()
+                    continue
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(descriptor)
+                    stream.close()
+                    continue
+                buffers[kind].extend(chunk)
+                if len(buffers["stdout"]) + len(buffers["stderr"]) > output_limit:
+                    abort("command output exceeds %d bytes: %s" % (output_limit, argv[0]))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            abort("command timed out after %ss: %s" % (timeout, argv[0]))
+        returncode = process.wait(timeout=remaining)
+        try:
+            stdout = buffers["stdout"].decode("utf-8")
+            stderr = buffers["stderr"].decode("utf-8")
+        except UnicodeError as exc:
+            abort("command returned invalid UTF-8: %s: %s" % (argv[0], exc))
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
     except (OSError, subprocess.TimeoutExpired) as exc:
         abort("command failed: %s: %s" % (argv[0], exc))
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for key in list(selector.get_map().values()):
+            try:
+                selector.unregister(key.fd)
+            except Exception:
+                pass
+            try:
+                key.data[1].close()
+            except Exception:
+                pass
+        selector.close()
+
+
+def run(argv, timeout=30, check=True, input_text=None):
+    result = run_bounded_process(argv, input_text or "", timeout)
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
         abort("command failed: %s: %s" % (argv[0], detail[:500]))
@@ -542,19 +761,58 @@ def pve_cas(action, request, timeout=30):
 
 def read_regular(path, limit=4 * 1024 * 1024, root_only=True):
     try:
-        info = path.lstat()
+        before = path.lstat()
     except OSError as exc:
         abort("cannot inspect %s: %s" % (path, exc))
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         abort("%s is not a regular non-symlink file" % path)
-    if root_only and (info.st_uid != 0 or info.st_mode & 0o022):
+    if before.st_nlink != 1:
+        abort("%s must have exactly one hard link" % path)
+    if root_only and (before.st_uid != 0 or before.st_mode & 0o022):
         abort("%s has unsafe ownership or mode" % path)
-    if info.st_size > limit:
+    if before.st_size > limit:
         abort("%s is unexpectedly large" % path)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        return path.read_text(encoding="utf-8")
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        abort("cannot open %s: %s" % (path, exc))
+    try:
+        opened = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        if (
+            (opened.st_dev, opened.st_ino) != identity
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (root_only and (opened.st_uid != 0 or opened.st_mode & 0o022))
+        ):
+            abort("%s changed identity or safety metadata while opening" % path)
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > limit:
+                abort("%s is unexpectedly large" % path)
+        after = path.lstat()
+        if (
+            (after.st_dev, after.st_ino) != identity
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or (root_only and (after.st_uid != 0 or after.st_mode & 0o022))
+        ):
+            abort("%s changed identity while being read" % path)
+        return b"".join(chunks).decode("utf-8")
     except (OSError, UnicodeError) as exc:
         abort("cannot read %s: %s" % (path, exc))
+    finally:
+        os.close(descriptor)
 
 
 def verify_membership_snapshot(expected):
@@ -2023,13 +2281,7 @@ def ssh_request(node: dict[str, Any], action: str, request: dict[str, Any], time
         "-o", "ConnectionAttempts=1",
         "--", f"root@{node['ip']}", remote_command,
     ]
-    try:
-        result = subprocess.run(
-            argv, input=payload, text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=timeout, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        fail(f"{node['name']} {action} could not run: {exc}")
+    result = run_bounded_process(argv, payload, timeout)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
         fail(f"{node['name']} {action} failed: {detail[:800]}")

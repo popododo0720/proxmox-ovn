@@ -5,7 +5,9 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
+import tempfile
 import types
 
 
@@ -14,6 +16,60 @@ MODULE_PATH = REPO / "deploy" / "scripts" / "pvn-topology"
 loader = SourceFileLoader("pvn_topology_test_module", str(MODULE_PATH))
 module = types.ModuleType(loader.name)
 loader.exec_module(module)
+
+
+module.run_bounded_process(
+    ["python3", "-c", "print('bounded-ok')"], "", 5, 1024
+)
+try:
+    module.run_bounded_process(
+        ["python3", "-c", "import os; os.write(1, b'x' * 2048)"],
+        "", 5, 1024,
+    )
+except module.TopologyError:
+    pass
+else:
+    raise AssertionError("coordinator accepted oversized child output")
+try:
+    module.run_bounded_process(
+        ["python3", "-c", "import time; time.sleep(2)"], "", 1, 1024
+    )
+except module.TopologyError:
+    pass
+else:
+    raise AssertionError("coordinator accepted a timed-out child")
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    safe = root / "safe"
+    safe.write_text("safe", encoding="utf-8")
+    safe.chmod(0o600)
+    assert module.read_limited(safe, 4) == "safe"
+    oversized = root / "oversized"
+    oversized.write_text("12345", encoding="utf-8")
+    oversized.chmod(0o600)
+    try:
+        module.read_limited(oversized, 4)
+    except module.TopologyError:
+        pass
+    else:
+        raise AssertionError("coordinator accepted a file grown over its bound")
+    symlink = root / "symlink"
+    symlink.symlink_to(safe)
+    try:
+        module.read_limited(symlink, 4)
+    except module.TopologyError:
+        pass
+    else:
+        raise AssertionError("coordinator followed a protected-file symlink")
+    hardlink = root / "hardlink"
+    os.link(safe, hardlink)
+    try:
+        module.read_limited(safe, 4)
+    except module.TopologyError:
+        pass
+    else:
+        raise AssertionError("coordinator accepted a multiply-linked protected file")
 
 
 def production_remote_namespace():
@@ -27,6 +83,40 @@ def production_remote_namespace():
 
 
 remote = production_remote_namespace()
+remote["run_bounded_process"](
+    ["python3", "-c", "print('remote-bounded-ok')"], "", 5, 1024
+)
+try:
+    remote["run_bounded_process"](
+        ["python3", "-c", "import os; os.write(2, b'x' * 2048)"],
+        "", 5, 1024,
+    )
+except remote["RemoteFailure"]:
+    pass
+else:
+    raise AssertionError("production remote helper accepted oversized output")
+with tempfile.TemporaryDirectory() as directory:
+    remote_safe = Path(directory) / "safe"
+    remote_safe.write_text("safe", encoding="utf-8")
+    remote_safe.chmod(0o600)
+    assert remote["read_regular"](remote_safe, 4) == "safe"
+    remote_oversized = Path(directory) / "oversized"
+    remote_oversized.write_text("12345", encoding="utf-8")
+    remote_oversized.chmod(0o600)
+    try:
+        remote["read_regular"](remote_oversized, 4)
+    except remote["RemoteFailure"]:
+        pass
+    else:
+        raise AssertionError("production remote helper accepted file growth")
+    remote_symlink = Path(directory) / "symlink"
+    remote_symlink.symlink_to(remote_safe)
+    try:
+        remote["read_regular"](remote_symlink, 4)
+    except remote["RemoteFailure"]:
+        pass
+    else:
+        raise AssertionError("production remote helper followed a symlink")
 remote_members = {
     "nodename": "prox2",
     "version": 71,
