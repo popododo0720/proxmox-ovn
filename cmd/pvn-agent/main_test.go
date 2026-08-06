@@ -83,6 +83,23 @@ func TestHeartbeatWithMembershipRequiresMatchingReporter(t *testing.T) {
 	}
 }
 
+func TestHeartbeatWithStandaloneMembership(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".members")
+	if err := os.WriteFile(path, []byte(`{"nodename":"pve-solo","version":7}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, err := heartbeatWithMembership(agent.NodeHeartbeat{Name: "pve-solo", ChassisID: "chassis-solo"}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if heartbeat.Quorate == nil || !*heartbeat.Quorate || fmt.Sprint(heartbeat.OnlineNodes) != "[pve-solo]" {
+		t.Fatalf("standalone heartbeat=%#v", heartbeat)
+	}
+	if _, err := heartbeatWithMembership(agent.NodeHeartbeat{Name: "other", ChassisID: "chassis-other"}, path); err == nil {
+		t.Fatal("mismatched standalone reporter unexpectedly accepted")
+	}
+}
+
 func TestHealthHandlerReflectsWatcherReadiness(t *testing.T) {
 	t.Parallel()
 
