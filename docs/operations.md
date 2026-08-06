@@ -323,6 +323,13 @@ when it is missing, malformed, duplicated, symlinked, or unsafely writable.
 The doctor also compares that effective address and `geneve` type with OVS
 `ovn-encap-ip`/`ovn-encap-type`, then verifies the address is present on a local
 interface whose MTU can carry the configured guest MTU plus encapsulation.
+On a clustered node it also compares `/etc/pve/corosync.conf` with one live
+`corosync-cmapctl` snapshot: `config_version`, the exact name/node-ID/ring
+mapping, every joined member's version and link addresses, and the local bind
+address must agree. A config written to pmxcfs but not loaded by the Corosync
+runtime therefore makes the doctor, node-readiness gate, and rolling-update
+health check fail before the node is treated as safe to reboot. A standalone
+node with no `corosync.conf` skips only this cluster-specific check.
 
 At boot, `pvn-guest-gate.service` leaves normal PVE behavior unchanged when
 the local marker is absent. When the marker exists, a failed readiness check

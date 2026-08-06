@@ -51,6 +51,7 @@ func Run(ctx context.Context, cfg config.Config, runner Runner) []Check {
 		}
 		return nil
 	}, "--verbose"))
+	checks = append(checks, corosyncRuntimeCheck(ctx, runner, defaultCorosyncConfigPath))
 
 	checks = append(checks, commandCheck(ctx, runner, "integration-bridge", "ovs-vsctl", nil, "br-exists", cfg.Agent.Bridge))
 	checks = append(checks, commandCheck(ctx, runner, "provider-bridge", "ovs-vsctl", nil, "br-exists", cfg.Networking.ProviderBridge))
