@@ -2640,6 +2640,79 @@ with tempfile.TemporaryDirectory() as temporary:
     assert backend.complete_proofs == 2
     assert store.load()["snapshot"]["topology_sha256"] == schema2_topology_digest
 
+# If the atomic write commits but its success response is lost, the durable
+# schema 2 snapshot wins. A rerun sees no repin and completes without writing a
+# duplicate transition or rolling the snapshot back.
+with tempfile.TemporaryDirectory() as temporary:
+    pinned_schema, live_schema = schema_projection_pair()
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(live_schema)
+    enter_complete_update(backend)
+    store.create(complete_ledger(pinned_schema, backend.cids))
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    original_update = store.update
+    response_losses = []
+
+    def commit_schema_then_lose_response(value):
+        if not response_losses and value["snapshot"] != store.load()["snapshot"]:
+            original_update(value)
+            response_losses.append(True)
+            raise ControlPlaneError("injected committed schema repin response loss")
+        original_update(value)
+
+    store.update = commit_schema_then_lose_response
+    expect_error(
+        lambda: control.apply(live_schema.confirmation),
+        "committed schema repin response loss",
+    )
+    committed = copy.deepcopy(store.load())
+    committed_bytes = store.ledger_path.read_bytes()
+    assert committed["snapshot"]["topology_sha256"] == schema2_topology_digest
+    assert backend.complete_proofs == 1
+
+    store.update = original_update
+    result = control.apply(live_schema.confirmation)
+    assert result["complete"] is True and response_losses == [True]
+    assert backend.complete_proofs == 1
+    assert store.load() == committed
+    assert store.ledger_path.read_bytes() == committed_bytes
+    assert ControlPlane._verify_ledger(live_schema, store.load()) == LedgerRepin()
+    assert not any(entry.startswith(("init:", "central:", "node:"))
+                   for entry in backend.log)
+
+# A writer that changes the control ledger after the fresh live proof is
+# detected by the final equality read. The external value remains byte-for-byte
+# authoritative; the schema projection is not allowed to overwrite it.
+with tempfile.TemporaryDirectory() as temporary:
+    pinned_schema, live_schema = schema_projection_pair()
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    backend = FakeBackend(live_schema)
+    enter_complete_update(backend)
+    store.create(complete_ledger(pinned_schema, backend.cids))
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    original_proof = backend.assert_complete_package_repin_safe
+    external_ledgers = []
+    external_bytes = []
+
+    def inject_external_ledger_change(found, ledger):
+        reports = original_proof(found, ledger)
+        changed = copy.deepcopy(store.load())
+        changed["cluster_uuid"] = str(uuid.uuid4())
+        store.update(changed)
+        external_ledgers.append(changed)
+        external_bytes.append(store.ledger_path.read_bytes())
+        return reports
+
+    backend.assert_complete_package_repin_safe = inject_external_ledger_change
+    expect_error(
+        lambda: control.apply(live_schema.confirmation),
+        "ledger changed before snapshot repin",
+    )
+    assert backend.complete_proofs == 1 and len(external_ledgers) == 1
+    assert store.load() == external_ledgers[0]
+    assert store.ledger_path.read_bytes() == external_bytes[0]
+    assert store.load()["snapshot"]["topology_sha256"] == legacy_topology_digest
+
 durable_snapshot = pinned.snapshot()
 epoch_only = copy.deepcopy(durable_snapshot)
 epoch_only["members_version"] += 100
