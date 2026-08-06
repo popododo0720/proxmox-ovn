@@ -64,10 +64,10 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 
 ### Current product work
 
-- [ ] Show human names in tables/selectors and keep full UUIDs in Details only
+- [x] Show human names in tables/selectors and keep full UUIDs in Details only
 - [x] Validate that a Project mapping names an existing PVE pool
 - [x] Guide first-use browser trust for the same-node `:8443` manager certificate
-- [ ] Keep the stateful-only security-group UI honest (no ineffective toggle)
+- [x] Keep the stateful-only security-group UI honest (no ineffective toggle)
 
 ---
 
