@@ -15,7 +15,7 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    container: debian:13
+    container: debian:13@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
     steps:
       - name: Install Debian 13 prerequisites
         run: >-
@@ -23,21 +23,21 @@ jobs:
           apt-get install -y --no-install-recommends
           ca-certificates file gcc gh git libc6-dev make python3 systemd
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Trust checked-out workspace
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.24.13'
           cache: true
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '24.x'
+          node-version: '24.18.0'
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -46,35 +46,6 @@ jobs:
         run: |
           set -euo pipefail
           release_version=${GITHUB_REF_NAME#v}
-          if [[ ! $release_version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+~-][A-Za-z0-9.+~-]+)?$ ]]; then
-            echo "unsupported release tag: $GITHUB_REF_NAME" >&2
-            exit 1
-          fi
-          grep -Fx "DEFAULT_VERSION=$release_version" deploy/scripts/pvn-install.sh
-          grep -Fx "DEFAULT_VERSION=$release_version" deploy/scripts/pvn-update.sh
-          grep -Fx "DEB_VERSION ?= $release_version" Makefile
-          head -n 1 packaging/debian/changelog | \
-            grep -Fx "proxmox-ovn ($release_version) unstable; urgency=medium"
-          grep -Fx "RELEASE_VERSION=$release_version" deploy/tests/pvn-install-test.sh
-          grep -Fx "RELEASE_VERSION=$release_version" deploy/tests/pvn-update-test.sh
-          node --input-type=commonjs - "$release_version" <<'NODE'
-          const fs = require("node:fs");
-
-          const expected = process.argv[2];
-          const packageJson = JSON.parse(fs.readFileSync("web/package.json", "utf8"));
-          const packageLock = JSON.parse(fs.readFileSync("web/package-lock.json", "utf8"));
-          const versions = [
-            ["web/package.json version", packageJson.version],
-            ["web/package-lock.json root version", packageLock.version],
-            ["web/package-lock.json package root version", packageLock.packages?.[""]?.version],
-          ];
-          for (const [location, actual] of versions) {
-            if (actual !== expected) {
-              console.error(`${location} is ${JSON.stringify(actual)}, expected ${expected}`);
-              process.exit(1);
-            }
-          }
-          NODE
           release_commit=$(git rev-parse --verify "${GITHUB_REF_NAME}^{commit}")
           if [[ $(git rev-parse HEAD) != "$release_commit" ]]; then
             printf 'checked-out commit does not match release tag: %s\n' \
@@ -94,9 +65,62 @@ jobs:
             "$(date -u -d "@$source_date_epoch" +%Y-%m-%dT%H:%M:%SZ)" \
             >> "$GITHUB_ENV"
           printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+          COMMIT=${release_commit:0:12} \
+            BUILD_DATE=$(date -u -d "@$source_date_epoch" +%Y-%m-%dT%H:%M:%SZ) \
+            SOURCE_DATE_EPOCH=$source_date_epoch \
+            make release-source-check DEB_VERSION="$release_version"
+
+      - name: Claim canonical release draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          remote_commit=$(gh api \
+            "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq '.sha')
+          if [[ $remote_commit != "$PVN_RELEASE_COMMIT_SHA" ]]; then
+            printf 'remote release tag moved from build commit: %s != %s\n' \
+              "$remote_commit" "$PVN_RELEASE_COMMIT_SHA" >&2
+            exit 1
+          fi
+          if ! gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes \
+              --title "PVN $GITHUB_REF_NAME"
+          fi
+          release_state=$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '[.author.login, .draft, .prerelease, .tag_name] | @tsv')
+          IFS=$'\t' read -r release_author release_is_draft \
+            release_is_prerelease release_tag_name <<< "$release_state"
+          if [[ $release_author != 'github-actions[bot]' ]]; then
+            printf 'release was not created by the canonical publisher: %s\n' \
+              "$release_author" >&2
+            exit 1
+          fi
+          if [[ $release_is_draft != true && $release_is_draft != false ]]; then
+            printf 'existing release has invalid draft state: %s\n' \
+              "$release_is_draft" >&2
+            exit 1
+          fi
+          if [[ $release_is_prerelease != false || \
+              $release_tag_name != "$GITHUB_REF_NAME" ]]; then
+            printf 'existing release has invalid tag or prerelease state\n' >&2
+            exit 1
+          fi
+          unexpected_uploaders=$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.assets[] | select(.uploader.login != "github-actions[bot]") | .name')
+          if [[ -n $unexpected_uploaders ]]; then
+            printf 'release contains assets from a noncanonical publisher:\n%s\n' \
+              "$unexpected_uploaders" >&2
+            exit 1
+          fi
 
       - name: Run release source gates
-        run: make fmt-check vet test test-race web-test ui-test package-check
+        run: make fmt-check vet test test-race web-test ui-test package-check release-check-test
 
       - name: Build and verify release
         run: >-
@@ -203,35 +227,52 @@ jobs:
               exit 1
             fi
           }
+          verify_release_provenance() {
+            local release_author unexpected_uploaders
+            release_author=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq '.author.login')
+            if [[ $release_author != 'github-actions[bot]' ]]; then
+              printf 'release was not created by the canonical publisher: %s\n' \
+                "$release_author" >&2
+              exit 1
+            fi
+            unexpected_uploaders=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq '.assets[] | select(.uploader.login != "github-actions[bot]") | .name')
+            if [[ -n $unexpected_uploaders ]]; then
+              printf 'release contains assets from a noncanonical publisher:\n%s\n' \
+                "$unexpected_uploaders" >&2
+              exit 1
+            fi
+          }
 
           verify_remote_tag
-          if release_state=$(gh release view "$GITHUB_REF_NAME" \
+          if ! release_state=$(gh release view "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --json isDraft,isPrerelease,tagName \
               --jq '[.isDraft, .isPrerelease, .tagName] | @tsv' \
               2>/dev/null); then
-            IFS=$'\t' read -r release_is_draft release_is_prerelease \
-              release_tag_name <<< "$release_state"
-            if [[ $release_is_draft != true && $release_is_draft != false ]]; then
-              printf 'existing release has invalid draft state: %s\n' \
-                "$release_is_draft" >&2
-              exit 1
-            fi
-            if [[ $release_is_prerelease != false ]]; then
-              printf 'existing release unexpectedly is a prerelease\n' >&2
-              exit 1
-            fi
-            if [[ $release_tag_name != "$GITHUB_REF_NAME" ]]; then
-              printf 'existing release has wrong tag: %s\n' \
-                "$release_tag_name" >&2
-              exit 1
-            fi
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes \
-              --title "PVN $GITHUB_REF_NAME"
-            release_is_draft=true
+            printf 'canonical release draft is missing after the claim step\n' >&2
+            exit 1
           fi
+          IFS=$'\t' read -r release_is_draft release_is_prerelease \
+            release_tag_name <<< "$release_state"
+          if [[ $release_is_draft != true && $release_is_draft != false ]]; then
+            printf 'existing release has invalid draft state: %s\n' \
+              "$release_is_draft" >&2
+            exit 1
+          fi
+          if [[ $release_is_prerelease != false ]]; then
+            printf 'existing release unexpectedly is a prerelease\n' >&2
+            exit 1
+          fi
+          if [[ $release_tag_name != "$GITHUB_REF_NAME" ]]; then
+            printf 'existing release has wrong tag: %s\n' \
+              "$release_tag_name" >&2
+            exit 1
+          fi
+          verify_release_provenance
 
           existing_output=$(gh release view "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" --json assets \
@@ -337,6 +378,7 @@ jobs:
               exit 1
             fi
           done
+          verify_release_provenance
 
           if [[ $release_is_draft == true ]]; then
             verify_remote_tag

@@ -2,15 +2,21 @@ SHELL := /bin/bash
 
 VERSION ?= dev
 DEB_VERSION ?= 0.2.17
-COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf unknown)
-BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD 2>/dev/null || date +%s)
+COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
+BUILD_DATE ?= $(shell date -u -d '@$(SOURCE_DATE_EPOCH)' +%Y-%m-%dT%H:%M:%SZ)
+override RELEASE_GO_VERSION := go1.24.13
+override RELEASE_NODE_VERSION := v24.18.0
+override RELEASE_NPM_VERSION := 11.16.0
+override RELEASE_DPKG_VERSION := 1.22.22
+export SOURCE_DATE_EPOCH COMMIT BUILD_DATE
 LDFLAGS := -s -w \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Version=$(VERSION) \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Commit=$(COMMIT) \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Date=$(BUILD_DATE)
 GO_BUILD_FLAGS := -trimpath -buildvcs=false
 
-.PHONY: all build web-build test test-race web-test ui-test vet fmt-check package-check deb release clean
+.PHONY: all build web-build test test-race web-test ui-test vet fmt-check package-check deb release-check-test release-source-check release-env-check release clean
 
 all: test build
 
@@ -47,6 +53,34 @@ fmt-check:
 package-check: build
 	packaging/tests/package-check.sh
 
+release-check-test:
+	tools/release-check-test.sh
+
+release-source-check:
+	tools/release-check "$(DEB_VERSION)"
+
+release-env-check: release-source-check
+	@test "$$(go env GOVERSION)" = "$(RELEASE_GO_VERSION)" || { \
+		printf 'release requires Go %s (found %s)\n' \
+			'$(RELEASE_GO_VERSION)' "$$(go env GOVERSION)" >&2; \
+		exit 1; \
+	}
+	@test "$$(node --version)" = "$(RELEASE_NODE_VERSION)" || { \
+		printf 'release requires Node %s (found %s)\n' \
+			'$(RELEASE_NODE_VERSION)' "$$(node --version)" >&2; \
+		exit 1; \
+	}
+	@test "$$(npm --version)" = "$(RELEASE_NPM_VERSION)" || { \
+		printf 'release requires npm %s (found %s)\n' \
+			'$(RELEASE_NPM_VERSION)' "$$(npm --version)" >&2; \
+		exit 1; \
+	}
+	@test "$$(dpkg-query -W -f='$${Version}' dpkg)" = "$(RELEASE_DPKG_VERSION)" || { \
+		printf 'release requires dpkg %s (found %s)\n' \
+			'$(RELEASE_DPKG_VERSION)' "$$(dpkg-query -W -f='$${Version}' dpkg)" >&2; \
+		exit 1; \
+	}
+
 deb: package-check web-build ui-test
 	$(MAKE) build VERSION=$(DEB_VERSION)
 	@set -eu; \
@@ -82,10 +116,11 @@ deb: package-check web-build ui-test
 	done; \
 	install -d dist; \
 	pvn_deb="dist/pvn-node_$(DEB_VERSION)_$${pvn_arch}.deb"; \
-	dpkg-deb --root-owner-group --build "$$pvn_root" "$$pvn_deb"; \
+	dpkg-deb --root-owner-group --uniform-compression -Zxz -z6 --threads-max=1 \
+		--build "$$pvn_root" "$$pvn_deb"; \
 	packaging/tests/package-check.sh "$$pvn_deb"
 
-release: clean
+release: release-env-check clean
 	+$(MAKE) deb DEB_VERSION=$(DEB_VERSION)
 	@set -eu; \
 	pvn_arch=$$(dpkg --print-architecture); \

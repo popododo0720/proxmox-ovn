@@ -1,0 +1,85 @@
+#!/bin/bash
+set -euo pipefail
+
+if (( $# != 1 )); then
+    printf 'usage: %s VERSION\n' "${0##*/}" >&2
+    exit 2
+fi
+
+version=$1
+case "$version" in
+    ''|*[!A-Za-z0-9.+~-]*)
+        printf 'unsupported release version: %s\n' "$version" >&2
+        exit 1
+        ;;
+esac
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+~-][A-Za-z0-9.+~-]+)?$ ]]; then
+    printf 'unsupported release version: %s\n' "$version" >&2
+    exit 1
+fi
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(git -C "$script_dir/.." rev-parse --show-toplevel)
+cd "$repo_root"
+
+grep -Fx "DEFAULT_VERSION=$version" deploy/scripts/pvn-install.sh
+grep -Fx "DEFAULT_VERSION=$version" deploy/scripts/pvn-update.sh
+grep -Fx "DEB_VERSION ?= $version" Makefile
+head -n 1 packaging/debian/changelog | \
+    grep -Fx "proxmox-ovn ($version) unstable; urgency=medium"
+grep -Fx "RELEASE_VERSION=$version" deploy/tests/pvn-install-test.sh
+grep -Fx "RELEASE_VERSION=$version" deploy/tests/pvn-update-test.sh
+
+node --input-type=commonjs - "$version" <<'NODE'
+const fs = require("node:fs");
+
+const expected = process.argv[2];
+const packageJson = JSON.parse(fs.readFileSync("web/package.json", "utf8"));
+const packageLock = JSON.parse(fs.readFileSync("web/package-lock.json", "utf8"));
+const versions = [
+  ["web/package.json version", packageJson.version],
+  ["web/package-lock.json root version", packageLock.version],
+  ["web/package-lock.json package root version", packageLock.packages?.[""]?.version],
+];
+for (const [location, actual] of versions) {
+  if (actual !== expected) {
+    console.error(`${location} is ${JSON.stringify(actual)}, expected ${expected}`);
+    process.exit(1);
+  }
+}
+NODE
+
+head_commit=$(git rev-parse --verify HEAD)
+tag_commit=$(git rev-parse --verify "v$version^{commit}" 2>/dev/null || true)
+if [[ $tag_commit != "$head_commit" ]]; then
+    printf 'release requires tag v%s at HEAD\n' "$version" >&2
+    exit 1
+fi
+if [[ -n $(git status --porcelain --untracked-files=all) ]]; then
+    printf 'release requires a clean worktree\n' >&2
+    exit 1
+fi
+
+expected_commit=$(git rev-parse --short=12 HEAD)
+expected_epoch=$(git show -s --format=%ct HEAD)
+expected_date=$(date -u -d "@$expected_epoch" +%Y-%m-%dT%H:%M:%SZ)
+if [[ ${COMMIT:-} != "$expected_commit" ]]; then
+    printf 'release COMMIT must be %s (found %s)\n' \
+        "$expected_commit" "${COMMIT:-unset}" >&2
+    exit 1
+fi
+if [[ ${SOURCE_DATE_EPOCH:-} != "$expected_epoch" ]]; then
+    printf 'release SOURCE_DATE_EPOCH must be %s (found %s)\n' \
+        "$expected_epoch" "${SOURCE_DATE_EPOCH:-unset}" >&2
+    exit 1
+fi
+if [[ ${BUILD_DATE:-} != "$expected_date" ]]; then
+    printf 'release BUILD_DATE must be %s (found %s)\n' \
+        "$expected_date" "${BUILD_DATE:-unset}" >&2
+    exit 1
+fi
+
+if [[ ${CI:-} != true || ${GITHUB_ACTIONS:-} != true ]]; then
+    printf 'canonical release assets may only be built by GitHub Actions\n' >&2
+    exit 1
+fi
