@@ -63,6 +63,16 @@ try:
         "OVN_Northbound": "22222222-2222-4222-8222-222222222222",
         "OVN_Southbound": "33333333-3333-4333-8333-333333333333",
     }
+    server_ids = {
+        "PVN_Control": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+        "OVN_Northbound": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+        "OVN_Southbound": "cccccccc-cccc-4ccc-8ccc-ccccccccccc3",
+    }
+    terms = {
+        "PVN_Control": 11,
+        "OVN_Northbound": 8,
+        "OVN_Southbound": 7,
+    }
     versions = {
         "PVN_Control": "1.0.0",
         "OVN_Northbound": "7.11.0",
@@ -81,6 +91,10 @@ try:
                 "available": True,
                 "healthy": True,
                 "cluster_id": cluster_ids[name],
+                "server_id": server_ids[name],
+                "role": "leader",
+                "term": terms[name],
+                "leader": "self",
                 "member_count": 3,
                 "connected_members": 3,
                 "quorum_size": 2,
@@ -263,8 +277,18 @@ else:
     check(stat.S_IMODE(backup_set.stat().st_mode) == 0o700, "backup set mode is not 0700")
     manifest = json.loads((backup_set / "manifest.json").read_text())
     check(manifest["consistency"] == "independent-per-database", "consistency claim drifted")
+    check(manifest["format"] == "pvn-db-backup/v2", "manifest format was not upgraded")
     check(len(manifest["databases"]) == 3, "all create did not capture three databases")
     for entry in manifest["databases"]:
+        check(
+            entry["role"] == "leader" and entry["leader"] == "self",
+            "source was not recorded as leader",
+        )
+        check(entry["term"] == terms[entry["database"]], "Raft term was not recorded")
+        check(
+            entry["server_id"] == server_ids[entry["database"]],
+            "Raft server ID was not recorded",
+        )
         check(
             stat.S_IMODE((backup_set / entry["file"]).stat().st_mode) == 0o600,
             f"{entry['file']} mode is not 0600",
@@ -272,6 +296,25 @@ else:
     verified = require_success(invoke("verify", str(backup_set)), "offline verify")
     check(verified["verified"] is True, "verify did not report success")
     check("tool compact" in calls.read_text(), "verify did not compact an offline copy")
+
+    legacy = clone_backup(backup_set, "legacy-v1")
+    legacy_manifest_path = legacy / "manifest.json"
+    legacy_manifest = json.loads(legacy_manifest_path.read_text())
+    legacy_manifest["format"] = "pvn-db-backup/v1"
+    for entry in legacy_manifest["databases"]:
+        for field in ("server_id", "role", "term", "leader"):
+            entry.pop(field)
+    legacy_manifest_path.write_text(
+        json.dumps(legacy_manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    legacy_verified = require_success(
+        invoke("verify", str(legacy)), "legacy offline verify"
+    )
+    check(
+        legacy_verified["format"] == "pvn-db-backup/v1",
+        "legacy manifest format was not preserved",
+    )
 
     reset_status()
     selected = require_success(
@@ -291,6 +334,40 @@ else:
         [entry["key"] for entry in selected_manifest["databases"]] == ["ovn-nb"],
         "selected create captured the wrong database set",
     )
+    check(
+        selected["database_identities"] == [
+            {
+                key: selected_manifest["databases"][0][key]
+                for key in (
+                    "key",
+                    "database",
+                    "cluster_id",
+                    "server_id",
+                    "role",
+                    "term",
+                    "leader",
+                    "member_count",
+                    "capture_started_at",
+                    "capture_completed_at",
+                    "sha256",
+                )
+            }
+        ],
+        "create report omitted the selected database identity",
+    )
+
+    follower = copy.deepcopy(base_status)
+    follower["databases"][1].update(role="follower", leader="abcd")
+    reset_status(follower)
+    follower_output = temporary / "follower-backups"
+    result = invoke(
+        "create", "--output", str(follower_output), "--database", "ovn-nb"
+    )
+    check(
+        result.returncode != 0 and "current local Raft leader" in result.stderr,
+        "selected follower created a backup",
+    )
+    check(not follower_output.exists(), "follower create changed the output filesystem")
 
     tampered = clone_backup(backup_set, "tampered")
     with (tampered / "pvn-control.ovsdb").open("ab") as output:
@@ -363,6 +440,87 @@ else:
     result = invoke("create", "--output", str(drift_output))
     check(result.returncode != 0 and "changed during backup" in result.stderr, "membership drift was accepted")
     check(not list(drift_output.iterdir()), "membership drift left a backup set behind")
+
+    cluster_drifted = copy.deepcopy(base_status)
+    cluster_drifted["databases"][1]["cluster_id"] = (
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    )
+    reset_status(sequence=[base_status, cluster_drifted])
+    cluster_drift_output = temporary / "cluster-drift-backups"
+    result = invoke(
+        "create",
+        "--output",
+        str(cluster_drift_output),
+        "--database",
+        "ovn-nb",
+    )
+    check(
+        result.returncode != 0 and "changed during backup" in result.stderr,
+        "Raft cluster identity drift was accepted",
+    )
+    check(
+        not list(cluster_drift_output.iterdir()),
+        "cluster identity drift left a backup set behind",
+    )
+
+    term_drifted = copy.deepcopy(base_status)
+    term_drifted["databases"][1]["term"] += 1
+    reset_status(sequence=[base_status, term_drifted])
+    term_drift_output = temporary / "term-drift-backups"
+    result = invoke(
+        "create",
+        "--output",
+        str(term_drift_output),
+        "--database",
+        "ovn-nb",
+    )
+    check(
+        result.returncode != 0 and "changed during backup" in result.stderr,
+        "Raft term drift was accepted",
+    )
+    check(not list(term_drift_output.iterdir()), "term drift left a backup set behind")
+
+    leadership_drifted = copy.deepcopy(base_status)
+    leadership_drifted["databases"][1].update(role="follower", leader="abcd")
+    reset_status(sequence=[base_status, leadership_drifted])
+    leadership_drift_output = temporary / "leadership-drift-backups"
+    result = invoke(
+        "create",
+        "--output",
+        str(leadership_drift_output),
+        "--database",
+        "ovn-nb",
+    )
+    check(
+        result.returncode != 0 and "current local Raft leader" in result.stderr,
+        "Raft leadership drift was accepted",
+    )
+    check(
+        not list(leadership_drift_output.iterdir()),
+        "leadership drift left a backup set behind",
+    )
+
+    server_drifted = copy.deepcopy(base_status)
+    server_drifted["databases"][1]["server_id"] = (
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    )
+    reset_status(sequence=[base_status, server_drifted])
+    server_drift_output = temporary / "server-drift-backups"
+    result = invoke(
+        "create",
+        "--output",
+        str(server_drift_output),
+        "--database",
+        "ovn-nb",
+    )
+    check(
+        result.returncode != 0 and "changed during backup" in result.stderr,
+        "Raft server identity drift was accepted",
+    )
+    check(
+        not list(server_drift_output.iterdir()),
+        "server identity drift left a backup set behind",
+    )
 
     result = invoke("restore", str(backup_set))
     check(result.returncode == 2 and "invalid choice" in result.stderr, "an undocumented restore command exists")

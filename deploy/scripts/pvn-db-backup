@@ -23,7 +23,8 @@ from typing import Any
 
 
 PROGRAM = "pvn-db-backup"
-FORMAT = "pvn-db-backup/v1"
+FORMAT = "pvn-db-backup/v2"
+LEGACY_FORMAT = "pvn-db-backup/v1"
 CONSISTENCY = "independent-per-database"
 SYSTEMCTL = "/usr/bin/systemctl"
 PVNCTL = "/usr/sbin/pvnctl"
@@ -62,6 +63,28 @@ class Database:
     @property
     def remote(self) -> str:
         return f"unix:{self.socket_path}"
+
+
+@dataclasses.dataclass(frozen=True)
+class RaftIdentity:
+    cluster_id: str
+    server_id: str
+    role: str
+    term: int
+    leader: str
+    member_count: int
+    connected_members: int
+    quorum_size: int
+
+    def manifest_fields(self) -> dict[str, Any]:
+        return {
+            "cluster_id": self.cluster_id,
+            "server_id": self.server_id,
+            "role": self.role,
+            "term": self.term,
+            "leader": self.leader,
+            "member_count": self.member_count,
+        }
 
 
 DATABASES = (
@@ -262,18 +285,13 @@ def positive_integer(value: Any, label: str) -> int:
     return value
 
 
-def central_status() -> dict[str, dict[str, Any]]:
-    raw = command([PVNCTL, "central", "status"], timeout=30)
-    try:
-        report = json.loads(raw)
-    except json.JSONDecodeError as error:
-        fail(f"pvnctl central status returned invalid JSON: {error}")
+def parse_central_status(report: Any) -> dict[str, RaftIdentity]:
     if not isinstance(report, dict) or report.get("healthy") is not True:
         fail("all three local Raft databases must report healthy")
     rows = report.get("databases")
     if not isinstance(rows, list) or len(rows) != len(DATABASES):
         fail("central status must contain exactly three database rows")
-    result: dict[str, dict[str, Any]] = {}
+    result: dict[str, RaftIdentity] = {}
     for row in rows:
         if not isinstance(row, dict):
             fail("central status database row is not an object")
@@ -298,14 +316,57 @@ def central_status() -> dict[str, dict[str, Any]]:
         cluster_id = row.get("cluster_id")
         if not isinstance(cluster_id, str) or not UUID.fullmatch(cluster_id):
             fail(f"{name} has no valid Raft cluster ID")
-        result[name] = {
-            "cluster_id": cluster_id.lower(),
-            "member_count": members,
-            "quorum_size": quorum,
-        }
+        server_id = row.get("server_id")
+        if not isinstance(server_id, str) or not UUID.fullmatch(server_id):
+            fail(f"{name} has no valid local Raft server ID")
+        role = row.get("role")
+        if role not in {"leader", "follower"}:
+            fail(f"{name} has an invalid local Raft role")
+        term = positive_integer(row.get("term"), f"{name} term")
+        leader = row.get("leader")
+        if (
+            not isinstance(leader, str)
+            or not leader
+            or len(leader) > 256
+            or "\n" in leader
+            or "\r" in leader
+        ):
+            fail(f"{name} has no valid Raft leader identity")
+        if role == "leader" and leader != "self":
+            fail(f"{name} local leader does not identify itself")
+        if role != "leader" and leader == "self":
+            fail(f"{name} local follower identifies itself as leader")
+        result[name] = RaftIdentity(
+            cluster_id=cluster_id.lower(),
+            server_id=server_id.lower(),
+            role=role,
+            term=term,
+            leader=leader,
+            member_count=members,
+            connected_members=connected,
+            quorum_size=quorum,
+        )
     if set(result) != set(DATABASE_BY_NAME):
         fail("central status is missing an expected database")
     return result
+
+
+def central_status() -> dict[str, RaftIdentity]:
+    raw = command([PVNCTL, "central", "status"], timeout=30)
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError as error:
+        fail(f"pvnctl central status returned invalid JSON: {error}")
+    return parse_central_status(report)
+
+
+def require_local_leaders(
+    status: dict[str, RaftIdentity], selected: tuple[Database, ...]
+) -> None:
+    for database in selected:
+        identity = status[database.name]
+        if identity.role != "leader" or identity.leader != "self":
+            fail(f"{database.name} must be backed up on its current local Raft leader")
 
 
 def require_socket(database: Database) -> None:
@@ -484,7 +545,11 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     top_keys = {"format", "consistency", "created_at", "source", "databases"}
     if set(manifest) != top_keys:
         fail("backup manifest has unknown or missing top-level fields")
-    if manifest.get("format") != FORMAT or manifest.get("consistency") != CONSISTENCY:
+    manifest_format = manifest.get("format")
+    if (
+        manifest_format not in {FORMAT, LEGACY_FORMAT}
+        or manifest.get("consistency") != CONSISTENCY
+    ):
         fail("backup manifest format or consistency model is unsupported")
     parse_timestamp(manifest.get("created_at"), "manifest created_at")
     source = manifest.get("source")
@@ -511,6 +576,8 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         "source_service_model",
         "snapshot_service_model",
     }
+    if manifest_format == FORMAT:
+        entry_keys |= {"server_id", "role", "term", "leader"}
     seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != entry_keys:
@@ -538,6 +605,13 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         members = positive_integer(entry.get("member_count"), f"{key} member_count")
         if members % 2 != 1:
             fail(f"backup manifest member count is not odd for {key}")
+        if manifest_format == FORMAT:
+            server_id = entry.get("server_id")
+            if not isinstance(server_id, str) or not UUID.fullmatch(server_id):
+                fail(f"backup manifest server ID is invalid for {key}")
+            if entry.get("role") != "leader" or entry.get("leader") != "self":
+                fail(f"backup manifest source was not the local leader for {key}")
+            positive_integer(entry.get("term"), f"{key} term")
         if entry.get("source_service_model") != "clustered":
             fail(f"backup source service model is unsupported for {key}")
         if entry.get("snapshot_service_model") != "standalone":
@@ -606,6 +680,7 @@ def verify_backup_set(backup_set: pathlib.Path) -> dict[str, Any]:
             shutil.rmtree(temporary_path)
     return {
         "backup_set": str(backup_set),
+        "format": manifest["format"],
         "consistency": CONSISTENCY,
         "databases": [entry["database"] for entry in entries],
         "verified": True,
@@ -646,6 +721,7 @@ def create_backup(output_root: pathlib.Path, selected: tuple[Database, ...]) -> 
     require_central_marker()
     command([SYSTEMCTL, "is-active", "--quiet", "pvn-central.target"], timeout=20)
     before = central_status()
+    require_local_leaders(before, selected)
     ensure_output_root(output_root)
     stamp = utc_now().replace("-", "").replace(":", "")
     base = f"pvn-db-backup-{stamp}-{safe_hostname()}-{secrets.token_hex(4)}"
@@ -664,32 +740,34 @@ def create_backup(output_root: pathlib.Path, selected: tuple[Database, ...]) -> 
             size, digest = backup_database(database, partial / database.filename)
             completed = utc_now()
             health = before[database.name]
-            entries.append(
-                {
-                    "key": database.key,
-                    "database": database.name,
-                    "file": database.filename,
-                    "capture_started_at": started,
-                    "capture_completed_at": completed,
-                    "sha256": digest,
-                    "bytes": size,
-                    "schema_version": version,
-                    "schema_checksum": checksum,
-                    "cluster_id": health["cluster_id"],
-                    "member_count": health["member_count"],
-                    "source_service_model": "clustered",
-                    "snapshot_service_model": "standalone",
-                }
-            )
+            entry = {
+                "key": database.key,
+                "database": database.name,
+                "file": database.filename,
+                "capture_started_at": started,
+                "capture_completed_at": completed,
+                "sha256": digest,
+                "bytes": size,
+                "schema_version": version,
+                "schema_checksum": checksum,
+                "source_service_model": "clustered",
+                "snapshot_service_model": "standalone",
+            }
+            entry.update(health.manifest_fields())
+            entries.append(entry)
         after = central_status()
+        require_local_leaders(after, selected)
         for database in selected:
             if after[database.name] != before[database.name]:
-                fail(f"{database.name} Raft identity or membership changed during backup")
+                fail(
+                    f"{database.name} Raft identity, term, leadership, or membership changed during backup"
+                )
+        hostname = safe_hostname()
         manifest = {
             "format": FORMAT,
             "consistency": CONSISTENCY,
             "created_at": utc_now(),
-            "source": {"hostname": safe_hostname()},
+            "source": {"hostname": hostname},
             "databases": entries,
         }
         write_manifest(partial / "manifest.json", manifest)
@@ -702,8 +780,29 @@ def create_backup(output_root: pathlib.Path, selected: tuple[Database, ...]) -> 
         committed = True
         return {
             "backup_set": str(final),
+            "format": FORMAT,
             "consistency": CONSISTENCY,
+            "source": {"hostname": hostname},
             "databases": [database.name for database in selected],
+            "database_identities": [
+                {
+                    key: entry[key]
+                    for key in (
+                        "key",
+                        "database",
+                        "cluster_id",
+                        "server_id",
+                        "role",
+                        "term",
+                        "leader",
+                        "member_count",
+                        "capture_started_at",
+                        "capture_completed_at",
+                        "sha256",
+                    )
+                }
+                for entry in entries
+            ],
             "verified": True,
         }
     finally:
