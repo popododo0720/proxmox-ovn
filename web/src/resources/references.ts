@@ -85,7 +85,12 @@ const operationReferences: Record<string, ResourceReference> = {
   'provider-network': providerNetworkReference,
   'provider-segment': currentProviderSegmentReference,
   'security-group': projectSecurityGroupReference,
-  'security-group-rule': { endpoint: '/security-group-rules', fallbackLabel: 'Security group rule' },
+  'security-group-rule': {
+    endpoint: '/security-group-rules',
+    labelKeys: ['description', 'direction'],
+    detailKeys: ['protocol', 'remote_cidr'],
+    fallbackLabel: 'Security group rule',
+  },
   node: nodeReference,
 };
 

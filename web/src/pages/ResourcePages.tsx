@@ -17,6 +17,7 @@ import type {
   Subnet,
 } from '../api/types';
 import { DefaultSecurityGroupBackfillPanel } from '../components/DefaultSecurityGroupBackfillPanel';
+import { OperationTargetLabel } from '../components/OperationTargetLabel';
 import { PortAttachmentPanel } from '../components/PortAttachmentPanel';
 import { PortDiagnosticCell } from '../components/PortDiagnostics';
 import type { FormField } from '../components/CreateDialog';
@@ -132,6 +133,7 @@ export function NetworksPage() {
       endpoint="/subnets"
       columns={[
         { key: 'name', label: 'Subnet', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed subnet', ['name', 'cidr'])}</strong> },
+        { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'network_id', label: 'Network', reference: projectNetworkReference },
         { key: 'cidr', label: 'CIDR', className: 'mono-cell' },
         { key: 'gateway_ip', label: 'Gateway', className: 'mono-cell' },
@@ -252,9 +254,11 @@ export function PortsPage({
       endpoint="/ports"
       columns={[
         { key: 'name', label: 'Port', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed port', ['name', 'mac_address'])}</strong> },
+        { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'network_id', label: 'Network', reference: projectNetworkReference },
         { key: 'mac_address', label: 'MAC address', className: 'mono-cell' },
         { key: 'fixed_ips', label: 'Fixed IPs', render: (item) => <FixedIPList fixedIPs={item.fixed_ips} /> },
+        { key: 'security_group_ids', label: 'Security groups', reference: projectSecurityGroupReference },
         { key: 'vmid', label: 'VM / node', render: (item) => item.vmid
           ? <span className="port-attachment-label"><span>{vmNames.get(item.vmid) ? `${vmNames.get(item.vmid)} (VM ${item.vmid})` : `VM ${item.vmid}`} · {item.nic || '?'}</span><span>on</span><ReferenceLabel value={item.node_id} source={nodeReference} /></span>
           : formatValue(undefined) },
@@ -302,6 +306,7 @@ export function FloatingIPsPage() {
     endpoint="/floating-ips"
     columns={[
       { key: 'address', label: 'Floating IP', className: 'mono-cell', render: (item) => <strong>{humanResourceLabel(item, 'Unavailable address', ['address', 'name'])}</strong> },
+      { key: 'provider_network_id', label: 'Provider network', reference: providerNetworkReference },
       { key: 'fixed_ip_address', label: 'Fixed IP', className: 'mono-cell' },
       { key: 'port_id', label: 'Port', reference: projectPortReference },
       { key: 'router_id', label: 'Router', reference: projectRouterReference },
@@ -358,11 +363,13 @@ export function SecurityGroupsPage() {
       endpoint="/security-group-rules"
       columns={[
         { key: 'security_group_id', label: 'Security group', reference: projectSecurityGroupReference },
+        { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'direction', label: 'Direction' },
         { key: 'protocol', label: 'Protocol' },
         { key: 'port_range_min', label: 'Port from' },
         { key: 'port_range_max', label: 'Port to' },
         { key: 'remote_cidr', label: 'Remote CIDR', className: 'mono-cell' },
+        { key: 'remote_group_id', label: 'Remote security group', reference: projectSecurityGroupReference },
         { key: 'description', label: 'Description' },
         { key: 'managed', label: 'Ownership', render: (item) => <StatusPill value={item.managed ? 'managed' : 'tenant'} /> },
         { key: 'action', label: 'Action' },
@@ -483,7 +490,7 @@ export function OperationsPage() {
     columns={[
       { key: 'action', label: 'Action', render: (item) => <strong>{item.action || item.kind || 'Operation'}</strong> },
       { key: 'target_kind', label: 'Resource' },
-      { key: 'target_id', label: 'Resource name', reference: (item) => operationTargetReference(item.target_kind) },
+      { key: 'target_id', label: 'Resource name', render: (item) => <OperationTargetLabel operation={item} /> },
       { key: 'target_revision', label: 'Revision' },
       { key: 'status', label: 'State' },
       { key: 'started_at', label: 'Started' },

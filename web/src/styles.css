@@ -167,6 +167,7 @@ td strong { color: #edf4f8; font-weight: 650; }
 .reference-error button { padding: 0; border: 0; color: var(--accent); background: transparent; font-size: 9px; font-weight: 700; cursor: pointer; }
 .reference-label { display: inline-flex; flex-wrap: wrap; gap: 4px 8px; color: #d5e0e6; }
 .reference-label > span:not(:last-child)::after { content: ","; color: var(--muted); }
+.operation-target-label { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; color: #d5e0e6; }
 .port-attachment-label { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; white-space: nowrap; }
 .port-attachment-label > span:nth-child(2) { color: var(--muted); font-size: 9px; }
 .port-diagnostic-cell { min-width: 270px; display: grid; gap: 7px; font-size: 10px; line-height: 1.45; }
