@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -69,6 +70,28 @@ func (runner *managedAuditRunner) Run(_ context.Context, _ string, arguments ...
 				cells = append(cells, auditTestMap(row.externalIDs))
 			case "options":
 				cells = append(cells, auditTestMap(row.options))
+			case "direction", "match", "action", "external_ip", "logical_ip":
+				cells = append(cells, row.attributes[heading])
+			case "priority", "tier":
+				text := row.attributes[heading]
+				if text == "" {
+					text = "0"
+				}
+				value, err := strconv.Atoi(text)
+				if err != nil {
+					return nil, fmt.Errorf("invalid test %s attribute %q", heading, row.attributes[heading])
+				}
+				cells = append(cells, value)
+			case "log":
+				text := row.attributes[heading]
+				if text == "" {
+					text = "false"
+				}
+				value, err := strconv.ParseBool(text)
+				if err != nil {
+					return nil, fmt.Errorf("invalid test log attribute %q", row.attributes[heading])
+				}
+				cells = append(cells, value)
 			default:
 				cells = append(cells, auditTestUUIDSet(row.references[heading]))
 			}
@@ -133,7 +156,8 @@ func seedManagedAuditPlan(t *testing.T, runner *managedAuditRunner, snapshot con
 		}
 		runner.put(&managedAuditRow{
 			table: expected.table, uuid: uuid, name: expected.name, rowType: expected.rowType,
-			externalIDs: externalIDs, options: auditTestCopyMap(expected.requiredOptions), references: make(map[string][]string),
+			externalIDs: externalIDs, options: auditTestCopyMap(expected.requiredOptions),
+			attributes: auditTestCopyMap(expected.requiredAttrs), references: make(map[string][]string),
 		})
 		actualByKey[key] = uuid
 	}
@@ -229,6 +253,45 @@ func TestAuditManagedGraphAcceptsCompleteRestoredGraphReadOnly(t *testing.T) {
 		if !seen[table.name] {
 			t.Errorf("audit did not scan %s", table.name)
 		}
+	}
+}
+
+func TestAuditManagedGraphRejectsSecurityCriticalACLAndNATDrift(t *testing.T) {
+	tests := []struct {
+		name   string
+		key    string
+		mutate func(*managedAuditRow)
+		want   string
+	}{
+		{name: "ACL direction", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["direction"] = "from-lport" }, want: "direction="},
+		{name: "ACL priority", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["priority"] = "1" }, want: "priority="},
+		{name: "ACL match", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["match"] = "ip4" }, want: "match="},
+		{name: "ACL action", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["action"] = "allow" }, want: "action="},
+		{name: "ACL tier", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["tier"] = "1" }, want: "tier="},
+		{name: "ACL log", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["log"] = "true" }, want: "log="},
+		{name: "ACL options", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.options["apply-after-lb"] = "true" }, want: "has options"},
+		{name: "NAT type", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.rowType = "snat" }, want: "has type"},
+		{name: "NAT external IP", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["external_ip"] = "192.0.2.99" }, want: "external_ip="},
+		{name: "NAT logical IP", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["logical_ip"] = "10.42.0.99" }, want: "logical_ip="},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, snapshot := comprehensiveManagedAuditFixture(t)
+			runner := newManagedAuditRunner()
+			plan, actual := seedManagedAuditPlan(t, runner, snapshot)
+			expected, found := plan.rows[test.key]
+			if !found {
+				t.Fatalf("fixture has no %s", test.key)
+			}
+			row := runner.rows[expected.table][actual[test.key]]
+			test.mutate(row)
+			renderer := newTestRenderer(t, runner, store)
+
+			err := renderer.AuditManagedGraph(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("unexpected drift audit error: %v", err)
+			}
+		})
 	}
 }
 

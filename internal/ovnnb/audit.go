@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,7 +37,7 @@ var managedAuditTables = []managedAuditTable{
 	{name: "Port_Group", columns: []string{"_uuid", "name", "external_ids", "ports", "acls"}},
 	{name: "Load_Balancer", columns: []string{"_uuid", "external_ids"}},
 	{name: "Load_Balancer_Health_Check", columns: []string{"_uuid", "external_ids"}},
-	{name: "ACL", columns: []string{"_uuid", "external_ids"}},
+	{name: "ACL", columns: []string{"_uuid", "direction", "priority", "match", "action", "tier", "log", "options", "external_ids"}},
 	{name: "QoS", columns: []string{"_uuid", "external_ids"}},
 	{name: "Mirror", columns: []string{"_uuid", "external_ids"}},
 	{name: "Meter", columns: []string{"_uuid", "external_ids"}},
@@ -45,7 +46,7 @@ var managedAuditTables = []managedAuditTable{
 	{name: "Logical_Router_Port", columns: []string{"_uuid", "name", "external_ids"}},
 	{name: "Logical_Router_Static_Route", columns: []string{"_uuid", "external_ids"}},
 	{name: "Logical_Router_Policy", columns: []string{"_uuid", "external_ids"}},
-	{name: "NAT", columns: []string{"_uuid", "external_ids", "gateway_port"}},
+	{name: "NAT", columns: []string{"_uuid", "type", "external_ip", "logical_ip", "external_ids", "gateway_port"}},
 	{name: "DHCP_Options", columns: []string{"_uuid", "external_ids"}},
 	{name: "DHCP_Relay", columns: []string{"_uuid", "external_ids"}},
 	{name: "Connection", columns: []string{"_uuid", "external_ids"}},
@@ -94,6 +95,7 @@ type managedAuditRow struct {
 	rowType     string
 	externalIDs map[string]string
 	options     map[string]string
+	attributes  map[string]string
 	references  map[string][]string
 }
 
@@ -109,6 +111,8 @@ type managedExpectedRow struct {
 	identity         map[string]string
 	requiredExternal map[string]string
 	requiredOptions  map[string]string
+	requiredAttrs    map[string]string
+	exactOptions     bool
 }
 
 type managedReferenceExpectation struct {
@@ -266,7 +270,8 @@ func decodeManagedAuditTable(spec managedAuditTable, output []byte) (map[string]
 			return nil, fmt.Errorf("row %d has %d cells for %d headings", index, len(cells), len(table.Headings))
 		}
 		row := &managedAuditRow{
-			table: spec.name, externalIDs: make(map[string]string), options: make(map[string]string), references: make(map[string][]string),
+			table: spec.name, externalIDs: make(map[string]string), options: make(map[string]string),
+			attributes: make(map[string]string), references: make(map[string][]string),
 		}
 		for cellIndex, heading := range table.Headings {
 			cell := cells[cellIndex]
@@ -282,6 +287,18 @@ func decodeManagedAuditTable(spec managedAuditTable, output []byte) (map[string]
 				row.externalIDs, err = decodeAuditStringMap(cell)
 			case "options":
 				row.options, err = decodeAuditStringMap(cell)
+			case "direction", "match", "action", "external_ip", "logical_ip":
+				var value string
+				err = json.Unmarshal(cell, &value)
+				row.attributes[heading] = value
+			case "priority", "tier":
+				var value int
+				err = json.Unmarshal(cell, &value)
+				row.attributes[heading] = strconv.Itoa(value)
+			case "log":
+				var value bool
+				err = json.Unmarshal(cell, &value)
+				row.attributes[heading] = strconv.FormatBool(value)
 			default:
 				row.references[heading], err = decodeAuditUUIDSet(cell)
 			}
@@ -446,17 +463,25 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
-		for _, owner := range []string{
-			group.ID + ":dhcpv4-client",
-			group.ID + ":dhcpv4-server",
-			group.ID + ":default-drop:to-lport",
-			group.ID + ":default-drop:from-lport",
+		for _, implicit := range []struct {
+			owner, direction, match, action string
+			priority                        int
+		}{
+			{group.ID + ":dhcpv4-client", "from-lport", "ip4 && udp && udp.src == 68 && udp.dst == 67", "allow", 3000},
+			{group.ID + ":dhcpv4-server", "to-lport", "ip4 && udp && udp.src == 67 && udp.dst == 68", "allow", 3000},
+			{group.ID + ":default-drop:to-lport", "to-lport", "ip4", "drop", 1000},
+			{group.ID + ":default-drop:from-lport", "from-lport", "ip4", "drop", 1000},
 		} {
-			aclKey := "acl/" + owner
+			aclKey := "acl/" + implicit.owner
 			if err := plan.add(managedExpectedRow{
-				key: aclKey, label: "implicit ACL " + owner, table: "ACL", preferredUUID: deterministicUUID("acl:" + owner),
-				identity:         map[string]string{"pvn-managed": "true", "pvn-owner": owner},
-				requiredExternal: map[string]string{"pvn-managed": "true", "pvn-owner": owner, "pvn-revision": strconv.FormatInt(group.Revision, 10)},
+				key: aclKey, label: "implicit ACL " + implicit.owner, table: "ACL", preferredUUID: deterministicUUID("acl:" + implicit.owner),
+				identity:         map[string]string{"pvn-managed": "true", "pvn-owner": implicit.owner},
+				requiredExternal: map[string]string{"pvn-managed": "true", "pvn-owner": implicit.owner, "pvn-revision": strconv.FormatInt(group.Revision, 10)},
+				requiredAttrs: map[string]string{
+					"direction": implicit.direction, "priority": strconv.Itoa(implicit.priority),
+					"match": implicit.match, "action": implicit.action, "tier": "0", "log": "false",
+				},
+				exactOptions: true,
 			}); err != nil {
 				return managedAuditPlan{}, err
 			}
@@ -466,14 +491,33 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 
 	for _, id := range sortedAuditMapKeys(index.rules) {
 		rule := index.rules[id]
-		if index.groups[rule.SecurityGroupID] == nil {
+		group := index.groups[rule.SecurityGroupID]
+		if group == nil {
 			return managedAuditPlan{}, fmt.Errorf("security group rule %q references absent group %q", rule.ID, rule.SecurityGroupID)
+		}
+		if group.ProjectID != rule.ProjectID {
+			return managedAuditPlan{}, fmt.Errorf("security group rule %q crosses project boundaries", rule.ID)
+		}
+		if rule.RemoteGroupID != "" {
+			remote := index.groups[rule.RemoteGroupID]
+			if remote == nil || remote.ProjectID != rule.ProjectID {
+				return managedAuditPlan{}, fmt.Errorf("security group rule %q references an absent or cross-project remote group", rule.ID)
+			}
+		}
+		spec, err := securityGroupRuleACLSpec(rule)
+		if err != nil {
+			return managedAuditPlan{}, fmt.Errorf("security group rule %q ACL: %w", rule.ID, err)
 		}
 		aclKey := "acl/" + rule.ID
 		if err := plan.add(managedExpectedRow{
 			key: aclKey, label: "security group rule ACL " + rule.ID, table: "ACL", preferredUUID: deterministicUUID("acl:" + rule.ID),
 			identity:         map[string]string{"pvn-managed": "true", "pvn-owner": rule.ID},
 			requiredExternal: map[string]string{"pvn-managed": "true", "pvn-owner": rule.ID, "pvn-revision": strconv.FormatInt(rule.Revision, 10)},
+			requiredAttrs: map[string]string{
+				"direction": spec.direction, "priority": strconv.Itoa(spec.priority),
+				"match": spec.match, "action": spec.action, "tier": "0", "log": "false",
+			},
+			exactOptions: true,
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -548,14 +592,23 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 
 		router := index.routers[routerInterface.RouterID]
 		if router.EnableSNAT && router.ExternalNetworkID != "" {
+			subnet := index.subnets[routerInterface.SubnetID]
+			if subnet == nil {
+				return managedAuditPlan{}, fmt.Errorf("router interface %q references absent subnet %q", routerInterface.ID, routerInterface.SubnetID)
+			}
+			prefix, err := netip.ParsePrefix(subnet.CIDR)
+			if err != nil || !prefix.Addr().Is4() {
+				return managedAuditPlan{}, fmt.Errorf("router interface %q subnet has an invalid IPv4 CIDR", routerInterface.ID)
+			}
 			snatKey := "snat/" + router.ID + "/" + routerInterface.ID
 			if err := plan.add(managedExpectedRow{
-				key: snatKey, label: "router SNAT " + routerInterface.ID, table: "NAT", preferredUUID: routerSNATUUID(router.ID, routerInterface.ID),
+				key: snatKey, label: "router SNAT " + routerInterface.ID, table: "NAT", preferredUUID: routerSNATUUID(router.ID, routerInterface.ID), rowType: "snat",
 				identity: map[string]string{"pvn-managed": "true", "pvn-kind": "router-snat", "pvn-router": router.ID, "pvn-router-interface": routerInterface.ID},
 				requiredExternal: map[string]string{
 					"pvn-managed": "true", "pvn-kind": "router-snat", "pvn-router": router.ID, "pvn-router-interface": routerInterface.ID,
 					"pvn-revision": strconv.FormatInt(router.Revision, 10), "pvn-interface-revision": strconv.FormatInt(routerInterface.Revision, 10),
 				},
+				requiredAttrs: map[string]string{"external_ip": router.ExternalIPAddress, "logical_ip": prefix.Masked().String()},
 			}); err != nil {
 				return managedAuditPlan{}, err
 			}
@@ -615,9 +668,10 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		}
 		key := "floating-ip/" + floatingIP.ID
 		if err := plan.add(managedExpectedRow{
-			key: key, label: "floating IP NAT " + floatingIP.ID, table: "NAT", preferredUUID: deterministicUUID("floating-ip-nat:" + floatingIP.ID),
+			key: key, label: "floating IP NAT " + floatingIP.ID, table: "NAT", preferredUUID: deterministicUUID("floating-ip-nat:" + floatingIP.ID), rowType: "dnat_and_snat",
 			identity:         auditIdentity(model.KindFloatingIP.String(), "pvn-id", floatingIP.ID),
 			requiredExternal: auditResourceExternal(floatingIP, map[string]string{"pvn-project": floatingIP.ProjectID}),
+			requiredAttrs:    map[string]string{"external_ip": floatingIP.Address, "logical_ip": floatingIP.FixedIPAddress},
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -922,6 +976,14 @@ func auditManagedInventory(plan managedAuditPlan, inventory managedAuditInventor
 				failures = append(failures, fmt.Errorf("%s UUID %q has parent option %s=%q instead of %q", expected.label, actual.uuid, option, actual.options[option], value))
 			}
 		}
+		if expected.exactOptions && !equalAuditStringMaps(actual.options, expected.requiredOptions) {
+			failures = append(failures, fmt.Errorf("%s UUID %q has options %v instead of %v", expected.label, actual.uuid, actual.options, expected.requiredOptions))
+		}
+		for attribute, value := range expected.requiredAttrs {
+			if actual.attributes[attribute] != value {
+				failures = append(failures, fmt.Errorf("%s UUID %q has %s=%q instead of %q", expected.label, actual.uuid, attribute, actual.attributes[attribute], value))
+			}
+		}
 	}
 
 	for _, table := range managedAuditTables {
@@ -1047,6 +1109,18 @@ func equalAuditStrings(left, right []string) bool {
 	}
 	for index := range left {
 		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalAuditStringMaps(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
 			return false
 		}
 	}
