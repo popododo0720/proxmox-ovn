@@ -3,6 +3,7 @@ package ovnnb
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ type recordingRunner struct {
 	dhcpCreated          bool
 	routerSNATFindOutput string
 	gatewayChassisOutput string
+	rows                 map[string]map[string]map[string]bool
 }
 
 type activeActiveRunner struct {
@@ -107,6 +109,14 @@ func (runner *attachedRaceRunner) Run(_ context.Context, _ string, arguments ...
 
 func (runner *activeActiveRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
 	joined := strings.Join(arguments, " ")
+	if strings.Contains(joined, "find Logical_Switch") {
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		if runner.created {
+			return []byte(runner.uuid + "\n"), nil
+		}
+		return nil, nil
+	}
 	if strings.Contains(joined, "_uuid=") {
 		return nil, errors.New("unsupported _uuid find condition")
 	}
@@ -146,23 +156,114 @@ func (runner *recordingRunner) Run(_ context.Context, _ string, arguments ...str
 	if strings.Contains(joined, "_uuid=") {
 		return nil, errors.New("unsupported _uuid find condition")
 	}
-	if strings.Contains(joined, "get DHCP_Options "+testOVSUUID+" _uuid") {
-		if runner.dhcpCreated {
-			return []byte(testOVSUUID + "\n"), nil
-		}
-		return nil, nil
-	}
-	if strings.Contains(joined, "create DHCP_Options") {
-		runner.dhcpCreated = true
-		return []byte(testOVSUUID + "\n"), nil
-	}
 	if strings.Contains(joined, "find NAT") && strings.Contains(joined, `external_ids:pvn-kind="router-snat"`) {
 		return []byte(runner.routerSNATFindOutput), nil
 	}
 	if strings.Contains(joined, "lrp-get-gateway-chassis") {
 		return []byte(runner.gatewayChassisOutput), nil
 	}
+	if output, handled := runner.readRows(arguments); handled {
+		return output, nil
+	}
+	runner.applyCreatesAndSets(arguments)
+	if strings.Contains(joined, "create DHCP_Options") {
+		runner.dhcpCreated = true
+		return []byte(testOVSUUID + "\n"), nil
+	}
 	return nil, nil
+}
+
+func (runner *recordingRunner) readRows(arguments []string) ([]byte, bool) {
+	for index, argument := range arguments {
+		if argument == "find" && index+1 < len(arguments) {
+			table := arguments[index+1]
+			conditions := arguments[index+2:]
+			var matches []string
+			for uuid, assignments := range runner.rows[table] {
+				matched := true
+				for _, condition := range conditions {
+					matched = matched && assignments[condition]
+				}
+				if matched {
+					matches = append(matches, uuid)
+				}
+			}
+			sort.Strings(matches)
+			return []byte(strings.Join(matches, "\n")), true
+		}
+		if argument == "get" && index+3 < len(arguments) && arguments[index+3] == "_uuid" {
+			table := arguments[index+1]
+			target := runner.resolveTestRow(table, arguments[index+2])
+			if target == "" {
+				return nil, true
+			}
+			return []byte(target + "\n"), true
+		}
+	}
+	return nil, false
+}
+
+func (runner *recordingRunner) applyCreatesAndSets(arguments []string) {
+	if runner.rows == nil {
+		runner.rows = make(map[string]map[string]map[string]bool)
+	}
+	for index := 0; index < len(arguments); index++ {
+		switch arguments[index] {
+		case "create":
+			if index+1 >= len(arguments) || index == 0 || !strings.HasPrefix(arguments[index-1], "--id=") {
+				continue
+			}
+			table := arguments[index+1]
+			uuid := strings.TrimPrefix(arguments[index-1], "--id=")
+			assignments := runner.testAssignments(arguments, index+2)
+			runner.putTestRow(table, uuid, assignments)
+		case "set":
+			if index+2 >= len(arguments) {
+				continue
+			}
+			table := arguments[index+1]
+			uuid := runner.resolveTestRow(table, arguments[index+2])
+			if uuid == "" {
+				continue
+			}
+			runner.putTestRow(table, uuid, runner.testAssignments(arguments, index+3))
+		}
+	}
+}
+
+func (runner *recordingRunner) testAssignments(arguments []string, start int) []string {
+	assignments := make([]string, 0)
+	for index := start; index < len(arguments) && arguments[index] != "--"; index++ {
+		if strings.Contains(arguments[index], "=") {
+			assignments = append(assignments, arguments[index])
+		}
+	}
+	return assignments
+}
+
+func (runner *recordingRunner) putTestRow(table, uuid string, assignments []string) {
+	if runner.rows[table] == nil {
+		runner.rows[table] = make(map[string]map[string]bool)
+	}
+	if runner.rows[table][uuid] == nil {
+		runner.rows[table][uuid] = make(map[string]bool)
+	}
+	for _, assignment := range assignments {
+		runner.rows[table][uuid][assignment] = true
+	}
+}
+
+func (runner *recordingRunner) resolveTestRow(table, target string) string {
+	if _, exists := runner.rows[table][target]; exists {
+		return target
+	}
+	name := stringAssignment("name", target)
+	for uuid, assignments := range runner.rows[table] {
+		if assignments[name] {
+			return uuid
+		}
+	}
+	return ""
 }
 
 func (runner *movingGatewayRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, error) {
@@ -180,11 +281,11 @@ func (runner *movingGatewayRunner) Run(ctx context.Context, binary string, argum
 
 func (runner *unavailableGatewayRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, error) {
 	joined := strings.Join(arguments, " ")
-	_, _ = runner.recordingRunner.Run(ctx, binary, arguments...)
+	output, err := runner.recordingRunner.Run(ctx, binary, arguments...)
 	if strings.Contains(joined, "lrp-add") || strings.Contains(joined, "get Logical_Router_Port") || strings.Contains(joined, "get Logical_Switch_Port") {
 		return []byte("database connection failed"), errors.New("exit status 1")
 	}
-	return nil, nil
+	return output, err
 }
 
 func (runner *providerPortRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, error) {
