@@ -304,6 +304,77 @@ func TestAuditManagedGraphRejectsParentConflict(t *testing.T) {
 	}
 }
 
+func TestAuditManagedGraphRejectsManagedChildrenOnAlternateOVN711References(t *testing.T) {
+	tests := []struct {
+		name        string
+		parentTable string
+		column      string
+		childTable  string
+	}{
+		{name: "logical switch ACL", parentTable: "Logical_Switch", column: "acls", childTable: "ACL"},
+		{name: "IPv6 DHCP options", parentTable: "Logical_Switch_Port", column: "dhcpv6_options", childTable: "DHCP_Options"},
+		{name: "NAT gateway port", parentTable: "NAT", column: "gateway_port", childTable: "Logical_Router_Port"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, snapshot := comprehensiveManagedAuditFixture(t)
+			runner := newManagedAuditRunner()
+			plan, actual := seedManagedAuditPlan(t, runner, snapshot)
+			parentKey := firstManagedAuditPlanKey(t, plan, test.parentTable)
+			childKey := firstManagedAuditPlanKey(t, plan, test.childTable)
+			parent := plan.rows[parentKey]
+			parentRow := runner.rows[parent.table][actual[parentKey]]
+			parentRow.references[test.column] = append(parentRow.references[test.column], actual[childKey])
+			renderer := newTestRenderer(t, runner, store)
+
+			err := renderer.AuditManagedGraph(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.parentTable+"."+test.column) {
+				t.Fatalf("unexpected alternate-reference audit error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuditManagedGraphRejectsForeignChildrenOnEveryExactOVN711Reference(t *testing.T) {
+	for _, reference := range managedAuditReferences {
+		if !reference.exactParentChildren {
+			continue
+		}
+		name := reference.parentTable + "." + reference.column
+		t.Run(name, func(t *testing.T) {
+			store, snapshot := comprehensiveManagedAuditFixture(t)
+			runner := newManagedAuditRunner()
+			plan, actual := seedManagedAuditPlan(t, runner, snapshot)
+			parentKey := firstManagedAuditPlanKey(t, plan, reference.parentTable)
+			parent := plan.rows[parentKey]
+			parentRow := runner.rows[parent.table][actual[parentKey]]
+			foreignUUID := deterministicUUID("foreign-reference:" + name)
+			runner.put(&managedAuditRow{
+				table: reference.childTable, uuid: foreignUUID, externalIDs: map[string]string{},
+				options: map[string]string{}, references: map[string][]string{},
+			})
+			parentRow.references[reference.column] = append(parentRow.references[reference.column], foreignUUID)
+			renderer := newTestRenderer(t, runner, store)
+
+			err := renderer.AuditManagedGraph(context.Background())
+			if err == nil || !strings.Contains(err.Error(), name+" children") || !strings.Contains(err.Error(), foreignUUID) {
+				t.Fatalf("unexpected foreign-reference audit error: %v", err)
+			}
+		})
+	}
+}
+
+func firstManagedAuditPlanKey(t *testing.T, plan managedAuditPlan, table string) string {
+	t.Helper()
+	for _, key := range sortedAuditMapKeys(plan.rows) {
+		if plan.rows[key].table == table {
+			return key
+		}
+	}
+	t.Fatalf("managed audit fixture has no %s row", table)
+	return ""
+}
+
 func removeAuditTestUUID(values []string, target string) []string {
 	result := make([]string, 0, len(values))
 	for _, value := range values {

@@ -29,8 +29,8 @@ var managedAuditTables = []managedAuditTable{
 	{name: "NB_Global", columns: []string{"_uuid", "external_ids"}},
 	{name: "Sample_Collector", columns: []string{"_uuid", "external_ids"}},
 	{name: "Copp", columns: []string{"_uuid", "external_ids"}},
-	{name: "Logical_Switch", columns: []string{"_uuid", "name", "external_ids", "ports"}},
-	{name: "Logical_Switch_Port", columns: []string{"_uuid", "name", "type", "external_ids", "options", "dhcpv4_options"}},
+	{name: "Logical_Switch", columns: []string{"_uuid", "name", "external_ids", "ports", "acls"}},
+	{name: "Logical_Switch_Port", columns: []string{"_uuid", "name", "type", "external_ids", "options", "dhcpv4_options", "dhcpv6_options"}},
 	{name: "Forwarding_Group", columns: []string{"_uuid", "external_ids"}},
 	{name: "Address_Set", columns: []string{"_uuid", "external_ids"}},
 	{name: "Port_Group", columns: []string{"_uuid", "name", "external_ids", "ports", "acls"}},
@@ -45,7 +45,7 @@ var managedAuditTables = []managedAuditTable{
 	{name: "Logical_Router_Port", columns: []string{"_uuid", "name", "external_ids"}},
 	{name: "Logical_Router_Static_Route", columns: []string{"_uuid", "external_ids"}},
 	{name: "Logical_Router_Policy", columns: []string{"_uuid", "external_ids"}},
-	{name: "NAT", columns: []string{"_uuid", "external_ids"}},
+	{name: "NAT", columns: []string{"_uuid", "external_ids", "gateway_port"}},
 	{name: "DHCP_Options", columns: []string{"_uuid", "external_ids"}},
 	{name: "DHCP_Relay", columns: []string{"_uuid", "external_ids"}},
 	{name: "Connection", columns: []string{"_uuid", "external_ids"}},
@@ -57,6 +57,34 @@ var managedAuditTables = []managedAuditTable{
 	{name: "BFD", columns: []string{"_uuid", "external_ids"}},
 	{name: "Chassis_Template_Var", columns: []string{"_uuid", "external_ids"}},
 	{name: "Sampling_App", columns: []string{"_uuid", "external_ids"}},
+}
+
+// managedAuditReferences is the complete OVN Northbound 7.11 reference map
+// whose child table can contain a row managed by PVN. Reverse checks reject a
+// managed child attached through any unexpected parent or column. Exact parent
+// checks additionally reject an unmanaged child attached to a managed parent.
+//
+// Logical_Switch.ports is the sole non-exact parent set because the current
+// router-interface peer LSP is deliberately unmarked renderer glue. Reverse
+// checks still prove that every managed LSP has exactly its desired switch.
+type managedAuditReferenceSpec struct {
+	parentTable         string
+	column              string
+	childTable          string
+	exactParentChildren bool
+}
+
+var managedAuditReferences = []managedAuditReferenceSpec{
+	{parentTable: "Logical_Router", column: "nat", childTable: "NAT", exactParentChildren: true},
+	{parentTable: "Logical_Router", column: "ports", childTable: "Logical_Router_Port", exactParentChildren: true},
+	{parentTable: "Logical_Router", column: "static_routes", childTable: "Logical_Router_Static_Route", exactParentChildren: true},
+	{parentTable: "Logical_Switch", column: "acls", childTable: "ACL", exactParentChildren: true},
+	{parentTable: "Logical_Switch", column: "ports", childTable: "Logical_Switch_Port"},
+	{parentTable: "Logical_Switch_Port", column: "dhcpv4_options", childTable: "DHCP_Options", exactParentChildren: true},
+	{parentTable: "Logical_Switch_Port", column: "dhcpv6_options", childTable: "DHCP_Options", exactParentChildren: true},
+	{parentTable: "NAT", column: "gateway_port", childTable: "Logical_Router_Port", exactParentChildren: true},
+	{parentTable: "Port_Group", column: "acls", childTable: "ACL", exactParentChildren: true},
+	{parentTable: "Port_Group", column: "ports", childTable: "Logical_Switch_Port", exactParentChildren: true},
 }
 
 type managedAuditRow struct {
@@ -91,9 +119,17 @@ type managedReferenceExpectation struct {
 	parentKeys  []string
 }
 
+type managedDirectReferenceExpectation struct {
+	label     string
+	parentKey string
+	column    string
+	childKeys []string
+}
+
 type managedAuditPlan struct {
-	rows       map[string]managedExpectedRow
-	references []managedReferenceExpectation
+	rows             map[string]managedExpectedRow
+	references       []managedReferenceExpectation
+	directReferences []managedDirectReferenceExpectation
 }
 
 type managedDesiredIndex struct {
@@ -588,6 +624,9 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		plan.expectParents("floating IP NAT parent", key, "Logical_Router", "nat", "router/"+floatingIP.RouterID)
 	}
 
+	if err := plan.completeReferenceCoverage(); err != nil {
+		return managedAuditPlan{}, err
+	}
 	return plan, nil
 }
 
@@ -703,6 +742,105 @@ func (plan *managedAuditPlan) expectParents(label, childKey, parentTable, column
 	plan.references = append(plan.references, managedReferenceExpectation{
 		label: label, childKey: childKey, parentTable: parentTable, column: column, parentKeys: unique,
 	})
+}
+
+func (plan *managedAuditPlan) completeReferenceCoverage() error {
+	tableColumns := make(map[string]map[string]bool, len(managedAuditTables))
+	for _, table := range managedAuditTables {
+		if table.name == "" || tableColumns[table.name] != nil {
+			return fmt.Errorf("managed audit has an invalid or duplicate table %q", table.name)
+		}
+		columns := make(map[string]bool, len(table.columns))
+		for _, column := range table.columns {
+			if column == "" || columns[column] {
+				return fmt.Errorf("managed audit table %s has an invalid or duplicate column %q", table.name, column)
+			}
+			columns[column] = true
+		}
+		tableColumns[table.name] = columns
+	}
+
+	type edge struct{ parentTable, column string }
+	specs := make(map[edge]managedAuditReferenceSpec, len(managedAuditReferences))
+	for _, spec := range managedAuditReferences {
+		key := edge{parentTable: spec.parentTable, column: spec.column}
+		if spec.parentTable == "" || spec.column == "" || spec.childTable == "" {
+			return errors.New("managed audit reference table, column, and child table are required")
+		}
+		if _, duplicate := specs[key]; duplicate {
+			return fmt.Errorf("managed audit has duplicate reference %s.%s", spec.parentTable, spec.column)
+		}
+		if !tableColumns[spec.parentTable][spec.column] {
+			return fmt.Errorf("managed audit reference %s.%s is absent from its inventory", spec.parentTable, spec.column)
+		}
+		if tableColumns[spec.childTable] == nil {
+			return fmt.Errorf("managed audit reference %s.%s has unknown child table %s", spec.parentTable, spec.column, spec.childTable)
+		}
+		specs[key] = spec
+	}
+
+	covered := make(map[string]bool)
+	for _, reference := range plan.references {
+		child, found := plan.rows[reference.childKey]
+		if !found {
+			return fmt.Errorf("managed audit reference %q has unknown child %q", reference.label, reference.childKey)
+		}
+		edgeKey := edge{parentTable: reference.parentTable, column: reference.column}
+		spec, found := specs[edgeKey]
+		if !found || spec.childTable != child.table {
+			return fmt.Errorf("managed audit reference %q is not an OVN 7.11 edge for child table %s", reference.label, child.table)
+		}
+		coverageKey := reference.childKey + "\x00" + reference.parentTable + "\x00" + reference.column
+		if covered[coverageKey] {
+			return fmt.Errorf("managed audit reference %q duplicates coverage for child %q", reference.label, reference.childKey)
+		}
+		covered[coverageKey] = true
+		for _, parentKey := range reference.parentKeys {
+			parent, found := plan.rows[parentKey]
+			if !found || parent.table != reference.parentTable {
+				return fmt.Errorf("managed audit reference %q has invalid %s parent %q", reference.label, reference.parentTable, parentKey)
+			}
+		}
+	}
+
+	for _, childKey := range sortedAuditMapKeys(plan.rows) {
+		child := plan.rows[childKey]
+		for _, spec := range managedAuditReferences {
+			if spec.childTable != child.table {
+				continue
+			}
+			coverageKey := childKey + "\x00" + spec.parentTable + "\x00" + spec.column
+			if covered[coverageKey] {
+				continue
+			}
+			plan.expectParents(child.label+" "+spec.parentTable+"."+spec.column+" parents", childKey, spec.parentTable, spec.column)
+			covered[coverageKey] = true
+		}
+	}
+
+	children := make(map[string][]string)
+	for _, reference := range plan.references {
+		for _, parentKey := range reference.parentKeys {
+			key := parentKey + "\x00" + reference.parentTable + "\x00" + reference.column
+			children[key] = append(children[key], reference.childKey)
+		}
+	}
+	for _, parentKey := range sortedAuditMapKeys(plan.rows) {
+		parent := plan.rows[parentKey]
+		for _, spec := range managedAuditReferences {
+			if !spec.exactParentChildren || spec.parentTable != parent.table {
+				continue
+			}
+			key := parentKey + "\x00" + spec.parentTable + "\x00" + spec.column
+			childKeys := append([]string(nil), children[key]...)
+			sort.Strings(childKeys)
+			plan.directReferences = append(plan.directReferences, managedDirectReferenceExpectation{
+				label:     parent.label + " " + spec.parentTable + "." + spec.column + " children",
+				parentKey: parentKey, column: spec.column, childKeys: childKeys,
+			})
+		}
+	}
+	return nil
 }
 
 func auditIdentity(kind, key, value string) map[string]string {
@@ -826,6 +964,35 @@ func auditManagedInventory(plan managedAuditPlan, inventory managedAuditInventor
 		actualParents := auditReferencingRows(inventory[reference.parentTable], reference.column, childUUID)
 		if !equalAuditStrings(actualParents, expectedParents) {
 			failures = append(failures, fmt.Errorf("%s for child UUID %q has parent UUIDs %v instead of %v", reference.label, childUUID, actualParents, expectedParents))
+		}
+	}
+	for _, reference := range plan.directReferences {
+		parentUUID := actualByKey[reference.parentKey]
+		if parentUUID == "" {
+			continue
+		}
+		expectedChildren := make([]string, 0, len(reference.childKeys))
+		complete := true
+		for _, childKey := range reference.childKeys {
+			childUUID := actualByKey[childKey]
+			if childUUID == "" {
+				complete = false
+				break
+			}
+			expectedChildren = append(expectedChildren, childUUID)
+		}
+		if !complete {
+			continue
+		}
+		sort.Strings(expectedChildren)
+		parent := plan.rows[reference.parentKey]
+		actualParent := inventory[parent.table][parentUUID]
+		if actualParent == nil {
+			continue
+		}
+		actualChildren := actualParent.references[reference.column]
+		if !equalAuditStrings(actualChildren, expectedChildren) {
+			failures = append(failures, fmt.Errorf("%s for parent UUID %q has child UUIDs %v instead of %v", reference.label, parentUUID, actualChildren, expectedChildren))
 		}
 	}
 	return failures
