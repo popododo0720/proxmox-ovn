@@ -1466,6 +1466,84 @@ func (renderer *Renderer) findMany(ctx context.Context, table string, conditions
 	return result, nil
 }
 
+// ownedRow identifies one PVN-managed OVN row using values that survive an
+// ovsdb-client restore. OVSDB restores preserve row data but allocate new row
+// UUIDs, so the deterministic UUID is only the preferred UUID for a fresh
+// insert; it is never sufficient proof of ownership on its own.
+type ownedRow struct {
+	table             string
+	deterministicUUID string
+	name              string
+	identity          []string
+}
+
+func managedRow(table, uuid, name string, identity ...string) ownedRow {
+	return ownedRow{
+		table:             table,
+		deterministicUUID: uuid,
+		name:              name,
+		identity: append([]string{
+			mapAssignment("external_ids", "pvn-managed", "true"),
+		}, identity...),
+	}
+}
+
+// lookupOwnedRow returns the actual OVN UUID of exactly one matching PVN row.
+// It deliberately probes the stable identity, the stable name (when present),
+// and the preferred deterministic UUID independently. This rejects both an
+// unowned name/UUID collision and a restored row plus a conflicting fresh row
+// instead of silently updating or deleting the wrong object.
+func (renderer *Renderer) lookupOwnedRow(ctx context.Context, row ownedRow) (string, error) {
+	if row.table == "" || len(row.identity) == 0 {
+		return "", errors.New("OVN owned-row table and identity are required")
+	}
+	if err := safeUUID(row.deterministicUUID); err != nil {
+		return "", err
+	}
+
+	owned, err := renderer.findMany(ctx, row.table, row.identity...)
+	if err != nil {
+		return "", err
+	}
+	if len(owned) > 1 {
+		return "", fmt.Errorf("OVN contains duplicate PVN-owned %s rows for %s", row.table, strings.Join(row.identity, ", "))
+	}
+
+	var named string
+	if row.name != "" {
+		named, err = renderer.findOne(ctx, row.table, stringAssignment("name", row.name))
+		if err != nil {
+			return "", err
+		}
+	}
+	preferred, err := renderer.findUUID(ctx, row.table, row.deterministicUUID)
+	if err != nil {
+		return "", err
+	}
+
+	if len(owned) == 0 {
+		if named != "" {
+			return "", fmt.Errorf("OVN %s name %q is occupied by row %q that is not owned by the expected PVN resource", row.table, row.name, named)
+		}
+		if preferred != "" {
+			return "", fmt.Errorf("OVN %s deterministic UUID %q is occupied by a row that is not owned by the expected PVN resource", row.table, preferred)
+		}
+		return "", nil
+	}
+
+	actual := owned[0]
+	if row.name != "" && named != actual {
+		if named == "" {
+			return "", fmt.Errorf("PVN-owned %s row %q does not have expected name %q", row.table, actual, row.name)
+		}
+		return "", fmt.Errorf("PVN-owned %s row %q conflicts with expected-name row %q", row.table, actual, named)
+	}
+	if preferred != "" && preferred != actual {
+		return "", fmt.Errorf("PVN-owned %s row %q conflicts with deterministic-UUID row %q", row.table, actual, preferred)
+	}
+	return actual, nil
+}
+
 func (renderer *Renderer) ensureRow(ctx context.Context, table, uuid string, assignments []string) error {
 	existing, err := renderer.findUUID(ctx, table, uuid)
 	if err != nil {

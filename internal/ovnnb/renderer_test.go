@@ -52,6 +52,12 @@ type uuidLookupRunner struct {
 	err       error
 }
 
+type ownedRowLookupRunner struct {
+	owned     []string
+	named     string
+	preferred string
+}
+
 type attachedRaceRunner struct {
 	uuid   string
 	exists bool
@@ -61,6 +67,26 @@ type attachedRaceRunner struct {
 func (runner *uuidLookupRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
 	runner.arguments = append([]string(nil), arguments...)
 	return runner.output, runner.err
+}
+
+func (runner *ownedRowLookupRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
+	joined := strings.Join(arguments, " ")
+	if strings.Contains(joined, "find Logical_Switch") {
+		if strings.Contains(joined, stringAssignment("name", logicalSwitch("network-1"))) {
+			if runner.named == "" {
+				return nil, nil
+			}
+			return []byte(runner.named + "\n"), nil
+		}
+		return []byte(strings.Join(runner.owned, "\n")), nil
+	}
+	if strings.Contains(joined, "get Logical_Switch "+logicalSwitchUUID("network-1")+" _uuid") {
+		if runner.preferred == "" {
+			return nil, nil
+		}
+		return []byte(runner.preferred + "\n"), nil
+	}
+	return nil, nil
 }
 
 func (runner *attachedRaceRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
@@ -232,6 +258,69 @@ func TestFindUUIDUsesOVN2503GetSemantics(t *testing.T) {
 	renderer := newTestRenderer(t, runner, controlstore.NewMemory())
 	if _, err := renderer.findUUID(context.Background(), "Logical_Switch", "not-a-uuid"); err == nil || len(runner.arguments) != 0 {
 		t.Fatalf("unsafe UUID lookup err=%v arguments=%v", err, runner.arguments)
+	}
+}
+
+func TestLookupOwnedRowAdoptsOnlyOneUnambiguousRestoredRow(t *testing.T) {
+	preferred := logicalSwitchUUID("network-1")
+	restored := deterministicUUID("restored-logical-switch")
+	foreign := deterministicUUID("foreign-logical-switch")
+	row := managedRow(
+		"Logical_Switch",
+		preferred,
+		logicalSwitch("network-1"),
+		mapAssignment("external_ids", "pvn-kind", model.KindNetwork.String()),
+		mapAssignment("external_ids", "pvn-id", "network-1"),
+	)
+	for name, test := range map[string]struct {
+		runner  ownedRowLookupRunner
+		want    string
+		wantErr string
+	}{
+		"missing": {},
+		"deterministic": {
+			runner: ownedRowLookupRunner{owned: []string{preferred}, named: preferred, preferred: preferred},
+			want:   preferred,
+		},
+		"restored": {
+			runner: ownedRowLookupRunner{owned: []string{restored}, named: restored},
+			want:   restored,
+		},
+		"duplicate-owned": {
+			runner:  ownedRowLookupRunner{owned: []string{preferred, restored}, named: restored, preferred: preferred},
+			wantErr: "duplicate PVN-owned",
+		},
+		"foreign-name": {
+			runner:  ownedRowLookupRunner{named: foreign},
+			wantErr: "not owned",
+		},
+		"foreign-deterministic-uuid": {
+			runner:  ownedRowLookupRunner{preferred: preferred},
+			wantErr: "not owned",
+		},
+		"restored-plus-deterministic-collision": {
+			runner:  ownedRowLookupRunner{owned: []string{restored}, named: restored, preferred: preferred},
+			wantErr: "conflicts with deterministic-UUID row",
+		},
+		"owned-name-mismatch": {
+			runner:  ownedRowLookupRunner{owned: []string{restored}},
+			wantErr: "does not have expected name",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := test.runner
+			renderer := newTestRenderer(t, &runner, controlstore.NewMemory())
+			actual, err := renderer.lookupOwnedRow(context.Background(), row)
+			if actual != test.want {
+				t.Fatalf("lookupOwnedRow() = %q, want %q (err=%v)", actual, test.want, err)
+			}
+			if test.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("lookupOwnedRow() error = %v, want substring %q", err, test.wantErr)
+			}
+		})
 	}
 }
 
