@@ -1,10 +1,27 @@
 proxmox-ovn (0.2.14) unstable; urgency=medium
 
-  * Show resource names in normal views and keep UUIDs in Details.
-  * Gate installs and updates on persisted/runtime Corosync consistency.
-  * Bound the updater's package-independent Corosync preflight before staging
-    and around every package transaction.
-  * Converge Corosync ring migrations through a live dual-ring handoff.
+  * Show human resource and PVE VM names in normal UI surfaces while retaining
+    raw UUIDs in Details and diagnostics.
+  * Detect stale Corosync runtime state and gate package post-install, install,
+    topology, and rolling-update boundaries on exact persisted/runtime state.
+  * Run a package-independent, timeout/output-bounded Corosync preflight before
+    staging and around every package transaction, including standalone checks.
+  * Converge Corosync migration through a fenced N/N dual-ring handoff and
+    safely resume the exact v0.2.13 stale-runtime boundary.
+  * Upgrade active canonical topology ledgers from schema 1 to schema 2 with a
+    single guarded CAS, exact live readiness, and raw control-ledger pinning.
+  * Atomically combine the exact v0.2.13-to-v0.2.14 package, topology, and
+    cluster-version 3-to-4 control snapshot repin; reject all nearby drift.
+  * Preserve standalone/clustered membership identity and harden remote helper
+    I/O, topology recovery, and later schema-2 rolling package gates.
+  * Split routine backups from leader-pinned recovery-window captures and add
+    strict fresh voter, Raft identity, service-freeze, and digest restore gates.
+  * Add verified forced OVN recovery reconciliation with restored-row UUID
+    adoption/references, DHCP ownership checks, and a read-only managed-graph
+    audit that reports malformed, orphaned, or conflicting rows without pruning.
+  * Make restore evidence copies reproducible and require complete node/central
+    target lifecycles around the one-database-at-a-time recovery runbook.
+  * Publish only the expected checksummed, version-safe GitHub release assets.
 
  -- PVN Project <root@localhost>  Thu, 06 Aug 2026 03:14:44 +0000
 

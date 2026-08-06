@@ -423,6 +423,21 @@ state before northd repopulates Southbound. It deliberately writes both PVN
 Control and Northbound, which is why normal managers must remain frozen. On
 failure, keep the freeze and investigate instead of starting a second restore.
 
+Success also includes a read-only managed-graph audit after reconciliation.
+The audit snapshots current PVN Control desired state, inventories every
+Northbound table that can carry `external_ids`, and requires every
+`pvn-managed=true` row to have one exact stable identity, required
+name/markers/options, no deterministic-UUID collision, and the exact desired
+child-to-parent UUID sets. Unknown managed table use, orphaned or malformed
+identity, duplicates, and missing/extra/conflicting parents fail closed. The
+PVN Control snapshot digest must also be unchanged from the beginning to the
+end of the audit. Reconciliation may create or update the current desired
+graph, but the audit itself never creates, updates, deletes, or prunes. In
+v0.2.14 an orphan is reported and left intact because no cluster ownership
+marker authorizes global cleanup; it is never silently deleted. If either
+reconciliation or audit fails, the command returns nonzero without a success
+JSON result, and the writer freeze must remain in place.
+
 ### 7. Restart through the targets and validate
 
 After the restore and forced reconciliation both succeed, run this on every

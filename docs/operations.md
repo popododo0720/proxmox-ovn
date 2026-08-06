@@ -514,10 +514,12 @@ also rejects a wrong/missing/extra seed remote, foreign CID, or server-ID
 collision before changing the ledger. The `complete` proof additionally
 cross-checks each live Raft row with the corresponding offline database SID,
 CID, and local address. Plan reports the required repin without writing. Apply
-repeats the proof under the cluster mutation lease, atomically replaces only
-the package-version snapshot, and then converges or revalidates forward. It
+repeats the proof under the cluster mutation lease and atomically replaces the
+eligible durable snapshot. A normal package repin may differ only by uniform
+forward package versions. The exact legacy package/topology/cluster-version
+bridge is described below. Apply then converges or revalidates forward; it
 never adopts an unpinned database, regenerates keys, removes state, or consumes
-the restart marker. Any mixed/downgraded package, membership/topology
+the restart marker. Any other mixed/downgraded package, membership/topology
 difference, unexpected progress, CID, marker, database, doctor, or service
 state remains a hard failure; do not edit the ledger to bypass it.
 
@@ -534,12 +536,69 @@ restart enough voters concurrently to lose quorum. Mixed-version compatibility
 is required for the duration of this rolling window; use a maintenance window
 for releases that declare a breaking database or wire-protocol change.
 
-For an already `complete` ledger, run `pvn-control-plane plan` and its confirmed
-`apply` immediately after the package rollout, while every restart marker still
-exists. The successful apply repins the durable package snapshot. Only then
-perform the one-voter-at-a-time restart sequence below and consume each marker;
-clearing or consuming a marker before the repin intentionally makes recovery
-fail closed.
+For an already `complete` schema-2 ledger, run `pvn-control-plane plan` and its
+confirmed `apply` immediately after the package rollout, while every restart
+marker still exists. The successful apply repins the durable package snapshot.
+Only then perform the one-voter-at-a-time restart sequence below and consume
+each marker; clearing or consuming a marker before the repin intentionally
+makes recovery fail closed.
+
+### Active v0.2.13 schema-1 upgrade to v0.2.14
+
+An active cluster whose complete v0.2.13 control snapshot still pins a
+canonical schema-1 topology needs two repins after the v0.2.14 rolling package
+update. Use this exact order:
+
+1. Finish the v0.2.14 rolling updater on every node. Keep every central target
+   running and retain every `central-restart-pending` marker. Do not begin the
+   one-voter restart sequence yet.
+2. Reuse the exact Geneve/provider CIDRs, guest MTU, provider acknowledgement,
+   and cluster name from the completed topology transaction. Review and apply
+   the active ledger-only upgrade:
+
+   ```sh
+   /usr/lib/pvn/pvn-topology plan \
+     --geneve-cidr EXACT_GENEVE_CIDR --provider-cidr EXACT_PROVIDER_CIDR \
+     --guest-mtu EXACT_GUEST_MTU
+
+   /usr/lib/pvn/pvn-topology apply \
+     --geneve-cidr EXACT_GENEVE_CIDR --provider-cidr EXACT_PROVIDER_CIDR \
+     --guest-mtu EXACT_GUEST_MTU \
+     --provider-port-ready OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP \
+     --confirm CLUSTER_NAME
+   ```
+
+   The plan must report `Upgrade readiness: READY`. Apply re-proves every
+   active node, complete topology journal, live doctor/Raft state, restart
+   marker, raw complete control ledger, and persisted/runtime Corosync pin. It
+   performs one shared topology-ledger compare-and-swap from the canonical
+   schema-1 file to its schema-2 projection. It does not change networking,
+   Corosync, journals, services, or markers.
+3. Run the control plan. At the exact legacy boundary it reports both
+   `package_repin_required: true` and
+   `topology_schema_repin_required: true`. Apply with the cluster name:
+
+   ```sh
+   /usr/lib/pvn/pvn-control-plane plan
+   /usr/lib/pvn/pvn-control-plane apply --confirm CLUSTER_NAME
+   ```
+
+   The combined bridge is deliberately one-use and exact: the complete
+   control snapshot must uniformly pin package `0.2.13`, cluster version `3`,
+   and the canonical schema-1 digest; all live nodes must uniformly run
+   `0.2.14`; and current PVE membership, the schema-2 Corosync candidate, and
+   every persisted/runtime Corosync report must agree on config version `4`.
+   The complete targets, PKI, database identities, N/N Raft health, doctors,
+   and restart markers must also pass the normal complete-ledger proof. Apply
+   repeats everything under the mutation lease and atomically pins the fresh
+   schema-2/package/cluster-version snapshot.
+4. Re-run both plans. The topology upgrade must be `already complete` and the
+   control plan must require no repin. Only then restart central voters one at
+   a time and consume their markers as described below.
+
+This is not a general `current = pinned + 1` exception. A different package
+pair, version jump, topology projection, journal, membership, or control phase
+fails closed and requires operator investigation.
 
 Do not clear the marker while a voter still runs the old process. Once every
 database has converged beyond the one-member seed, use this sequence on exactly
