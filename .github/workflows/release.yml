@@ -50,10 +50,50 @@ jobs:
           grep -Fx "DEFAULT_VERSION=$release_version" deploy/scripts/pvn-install.sh
           grep -Fx "DEFAULT_VERSION=$release_version" deploy/scripts/pvn-update.sh
           grep -Fx "DEB_VERSION ?= $release_version" Makefile
+          head -n 1 packaging/debian/changelog | \
+            grep -Fx "proxmox-ovn ($release_version) unstable; urgency=medium"
           printf 'PVN_RELEASE_VERSION=%s\n' "$release_version" >> "$GITHUB_ENV"
+          printf 'PVN_RELEASE_ARCH=%s\n' "$(dpkg --print-architecture)" >> "$GITHUB_ENV"
 
       - name: Build and verify release
         run: make release DEB_VERSION="$PVN_RELEASE_VERSION"
+
+      - name: Validate release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            SHA256SUMS
+            pvn-cluster-install
+            pvn-cluster-lease
+            pvn-cluster-update
+            pvn-install.sh
+            "pvn-node_${PVN_RELEASE_VERSION}_${PVN_RELEASE_ARCH}.deb"
+            pvn-update.sh
+          )
+          mapfile -t actual < <(
+            find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort
+          )
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+          if (( ${#actual[@]} != ${#wanted[@]} )); then
+            printf 'unexpected release assets:\n' >&2
+            printf '  %s\n' "${actual[@]}" >&2
+            exit 1
+          fi
+          for index in "${!wanted[@]}"; do
+            if [[ ${actual[$index]} != "${wanted[$index]}" ]]; then
+              printf 'unexpected release assets:\n' >&2
+              printf '  %s\n' "${actual[@]}" >&2
+              exit 1
+            fi
+          done
+          for asset in "${expected[@]}"; do
+            [[ -f "dist/$asset" && ! -L "dist/$asset" ]] || {
+              printf 'release asset is missing or unsafe: %s\n' "$asset" >&2
+              exit 1
+            }
+          done
+          (cd dist && sha256sum --check SHA256SUMS)
 
       - name: Publish GitHub Release
         shell: bash
@@ -61,12 +101,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          assets=(dist/*)
-          if (( ${#assets[@]} == 0 )); then
-            echo 'release build produced no assets' >&2
-            exit 1
-          fi
+          assets=(
+            dist/SHA256SUMS
+            dist/pvn-cluster-install
+            dist/pvn-cluster-lease
+            dist/pvn-cluster-update
+            dist/pvn-install.sh
+            "dist/pvn-node_${PVN_RELEASE_VERSION}_${PVN_RELEASE_ARCH}.deb"
+            dist/pvn-update.sh
+          )
           if gh release view "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber \
