@@ -1354,6 +1354,43 @@ func TestRendererRejectsRestoredDuplicateAndForeignNonRootRows(t *testing.T) {
 	})
 }
 
+func TestSubnetDHCPRemovalPreflightsRestoredDuplicateBeforeClearingPorts(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*Renderer, *model.Subnet) error
+	}{
+		{name: "render-disabled", run: func(renderer *Renderer, subnet *model.Subnet) error {
+			return renderer.Render(context.Background(), subnet)
+		}},
+		{name: "delete", run: func(renderer *Renderer, subnet *model.Subnet) error {
+			return renderer.Delete(context.Background(), subnet)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, fixture := newNorthSouthFixture(t)
+			port := mustCreate(t, store, &model.Port{
+				Metadata: model.Metadata{ID: "port-dhcp-preflight"}, ProjectID: fixture.project.ID,
+				NetworkID: fixture.internalNetwork.ID, Name: "vm-preflight-net0", MACAddress: "02:00:00:00:00:55",
+				FixedIPs: []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.55"}},
+			}).(*model.Port)
+			runner := &recordingRunner{}
+			runner.seedOwnedRow(logicalSwitchPortOwnedRow(port.ID, port.LSPName), deterministicUUID("restored:preflight-port"))
+			dhcp := dhcpOptionsOwnedRow(fixture.internalSubnet.ID)
+			runner.seedOwnedRow(dhcp, deterministicUUID("restored:duplicate-dhcp-a"))
+			runner.seedOwnedRow(dhcp, deterministicUUID("restored:duplicate-dhcp-b"))
+			renderer := newTestRenderer(t, runner, store)
+
+			err := test.run(renderer, fixture.internalSubnet)
+			if err == nil || !strings.Contains(err.Error(), "duplicate PVN-owned DHCP_Options") {
+				t.Fatalf("duplicate restored DHCP error = %v", err)
+			}
+			if runner.contains("clear Logical_Switch_Port") {
+				t.Fatalf("port DHCP was cleared before duplicate ownership failed: %v", runner.calls)
+			}
+		})
+	}
+}
+
 func TestDerivedNamesDoNotAliasPunctuation(t *testing.T) {
 	if logicalSwitch("a-b") == logicalSwitch("ab") || portGroup("a:b") == portGroup("a.b") {
 		t.Fatal("derived OVN names alias distinct PVN identifiers")

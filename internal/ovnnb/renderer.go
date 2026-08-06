@@ -85,12 +85,18 @@ func (renderer *Renderer) Delete(ctx context.Context, resource model.Resource) e
 		_, err = renderer.client.run(ctx, "--", "--if-exists", "ls-del", uuid)
 		return wrapRender("delete network", value.ID, err)
 	case *model.Subnet:
+		uuid, err := renderer.lookupOwnedRow(ctx, dhcpOptionsOwnedRow(value.ID))
+		if err != nil {
+			return wrapRender("delete subnet", value.ID, err)
+		}
+		// Resolve the DHCP row before changing any port references. A duplicate
+		// restored identity is ambiguous and must fail closed without partially
+		// clearing DHCP from otherwise healthy logical switch ports.
 		if err := renderer.attachDHCPToPorts(ctx, value, ""); err != nil {
 			return err
 		}
-		uuid, err := renderer.lookupOwnedRow(ctx, dhcpOptionsOwnedRow(value.ID))
-		if err != nil || uuid == "" {
-			return wrapRender("delete subnet", value.ID, err)
+		if uuid == "" {
+			return nil
 		}
 		_, err = renderer.client.run(ctx, "--", "--if-exists", "destroy", "DHCP_Options", uuid)
 		return wrapRender("delete subnet", value.ID, err)
@@ -301,12 +307,17 @@ func (renderer *Renderer) subnet(ctx context.Context, subnet *model.Subnet) erro
 }
 
 func (renderer *Renderer) clearSubnetDHCP(ctx context.Context, subnet *model.Subnet) error {
+	uuid, err := renderer.lookupOwnedRow(ctx, dhcpOptionsOwnedRow(subnet.ID))
+	if err != nil {
+		return wrapRender("remove subnet DHCP", subnet.ID, err)
+	}
+	// Ownership is a preflight gate: do not detach any port if restored rows
+	// make this subnet's DHCP identity ambiguous.
 	if err := renderer.attachDHCPToPorts(ctx, subnet, ""); err != nil {
 		return err
 	}
-	uuid, err := renderer.lookupOwnedRow(ctx, dhcpOptionsOwnedRow(subnet.ID))
-	if err != nil || uuid == "" {
-		return wrapRender("remove subnet DHCP", subnet.ID, err)
+	if uuid == "" {
+		return nil
 	}
 	_, err = renderer.client.run(ctx, "--", "--if-exists", "destroy", "DHCP_Options", uuid)
 	return wrapRender("remove subnet DHCP", subnet.ID, err)
