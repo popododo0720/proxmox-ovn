@@ -366,7 +366,7 @@ pve_ssh_node "$copy_node" "$copy_ip" \
   "set -eu; umask 077; test ! -e '$copy_root'; install -d -o root -g root -m 0700 '$copy_root'"
 /usr/bin/tar -C "$source_root" -cf - -- "$backup_name" | \
   pve_ssh_node "$copy_node" "$copy_ip" \
-    "set -eu; /usr/bin/tar -C '$copy_root' --keep-old-files --no-overwrite-dir -xpf -"
+    "set -eu; /usr/bin/tar -C '$copy_root' --keep-old-files -xpf -"
 pve_ssh_node "$copy_node" "$copy_ip" \
   "/usr/sbin/pvn-db-backup verify '$copy_root/$backup_name'"
 ```
