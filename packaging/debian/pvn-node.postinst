@@ -1,6 +1,25 @@
 #!/bin/sh
 set -eu
 
+package_transition_directory=/run/pvn-node
+package_transition_auth=$package_transition_directory/package-configuring
+package_transition_temporary=
+package_transition_open=false
+node_restart_intent=/var/lib/pvn-node/node-restart-pending
+
+cleanup_package_transition() {
+    exec 9>&-
+    if [ -n "$package_transition_temporary" ]; then
+        rm -f -- "$package_transition_temporary"
+    fi
+    if [ "$package_transition_open" = true ]; then
+        rm -f -- "$package_transition_auth" || true
+    fi
+}
+
+trap cleanup_package_transition EXIT
+trap 'exit 1' HUP INT TERM
+
 install_ui() {
     [ -x /usr/lib/pvn/pvn-ui-inject ] || {
         echo "PVN UI injector is missing" >&2
@@ -29,7 +48,7 @@ verify_corosync_runtime() {
 mark_central_restart_pending() {
     state_dir=/var/lib/pvn-node
     marker=$state_dir/central-restart-pending
-    if [ -e "$state_dir" ]; then
+    if [ -e "$state_dir" ] || [ -L "$state_dir" ]; then
         [ -d "$state_dir" ] && [ ! -L "$state_dir" ] || {
             echo "$state_dir must be a real directory" >&2
             return 1
@@ -57,6 +76,180 @@ mark_central_restart_pending() {
         rm -f -- "$temporary"
         return 1
     fi
+}
+
+current_package_version() {
+    version=$(dpkg-query -W -f='${Version}' pvn-node 2>/dev/null || true)
+    case "$version" in
+        ''|*[!A-Za-z0-9.+:~_-]*) return 1 ;;
+    esac
+    printf '%s\n' "$version"
+}
+
+ensure_restart_state_directory() {
+    state_dir=/var/lib/pvn-node
+    if [ -e "$state_dir" ] || [ -L "$state_dir" ]; then
+        [ -d "$state_dir" ] && [ ! -L "$state_dir" ] || {
+            echo "$state_dir must be a real directory" >&2
+            return 1
+        }
+    else
+        install -d -m 0700 -o root -g root "$state_dir"
+    fi
+    [ "$(stat -c '%u:%g:%a' "$state_dir")" = 0:0:700 ] || {
+        echo "$state_dir must be root:root mode 0700" >&2
+        return 1
+    }
+}
+
+node_restart_intent_state() {
+    expected=$1
+    state_dir=/var/lib/pvn-node
+    if [ ! -e "$state_dir" ] && [ ! -L "$state_dir" ]; then
+        printf '%s\n' none
+        return 0
+    fi
+    ensure_restart_state_directory || return 1
+    if [ ! -e "$node_restart_intent" ] && [ ! -L "$node_restart_intent" ]; then
+        printf '%s\n' none
+        return 0
+    fi
+    [ -f "$node_restart_intent" ] && [ ! -L "$node_restart_intent" ] || {
+        echo "$node_restart_intent must be a regular non-symlink file" >&2
+        return 1
+    }
+    before=$(stat -c '%d:%i:%u:%g:%a:%h:%s' "$node_restart_intent") || return 1
+    size=$(stat -c '%s' "$node_restart_intent") || return 1
+    case "$before" in
+        "$(stat -c '%d:%i' "$node_restart_intent")":0:0:600:1:*) ;;
+        *)
+            echo "$node_restart_intent has unsafe metadata" >&2
+            return 1
+            ;;
+    esac
+    [ "$size" -gt 0 ] && [ "$size" -le 512 ] || {
+        echo "$node_restart_intent has an unsafe size" >&2
+        return 1
+    }
+    content=$(cat -- "$node_restart_intent") || return 1
+    after=$(stat -c '%d:%i:%u:%g:%a:%h:%s' "$node_restart_intent") || return 1
+    [ "$after" = "$before" ] || {
+        echo "$node_restart_intent changed while being read" >&2
+        return 1
+    }
+    case "$content" in
+        "$expected|inactive|none") ;;
+        "$expected|active|"*)
+            pids=${content#"$expected|active|"}
+            case "$pids" in ''|*[!0-9,]*) return 1 ;; esac
+            old_ifs=$IFS
+            IFS=,
+            set -- $pids
+            IFS=$old_ifs
+            [ "$#" -eq 4 ] || return 1
+            for pid in "$@"; do
+                case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+            done
+            ;;
+        *)
+            echo "$node_restart_intent does not match installed pvn-node" >&2
+            return 1
+            ;;
+    esac
+    [ "$size" -eq $((${#content} + 1)) ] || {
+        echo "$node_restart_intent must contain exactly one record line" >&2
+        return 1
+    }
+    printf '%s\n' "$content"
+}
+
+mark_node_restart_pending() {
+    record=$1
+    ensure_restart_state_directory
+    temporary=$(mktemp /var/lib/pvn-node/.node-restart-pending.XXXXXXXX)
+    if ! printf '%s\n' "$record" >"$temporary" ||
+        ! chown root:root "$temporary" 9>&- || ! chmod 0600 "$temporary" 9>&- ||
+        ! mv -f -- "$temporary" "$node_restart_intent" 9>&-
+    then
+        rm -f -- "$temporary" 9>&- || true
+        return 1
+    fi
+}
+
+consume_node_restart_pending() {
+    version=$1
+    record=$2
+    [ "$(node_restart_intent_state "$version")" = "$record" ] || return 1
+    rm -f -- "$node_restart_intent"
+}
+
+authorize_package_transition() {
+    version=$(current_package_version) || {
+        echo "cannot authorize an unsafe pvn-node package version" >&2
+        return 1
+    }
+    if [ -e "$package_transition_directory" ] || [ -L "$package_transition_directory" ]; then
+        [ -d "$package_transition_directory" ] && [ ! -L "$package_transition_directory" ] || {
+            echo "$package_transition_directory must be a real directory" >&2
+            return 1
+        }
+    else
+        install -d -m 0700 -o root -g root "$package_transition_directory"
+    fi
+    [ "$(stat -c '%U:%G:%a' "$package_transition_directory")" = root:root:700 ] || {
+        echo "$package_transition_directory must be root:root mode 0700" >&2
+        return 1
+    }
+    package_transition_temporary=$(mktemp "$package_transition_directory/.package-configuring.XXXXXXXX")
+    exec 9>"$package_transition_temporary"
+    /usr/bin/python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)'
+    if ! printf '%s\n' "$version" >&9 ||
+        ! chown root:root "$package_transition_temporary" 9>&- ||
+        ! chmod 0600 "$package_transition_temporary" 9>&- ||
+        ! mv -f -- "$package_transition_temporary" "$package_transition_auth" 9>&-
+    then
+        return 1
+    fi
+    package_transition_temporary=
+    package_transition_open=true
+}
+
+safe_activation_marker() {
+    marker=$1
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    [ "$(stat -c '%u:%g:%a:%h:%s' "$marker")" = 0:0:644:1:0 ]
+}
+
+safe_node_activation_marker() {
+    safe_activation_marker /etc/pvn/node-enabled
+}
+
+recoverable_failed_node_stack() {
+    [ "${1:-}" = configure ] || return 1
+    [ -n "${2:-}" ] || return 1
+    case "$2" in *[!A-Za-z0-9.+:~_-]*) return 1 ;; esac
+    [ "$3" != none ] || return 1
+    safe_node_activation_marker || return 1
+    systemctl is-enabled --quiet pvn-node.target || return 1
+    case "$4" in inactive|failed) ;; *) return 1 ;; esac
+}
+
+central_process_ids() {
+    result=
+    for unit in pvn-control-db.service ovn-ovsdb-server-nb.service \
+        ovn-ovsdb-server-sb.service ovn-northd.service
+    do
+        pid=$(systemctl show --property=MainPID --value "$unit" 2>/dev/null || true)
+        case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+        case ",$result," in *",$pid,"*) return 1 ;; esac
+        result=${result:+$result,}$pid
+    done
+    printf '%s\n' "$result"
+}
+
+invalidate_node_readiness() {
+    systemctl stop pvn-node-ready.service pvn-node.target 9>&- \
+        >/dev/null 2>&1 || true
 }
 
 if [ "${1:-}" = "triggered" ]; then
@@ -101,31 +294,172 @@ systemctl mask ovn-host.service >/dev/null 2>&1 || true
 # visibly failed without exposing an unmanaged OVN startup path.
 install_ui
 
-# A first install is deliberately inert. An operator activates pvn-node.target
-# after staging shared config, local config, PKI, and both OVS bridges. During
-# upgrades only already-active node services are restarted.
+# Record and lock the transition before restarting the manager. The manager's
+# startup probe is intentionally reachability-only because the preserved old
+# northd can be unsynchronized; every OVN mutation still has a strict sync
+# fence. During postinst, dpkg reports half-configured, so the root-only live
+# flock is the additional bounded authorization consumed by node readiness.
+pvn_package_version=$(current_package_version) || {
+    echo "cannot determine the configured pvn-node package version" >&2
+    exit 1
+}
+pvn_node_restart_intent=$(node_restart_intent_state "$pvn_package_version") || {
+    echo "node restart intent is unsafe or belongs to another package version" >&2
+    exit 1
+}
+
+pvn_central_active=false
+pvn_central_pids=
+pvn_central_target_state=$(systemctl show --property=ActiveState --value \
+    pvn-central.target 2>/dev/null || true)
+case "$pvn_central_target_state" in
+    active)
+        pvn_central_active=true
+        safe_activation_marker /etc/pvn/central/enabled || {
+            echo "active central activation marker is unsafe" >&2
+            exit 1
+        }
+        pvn_central_pids=$(central_process_ids) || {
+            echo "active central services lack stable process identities" >&2
+            exit 1
+        }
+        ;;
+    inactive) ;;
+    *)
+        echo "pvn-central.target is neither active nor safely inactive" >&2
+        exit 1
+        ;;
+esac
+pvn_node_restart_record="$pvn_package_version|inactive|none"
+if [ "$pvn_central_active" = true ]; then
+    pvn_node_restart_record="$pvn_package_version|active|$pvn_central_pids"
+fi
+if [ "$pvn_node_restart_intent" != none ] && \
+    [ "$pvn_node_restart_intent" != "$pvn_node_restart_record" ]; then
+    echo "node restart intent central process identity changed" >&2
+    exit 1
+fi
+if [ "$pvn_central_active" = true ]; then
+    mark_central_restart_pending
+fi
+
+pvn_node_active=false
+pvn_node_recovery=false
 if systemctl is-active --quiet pvn-node.target; then
+    safe_node_activation_marker || {
+        echo "active node activation marker is unsafe" >&2
+        exit 1
+    }
+    pvn_node_active=true
+else
+    pvn_node_target_state=$(systemctl show --property=ActiveState --value \
+        pvn-node.target 2>/dev/null || true)
+    case "$pvn_node_target_state" in
+        inactive|failed) ;;
+        *)
+            echo "pvn-node.target is neither active nor safely settled" >&2
+            exit 1
+            ;;
+    esac
+    if recoverable_failed_node_stack "${1:-}" "${2:-}" \
+        "$pvn_node_restart_intent" "$pvn_node_target_state"; then
+        pvn_node_recovery=true
+    fi
+fi
+if [ "$pvn_node_restart_intent" != none ] && [ "$pvn_node_active" != true ] && \
+    [ "$pvn_node_recovery" != true ]; then
+    echo "pending node restart cannot be safely resumed" >&2
+    exit 1
+fi
+if { [ "$pvn_node_active" = true ] || [ "$pvn_node_recovery" = true ]; } && \
+    [ "$pvn_central_active" != true ]; then
+    echo "active or recovering node stack requires an active central target" >&2
+    exit 1
+fi
+
+# A first install and an intentionally clean stop remain inert. Only a durable
+# restart intent written by this postinst can authorize recovery of an
+# interrupted upgrade/reconfigure.
+if [ "$pvn_node_active" = true ] || [ "$pvn_node_recovery" = true ]; then
+    mark_node_restart_pending "$pvn_node_restart_record"
+    if [ "$pvn_central_active" = true ]; then
+        authorize_package_transition
+    fi
+    if ! systemctl stop pvn-node-ready.service pvn-node.target 9>&-; then
+        echo "PVN node target/readiness could not be stopped for package upgrade" >&2
+        exit 1
+    fi
     if ! systemctl restart \
         pvn-ovn-host-config.service ovn-controller.service \
-        pvn-manager.service pvn-agent.service pvn-node-ready.service
+        pvn-manager.service pvn-agent.service 9>&-
     then
         echo "PVN node stack failed to restart during package upgrade" >&2
         systemctl --no-pager --full status \
             pvn-node.target pvn-node-ready.service \
             pvn-ovn-host-config.service ovn-controller.service \
-            pvn-manager.service pvn-agent.service >&2 || true
+            pvn-manager.service pvn-agent.service 9>&- >&2 || true
         exit 1
     fi
+    if [ "$pvn_central_active" = true ]; then
+        pvn_central_pids_after=$(central_process_ids 9>&-) || {
+            echo "active central services lost stable process identities" >&2
+            exit 1
+        }
+        [ "$pvn_central_pids_after" = "$pvn_central_pids" ] || {
+            echo "active central process identity changed during package upgrade" >&2
+            exit 1
+        }
+    fi
+    # Readiness is deliberately the final fallible package action. Recovery
+    # starts the target only after its individual requirements and central PID
+    # proof are complete; the target transaction includes node readiness.
+    if ! systemctl start pvn-node.target 9>&-; then
+        echo "PVN node target/readiness failed during package upgrade" >&2
+        invalidate_node_readiness
+        exit 1
+    fi
+    for unit in pvn-node.target pvn-node-ready.service pvn-manager.service \
+        pvn-ovn-host-config.service ovn-controller.service pvn-agent.service
+    do
+        if ! systemctl is-active --quiet "$unit" 9>&-; then
+            echo "$unit is not active after package upgrade" >&2
+            invalidate_node_readiness
+            exit 1
+        fi
+    done
+    pvn_central_target_state_after=$(systemctl show --property=ActiveState \
+        --value pvn-central.target 9>&- 2>/dev/null || true)
+    pvn_node_restart_record_after="$pvn_package_version|inactive|none"
+    if [ "$pvn_central_target_state_after" = active ]; then
+        safe_activation_marker /etc/pvn/central/enabled 9>&- || {
+            echo "final central activation marker is unsafe" >&2
+            invalidate_node_readiness
+            exit 1
+        }
+        pvn_central_pids_final=$(central_process_ids 9>&-) || {
+            echo "active central services lost final process identities" >&2
+            invalidate_node_readiness
+            exit 1
+        }
+        pvn_node_restart_record_after="$pvn_package_version|active|$pvn_central_pids_final"
+    elif [ "$pvn_central_target_state_after" != inactive ]; then
+        echo "central target entered an unsafe final state" >&2
+        invalidate_node_readiness
+        exit 1
+    fi
+    [ "$pvn_node_restart_record_after" = "$pvn_node_restart_record" ] || {
+        echo "central process identity changed during final node readiness" >&2
+        invalidate_node_readiness
+        exit 1
+    }
+    consume_node_restart_pending "$pvn_package_version" \
+        "$pvn_node_restart_record" 9>&- || {
+        echo "cannot consume the completed node restart intent" >&2
+        invalidate_node_readiness
+        exit 1
+    }
 else
     systemctl stop ovn-controller.service >/dev/null 2>&1 || true
-fi
-
-# Active central processes intentionally survive package configuration so a
-# single dpkg transaction cannot unexpectedly remove Raft quorum. The rolling
-# operator consumes this root-only marker only after every package health gate
-# and a separately verified, quorum-safe restart of that voter.
-if systemctl is-active --quiet pvn-central.target; then
-    mark_central_restart_pending
 fi
 
 exit 0

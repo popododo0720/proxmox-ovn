@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import pathlib
@@ -49,6 +50,9 @@ with tempfile.TemporaryDirectory() as temporary:
     restart_directory = root / "pvn-node"
     restart_directory.mkdir(mode=0o700)
     restart_marker = restart_directory / "central-restart-pending"
+    package_transition_directory = root / "run-pvn-node"
+    package_transition_directory.mkdir(mode=0o700)
+    package_transition_auth = package_transition_directory / "package-configuring"
     db_params = root / "ovn-northd-db-params.conf"
 
     write_executable(
@@ -123,7 +127,8 @@ for name in ("DPKG_ROOT", "DPKG_ADMINDIR"):
 if os.environ.get("FAKE_DPKG_FAILURE") == "yes":
     raise SystemExit(3)
 version = os.environ.get("FAKE_INSTALLED_VERSION", "0.2.16")
-print(f"install ok installed\\t{version}")
+status = os.environ.get("FAKE_PACKAGE_STATUS", "installed")
+print(f"install ok {status}\\t{version}")
 """,
     )
 
@@ -138,6 +143,9 @@ print(f"install ok installed\\t{version}")
             "PVN_NORTHD_SYSTEMCTL": str(systemctl),
             "PVN_NORTHD_DPKG_QUERY": str(dpkg_query),
             "PVN_NORTHD_RESTART_STATE_DIR": str(restart_directory),
+            "PVN_NORTHD_PACKAGE_TRANSITION_DIR": str(
+                package_transition_directory
+            ),
             "PVN_NORTHD_DB_PARAMS": str(db_params),
             "FAKE_START_CALLS": str(calls),
             "FAKE_QUERY_CALLS": str(query_calls),
@@ -206,6 +214,18 @@ print(f"install ok installed\\t{version}")
     def remove_marker() -> None:
         restart_marker.unlink(missing_ok=True)
         role_counter.unlink(missing_ok=True)
+
+    def write_package_auth(version: str = "0.2.16", *, locked: bool) -> int:
+        package_transition_auth.unlink(missing_ok=True)
+        descriptor = os.open(
+            package_transition_auth,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.write(descriptor, (version + "\n").encode("ascii"))
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor
 
     standalone_hosts = ["192.0.2.10"]
     write_config(config(standalone_hosts))
@@ -329,6 +349,13 @@ print(f"install ok installed\\t{version}")
     cfg_drift = run("status", {"FAKE_NB_CFG": "43"})
     check(cfg_drift.returncode != 0 and "synchronization is incomplete" in cfg_drift.stderr, "NB/SB cfg drift was accepted")
 
+    node_ready_without_marker = run("node-ready", {"FAKE_NB_CFG": "43"})
+    check(
+        node_ready_without_marker.returncode != 0
+        and "synchronization is incomplete" in node_ready_without_marker.stderr,
+        "normal node readiness accepted cfg drift without a restart marker",
+    )
+
     malformed_cfg = run("status", {"FAKE_SB_NB_CFG": "[42]"})
     check(malformed_cfg.returncode != 0 and "canonical non-negative integer" in malformed_cfg.stderr, "malformed cfg value was accepted")
 
@@ -340,6 +367,109 @@ print(f"install ok installed\\t{version}")
 
     write_config(config(raft_hosts))
     write_marker()
+    transition_node_ready = run(
+        "node-ready",
+        {"FAKE_ROLE": "active", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        transition_node_ready.returncode == 0
+        and transition_node_ready.stdout.strip()
+        == "PVN_NORTHD role=active nb=unchecked sb=unchecked cfg=pending transition=central-restart-pending",
+        f"package transition node readiness rejected the preserved active northd: {transition_node_ready.stderr}",
+    )
+    disconnected_node_ready = run(
+        "node-ready",
+        {
+            "FAKE_ROLE": "active",
+            "FAKE_NB_CFG": "43",
+            "FAKE_NB_CONNECTION": "not connected",
+        },
+    )
+    check(
+        disconnected_node_ready.returncode == 0
+        and "transition=central-restart-pending" in disconnected_node_ready.stdout,
+        "transition node readiness rejected the preserved disconnected old northd",
+    )
+    check(
+        "connected" not in disconnected_node_ready.stdout,
+        "relaxed package transition falsely reported disconnected IDLs as connected",
+    )
+
+    half_configured_without_auth = run(
+        "node-ready",
+        {"FAKE_ROLE": "active", "FAKE_PACKAGE_STATUS": "half-configured"},
+    )
+    check(
+        half_configured_without_auth.returncode != 0
+        and "package transition" in half_configured_without_auth.stderr,
+        "half-configured package was accepted without live postinst authorization",
+    )
+    stale_auth_descriptor = write_package_auth(locked=False)
+    os.close(stale_auth_descriptor)
+    half_configured_stale_auth = run(
+        "node-ready",
+        {"FAKE_ROLE": "active", "FAKE_PACKAGE_STATUS": "half-configured"},
+    )
+    check(
+        half_configured_stale_auth.returncode != 0
+        and "stale and unlocked" in half_configured_stale_auth.stderr,
+        "half-configured package accepted a stale postinst authorization",
+    )
+    live_auth_descriptor = write_package_auth(locked=True)
+    half_configured_live_auth = run(
+        "node-ready",
+        {"FAKE_ROLE": "active", "FAKE_PACKAGE_STATUS": "half-configured"},
+    )
+    check(
+        half_configured_live_auth.returncode == 0
+        and "transition=central-restart-pending" in half_configured_live_auth.stdout,
+        f"live postinst authorization was rejected: {half_configured_live_auth.stderr}",
+    )
+    os.close(live_auth_descriptor)
+    package_transition_auth.unlink()
+
+    wrong_auth_descriptor = write_package_auth("0.2.15", locked=True)
+    half_configured_wrong_auth = run(
+        "node-ready",
+        {"FAKE_ROLE": "active", "FAKE_PACKAGE_STATUS": "half-configured"},
+    )
+    check(
+        half_configured_wrong_auth.returncode != 0
+        and "does not match installed" in half_configured_wrong_auth.stderr,
+        "half-configured package accepted a locked authorization for another version",
+    )
+    os.close(wrong_auth_descriptor)
+    package_transition_auth.unlink()
+
+    unsafe_auth_descriptor = write_package_auth(locked=True)
+    package_transition_auth.chmod(0o666)
+    half_configured_unsafe_auth = run(
+        "node-ready",
+        {"FAKE_ROLE": "active", "FAKE_PACKAGE_STATUS": "half-configured"},
+    )
+    check(
+        half_configured_unsafe_auth.returncode != 0
+        and "mode 0600" in half_configured_unsafe_auth.stderr,
+        "half-configured package accepted a writable authorization",
+    )
+    os.close(unsafe_auth_descriptor)
+    package_transition_auth.unlink()
+
+    linked_auth_descriptor = write_package_auth(locked=True)
+    auth_hardlink = root / "package-auth-hardlink"
+    os.link(package_transition_auth, auth_hardlink)
+    half_configured_linked_auth = run(
+        "node-ready",
+        {"FAKE_ROLE": "active", "FAKE_PACKAGE_STATUS": "half-configured"},
+    )
+    check(
+        half_configured_linked_auth.returncode != 0
+        and "exactly one hard link" in half_configured_linked_auth.stderr,
+        "half-configured package accepted a hardlinked authorization",
+    )
+    os.close(linked_auth_descriptor)
+    auth_hardlink.unlink()
+    package_transition_auth.unlink()
     transition_wait = run(
         "wait",
         {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
@@ -410,6 +540,15 @@ print(f"install ok installed\\t{version}")
         wrong_version.returncode != 0
         and "does not match installed" in wrong_version.stderr,
         "wait accepted a restart marker for another installed version",
+    )
+    wrong_version_node_ready = run(
+        "node-ready",
+        {"FAKE_ROLE": "active", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        wrong_version_node_ready.returncode != 0
+        and "does not match installed" in wrong_version_node_ready.stderr,
+        "node readiness accepted a restart marker for another installed version",
     )
 
     write_marker()

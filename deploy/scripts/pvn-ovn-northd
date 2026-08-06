@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import ipaddress
 import json
 import os
@@ -42,6 +43,12 @@ RESTART_STATE_DIRECTORY = pathlib.Path(
     os.environ.get("PVN_NORTHD_RESTART_STATE_DIR", "/var/lib/pvn-node")
 )
 RESTART_MARKER = RESTART_STATE_DIRECTORY / "central-restart-pending"
+PACKAGE_TRANSITION_STATE_DIRECTORY = pathlib.Path(
+    os.environ.get("PVN_NORTHD_PACKAGE_TRANSITION_DIR", "/run/pvn-node")
+)
+PACKAGE_TRANSITION_AUTH = (
+    PACKAGE_TRANSITION_STATE_DIRECTORY / "package-configuring"
+)
 NORTHD_DB_PARAMS = pathlib.Path(
     os.environ.get(
         "PVN_NORTHD_DB_PARAMS", "/etc/ovn/ovn-northd-db-params.conf"
@@ -381,11 +388,23 @@ class Status:
         return self.nb_cfg == self.nb_sb_cfg and self.nb_cfg == self.sb_nb_cfg
 
 
-def check_local_status(deadline: float | None = None) -> str:
+def check_local_role(deadline: float | None = None) -> str:
     run_bounded(
         [SYSTEMCTL, "is-active", "--quiet", "ovn-northd.service"],
         command_timeout(deadline),
     )
+    raw_status = one_line(
+        [OVN_APPCTL, "-t", "ovn-northd", "status"],
+        "northd role status",
+        deadline,
+    )
+    if raw_status not in {"Status: active", "Status: standby"}:
+        fail(f"northd reported an invalid active/standby status: {raw_status!r}")
+    return raw_status.removeprefix("Status: ")
+
+
+def check_local_status(deadline: float | None = None) -> str:
+    role = check_local_role(deadline)
     nb_connection = one_line(
         [OVN_APPCTL, "-t", "ovn-northd", "nb-connection-status"],
         "northd NB connection status",
@@ -401,14 +420,7 @@ def check_local_status(deadline: float | None = None) -> str:
             "northd database connection is incomplete: "
             f"NB={nb_connection!r} SB={sb_connection!r}"
         )
-    raw_status = one_line(
-        [OVN_APPCTL, "-t", "ovn-northd", "status"],
-        "northd role status",
-        deadline,
-    )
-    if raw_status not in {"Status: active", "Status: standby"}:
-        fail(f"northd reported an invalid active/standby status: {raw_status!r}")
-    return raw_status.removeprefix("Status: ")
+    return role
 
 
 def observe_status(
@@ -466,6 +478,22 @@ def check_status(
     if not status.synchronized:
         fail(synchronization_error(status))
     return status
+
+
+def node_ready_status(
+    config: Connections, deadline: float | None = None
+) -> tuple[Status, bool]:
+    """Gate node readiness without making package repin depend on northd restart."""
+    if not transition_marker_matches(deadline):
+        return check_status(config, deadline), False
+    # Package configuration intentionally preserves the old split northd,
+    # whose local NB or SB IDL can already be disconnected. The exact marker
+    # relaxes only this node-readiness diagnostic: manager reachability uses
+    # the complete NB voter set and every mutation retains a strict sync fence.
+    role = check_local_role(deadline)
+    if not transition_marker_matches(deadline):
+        fail("central restart marker disappeared during node readiness")
+    return Status(role=role, nb_cfg=0, nb_sb_cfg=0, sb_nb_cfg=0), True
 
 
 def validate_restart_directory(metadata: os.stat_result) -> None:
@@ -615,7 +643,153 @@ def read_restart_marker() -> str | None:
     return version
 
 
-def installed_package_version(deadline: float | None = None) -> str:
+def validate_package_transition_directory(metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        fatal(
+            "package transition state must be a real directory: "
+            f"{PACKAGE_TRANSITION_STATE_DIRECTORY}"
+        )
+    if (
+        metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fatal(
+            "package transition state must be root:root mode 0700: "
+            f"{PACKAGE_TRANSITION_STATE_DIRECTORY}"
+        )
+
+
+def validate_package_transition_auth(metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fatal(
+            "package transition authorization must be a regular non-symlink "
+            f"file: {PACKAGE_TRANSITION_AUTH}"
+        )
+    if metadata.st_nlink != 1:
+        fatal(
+            "package transition authorization must have exactly one hard link: "
+            f"{PACKAGE_TRANSITION_AUTH}"
+        )
+    if (
+        metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        fatal(
+            "package transition authorization must be root:root mode 0600: "
+            f"{PACKAGE_TRANSITION_AUTH}"
+        )
+    if metadata.st_size > MAX_MARKER_BYTES:
+        fatal(
+            "package transition authorization exceeds "
+            f"{MAX_MARKER_BYTES} bytes: {PACKAGE_TRANSITION_AUTH}"
+        )
+
+
+def require_live_package_transition(expected_version: str) -> None:
+    try:
+        directory_before = PACKAGE_TRANSITION_STATE_DIRECTORY.lstat()
+    except OSError as error:
+        fatal(f"cannot inspect package transition state: {error}")
+    validate_package_transition_directory(directory_before)
+    directory_identity = (directory_before.st_dev, directory_before.st_ino)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    try:
+        directory_descriptor = os.open(
+            PACKAGE_TRANSITION_STATE_DIRECTORY, directory_flags
+        )
+    except OSError as error:
+        fatal(f"cannot open package transition state: {error}")
+    try:
+        directory_opened = os.fstat(directory_descriptor)
+        validate_package_transition_directory(directory_opened)
+        if (directory_opened.st_dev, directory_opened.st_ino) != directory_identity:
+            fatal("package transition state changed identity")
+        try:
+            auth_before = os.stat(
+                PACKAGE_TRANSITION_AUTH.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            fatal(f"cannot inspect package transition authorization: {error}")
+        validate_package_transition_auth(auth_before)
+        auth_identity = (auth_before.st_dev, auth_before.st_ino)
+        auth_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            auth_flags |= os.O_NOFOLLOW
+        try:
+            auth_descriptor = os.open(
+                PACKAGE_TRANSITION_AUTH.name,
+                auth_flags,
+                dir_fd=directory_descriptor,
+            )
+        except OSError as error:
+            fatal(f"cannot open package transition authorization: {error}")
+        try:
+            auth_opened = os.fstat(auth_descriptor)
+            validate_package_transition_auth(auth_opened)
+            if (auth_opened.st_dev, auth_opened.st_ino) != auth_identity:
+                fatal("package transition authorization changed identity")
+            try:
+                fcntl.flock(auth_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            except OSError as error:
+                fatal(f"cannot inspect package transition lock: {error}")
+            else:
+                fcntl.flock(auth_descriptor, fcntl.LOCK_UN)
+                fatal("package transition authorization is stale and unlocked")
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = os.read(
+                    auth_descriptor,
+                    min(4096, MAX_MARKER_BYTES + 1 - size),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_MARKER_BYTES:
+                    fatal(
+                        "package transition authorization exceeds "
+                        f"{MAX_MARKER_BYTES} bytes"
+                    )
+            auth_after = os.stat(
+                PACKAGE_TRANSITION_AUTH.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            validate_package_transition_auth(auth_after)
+            if (auth_after.st_dev, auth_after.st_ino) != auth_identity:
+                fatal("package transition authorization changed while being read")
+        finally:
+            os.close(auth_descriptor)
+        directory_after = PACKAGE_TRANSITION_STATE_DIRECTORY.lstat()
+        validate_package_transition_directory(directory_after)
+        if (directory_after.st_dev, directory_after.st_ino) != directory_identity:
+            fatal("package transition state changed while being read")
+    except OSError as error:
+        fatal(f"cannot read package transition authorization: {error}")
+    finally:
+        os.close(directory_descriptor)
+    try:
+        raw = b"".join(chunks).decode("ascii")
+    except UnicodeError as error:
+        fatal(f"package transition authorization is not ASCII: {error}")
+    if raw != expected_version + "\n":
+        fatal("package transition authorization does not match installed pvn-node")
+
+
+def package_status_and_version(
+    deadline: float | None = None,
+) -> tuple[str, str]:
     try:
         output = run_bounded(
             [
@@ -629,25 +803,32 @@ def installed_package_version(deadline: float | None = None) -> str:
     except NorthdError as error:
         fatal(f"cannot verify the installed pvn-node version: {error}")
     match = re.fullmatch(
-        r"install ok installed\t([A-Za-z0-9.+:~_-]{1,128})\n",
-        output,
+        r"install ok ([a-z-]+)\t([A-Za-z0-9.+:~_-]{1,128})\n", output
     )
     if match is None:
         fatal("dpkg-query returned an invalid installed pvn-node record")
-    return match.group(1)
+    return match.group(1), match.group(2)
 
 
 def transition_marker_matches(deadline: float | None = None) -> bool:
     marker_version = read_restart_marker()
     if marker_version is None:
         return False
-    installed_version = installed_package_version(deadline)
+    package_status, installed_version = package_status_and_version(deadline)
     if marker_version != installed_version:
         fatal(
             "restart marker does not match installed pvn-node: "
             f"marker={marker_version!r} installed={installed_version!r}"
         )
-    return True
+    if package_status == "installed":
+        return True
+    if package_status == "half-configured":
+        require_live_package_transition(installed_version)
+        return True
+    fatal(
+        "restart marker is not authorized for pvn-node package state: "
+        f"{package_status}"
+    )
 
 
 def transition_standby_ready(
@@ -707,6 +888,14 @@ def emit_transition_status(status: Status) -> None:
     )
 
 
+def emit_package_transition_status(status: Status) -> None:
+    print(
+        "PVN_NORTHD "
+        f"role={status.role} nb=unchecked sb=unchecked "
+        "cfg=pending transition=central-restart-pending"
+    )
+
+
 def wait_ready(config: Connections) -> None:
     deadline = time.monotonic() + WAIT_SECONDS
     last_error = "northd readiness has not been checked"
@@ -733,13 +922,25 @@ def wait_ready(config: Connections) -> None:
 def main(arguments: list[str]) -> int:
     if os.geteuid() != 0:
         fail("pvn-ovn-northd must run as root")
-    if len(arguments) != 1 or arguments[0] not in {"start", "status", "wait"}:
-        fail("usage: pvn-ovn-northd {start|status|wait}")
+    if len(arguments) != 1 or arguments[0] not in {
+        "start",
+        "status",
+        "node-ready",
+        "wait",
+    }:
+        fail("usage: pvn-ovn-northd {start|status|node-ready|wait}")
     config = connections()
     if arguments[0] == "start":
         start(config)
     if arguments[0] == "status":
         emit_status(check_status(config))
+        return 0
+    if arguments[0] == "node-ready":
+        status, transition = node_ready_status(config)
+        if transition:
+            emit_package_transition_status(status)
+        else:
+            emit_status(status)
         return 0
     wait_ready(config)
     return 0

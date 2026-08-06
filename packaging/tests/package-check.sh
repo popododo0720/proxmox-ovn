@@ -33,6 +33,8 @@ deploy/tests/pvn-update-test.sh
 deploy/tests/pvn-cluster-lease-test.sh
 deploy/tests/pvn-ovn-db-listeners-test.sh
 python3 -B deploy/tests/pvn-ovn-northd-test.py
+python3 -B deploy/tests/pvn-node-ready-test.py
+python3 -B packaging/tests/pvn-postinst-test.py
 deploy/tests/pvn-topology-test.sh
 python3 -B deploy/tests/pvn-topology-standalone-test.py
 python3 -B deploy/tests/pvn-topology-corosync-test.py
@@ -177,7 +179,7 @@ grep -q 'transition=central-restart-pending' deploy/scripts/pvn-ovn-northd || {
     echo "PVN northd wait must identify its marker-scoped standby transition" >&2
     exit 1
 }
-grep -q 'def installed_package_version' deploy/scripts/pvn-ovn-northd || {
+grep -q 'def package_status_and_version' deploy/scripts/pvn-ovn-northd || {
     echo "PVN northd transition must verify the installed package version" >&2
     exit 1
 }
@@ -227,15 +229,17 @@ install -d "$readiness_bin"
 sed \
     -e 's#\[ ! -S /run/pvn/manager.sock \]#false#g' \
     -e 's#\[ -S /run/pvn/manager.sock \]#true#g' \
+    -e 's#safe_activation_marker /etc/pvn/node-enabled node || exit 2#true#' \
     -e "s#/usr/bin/systemctl#$readiness_bin/systemctl#g" \
     -e "s#/usr/bin/curl#$readiness_bin/curl#g" \
     -e "s#/usr/bin/ovn-appctl#$readiness_bin/ovn-appctl#g" \
     -e "s#/usr/sbin/pvnctl#$readiness_bin/pvnctl#g" \
     -e "s#/usr/lib/pvn/pvn-ui-verify#$readiness_bin/ui-verify#g" \
+    -e "s#/usr/lib/pvn/pvn-ovn-northd#$readiness_bin/pvn-ovn-northd#g" \
     -e "s#/usr/bin/sleep#$readiness_bin/sleep#g" \
     deploy/scripts/pvn-node-ready > "$readiness_test"
 chmod 0755 "$readiness_test"
-for command in systemctl pvnctl ui-verify sleep; do
+for command in systemctl pvnctl ui-verify pvn-ovn-northd sleep; do
     printf '#!/bin/sh\nexit 0\n' > "$readiness_bin/$command"
     chmod 0755 "$readiness_bin/$command"
 done

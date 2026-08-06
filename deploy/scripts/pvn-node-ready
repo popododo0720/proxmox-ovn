@@ -8,6 +8,16 @@ attempt=1
 max_attempts=30
 last_output='PVN readiness checks have not run'
 
+safe_activation_marker() {
+    marker_path=$1
+    marker_label=$2
+    [ -f "$marker_path" ] && [ ! -L "$marker_path" ] &&
+        [ "$(stat -c '%u:%g:%a:%h:%s' "$marker_path")" = 0:0:644:1:0 ] || {
+            echo "$marker_label activation marker must be an empty root:root mode 0644 file with one link" >&2
+            return 1
+        }
+}
+
 [ "$health_listen" = 127.0.0.1:9476 ] || {
     echo "PVN_HEALTH_LISTEN must use the packaged loopback endpoint" >&2
     exit 2
@@ -16,6 +26,7 @@ last_output='PVN readiness checks have not run'
     echo "PVN_AGENT_HEALTH_URL must use the packaged loopback endpoint" >&2
     exit 2
 }
+safe_activation_marker /etc/pvn/node-enabled node || exit 2
 
 if ! ui_output=$(/usr/lib/pvn/pvn-ui-verify 2>&1); then
     printf '%s\n' "$ui_output" >&2
@@ -37,6 +48,13 @@ controller_is_connected() {
     [ "$controller_status" = connected ]
 }
 
+central_northd_is_ready() {
+    if [ -e /etc/pvn/central/enabled ] || [ -L /etc/pvn/central/enabled ]; then
+        safe_activation_marker /etc/pvn/central/enabled central || return 1
+        /usr/lib/pvn/pvn-ovn-northd node-ready
+    fi
+}
+
 while [ "$attempt" -le "$max_attempts" ]; do
     if [ ! -S /run/pvn/manager.sock ]; then
         last_output='PVN manager runtime socket is not ready'
@@ -44,6 +62,8 @@ while [ "$attempt" -le "$max_attempts" ]; do
         last_output='one or more required PVN node services are not active'
     elif ! controller_is_connected; then
         last_output="OVN Southbound controller is not connected: $controller_status"
+    elif ! northd_output=$(central_northd_is_ready 2>&1); then
+        last_output="PVN central northd is not ready: $northd_output"
     elif ! agent_health=$(/usr/bin/curl --fail --silent --show-error \
         --noproxy '*' --proto '=http' --connect-timeout 1 --max-time 2 \
         "$health_url" 2>&1)
@@ -54,7 +74,7 @@ while [ "$attempt" -le "$max_attempts" ]; do
         # attempts. Manager socket creation also proves its DB probes passed.
         /usr/bin/sleep 2
         if [ -S /run/pvn/manager.sock ] && required_units_active && \
-            controller_is_connected && \
+            controller_is_connected && central_northd_is_ready >/dev/null 2>&1 && \
             /usr/bin/curl --fail --silent --show-error --noproxy '*' \
                 --proto '=http' --connect-timeout 1 --max-time 2 \
                 "$health_url" >/dev/null
