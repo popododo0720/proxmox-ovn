@@ -66,6 +66,13 @@ function resourceLabel(resource: BaseResource): string {
   return 'resource';
 }
 
+function editableResource(resource: BaseResource): Record<string, unknown> {
+  const value = { ...resource };
+  delete value.managed;
+  delete value.read_only;
+  return value;
+}
+
 export function ResourcePage<T extends BaseResource>({
   title,
   description,
@@ -195,8 +202,8 @@ export function ResourcePage<T extends BaseResource>({
                     <td className="actions-column">
                       <span className="table-actions">
                         <button className="table-action" disabled={deleting === item.id} onClick={() => setViewing(item)}>Details</button>
-                        {editFields && <button className="table-action" disabled={deleting === item.id} onClick={() => setEditing(item)}>Edit</button>}
-                        {allowDelete && (
+                        {editFields && item.read_only !== true && <button className="table-action" disabled={deleting === item.id} onClick={() => setEditing(item)}>Edit</button>}
+                        {allowDelete && item.read_only !== true && (
                           <button className="table-action danger" disabled={deleting === item.id} onClick={() => void remove(item)}>
                             {deleting === item.id ? 'Deleting…' : 'Delete'}
                           </button>
@@ -236,7 +243,7 @@ export function ResourcePage<T extends BaseResource>({
           onClose={() => setEditing(null)}
           onSubmit={async (payload) => {
             if (updateResource) await updateResource(editing, payload);
-            else await api.update<T>(endpoint, editing.id, { ...editing, ...payload }, editing.revision);
+            else await api.update<T>(endpoint, editing.id, { ...editableResource(editing), ...payload }, editing.revision);
             catalog.invalidate();
           }}
         />

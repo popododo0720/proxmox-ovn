@@ -306,6 +306,7 @@ export function SecurityGroupsPage() {
         { key: 'name', label: 'Security group', render: (item) => <strong>{item.name || 'Unnamed security group'}</strong> },
         { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'description', label: 'Description' },
+        { key: 'managed', label: 'Ownership', render: (item) => <StatusPill value={item.managed ? 'managed' : 'tenant'} /> },
         { key: 'stateful', label: 'Stateful' },
         { key: 'state', label: 'State' },
       ]}
@@ -333,6 +334,7 @@ export function SecurityGroupsPage() {
         { key: 'port_range_max', label: 'Port to' },
         { key: 'remote_cidr', label: 'Remote CIDR', className: 'mono-cell' },
         { key: 'description', label: 'Description' },
+        { key: 'managed', label: 'Ownership', render: (item) => <StatusPill value={item.managed ? 'managed' : 'tenant'} /> },
         { key: 'action', label: 'Action' },
         { key: 'state', label: 'State' },
       ]}

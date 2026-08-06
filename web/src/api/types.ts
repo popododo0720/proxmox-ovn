@@ -218,6 +218,8 @@ export interface SecurityGroup extends BaseResource {
   project_id?: string;
   description?: string;
   stateful?: boolean;
+  managed?: boolean;
+  read_only?: boolean;
 }
 
 export interface SecurityGroupRule extends BaseResource {
@@ -232,6 +234,8 @@ export interface SecurityGroupRule extends BaseResource {
   remote_group_id?: string;
   action?: 'allow' | 'drop' | string;
   description?: string;
+  managed?: boolean;
+  read_only?: boolean;
 }
 
 export interface ProviderNetwork extends BaseResource {

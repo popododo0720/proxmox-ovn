@@ -108,19 +108,22 @@ describe('resource reference UX', () => {
 
 describe('security group statefulness', () => {
   it('explains stateful-only behavior and does not offer a writable Stateful field', async () => {
+    const update = vi.fn(async (_endpoint: string, _id: string, _input: unknown) => ({ id: 'security-group-aaaaaaaa' }));
     const list = vi.fn(async (endpoint: string) => {
       if (endpoint === '/security-groups') return { items: [{
         id: 'security-group-aaaaaaaa',
         name: 'web',
         project_id: 'project-aaaaaaaa',
         stateful: true,
+        managed: false,
+        read_only: false,
       }] };
       if (endpoint === '/projects') return { items: [{ id: 'project-aaaaaaaa', name: 'Tenant A' }] };
       return { items: [] };
     });
 
     render(
-      <ApiProvider client={{ list } as unknown as ApiClient}>
+      <ApiProvider client={{ list, update } as unknown as ApiClient}>
         <SecurityGroupsPage />
       </ApiProvider>,
     );
@@ -134,6 +137,10 @@ describe('security group statefulness', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
     expect(screen.queryByRole('checkbox', { name: 'Stateful' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    expect(update).toHaveBeenCalledOnce();
+    expect(update.mock.calls[0][2]).not.toHaveProperty('managed');
+    expect(update.mock.calls[0][2]).not.toHaveProperty('read_only');
   });
 
   it('shows reserved default policy and rule references by human name', async () => {
@@ -145,6 +152,8 @@ describe('security group statefulness', () => {
         project_id: 'project-aaaaaaaa',
         stateful: true,
         state: 'ready',
+        managed: true,
+        read_only: true,
       }] };
       if (endpoint === '/security-group-rules') return { items: [
         {
@@ -156,6 +165,8 @@ describe('security group statefulness', () => {
           action: 'allow',
           description: 'Allow all IPv4 egress',
           state: 'ready',
+          managed: true,
+          read_only: true,
         },
         {
           id: 'security-group-rule-bbbbbbbb',
@@ -166,6 +177,23 @@ describe('security group statefulness', () => {
           action: 'allow',
           description: 'Allow IPv4 ingress from this security group',
           state: 'ready',
+          managed: true,
+          read_only: true,
+        },
+        {
+          id: 'security-group-rule-cccccccc',
+          security_group_id: 'security-group-default-aaaaaaaa',
+          project_id: 'project-aaaaaaaa',
+          direction: 'ingress',
+          ethertype: 'IPv4',
+          protocol: 'tcp',
+          port_range_min: 443,
+          port_range_max: 443,
+          action: 'allow',
+          description: 'Tenant HTTPS extension',
+          state: 'ready',
+          managed: false,
+          read_only: false,
         },
       ] };
       if (endpoint === '/projects') return { items: [{ id: 'project-aaaaaaaa', name: 'Tenant A' }] };
@@ -183,9 +211,14 @@ describe('security group statefulness', () => {
     const tables = await screen.findAllByRole('table');
     expect(within(tables[0]).getByText('default')).toBeInTheDocument();
     expect(within(tables[0]).getByText('PVN managed default security group')).toBeInTheDocument();
-    expect(await within(tables[1]).findAllByText('default · PVN managed default security group')).toHaveLength(2);
+    expect(await within(tables[1]).findAllByText('default · PVN managed default security group')).toHaveLength(3);
     expect(within(tables[1]).getByText('Allow all IPv4 egress')).toBeInTheDocument();
     expect(within(tables[1]).getByText('Allow IPv4 ingress from this security group')).toBeInTheDocument();
+    expect(within(tables[1]).getByText('Tenant HTTPS extension')).toBeInTheDocument();
+    expect(within(tables[0]).queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
+    expect(within(tables[0]).queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument();
+    expect(within(tables[1]).getAllByRole('button', { name: 'Edit' })).toHaveLength(1);
+    expect(within(tables[1]).getAllByRole('button', { name: 'Delete' })).toHaveLength(1);
     expect(tables[0]).not.toHaveTextContent('security-group-default-aaaaaaaa');
     expect(tables[1]).not.toHaveTextContent('security-group-default-aaaaaaaa');
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/security-groups')).toHaveLength(1);

@@ -416,10 +416,10 @@ func (s *Server) list(writer http.ResponseWriter, request *http.Request, kind mo
 		s.storeError(writer, err)
 		return
 	}
-	visible := make([]model.Resource, 0, len(resources))
+	visible := make([]any, 0, len(resources))
 	for _, resource := range resources {
 		if s.authorizeRead(request.Context(), resource) == nil {
-			visible = append(visible, resource)
+			visible = append(visible, resourceAPIView(resource))
 		}
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"data": visible})
@@ -442,7 +442,7 @@ func (s *Server) get(writer http.ResponseWriter, request *http.Request, kind mod
 		return
 	}
 	setETag(writer, resource.GetMetadata().Revision)
-	writeJSON(writer, http.StatusOK, map[string]any{"data": resource})
+	writeJSON(writer, http.StatusOK, map[string]any{"data": resourceAPIView(resource)})
 }
 
 func (s *Server) create(writer http.ResponseWriter, request *http.Request, kind model.Kind) {
@@ -499,11 +499,11 @@ func (s *Server) create(writer http.ResponseWriter, request *http.Request, kind 
 	setETag(writer, created.GetMetadata().Revision)
 	if replayed {
 		writer.Header().Set("Idempotency-Replayed", "true")
-		writeJSON(writer, http.StatusOK, map[string]any{"data": created})
+		writeJSON(writer, http.StatusOK, map[string]any{"data": resourceAPIView(created)})
 		return
 	}
 	writer.Header().Set("Location", "/api/v1/"+kind.Collection()+"/"+created.GetMetadata().ID)
-	writeJSON(writer, http.StatusCreated, map[string]any{"data": created})
+	writeJSON(writer, http.StatusCreated, map[string]any{"data": resourceAPIView(created)})
 }
 
 func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind model.Kind, id string) {
@@ -589,7 +589,7 @@ func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind 
 	if replayed {
 		writer.Header().Set("Idempotency-Replayed", "true")
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"data": updated})
+	writeJSON(writer, http.StatusOK, map[string]any{"data": resourceAPIView(updated)})
 }
 
 func (s *Server) requireExistingProjectPool(writer http.ResponseWriter, request *http.Request, resource model.Resource) bool {
