@@ -199,11 +199,43 @@ gates:
 
 The apply transaction creates `br-int` and `br-provider`, moves only the
 selected provider NIC under OVS, and publishes a root-private shared topology
-ledger after every node verifies the desired state. If a selected Geneve NIC
-carries a Corosync ring, the command first migrates that ring to the
-already-verified management address; a provider NIC carrying any Corosync ring
-is rejected. Any failure rolls back all network changes owned by that
-transaction. It never creates an activation marker or starts PVN/OVN.
+ledger after every node verifies the desired state. A provider NIC carrying
+any Corosync ring is rejected.
+
+If a selected Geneve NIC carries a Corosync ring, migration uses two fenced
+stages. The existing N/N Geneve ring remains the safety path while a management
+address is added on an unused KNET ring. Only after every daemon has loaded the
+dual-ring configuration and the management ring is N/N connected does PVN
+remove the Geneve ring and converge every daemon to the final configuration.
+Every candidate and rollback configuration passes `corosync -t` on every node
+before use. Each shared write is a compare-and-swap from the exact preceding
+SHA-256 boundary; unrelated operator drift stops the transaction.
+
+A cluster-wide reload is followed by an exact persisted/runtime sweep. If a
+daemon did not load the candidate, PVN restarts Corosync on at most one node at
+a time, non-coordinator nodes first and the coordinator last. It requires the
+safety ring to remain N/N before and after each restart. A lost command response
+counts as success only when a fresh cluster-wide probe proves the exact target.
+On convergence failure, PVN restores a validated safety boundary when that
+rollback can be proven; a recovery stage with no safe rollback remains on its
+exact rerunnable boundary. Failure to prove either condition stops for operator
+audit. No host-network change has begun at any of these boundaries.
+
+A rerun also recognizes the v0.2.13 stale-runtime failure shape in which the
+shared file names a single management ring while every daemon still uniformly
+runs the old Geneve topology. Recovery is allowed only when the live node IDs,
+membership, joined status, rings, bind addresses, and runtime version boundary
+form one consistent fully connected state. PVN then keeps that live Geneve ring
+as the safety path and adds management on a different unused ring; it never
+publishes or reloads an intermediate single-ring address replacement. Mixed or
+ambiguous stale state fails closed.
+
+Immediately before network staging, PVN again requires one identical shared
+Corosync file and an exact loaded runtime on every node, with no ring using the
+Geneve addresses. The final root-private topology ledger pins that file's
+SHA-256, `config_version`, and complete ring mapping. Any network failure rolls
+back all network changes owned by the transaction. Apply never creates an
+activation marker or starts PVN/OVN.
 
 ## 4. Plan configuration and node-local PKI
 

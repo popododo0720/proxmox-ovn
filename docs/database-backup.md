@@ -65,8 +65,7 @@ that will receive the restore request.
 
 1. Record `pvnctl central status` from at least two voters. Require all three
    databases healthy, every configured voter connected, no membership change,
-   and the expected cluster IDs. Stop if any value differs. Take and verify a
-   fresh pre-restore backup.
+   and the expected cluster IDs. Stop if any value differs.
 
 2. Choose exactly one database and its fixed snapshot/socket pair:
 
@@ -90,6 +89,19 @@ that will receive the restore request.
    Confirm those units are inactive on every applicable node. Block UI/API
    changes and manual OVN writes for the maintenance window. If cluster-wide
    quiescence cannot be proven, do not restore.
+
+   While writers remain frozen and all three database services remain active,
+   create and verify a fresh backup set for this database's maintenance window.
+   Copy the complete set to a second node or off-host durable storage and verify
+   that copy too. Use this frozen set for the drill; an older set captured
+   before writer quiescence or a set that exists only on its source voter is not
+   sufficient recovery evidence.
+
+   ```sh
+   pvn-db-backup create
+   pvn-db-backup verify /var/backups/pvn/EXACT_FRESH_BACKUP_SET
+   # Copy the whole directory, then verify it at the independent destination.
+   ```
 
 4. Verify the selected set again, obtain the expected digest from its manifest,
    and require an exact typed confirmation. Replace all uppercase placeholders;
@@ -156,8 +168,10 @@ that will receive the restore request.
 
    Re-run `pvnctl central status` on multiple voters. On every node, require
    `pvnctl doctor`, `systemctl restart pvn-node-ready.service`, the agent
-   `/healthz` check, and a deliberate test-port attach/detach to pass before
-   reopening API/UI changes.
+   `/healthz` check, and a deliberate test-port attach/detach plus security
+   policy/dataplane test to pass before reopening API/UI changes. Preserve the
+   fresh backup and complete this gate before scheduling a separate maintenance
+   window, with another fresh frozen backup, for another database.
 
 ## Database-specific recovery intent
 

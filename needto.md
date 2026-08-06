@@ -1,8 +1,9 @@
 # PVN — shipped, verified, and still needed
 
 Status snapshot for follow-up work. Reflects the intended v1 feature set in
-`README.md` / `docs/architecture.md`, the live three-node lab evidence through
-v0.2.13, and gaps that still need implementation or destructive recovery tests.
+`README.md` / `docs/architecture.md`, source-tree work for v0.2.14, the live
+three-node lab evidence through v0.2.13, and gaps that still need destructive
+recovery tests.
 
 **How to use:** treat “v1 must-pass” as release gates; everything else is
 prioritized backlog. Update this file when items ship or scope changes.
@@ -43,8 +44,11 @@ These are not new product features so much as **proof the current code works**.
 - [x] Security group allow / deny behaves as expected
 - [x] Node reboot: agent re-binds; guests recover or fail closed as designed
 - [x] Package upgrade on active node (fail-closed / safe path)
-- [ ] Backup/restore drill: PVN_Control + OVN NB + OVN SB independently, then
-      reconcile (no cross-DB transaction assumption)
+- [ ] Backup/restore drill: in a separate window for each database, freeze all
+      writers and independently copy / verify a fresh set, then restore exactly
+      one of PVN_Control, OVN NB, or OVN SB; prove 3/3 Raft/CID, reconcile,
+      security policy, and dataplane health after each (no cross-DB transaction
+      assumption)
 
 ### Operator prerequisites (document + checklist in runbooks)
 
@@ -70,6 +74,10 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 - [x] Keep the stateful-only security-group UI honest (no ineffective toggle)
 - [x] Auto-provision and continuously repair a project default security policy;
       keep legacy unrestricted ports explicit until preview-token backfill
+- [x] Fence Corosync Geneve-to-management migration through an N/N dual-ring
+      safety path, exact persisted/runtime gates, resumable stage boundaries,
+      and strict recovery of the uniform v0.2.13 stale-runtime shape before any
+      host-network mutation
 
 ---
 
