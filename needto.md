@@ -62,9 +62,11 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 
 ### Release packaging
 
-- [x] Freeze and publish a release tree (`pvn-node` deb, `pvn-cluster-install`,
-      `SHA256SUMS`, `pvn-install.sh`) on a real HTTPS host if using curl install
-- [x] Keep GitHub release assets consistent with README
+- [x] Freeze and publish the exact seven-file release tree: `pvn-node` deb,
+      `pvn-install.sh`, `pvn-update.sh`, `pvn-cluster-install`,
+      `pvn-cluster-update`, `pvn-cluster-lease`, and `SHA256SUMS`
+- [x] Reject tag/changelog/bootstrap version mismatch, checksum failure, and
+      missing or extra GitHub release assets before upload
 
 ### Current product work
 
