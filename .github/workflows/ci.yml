@@ -15,6 +15,8 @@ jobs:
       - name: Install Debian 13 prerequisites
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates file git make python3 systemd
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Trust checked-out workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.24.13'
@@ -27,6 +29,8 @@ jobs:
       - name: Install Debian 13 prerequisites
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git make
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Trust checked-out workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.18.0'
@@ -40,6 +44,8 @@ jobs:
       - name: Install Debian 13 prerequisites
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates file git make python3 systemd
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Trust checked-out workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.24.13'
