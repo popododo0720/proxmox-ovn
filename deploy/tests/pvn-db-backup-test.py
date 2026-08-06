@@ -25,7 +25,11 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-temporary = pathlib.Path(tempfile.mkdtemp(prefix=".pvn-db-backup-test-", dir=REPO))
+# The production command deliberately rejects any path component not owned by
+# root.  GitHub Actions checks out under /__w, whose outer directory is owned
+# by the runner account even inside the root container, so keep the isolated
+# fixture directly under the root-owned filesystem instead of the checkout.
+temporary = pathlib.Path(tempfile.mkdtemp(prefix=".pvn-db-backup-test-", dir="/"))
 os.chmod(temporary, 0o700)
 listeners: list[socket.socket] = []
 try:
