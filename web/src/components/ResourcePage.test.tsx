@@ -178,6 +178,43 @@ describe('ResourcePage resource identity', () => {
     expect(alert.textContent).not.toMatch(uuidPattern);
   });
 
+  it('keeps a UUID-shaped name out of delete confirmation and edit headings', async () => {
+    const resourceID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const nameThatLooksLikeID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
+    const list = vi.fn().mockResolvedValue({ items: [{
+      id: resourceID,
+      name: nameThatLooksLikeID,
+      description: 'test',
+      revision: 1,
+    }] });
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+
+    render(
+      <ApiProvider client={{ list } as unknown as ApiClient}>
+        <ResourcePage
+          title="Networks"
+          description="Tenant networks"
+          endpoint="/networks"
+          columns={[{ key: 'name', label: 'Network' }]}
+          editFields={[{ name: 'description', label: 'Description' }]}
+          allowDelete
+        />
+      </ApiProvider>,
+    );
+
+    expect(await screen.findByText('[resource]')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(confirm).toHaveBeenCalledWith('Delete resource? This request is reconciled through OVN.');
+    expect(confirm.mock.calls.flat().join(' ')).not.toContain(resourceID);
+    expect(confirm.mock.calls.flat().join(' ')).not.toContain(nameThatLooksLikeID);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('heading', { name: 'Edit resource' })).toBeInTheDocument();
+    expect(dialog).not.toHaveTextContent(resourceID);
+    expect(dialog).not.toHaveTextContent(nameThatLooksLikeID);
+  });
+
   it('edits a safe field with the complete resource and optimistic revision', async () => {
     const item = {
       id: 'provider-1',

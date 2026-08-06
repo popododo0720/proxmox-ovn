@@ -24,6 +24,26 @@ export function redactResourceIDs(value: unknown, aliases: ResourceAlias[] = [])
   return result.replace(uuidPattern, '[resource]');
 }
 
+export function humanLabel(value: unknown, fallback: string): string {
+  const label = redactResourceIDs(value);
+  const humanContent = label
+    .replaceAll('[resource]', '')
+    .replace(/[\s._:/-]+/g, '');
+  return humanContent ? label : fallback;
+}
+
+export function humanResourceLabel(
+  resource: Record<string, unknown>,
+  fallback: string,
+  keys: string[] = ['name', 'address', 'cidr', 'management_address'],
+): string {
+  for (const key of keys) {
+    const label = humanLabel(resource[key], '');
+    if (label) return label;
+  }
+  return fallback;
+}
+
 export function uiErrorMessage(
   reason: unknown,
   fallback: string,

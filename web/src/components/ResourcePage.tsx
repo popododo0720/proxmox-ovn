@@ -1,7 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { useApi } from '../api/context';
 import type { BaseResource } from '../api/types';
-import { redactResourceIDs, uiErrorMessage } from '../diagnostics/display';
+import { humanResourceLabel, redactResourceIDs, uiErrorMessage } from '../diagnostics/display';
 import { CreateDialog, type FormField } from './CreateDialog';
 import { EmptyState } from './EmptyState';
 import { ErrorState } from './ErrorState';
@@ -60,11 +60,7 @@ export function formatValue(value: unknown): ReactNode {
 }
 
 function resourceLabel(resource: BaseResource): string {
-  for (const key of ['name', 'address', 'cidr']) {
-    const value = resource[key];
-    if (value !== null && value !== undefined && value !== '') return String(value);
-  }
-  return 'resource';
+  return humanResourceLabel(resource, 'resource', ['name', 'address', 'cidr']);
 }
 
 function editableResource(resource: BaseResource): Record<string, unknown> {

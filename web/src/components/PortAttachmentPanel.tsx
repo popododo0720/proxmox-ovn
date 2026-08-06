@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { ApiError } from '../api/client';
 import { useApi } from '../api/context';
 import type { NodeStatus, Port } from '../api/types';
-import { redactResourceIDs, uiErrorMessage } from '../diagnostics/display';
+import { humanLabel, humanResourceLabel, redactResourceIDs, uiErrorMessage } from '../diagnostics/display';
 import { observeVM, type RuntimeDiagnostic } from '../diagnostics/port';
 import { pveBridge } from '../pve/bridge';
 import {
@@ -174,9 +174,10 @@ export function PortAttachmentPanel({
       const result = action === 'attach'
         ? await attachVMPort(api, bridge, selectedPort, selection, { onStep: setBusyStep })
         : await detachVMPort(api, bridge, selectedPort, selection, { onStep: setBusyStep });
+      const portName = humanResourceLabel(result, 'Port', ['name', 'mac_address']);
       setMessage(action === 'attach'
-        ? `${redactResourceIDs(result.name || result.mac_address || 'Port')} is bound and the VM NIC is enabled.`
-        : `${redactResourceIDs(result.name || result.mac_address || 'Port')} is unbound and the VM NIC was removed.`);
+        ? `${portName} is bound and the VM NIC is enabled.`
+        : `${portName} is unbound and the VM NIC was removed.`);
       clearInspection();
       portCatalog.invalidate();
       onChanged?.();
@@ -217,14 +218,22 @@ export function PortAttachmentPanel({
           <span>PVN port</span>
           <select value={portID} onChange={(event) => { setPortID(event.target.value); clearInspection(); setMessage(''); }} disabled={loading || Boolean(busyStep)}>
             {!ports.length && <option value="">No ports available</option>}
-            {ports.map((port) => <option value={port.id} key={port.id}>{port.name || port.mac_address || 'Unnamed port'} · {port.mac_address || 'no MAC'} · {port.binding_status || 'unknown'}</option>)}
+            {ports.map((port) => (
+              <option value={port.id} key={port.id}>
+                {humanResourceLabel(port, 'Unnamed port', ['name', 'mac_address'])} · {humanLabel(port.mac_address, 'no MAC')} · {port.binding_status || 'unknown'}
+              </option>
+            ))}
           </select>
         </label>
         <label className="form-field">
           <span>PVE node</span>
           <select value={nodeID} onChange={(event) => { setNodeID(event.target.value); clearInspection(); }} disabled={attached || Boolean(busyStep)}>
             <option value="" disabled>Select node…</option>
-            {nodes.map((node) => <option value={node.id} key={node.id}>{node.name || node.management_address || 'Unavailable node'}{node.enabled === false ? ' (disabled)' : ''}</option>)}
+            {nodes.map((node) => (
+              <option value={node.id} key={node.id}>
+                {humanResourceLabel(node, 'Unavailable node', ['name', 'management_address'])}{node.enabled === false ? ' (disabled)' : ''}
+              </option>
+            ))}
           </select>
         </label>
         <label className="form-field">

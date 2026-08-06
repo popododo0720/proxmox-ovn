@@ -26,7 +26,7 @@ import { ResourcePage, formatValue, type Column } from '../components/ResourcePa
 import { resourceOptionLabel } from '../components/ResourceSelect';
 import { StatusPill } from '../components/StatusPill';
 import { operationErrorSummary } from '../diagnostics/operation';
-import { redactResourceIDs } from '../diagnostics/display';
+import { humanLabel, humanResourceLabel } from '../diagnostics/display';
 import { pveBridge, type PveBridge, type PveQemuVM } from '../pve/bridge';
 import {
   currentProviderSegmentReference,
@@ -52,7 +52,7 @@ const projectField: FormField = {
 };
 
 const projectColumns: Column<Project>[] = [
-  { key: 'name', label: 'Project', render: (item) => <strong>{item.name || 'Unnamed project'}</strong> },
+  { key: 'name', label: 'Project', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed project', ['name'])}</strong> },
   { key: 'pool_id', label: 'PVE pool' },
   { key: 'state', label: 'State' },
 ];
@@ -108,7 +108,7 @@ export function NetworksPage() {
       description="Tenant logical switches backed by Geneve overlays."
       endpoint="/networks"
       columns={[
-        { key: 'name', label: 'Network', render: (item) => <strong>{item.name || 'Unnamed network'}</strong> },
+        { key: 'name', label: 'Network', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed network', ['name'])}</strong> },
         { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'external', label: 'External' },
         { key: 'mtu', label: 'MTU' },
@@ -131,7 +131,7 @@ export function NetworksPage() {
       description="IPv4 address pools, gateways, and OVN-native DHCP options."
       endpoint="/subnets"
       columns={[
-        { key: 'name', label: 'Subnet', render: (item) => <strong>{item.name || item.cidr || 'Unnamed subnet'}</strong> },
+        { key: 'name', label: 'Subnet', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed subnet', ['name', 'cidr'])}</strong> },
         { key: 'network_id', label: 'Network', reference: projectNetworkReference },
         { key: 'cidr', label: 'CIDR', className: 'mono-cell' },
         { key: 'gateway_ip', label: 'Gateway', className: 'mono-cell' },
@@ -165,7 +165,7 @@ export function RoutersPage() {
       description="Distributed east-west routing with optional centralized north-south SNAT."
       endpoint="/routers"
       columns={[
-        { key: 'name', label: 'Router', render: (item) => <strong>{item.name || 'Unnamed router'}</strong> },
+        { key: 'name', label: 'Router', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed router', ['name'])}</strong> },
         { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'external_network_id', label: 'External network', reference: externalNetworkReference },
         { key: 'external_subnet_id', label: 'External subnet', reference: externalSubnetReference },
@@ -217,7 +217,10 @@ export function RoutersPage() {
 }
 
 function vmNamesByID(vms: PveQemuVM[]): Map<number, string> {
-  return new Map(vms.flatMap((vm) => vm.name ? [[vm.vmid, redactResourceIDs(vm.name)] as const] : []));
+  return new Map(vms.flatMap((vm) => {
+    const name = humanLabel(vm.name, '');
+    return name ? [[vm.vmid, name] as const] : [];
+  }));
 }
 
 export function PortsPage({
@@ -248,7 +251,7 @@ export function PortsPage({
       description="Logical switch ports, fixed IP allocations, and chassis bindings."
       endpoint="/ports"
       columns={[
-        { key: 'name', label: 'Port', render: (item) => <strong>{item.name || item.mac_address || 'Unnamed port'}</strong> },
+        { key: 'name', label: 'Port', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed port', ['name', 'mac_address'])}</strong> },
         { key: 'network_id', label: 'Network', reference: projectNetworkReference },
         { key: 'mac_address', label: 'MAC address', className: 'mono-cell' },
         { key: 'fixed_ips', label: 'Fixed IPs', render: (item) => <FixedIPList fixedIPs={item.fixed_ips} /> },
@@ -298,7 +301,7 @@ export function FloatingIPsPage() {
     description="North-south addresses are pending while OVN applies them, active when associated NAT is realized, and down while reserved."
     endpoint="/floating-ips"
     columns={[
-      { key: 'address', label: 'Floating IP', className: 'mono-cell', render: (item) => <strong>{item.address || item.name || 'Unavailable address'}</strong> },
+      { key: 'address', label: 'Floating IP', className: 'mono-cell', render: (item) => <strong>{humanResourceLabel(item, 'Unavailable address', ['address', 'name'])}</strong> },
       { key: 'fixed_ip_address', label: 'Fixed IP', className: 'mono-cell' },
       { key: 'port_id', label: 'Port', reference: projectPortReference },
       { key: 'router_id', label: 'Router', reference: projectRouterReference },
@@ -330,7 +333,7 @@ export function SecurityGroupsPage() {
       description="Stateful-only OVN port-group policies. Each project's reserved default policy appears here and is applied automatically when a new port has no explicit selection."
       endpoint="/security-groups"
       columns={[
-        { key: 'name', label: 'Security group', render: (item) => <strong>{item.name || 'Unnamed security group'}</strong> },
+        { key: 'name', label: 'Security group', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed security group', ['name'])}</strong> },
         { key: 'project_id', label: 'Project', reference: projectReference },
         { key: 'description', label: 'Description' },
         { key: 'managed', label: 'Ownership', render: (item) => <StatusPill value={item.managed ? 'managed' : 'tenant'} /> },
@@ -403,7 +406,7 @@ export function ProviderNetworksPage() {
       description="Shared external network containers exposed to tenant routers."
       endpoint="/provider-networks"
       columns={[
-        { key: 'name', label: 'Network', render: (item) => <strong>{item.name || 'Unnamed provider network'}</strong> },
+        { key: 'name', label: 'Network', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed provider network', ['name'])}</strong> },
         { key: 'shared', label: 'Shared' },
         { key: 'default_segment_id', label: 'Default segment', reference: currentProviderSegmentReference },
         { key: 'description', label: 'Description' },
@@ -428,7 +431,7 @@ export function ProviderNetworksPage() {
       description="Flat or VLAN bridge mappings consumed by gateway chassis."
       endpoint="/provider-segments"
       columns={[
-        { key: 'name', label: 'Segment', render: (item) => <strong>{item.name || 'Unnamed provider segment'}</strong> },
+        { key: 'name', label: 'Segment', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed provider segment', ['name'])}</strong> },
         { key: 'provider_network_id', label: 'Provider network', reference: providerNetworkReference },
         { key: 'network_type', label: 'Type' },
         { key: 'physical_network', label: 'Bridge mapping' },
@@ -461,7 +464,7 @@ export function NodesPage() {
     description="PVN installation health, OVSDB membership, and north-south gateway placement."
     endpoint="/nodes"
     columns={[
-      { key: 'name', label: 'Node', render: (item) => <strong>{item.name || item.management_address || 'Unnamed node'}</strong> },
+      { key: 'name', label: 'Node', render: (item) => <strong>{humanResourceLabel(item, 'Unnamed node', ['name', 'management_address'])}</strong> },
       { key: 'management_address', label: 'Management IP', className: 'mono-cell' },
       { key: 'roles', label: 'Roles' },
       { key: 'enabled', label: 'Enabled', render: (item) => <StatusPill value={item.enabled ? 'enabled' : 'disabled'} /> },

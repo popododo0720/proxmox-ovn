@@ -1,5 +1,5 @@
 import type { NodeStatus, Port } from '../api/types';
-import { redactResourceIDs } from './display';
+import { humanLabel, humanResourceLabel, redactResourceIDs } from './display';
 
 export type ChassisDiagnostic = 'matched' | 'mismatch' | 'missing' | 'not requested' | 'unavailable';
 export type RuntimeDiagnostic = 'matched' | 'mismatch' | 'not-found' | 'ambiguous' | 'not-bindable' | 'error';
@@ -61,16 +61,17 @@ export function observeVM(
 }
 
 export function portDisplayName(port: Port): string {
-  return redactResourceIDs(port.name || port.mac_address || 'Unnamed port');
+  return humanResourceLabel(port, 'Unnamed port', ['name', 'mac_address']);
 }
 
 export function nodeDisplayName(node: NodeStatus | undefined): string {
-  return redactResourceIDs(node?.name || node?.management_address || 'Unavailable node');
+  return node ? humanResourceLabel(node, 'Unavailable node', ['name', 'management_address']) : 'Unavailable node';
 }
 
 export function vmDisplayName(port: Port, observation?: VMObservation): string {
   if (!port.vmid) return 'Not attached';
-  return observation?.name ? `${redactResourceIDs(observation.name)} (VM ${port.vmid})` : `VM ${port.vmid}`;
+  const name = humanLabel(observation?.name, '');
+  return name ? `${name} (VM ${port.vmid})` : `VM ${port.vmid}`;
 }
 
 export function chassisDiagnostic(port: Port, node: NodeStatus | undefined): ChassisDiagnostic {

@@ -12,9 +12,11 @@ describe('firstFreeNIC', () => {
   });
 
   it('uses human port and node labels while retaining exact option values', async () => {
+    const portID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const nodeID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
     const list = vi.fn(async (endpoint: string) => endpoint === '/ports'
-      ? { items: [{ id: 'port-aaaaaaaa', mac_address: '02:00:00:00:00:08', binding_status: 'unbound' }] }
-      : { items: [{ id: 'node-bbbbbbbb', management_address: '192.0.2.10', enabled: true }] });
+      ? { items: [{ id: portID, name: portID, mac_address: '02:00:00:00:00:08', binding_status: 'unbound' }] }
+      : { items: [{ id: nodeID, name: nodeID, management_address: '192.0.2.10', enabled: true }] });
 
     render(
       <ApiProvider client={{ list } as unknown as ApiClient}>
@@ -24,10 +26,10 @@ describe('firstFreeNIC', () => {
 
     const portOption = await screen.findByRole('option', { name: '02:00:00:00:00:08 · 02:00:00:00:00:08 · unbound' });
     const nodeOption = await screen.findByRole('option', { name: '192.0.2.10' });
-    expect(portOption).toHaveValue('port-aaaaaaaa');
-    expect(nodeOption).toHaveValue('node-bbbbbbbb');
-    expect(screen.queryByText('port-aaaaaaaa')).not.toBeInTheDocument();
-    expect(screen.queryByText('node-bbbbbbbb')).not.toBeInTheDocument();
+    expect(portOption).toHaveValue(portID);
+    expect(nodeOption).toHaveValue(nodeID);
+    expect(document.body).not.toHaveTextContent(portID);
+    expect(document.body).not.toHaveTextContent(nodeID);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/ports')).toHaveLength(1);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/nodes')).toHaveLength(1);
   });

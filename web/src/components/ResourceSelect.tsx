@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { BaseResource } from '../api/types';
-import { redactResourceIDs } from '../diagnostics/display';
+import { humanLabel, redactResourceIDs } from '../diagnostics/display';
 import { useResourceCatalog } from './ResourceCatalog';
 
 export interface ResourceMatch {
@@ -46,7 +46,8 @@ function readPath(value: unknown, path: string): unknown {
 function firstText(resource: BaseResource, keys: string[]): string {
   for (const key of keys) {
     const value = readPath(resource, key);
-    if (value !== null && value !== undefined && value !== '') return redactResourceIDs(String(value));
+    const label = humanLabel(value, '');
+    if (label) return label;
   }
   return '';
 }

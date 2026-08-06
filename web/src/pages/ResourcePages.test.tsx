@@ -5,6 +5,7 @@ import { ApiProvider } from '../api/context';
 import type { FloatingIP } from '../api/types';
 import {
   floatingIPDisplayStatus,
+  NetworksPage,
   OperationsPage,
   PortsPage,
   SecurityGroupsPage,
@@ -26,6 +27,42 @@ describe('floatingIPDisplayStatus', () => {
 });
 
 describe('resource reference UX', () => {
+  it('redacts a UUID-shaped network name in the custom table renderer but preserves raw UUIDs in Details', async () => {
+    const resourceID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const nameThatLooksLikeID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
+    const projectID = 'b67beeb6-72ef-4a70-87c4-9f6f4ab9ce82';
+    const list = vi.fn(async (endpoint: string) => {
+      if (endpoint === '/networks') return { items: [{
+        id: resourceID,
+        name: nameThatLooksLikeID,
+        project_id: projectID,
+        mtu: 1400,
+        external: false,
+        state: 'ready',
+      }] };
+      if (endpoint === '/projects') return { items: [{ id: projectID, name: 'Tenant A' }] };
+      return { items: [] };
+    });
+
+    render(
+      <ApiProvider client={{ list } as unknown as ApiClient}>
+        <NetworksPage />
+      </ApiProvider>,
+    );
+
+    const table = await screen.findByRole('table');
+    expect(within(table).getByText('Unnamed network')).toBeInTheDocument();
+    expect(await within(table).findByText('Tenant A')).toBeInTheDocument();
+    expect(table).not.toHaveTextContent(resourceID);
+    expect(table).not.toHaveTextContent(nameThatLooksLikeID);
+
+    fireEvent.click(within(table).getByRole('button', { name: 'Details' }));
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent(resourceID);
+    expect(dialog).toHaveTextContent(nameThatLooksLikeID);
+    expect(dialog).toHaveTextContent(projectID);
+  });
+
   it('resolves polymorphic operation targets and handles an unknown kind neutrally', async () => {
     const targetID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
     const unrelatedID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
