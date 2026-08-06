@@ -43,6 +43,7 @@ DEFAULT_LEASE_BIN = "/usr/lib/pvn/pvn-cluster-lease"
 LEASE_DOMAIN = "mutation"
 MAX_KNOWN_HOSTS_BYTES = 1024 * 1024
 SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 PROVIDER_ACK = "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP"
 DATABASES = {
     "PVN_Control": 6646,
@@ -77,6 +78,59 @@ def ipv4(value: Any, label: str) -> str:
     if parsed.version != 4 or parsed.is_unspecified or parsed.is_multicast:
         raise ControlPlaneError(f"{label} must be a usable IPv4 address")
     return str(parsed)
+
+
+def validate_corosync_pin(
+    value: Any, expected_nodes: set[str], label: str = "topology Corosync pin"
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "sha256", "config_version", "rings",
+    }:
+        raise ControlPlaneError(
+            f"{label} must contain exactly sha256, config_version, and rings"
+        )
+    digest = value.get("sha256")
+    version = value.get("config_version")
+    rings = value.get("rings")
+    if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+        raise ControlPlaneError(f"{label} sha256 is invalid")
+    if type(version) is not int or version < 0:
+        raise ControlPlaneError(f"{label} config_version is invalid")
+    if not isinstance(rings, dict) or not 1 <= len(rings) <= 8:
+        raise ControlPlaneError(f"{label} rings must contain 1..8 KNET links")
+    normalized: dict[str, dict[str, str]] = {}
+    for raw_ring, addresses in rings.items():
+        if not isinstance(raw_ring, str) or not re.fullmatch(r"[0-7]", raw_ring):
+            raise ControlPlaneError(f"{label} has an invalid KNET ring key")
+        if not isinstance(addresses, dict) or set(addresses) != expected_nodes:
+            raise ControlPlaneError(
+                f"{label} ring{raw_ring} node set differs from PVE membership"
+            )
+        normalized[raw_ring] = {}
+        for name, address in addresses.items():
+            if not isinstance(address, str):
+                raise ControlPlaneError(
+                    f"{label} ring{raw_ring} address for {name} is invalid"
+                )
+            if address == name:
+                normalized_address = address
+            else:
+                normalized_address = ipv4(
+                    address, f"{label} ring{raw_ring} address for {name}"
+                )
+                if normalized_address != address:
+                    raise ControlPlaneError(
+                        f"{label} ring{raw_ring} address for {name} is not canonical"
+                    )
+            normalized[raw_ring][name] = normalized_address
+    return {
+        "sha256": digest,
+        "config_version": version,
+        "rings": {
+            ring: dict(sorted(addresses.items()))
+            for ring, addresses in sorted(normalized.items(), key=lambda item: int(item[0]))
+        },
+    }
 
 
 def secure_json(path: pathlib.Path, label: str) -> tuple[dict[str, Any], bytes]:
@@ -134,6 +188,7 @@ class Discovery:
     members_version: int
     cluster_version: int
     topology_sha256: str
+    legacy_topology_sha256: str | None
     guest_mtu: int
     physnet: str
     nodes: tuple[Node, ...]
@@ -150,6 +205,16 @@ class Discovery:
             "physnet": self.physnet,
             "nodes": [node.frozen() for node in self.nodes],
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class LedgerRepin:
+    package: bool = False
+    topology_schema: bool = False
+
+    @property
+    def required(self) -> bool:
+        return self.package or self.topology_schema
 
 
 class LedgerStore:
@@ -270,6 +335,9 @@ PVN_CONFIG = "/etc/pve/pvn/config.json"
 PVNCTL_BIN = "/usr/sbin/pvnctl"
 OPENSSL_BIN = "/usr/bin/openssl"
 PVN_GROUP = "pvn"
+COROSYNC_CONFIG = pathlib.Path("/etc/pve/corosync.conf")
+MAX_COROSYNC_BYTES = 4 * 1024 * 1024
+NODE_BLOCK = re.compile(r"(?ms)^\s*node\s*\{.*?^\s*\}")
 
 def fail(message):
     print(message, file=sys.stderr)
@@ -295,6 +363,19 @@ def run_binary(arguments, input_data=None, check=True):
         fail(f"{' '.join(arguments)}: {detail}")
     return result
 
+def run_quiet(arguments, timeout):
+    try:
+        result = subprocess.run(
+            arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False, timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired:
+        fail(f"{' '.join(arguments)} timed out after {timeout} seconds")
+    except OSError as error:
+        fail(f"cannot execute {' '.join(arguments)}: {error}")
+    return result.returncode
+
 def safe_name(value, label):
     if not isinstance(value, str) or not SAFE_NAME.fullmatch(value) or value in (".", ".."):
         fail(f"{label} is unsafe or empty")
@@ -308,6 +389,127 @@ def ipv4(value, label):
     if address.version != 4 or address.is_unspecified or address.is_multicast:
         fail(f"{label} must be a usable IPv4 address")
     return str(address)
+
+def secure_file_bytes(path, label, maximum):
+    try:
+        before = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect {label}: {error}")
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        fail(f"{label} is not a regular non-symlink file")
+    if before.st_uid != 0 or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) & 0o022:
+        fail(f"{label} owner/link/mode is unsafe")
+    if before.st_size > maximum:
+        fail(f"{label} exceeds the size limit")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot securely open {label}: {error}")
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            fail(f"{label} changed while opening")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or \
+                opened.st_uid != 0 or stat.S_IMODE(opened.st_mode) & 0o022:
+            fail(f"opened {label} owner/link/mode is unsafe")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                fail(f"{label} exceeds the size limit")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+def corosync_snapshot(data, expected_cluster_name, expected_nodes):
+    if not isinstance(expected_nodes, dict) or not expected_nodes or any(
+            not isinstance(name, str) or not SAFE_NAME.fullmatch(name) or
+            type(node_id) is not int or node_id <= 0
+            for name, node_id in expected_nodes.items()):
+        fail("Corosync probe expected membership is invalid")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("corosync.conf is not valid UTF-8")
+    clusters = re.findall(r"^\s*cluster_name:\s*(\S+)\s*$", text, re.M)
+    versions = re.findall(r"^\s*config_version:\s*(\d+)\s*$", text, re.M)
+    if clusters != [expected_cluster_name] or len(versions) != 1:
+        fail("corosync.conf cluster name/config_version differs from PVE membership")
+    version = int(versions[0])
+    found_nodes = {}
+    rings = {}
+    for match in NODE_BLOCK.finditer(text):
+        block = match.group(0)
+        names = re.findall(r"^\s*name:\s*(\S+)\s*$", block, re.M)
+        node_ids = re.findall(r"^\s*nodeid:\s*(\d+)\s*$", block, re.M)
+        if len(names) != 1 or len(node_ids) != 1 or names[0] in found_nodes:
+            fail("corosync.conf has malformed or duplicate node blocks")
+        name = names[0]
+        node_id = int(node_ids[0])
+        if expected_nodes.get(name) != node_id:
+            fail("corosync.conf node identity differs from PVE membership")
+        found_nodes[name] = node_id
+        found_rings = set()
+        for raw_ring, raw_address in re.findall(
+                r"^\s*ring(\d+)_addr:\s*(\S+)\s*$", block, re.M):
+            ring = int(raw_ring)
+            if ring < 0 or ring > 7 or ring in found_rings:
+                fail(f"corosync.conf node {name} has an invalid/duplicate KNET ring")
+            found_rings.add(ring)
+            if raw_address == name:
+                address = raw_address
+            else:
+                address = ipv4(raw_address, f"corosync.conf ring{ring} address for {name}")
+                if address != raw_address:
+                    fail(f"corosync.conf ring{ring} address for {name} is not canonical")
+            rings.setdefault(str(ring), {})[name] = address
+        if not found_rings:
+            fail(f"corosync.conf node {name} has no KNET ring")
+    if found_nodes != expected_nodes:
+        fail("corosync.conf node set differs from PVE membership")
+    if not 1 <= len(rings) <= 8 or any(set(addresses) != set(expected_nodes)
+                                      for addresses in rings.values()):
+        fail("corosync.conf rings do not cover every PVE member")
+    return {
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "config_version": version,
+        "rings": {
+            ring: dict(sorted(addresses.items()))
+            for ring, addresses in sorted(rings.items(), key=lambda item: int(item[0]))
+        },
+    }
+
+def probe_corosync(request):
+    if not isinstance(request, dict) or set(request) != {"cluster_name", "nodes"}:
+        fail("Corosync probe request is malformed")
+    cluster_name = safe_name(request.get("cluster_name"), "Corosync cluster name")
+    expected_nodes = request.get("nodes")
+    before_data = secure_file_bytes(COROSYNC_CONFIG, "corosync.conf", MAX_COROSYNC_BYTES)
+    before = corosync_snapshot(before_data, cluster_name, expected_nodes)
+    consistent = run_quiet(
+        [PVNCTL_BIN, "doctor", "--check", "corosync-runtime-config"], 30
+    ) == 0
+    after_data = secure_file_bytes(COROSYNC_CONFIG, "corosync.conf", MAX_COROSYNC_BYTES)
+    after = corosync_snapshot(after_data, cluster_name, expected_nodes)
+    if after != before or after_data != before_data:
+        fail("corosync.conf changed during persisted/runtime verification")
+    return before, consistent
+
+def probe_standalone_corosync():
+    if os.path.lexists(COROSYNC_CONFIG):
+        fail("standalone node unexpectedly has /etc/pve/corosync.conf")
+    consistent = run_quiet(
+        [PVNCTL_BIN, "doctor", "--check", "corosync-runtime-config"], 30
+    ) == 0
+    if os.path.lexists(COROSYNC_CONFIG):
+        fail("standalone Corosync state appeared during persisted/runtime verification")
+    return consistent
 
 def node_identity(value):
     if not isinstance(value, dict):
@@ -556,6 +758,8 @@ action = sys.argv[1]
 payload = json.load(sys.stdin)
 
 if action == "probe":
+    if not isinstance(payload, dict) or set(payload) != {"bridges", "corosync"}:
+        fail("probe request is malformed")
     version = run(["dpkg-query", "-W", "-f=${Version}", "pvn-node"]).stdout.strip()
     pve = run(["dpkg-query", "-W", "-f=${Version}", "pve-manager"]).stdout.strip().split(":")[-1]
     addresses = []
@@ -565,8 +769,17 @@ if action == "probe":
                 addresses.append({"ip": address["local"], "interface": link["ifname"],
                                   "mtu": int(link["mtu"])})
     bridges = {}
+    if not isinstance(payload["bridges"], list) or not all(
+            isinstance(bridge, str) and SAFE_NAME.fullmatch(bridge)
+            for bridge in payload["bridges"]):
+        fail("probe bridge list is malformed")
     for bridge in payload["bridges"]:
         bridges[bridge] = run(["ovs-vsctl", "--timeout=10", "br-exists", bridge], check=False).returncode == 0
+    if payload["corosync"] is None:
+        corosync = None
+        corosync_runtime_consistent = probe_standalone_corosync()
+    else:
+        corosync, corosync_runtime_consistent = probe_corosync(payload["corosync"])
     pvn_gid = grp.getgrnam(PVN_GROUP).gr_gid
     node_key = PKI_DIR / "node-key.pem"
     node_public_key = None
@@ -589,6 +802,8 @@ if action == "probe":
         "pve_version": pve,
         "addresses": addresses,
         "bridges": bridges,
+        "corosync": corosync,
+        "corosync_runtime_consistent": corosync_runtime_consistent,
         "cert_hashes": {
             **certificate_hashes,
             "public_key": node_public_key,
@@ -1057,24 +1272,61 @@ class SystemBackend:
         members, members_raw = secure_json(self.members_path, ".members")
         topology, topology_raw = secure_json(self.topology_path, "topology ledger")
         local_name = safe_name(members.get("nodename"), ".members nodename")
-        nodelist = members.get("nodelist")
-        if not isinstance(nodelist, dict) or local_name not in nodelist:
-            raise ControlPlaneError(".members nodelist is missing the local node")
+        members_version = members.get("version")
+        if type(members_version) is not int or members_version < 0:
+            raise ControlPlaneError(".members version is invalid")
         cluster = members.get("cluster")
         if isinstance(cluster, dict) and cluster.get("name"):
             mode = "raft"
             cluster_name = safe_name(cluster.get("name"), "PVE cluster name")
+            nodelist = members.get("nodelist")
+            if not isinstance(nodelist, dict) or local_name not in nodelist:
+                raise ControlPlaneError(".members nodelist is missing the local node")
             if cluster.get("quorate") != 1 or cluster.get("nodes") != len(nodelist):
                 raise ControlPlaneError("PVE membership is not fully online and quorate")
             confirmation = cluster_name
-            cluster_version = int(cluster.get("version", 0))
+            cluster_version = cluster.get("version")
+            if type(cluster_version) is not int or cluster_version < 0:
+                raise ControlPlaneError("PVE cluster version is invalid")
         else:
-            if len(nodelist) != 1:
-                raise ControlPlaneError("standalone .members contains multiple nodes")
+            if cluster is not None or members.get("nodelist") is not None:
+                raise ControlPlaneError(
+                    "standalone .members must not contain cluster/nodelist state"
+                )
             mode = "standalone"
             cluster_name = f"standalone-{local_name}"
             confirmation = cluster_name
             cluster_version = 0
+
+        if topology.get("schema") != 2 or topology.get("phase") != "complete" or \
+                topology.get("cluster_name") != cluster_name:
+            raise ControlPlaneError(
+                "topology ledger must be schema 2, phase complete, and match the PVE cluster"
+            )
+        if mode == "standalone":
+            standalone_nodes = topology.get("nodes")
+            if not isinstance(standalone_nodes, list) or len(standalone_nodes) != 1 or \
+                    not isinstance(standalone_nodes[0], dict):
+                raise ControlPlaneError(
+                    "standalone topology ledger must contain exactly one node"
+                )
+            standalone_node = standalone_nodes[0]
+            if standalone_node.get("name") != local_name or \
+                    standalone_node.get("node_id") != 0:
+                raise ControlPlaneError(
+                    "standalone topology node identity differs from local PVE"
+                )
+            standalone_management = ipv4(
+                standalone_node.get("management_ip"),
+                f"PVE node {local_name} management IP",
+            )
+            nodelist = {
+                local_name: {
+                    "id": 0,
+                    "online": 1,
+                    "ip": standalone_management,
+                },
+            }
         node_count = len(nodelist)
         if mode == "raft" and (node_count < 3 or node_count % 2 == 0):
             raise ControlPlaneError(
@@ -1088,11 +1340,6 @@ class SystemBackend:
         if any(type(member.get("id")) is not int for member in nodelist.values()):
             raise ControlPlaneError(".members nodelist contains an invalid node id")
 
-        if topology.get("schema") != 1 or topology.get("phase") != "complete" or \
-                topology.get("cluster_name") != cluster_name:
-            raise ControlPlaneError(
-                "topology ledger must be schema 1, phase complete, and match the PVE cluster"
-            )
         membership_snapshot = {
             "cluster_name": cluster_name,
             "nodes": [
@@ -1110,6 +1357,23 @@ class SystemBackend:
         if topology.get("membership_snapshot") != membership_snapshot or \
                 topology.get("membership_hash") != membership_hash:
             raise ControlPlaneError("topology membership snapshot/hash differs from .members")
+        expected_node_names = {row["name"] for row in membership_snapshot["nodes"]}
+        if mode == "standalone":
+            if "corosync" not in topology or topology.get("corosync") is not None:
+                raise ControlPlaneError(
+                    "standalone topology schema 2 must contain explicit corosync null"
+                )
+            expected_corosync = None
+        else:
+            expected_corosync = validate_corosync_pin(
+                topology.get("corosync"), expected_node_names
+            )
+            if topology.get("corosync") != expected_corosync:
+                raise ControlPlaneError("topology Corosync pin is not canonical")
+        legacy_topology = copy.deepcopy(topology)
+        legacy_topology["schema"] = 1
+        legacy_topology.pop("corosync", None)
+        legacy_topology_sha256 = sha256(canonical_json(legacy_topology))
         readiness = topology.get("provider_readiness")
         if not isinstance(readiness, dict) or readiness.get("operator_ack") is not True or \
                 readiness.get("ack_phrase") != PROVIDER_ACK:
@@ -1141,7 +1405,13 @@ class SystemBackend:
             if not isinstance(member, dict) or member.get("online") != 1:
                 raise ControlPlaneError(f"PVE node {name} is offline or malformed")
             node_id = member.get("id")
-            if type(node_id) is not int or node_id <= 0 or node_id in seen_ids:
+            invalid_node_id = (
+                type(node_id) is not int
+                or node_id in seen_ids
+                or (mode == "standalone" and node_id != 0)
+                or (mode == "raft" and node_id <= 0)
+            )
+            if invalid_node_id:
                 raise ControlPlaneError(f"PVE node {name} has an invalid/duplicate node id")
             seen_ids.add(node_id)
             management = ipv4(member.get("ip"), f"PVE node {name} management IP")
@@ -1175,7 +1445,19 @@ class SystemBackend:
         nodes: list[Node] = []
         versions: set[str] = set()
         for node_id, name, control, geneve, geneve_interface, provider_interface, provider in sorted(records):
-            probe = self._remote(name, "probe", {"bridges": ["br-int", provider]})
+            corosync_request = None
+            if mode == "raft":
+                corosync_request = {
+                    "cluster_name": cluster_name,
+                    "nodes": {
+                        member_name: member["id"]
+                        for member_name, member in nodelist.items()
+                    },
+                }
+            probe = self._remote(name, "probe", {
+                "bridges": ["br-int", provider],
+                "corosync": corosync_request,
+            })
             self.probes[name] = probe
             if not str(probe.get("pve_version", "")).startswith("9."):
                 raise ControlPlaneError(f"node {name} is not PVE 9")
@@ -1193,6 +1475,29 @@ class SystemBackend:
                 raise ControlPlaneError(f"node {name} Geneve IP/interface differs from the ledger")
             if not all(probe.get("bridges", {}).get(bridge) for bridge in ["br-int", provider]):
                 raise ControlPlaneError(f"node {name} is missing the topology OVS bridges")
+            if mode == "standalone":
+                if "corosync" not in probe or probe.get("corosync") is not None or \
+                        probe.get("corosync_runtime_consistent") is not True:
+                    raise ControlPlaneError(
+                        f"standalone node {name} returned unexpected Corosync state"
+                    )
+            else:
+                reported_corosync = validate_corosync_pin(
+                    probe.get("corosync"), expected_node_names,
+                    f"node {name} Corosync report",
+                )
+                if probe.get("corosync") != reported_corosync:
+                    raise ControlPlaneError(
+                        f"node {name} Corosync report is not canonical"
+                    )
+                if probe.get("corosync_runtime_consistent") is not True:
+                    raise ControlPlaneError(
+                        f"node {name} Corosync persisted/runtime state differs"
+                    )
+                if reported_corosync != expected_corosync:
+                    raise ControlPlaneError(
+                        f"node {name} Corosync state differs from the topology ledger pin"
+                    )
             hostname = str(probe.get("hostname", "")).split(".", 1)[0]
             if hostname != name:
                 raise ControlPlaneError(f"SSH target {name} reports hostname {probe.get('hostname')!r}")
@@ -1213,9 +1518,9 @@ class SystemBackend:
                 f"{effective_geneve_mtu} minus 100"
             )
         return Discovery(mode, confirmation, cluster_name, local_name,
-                         int(members.get("version", 0)), cluster_version,
-                         sha256(canonical_json(topology)), guest_mtu, physnet,
-                         tuple(nodes))
+                         members_version, cluster_version,
+                         sha256(canonical_json(topology)),
+                         legacy_topology_sha256, guest_mtu, physnet, tuple(nodes))
 
     def assert_pristine(self, discovery: Discovery) -> None:
         for node in discovery.nodes:
@@ -1835,12 +2140,12 @@ class ControlPlane:
     def plan(self) -> dict[str, Any]:
         discovery = self.backend.discover()
         ledger = self.store.load()
-        package_repin = False
+        repin = LedgerRepin()
         if ledger is not None:
-            package_repin = self._verify_ledger(
+            repin = self._verify_ledger(
                 discovery, ledger, allow_package_repin=True
             )
-            if package_repin:
+            if repin.package:
                 self._assert_package_repin_safe(discovery, ledger)
         actions = [
             "freeze membership/topology/package in the private pmxcfs ledger",
@@ -1850,7 +2155,7 @@ class ControlPlane:
             "with exact three-DB health gates",
             "activate transport nodes one at a time after central convergence",
         ]
-        if package_repin:
+        if repin.package:
             source_phase = ledger["phase"]
             if source_phase == "planned":
                 description = "untouched planned ledger"
@@ -1864,14 +2169,21 @@ class ControlPlane:
                 0,
                 f"atomically repin the {description} to the uniform newer package",
             )
+        if repin.topology_schema:
+            actions.insert(
+                0,
+                "atomically replace the legacy schema 1 topology digest with its "
+                "exact schema 2 Corosync-pinned projection",
+            )
         return {
             "read_only": True,
             "confirmation": discovery.confirmation,
             "mode": discovery.mode,
             "nodes": [node.frozen() for node in discovery.nodes],
             "existing_phase": ledger.get("phase") if ledger else None,
-            "package_repin_required": package_repin,
-            "package_repin_source_phase": ledger.get("phase") if package_repin else None,
+            "package_repin_required": repin.package,
+            "package_repin_source_phase": ledger.get("phase") if repin.package else None,
+            "topology_schema_repin_required": repin.topology_schema,
             "actions": actions,
         }
 
@@ -1900,11 +2212,12 @@ class ControlPlane:
                 }
                 self.store.create(ledger)
             else:
-                package_repin = self._verify_ledger(
+                repin = self._verify_ledger(
                     discovery, ledger, allow_package_repin=True
                 )
-                if package_repin:
+                if repin.package:
                     self._assert_package_repin_safe(discovery, ledger)
+                if repin.required:
                     ledger = copy.deepcopy(ledger)
                     ledger["snapshot"] = discovery.snapshot()
                     self.store.update(ledger)
@@ -2112,6 +2425,33 @@ class ControlPlane:
         return compared.returncode == 0
 
     @classmethod
+    def _schema2_projection_transition(
+        cls, discovery: Discovery, pinned: dict[str, Any], live: dict[str, Any]
+    ) -> bool:
+        legacy_digest = discovery.legacy_topology_sha256
+        return (
+            isinstance(legacy_digest, str)
+            and SHA256_RE.fullmatch(legacy_digest) is not None
+            and pinned.get("topology_sha256") == legacy_digest
+            and live.get("topology_sha256") == discovery.topology_sha256
+            and legacy_digest != discovery.topology_sha256
+        )
+
+    @classmethod
+    def _topology_schema_snapshot_repin_allowed(
+        cls, discovery: Discovery, ledger: dict[str, Any]
+    ) -> bool:
+        pinned = cls._normalized_durable_snapshot(ledger.get("snapshot"))
+        live = cls._normalized_durable_snapshot(discovery.snapshot())
+        if pinned is None or live is None or not cls._schema2_projection_transition(
+            discovery, pinned, live
+        ):
+            return False
+        pinned = copy.deepcopy(pinned)
+        pinned["topology_sha256"] = live["topology_sha256"]
+        return pinned == live
+
+    @classmethod
     def _package_snapshot_repin_allowed(
         cls, discovery: Discovery, ledger: dict[str, Any]
     ) -> bool:
@@ -2143,6 +2483,11 @@ class ControlPlane:
         for snapshot in (pinned_without_versions, live_without_versions):
             for node in snapshot["nodes"]:
                 node["package_version"] = None
+        if cls._schema2_projection_transition(
+            discovery, pinned_without_versions, live_without_versions
+        ):
+            pinned_without_versions["topology_sha256"] = \
+                live_without_versions["topology_sha256"]
         return pinned_without_versions == live_without_versions
 
     @staticmethod
@@ -2262,7 +2607,7 @@ class ControlPlane:
     def _verify_ledger(
         cls, discovery: Discovery, ledger: dict[str, Any],
         allow_package_repin: bool = False,
-    ) -> bool:
+    ) -> LedgerRepin:
         if ledger.get("version") != LEDGER_VERSION:
             raise ControlPlaneError("unsupported control-plane ledger version")
         live_snapshot = discovery.snapshot()
@@ -2276,7 +2621,18 @@ class ControlPlane:
                 cls._partial_central_package_repin_allowed(discovery, ledger) or
                 cls._complete_package_repin_allowed(discovery, ledger)
             )
-        if not durable_match and not package_repin:
+        topology_only_repin = not durable_match and allow_package_repin and \
+            cls._topology_schema_snapshot_repin_allowed(discovery, ledger)
+        pinned_snapshot = cls._normalized_durable_snapshot(ledger.get("snapshot"))
+        topology_transition = (
+            not durable_match
+            and pinned_snapshot is not None
+            and cls._schema2_projection_transition(
+                discovery, pinned_snapshot,
+                cls._normalized_durable_snapshot(live_snapshot) or {},
+            )
+        )
+        if not durable_match and not package_repin and not topology_only_repin:
             raise ControlPlaneError("live membership/topology/package drift from the ledger")
         try:
             uuid.UUID(ledger["cluster_uuid"])
@@ -2314,7 +2670,11 @@ class ControlPlane:
                     raise ControlPlaneError("ledger database cluster ID set is invalid")
                 if db_cids["PVN_Control"] != control_cid:
                     raise ControlPlaneError("ledger Control DB cluster ID pins disagree")
-        return package_repin
+        return LedgerRepin(
+            package=package_repin,
+            topology_schema=(package_repin or topology_only_repin)
+            and topology_transition,
+        )
 
     @staticmethod
     def _render_config(discovery: Discovery, cluster_id: str) -> dict[str, Any]:

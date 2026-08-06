@@ -60,7 +60,7 @@ def discovery(count=3, package="0.1.1"):
     mode = "standalone" if count == 1 else "raft"
     confirm = "standalone-pve-a" if count == 1 else "test-cluster"
     return Discovery(mode, confirm, confirm, "pve-a", 7, 3 if count > 1 else 0,
-                     "a" * 64, 1380, "provider", nodes)
+                     "a" * 64, None, 1380, "provider", nodes)
 
 
 class FakeBackend:
@@ -450,6 +450,175 @@ with tempfile.TemporaryDirectory() as temporary:
         assert "clustered database" in error.getvalue()
 
 
+# Corosync probe parsing and file access preserve the exact shared-file bytes,
+# membership/ring mapping, and root-owned no-link/no-write boundary.
+def load_remote_corosync_helpers():
+    tree = ast.parse(module["REMOTE_HELPER"])
+    selected = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {
+            "fail", "ipv4", "secure_file_bytes", "corosync_snapshot",
+        }
+    ]
+    namespace = {
+        "hashlib": hashlib,
+        "ipaddress": ipaddress,
+        "os": os,
+        "re": re,
+        "stat": module["stat"],
+        "sys": sys,
+        "SAFE_NAME": module["SAFE_NAME"],
+        "NODE_BLOCK": re.compile(r"(?ms)^\s*node\s*\{.*?^\s*\}"),
+    }
+    exec(compile(ast.Module(body=selected, type_ignores=[]),
+                 "remote-corosync", "exec"), namespace)
+    return namespace
+
+
+def expect_remote_failure(callback, message):
+    error = io.StringIO()
+    with contextlib.redirect_stderr(error):
+        try:
+            callback()
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("remote Corosync guard unexpectedly passed")
+    assert message in error.getvalue(), error.getvalue()
+
+
+with tempfile.TemporaryDirectory() as temporary:
+    helpers = load_remote_corosync_helpers()
+    root = pathlib.Path(temporary)
+    config = root / "corosync.conf"
+    content = b"""totem {
+    cluster_name: test-cluster
+    config_version: 9
+}
+nodelist {
+    node {
+        name: pve-a
+        nodeid: 1
+        ring1_addr: 192.0.2.11
+    }
+    node {
+        name: pve-b
+        nodeid: 2
+        ring1_addr: 192.0.2.12
+    }
+    node {
+        name: pve-c
+        nodeid: 3
+        ring1_addr: 192.0.2.13
+    }
+}
+"""
+    config.write_bytes(content)
+    config.chmod(0o640)
+    opened = helpers["secure_file_bytes"](config, "corosync.conf", 4096)
+    assert opened == content
+    snapshot = helpers["corosync_snapshot"](
+        opened, "test-cluster", {"pve-a": 1, "pve-b": 2, "pve-c": 3}
+    )
+    assert snapshot == {
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "config_version": 9,
+        "rings": {"1": {
+            "pve-a": "192.0.2.11",
+            "pve-b": "192.0.2.12",
+            "pve-c": "192.0.2.13",
+        }},
+    }
+    expect_remote_failure(
+        lambda: helpers["corosync_snapshot"](
+            opened, "wrong-cluster", {"pve-a": 1, "pve-b": 2, "pve-c": 3}
+        ),
+        "cluster name/config_version",
+    )
+    expect_remote_failure(
+        lambda: helpers["corosync_snapshot"](
+            opened, "test-cluster", {"pve-a": 1, "pve-b": 2, "pve-c": 4}
+        ),
+        "node identity differs",
+    )
+    hardlink = root / "corosync-hardlink"
+    os.link(config, hardlink)
+    expect_remote_failure(
+        lambda: helpers["secure_file_bytes"](config, "corosync.conf", 4096),
+        "owner/link/mode",
+    )
+    hardlink.unlink()
+    config.chmod(0o660)
+    expect_remote_failure(
+        lambda: helpers["secure_file_bytes"](config, "corosync.conf", 4096),
+        "owner/link/mode",
+    )
+    config.chmod(0o640)
+    symlink = root / "corosync-link"
+    symlink.symlink_to(config)
+    expect_remote_failure(
+        lambda: helpers["secure_file_bytes"](symlink, "corosync.conf", 4096),
+        "non-symlink",
+    )
+    expect_remote_failure(
+        lambda: helpers["secure_file_bytes"](config, "corosync.conf", 8),
+        "size limit",
+    )
+
+remote_helper_source = module["REMOTE_HELPER"]
+assert remote_helper_source.count(
+    'secure_file_bytes(COROSYNC_CONFIG, "corosync.conf", MAX_COROSYNC_BYTES)'
+) == 2
+assert '[PVNCTL_BIN, "doctor", "--check", "corosync-runtime-config"], 30' in \
+    remote_helper_source
+assert "stdout=subprocess.DEVNULL" in remote_helper_source
+assert remote_helper_source.count("os.path.lexists(COROSYNC_CONFIG)") == 2
+
+remote_tree = ast.parse(remote_helper_source)
+standalone_guard_nodes = [
+    node for node in remote_tree.body
+    if isinstance(node, ast.FunctionDef) and node.name in {
+        "fail", "probe_standalone_corosync",
+    }
+]
+
+class StandaloneCorosyncPath:
+    def __init__(self, states):
+        self.states = iter(states)
+
+    def lexists(self, _path):
+        return next(self.states)
+
+
+def standalone_guard(states, doctor_status=0):
+    calls = []
+    namespace = {
+        "os": types.SimpleNamespace(path=StandaloneCorosyncPath(states)),
+        "sys": sys,
+        "COROSYNC_CONFIG": pathlib.Path("/etc/pve/corosync.conf"),
+        "PVNCTL_BIN": "/usr/sbin/pvnctl",
+        "run_quiet": lambda arguments, timeout: (
+            calls.append((arguments, timeout)) or doctor_status
+        ),
+    }
+    exec(compile(ast.Module(body=standalone_guard_nodes, type_ignores=[]),
+                 "standalone-corosync", "exec"), namespace)
+    return namespace["probe_standalone_corosync"], calls
+
+
+guard, calls = standalone_guard([False, False])
+assert guard() is True
+assert calls == [([
+    "/usr/sbin/pvnctl", "doctor", "--check", "corosync-runtime-config",
+], 30)]
+guard, _ = standalone_guard([False, False], doctor_status=1)
+assert guard() is False
+guard, _ = standalone_guard([True])
+expect_remote_failure(guard, "unexpectedly has")
+guard, _ = standalone_guard([False, True])
+expect_remote_failure(guard, "appeared during")
+
+
 # Exercise the production init-control dispatch with fake ovsdb-tool,
 # pvnctl, and systemctl processes. This covers the legacy unknown-CID stub,
 # new --cid-pinned stub, and the post-activation/pre-ledger-write resume state.
@@ -784,26 +953,38 @@ def canonical_topology_fixture(root, count=3, standalone=False):
     members = {
         "nodename": "pve-a",
         "version": 7,
-        "nodelist": {
-            name: {"id": node_id, "online": 1, "ip": management}
-            for name, node_id, management, _ in records
-        },
     }
     if not standalone:
+        members["nodelist"] = {
+            name: {"id": node_id, "online": 1, "ip": management}
+            for name, node_id, management, _ in records
+        }
         members["cluster"] = {
             "name": "test-cluster", "version": 3, "nodes": count, "quorate": 1,
         }
     membership = {
         "cluster_name": cluster_name,
         "nodes": [
-            {"name": name, "node_id": node_id, "management_ip": management}
+            {"name": name, "node_id": 0 if standalone else node_id,
+             "management_ip": management}
             for name, node_id, management, _ in records
         ],
     }
+    corosync = None if standalone else {
+        "sha256": hashlib.sha256(b"canonical-corosync-conf").hexdigest(),
+        "config_version": 3,
+        "rings": {
+            "1": {
+                name: management
+                for name, _, management, _ in records
+            },
+        },
+    }
     topology = {
-        "schema": 1,
+        "schema": 2,
         "phase": "complete",
         "cluster_name": cluster_name,
+        "corosync": corosync,
         "membership_snapshot": membership,
         "membership_hash": module["sha256"](
             json.dumps(membership, sort_keys=True, separators=(",", ":")).encode()
@@ -811,7 +992,7 @@ def canonical_topology_fixture(root, count=3, standalone=False):
         "nodes": [
             {
                 "name": name,
-                "node_id": node_id,
+                "node_id": 0 if standalone else node_id,
                 "management_ip": management,
                 "control_ip": management,
                 "geneve_ip": geneve,
@@ -855,10 +1036,29 @@ def canonical_topology_fixture(root, count=3, standalone=False):
                 {"ip": geneve, "interface": "ens4", "mtu": 1442},
             ],
             "bridges": {"br-int": True, "br-provider": True},
+            "corosync": copy.deepcopy(corosync),
+            "corosync_runtime_consistent": True,
         }
         for name, _, management, geneve in records
     }
-    backend._remote = lambda name, _action, _payload: copy.deepcopy(probes[name])
+    backend.test_probes = probes
+
+    def remote(name, action, payload):
+        assert action == "probe"
+        assert set(payload) == {"bridges", "corosync"}
+        if standalone:
+            assert payload["corosync"] is None
+        else:
+            assert payload["corosync"] == {
+                "cluster_name": cluster_name,
+                "nodes": {
+                    node_name: node_id
+                    for node_name, node_id, _, _ in records
+                },
+            }
+        return copy.deepcopy(backend.test_probes[name])
+
+    backend._remote = remote
     return backend, topology_path, topology
 
 
@@ -869,6 +1069,17 @@ with tempfile.TemporaryDirectory() as temporary:
     assert found.guest_mtu == 1300
     assert found.nodes[0].geneve_interface == "ens4"
     assert found.nodes[0].provider_interface == "ens5"
+    legacy_projection = copy.deepcopy(topology)
+    legacy_projection["schema"] = 1
+    legacy_projection.pop("corosync")
+    assert found.legacy_topology_sha256 == module["sha256"](
+        module["canonical_json"](legacy_projection)
+    )
+
+    invalid = copy.deepcopy(topology)
+    invalid["schema"] = 1
+    topology_path.write_text(json.dumps(invalid))
+    expect_error(backend.discover, "schema 2")
 
     invalid = copy.deepcopy(topology)
     invalid["phase"] = "network-staged"
@@ -890,6 +1101,56 @@ with tempfile.TemporaryDirectory() as temporary:
     topology_path.write_text(json.dumps(invalid))
     expect_error(backend.discover, "exceeds effective Geneve MTU")
 
+    malformed_corosync = []
+    invalid = copy.deepcopy(topology)
+    invalid.pop("corosync")
+    malformed_corosync.append((invalid, "exactly sha256"))
+    invalid = copy.deepcopy(topology)
+    invalid["corosync"]["extra"] = True
+    malformed_corosync.append((invalid, "exactly sha256"))
+    invalid = copy.deepcopy(topology)
+    invalid["corosync"]["sha256"] = "A" * 64
+    malformed_corosync.append((invalid, "sha256 is invalid"))
+    invalid = copy.deepcopy(topology)
+    invalid["corosync"]["config_version"] = True
+    malformed_corosync.append((invalid, "config_version is invalid"))
+    invalid = copy.deepcopy(topology)
+    invalid["corosync"]["rings"] = {}
+    malformed_corosync.append((invalid, "1..8 KNET links"))
+    invalid = copy.deepcopy(topology)
+    invalid["corosync"]["rings"] = {"8": invalid["corosync"]["rings"]["1"]}
+    malformed_corosync.append((invalid, "invalid KNET ring key"))
+    invalid = copy.deepcopy(topology)
+    invalid["corosync"]["rings"]["1"].pop("pve-c")
+    malformed_corosync.append((invalid, "node set differs"))
+    invalid = copy.deepcopy(topology)
+    invalid["corosync"]["rings"]["1"]["pve-c"] = "not-an-address"
+    malformed_corosync.append((invalid, "not an IP address"))
+    for invalid, message in malformed_corosync:
+        topology_path.write_text(json.dumps(invalid))
+        expect_error(backend.discover, message)
+
+    topology_path.write_text(json.dumps(topology))
+    baseline_probes = copy.deepcopy(backend.test_probes)
+
+    def reject_corosync_probe(mutate, message):
+        backend.test_probes = copy.deepcopy(baseline_probes)
+        mutate(backend.test_probes["pve-b"])
+        expect_error(backend.discover, message)
+
+    reject_corosync_probe(
+        lambda probe: probe["corosync"].update(extra=True), "exactly sha256"
+    )
+    reject_corosync_probe(
+        lambda probe: probe.update(corosync_runtime_consistent=False),
+        "persisted/runtime state differs",
+    )
+    reject_corosync_probe(
+        lambda probe: probe["corosync"].update(sha256="f" * 64),
+        "differs from the topology ledger pin",
+    )
+    backend.test_probes = baseline_probes
+
 
 # Discovery accepts exactly one standalone node and every clustered odd size
 # from three upward. Clustered one-node and even-sized layouts stop before any
@@ -900,6 +1161,25 @@ with tempfile.TemporaryDirectory() as temporary:
     )
     found = backend.discover()
     assert len(found.nodes) == 1 and found.mode == "standalone"
+    assert found.nodes[0].node_id == 0
+    assert json.loads(backend.members_path.read_text()) == {
+        "nodename": "pve-a", "version": 7,
+    }
+    topology = json.loads(backend.topology_path.read_text())
+    invalid = copy.deepcopy(topology)
+    invalid.pop("corosync")
+    backend.topology_path.write_text(json.dumps(invalid))
+    expect_error(backend.discover, "explicit corosync null")
+    invalid = copy.deepcopy(topology)
+    invalid["corosync"] = {
+        "sha256": "a" * 64, "config_version": 1,
+        "rings": {"0": {"pve-a": "192.0.2.11"}},
+    }
+    backend.topology_path.write_text(json.dumps(invalid))
+    expect_error(backend.discover, "explicit corosync null")
+    backend.topology_path.write_text(json.dumps(topology))
+    backend.test_probes["pve-a"]["corosync_runtime_consistent"] = False
+    expect_error(backend.discover, "unexpected Corosync state")
 
 for supported_count in (3, 5, 7):
     with tempfile.TemporaryDirectory() as temporary:
@@ -2197,6 +2477,75 @@ topology_drift = Discovery(**{
     **discovery(package="0.1.2").__dict__, "topology_sha256": "b" * 64,
 })
 expect_package_repin_rejected(pinned, topology_drift)
+
+# A schema 2 topology can replace the previously pinned schema 1 digest only
+# through its exact canonical projection. This composes with the existing
+# package repin, but no other durable field may change.
+legacy_topology_digest = "1" * 64
+schema2_topology_digest = "2" * 64
+schema1_pinned = Discovery(**{
+    **discovery(package="0.1.1").__dict__,
+    "topology_sha256": legacy_topology_digest,
+    "legacy_topology_sha256": None,
+})
+schema2_same_package = Discovery(**{
+    **schema1_pinned.__dict__,
+    "topology_sha256": schema2_topology_digest,
+    "legacy_topology_sha256": legacy_topology_digest,
+})
+schema2_new_package = Discovery(**{
+    **discovery(package="0.1.2").__dict__,
+    "topology_sha256": schema2_topology_digest,
+    "legacy_topology_sha256": legacy_topology_digest,
+})
+schema1_ledger = planned_ledger(schema1_pinned)
+schema_only_repin = ControlPlane._verify_ledger(
+    schema2_same_package, schema1_ledger, allow_package_repin=True
+)
+assert schema_only_repin.topology_schema and not schema_only_repin.package
+combined_repin = ControlPlane._verify_ledger(
+    schema2_new_package, schema1_ledger, allow_package_repin=True
+)
+assert combined_repin.topology_schema and combined_repin.package
+
+for unsafe_schema2 in (
+    Discovery(**{
+        **schema2_new_package.__dict__,
+        "legacy_topology_sha256": None,
+    }),
+    Discovery(**{
+        **schema2_new_package.__dict__,
+        "legacy_topology_sha256": "z" * 64,
+    }),
+    Discovery(**{
+        **schema2_new_package.__dict__,
+        "guest_mtu": schema2_new_package.guest_mtu + 1,
+    }),
+    Discovery(**{
+        **schema2_new_package.__dict__,
+        "cluster_version": schema2_new_package.cluster_version + 1,
+    }),
+):
+    expect_error(
+        lambda unsafe=unsafe_schema2: ControlPlane._verify_ledger(
+            unsafe, schema1_ledger, allow_package_repin=True
+        ),
+        "drift",
+    )
+
+with tempfile.TemporaryDirectory() as temporary:
+    store = LedgerStore(pathlib.Path(temporary) / "private")
+    store.create(copy.deepcopy(schema1_ledger))
+    backend = FakeBackend(schema2_same_package)
+    control = ControlPlane(backend, store, timeout=0.01, interval=0)
+    plan = control.plan()
+    assert plan["topology_schema_repin_required"] is True
+    assert plan["package_repin_required"] is False
+    result = control.apply(schema2_same_package.confirmation)
+    assert result["complete"] is True
+    assert store.load()["snapshot"]["topology_sha256"] == schema2_topology_digest
+    assert ControlPlane._verify_ledger(schema2_same_package, store.load()) == \
+        module["LedgerRepin"]()
 
 durable_snapshot = pinned.snapshot()
 epoch_only = copy.deepcopy(durable_snapshot)
