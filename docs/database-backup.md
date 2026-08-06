@@ -19,7 +19,8 @@ membership, capture interval, schema identity, size, and SHA-256 for every
 snapshot. A default backup checks stable cluster identity and membership but
 does not require the local node to lead every selected database. A recovery
 backup requires one explicit database and unchanged local leadership for its
-entire capture.
+entire capture. Both modes currently require live clustered Raft databases;
+standalone-format one-node database services are not supported.
 
 ## Routine backup and offline verification
 
@@ -92,8 +93,10 @@ database. Never loop over the table or reuse a set from an earlier window.
 | `OVN_Northbound` | `ovn-nb` | `ovn-northbound.ovsdb` | `unix:/run/ovn/ovnnb_db.sock` | 6643 |
 | `OVN_Southbound` | `ovn-sb` | `ovn-southbound.ovsdb` | `unix:/run/ovn/ovnsb_db.sock` | 6644 |
 
-The examples use three voters. For another odd voter count, provide exactly
-one fresh report per reported member. Set these values before the window:
+The runbook applies only to clustered Raft deployments and the examples use
+three voters. For another supported odd voter count of at least three, provide
+exactly one fresh report per reported member. Set these values before the
+window:
 
 ```bash
 set -euo pipefail
@@ -137,10 +140,12 @@ the three OVSDB Raft cluster UUIDs.
 
 Block PVN UI/API mutations, PVE HA and migration actions, guest lifecycle
 changes that touch NICs, control-plane apply/update jobs, and manual OVN
-writes. On every PVE node, stop the node writers and controller:
+writes. On every PVE node, stop the complete node target. Its `PartOf=`
+relationships stop the manager, host configuration service, controller,
+agent, and readiness gate together:
 
 ```sh
-systemctl stop pvn-agent.service pvn-manager.service ovn-controller.service
+systemctl stop pvn-node.target
 ```
 
 On every central voter, stop the complete central target. Its `PartOf=`
@@ -162,8 +167,9 @@ for unit in pvn-control-db.service \
   ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service; do
   [ "$(systemctl show --property=ActiveState --value "$unit")" = active ] || exit 1
 done
-for unit in pvn-central.target ovn-northd.service \
-  pvn-manager.service pvn-agent.service ovn-controller.service; do
+for unit in pvn-node.target pvn-node-ready.service \
+  pvn-central.target ovn-northd.service pvn-manager.service \
+  pvn-agent.service ovn-controller.service; do
   [ "$(systemctl show --property=ActiveState --value "$unit")" = inactive ] || exit 1
 done
 ```
@@ -336,8 +342,7 @@ pve_ssh_node "$copy_node" "$copy_ip" \
 ```
 
 Never merge or resume a partial destination. After auditing a failed copy, use
-a new empty path. A one-voter deployment needs genuinely off-host durable
-storage; a second directory on the same disk is not independent evidence.
+a new empty path on another voter or genuinely off-host durable storage.
 
 ### 4. Run the mandatory fresh pre-restore gate
 
@@ -428,18 +433,19 @@ systemctl start pvn-central.target
 ```
 
 Do not start northd with dependency overrides. Wait until
-`pvnctl central status` succeeds on every voter. Then start the stopped node
-components on every PVE node; systemd resolves the agent dependencies:
+`pvnctl central status` succeeds on every voter. Then start the complete node
+target on every PVE node so its readiness gate and all required components
+return as one lifecycle:
 
 ```sh
-systemctl start ovn-controller.service pvn-manager.service pvn-agent.service
+systemctl start pvn-node.target
 ```
 
 Before reopening UI/API and guest operations, require all of the following:
 
 - `pvnctl central status` succeeds on every central voter;
 - `pvnctl doctor` succeeds on every node;
-- `systemctl restart pvn-node-ready.service` succeeds on every node;
+- `pvn-node.target` and `pvn-node-ready.service` are active on every node;
 - the agent `/healthz` check and every controller connection are healthy;
 - logical inventory matches stable PVN IDs and names (raw OVSDB UUIDs may have
   changed); and
@@ -451,8 +457,8 @@ operator log until validation is complete. Another database requires another
 freeze, a new Raft baseline, a new boundary, and a new recovery-window set.
 
 If the window is aborted before the restore, start `pvn-central.target` on all
-central voters, start the three node components on every node, and complete the
-same health validation before returning service.
+central voters, start `pvn-node.target` on every node, and complete the same
+health validation before returning service.
 
 ## Database-specific intent
 

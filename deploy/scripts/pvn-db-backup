@@ -131,6 +131,8 @@ DATABASE_UNITS = (
     "ovn-ovsdb-server-sb.service",
 )
 RECOVERY_INACTIVE_UNITS = (
+    "pvn-node.target",
+    "pvn-node-ready.service",
     "pvn-central.target",
     "ovn-northd.service",
     "pvn-manager.service",

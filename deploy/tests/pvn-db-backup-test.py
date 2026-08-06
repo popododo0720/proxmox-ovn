@@ -129,7 +129,7 @@ try:
         "fi\n"
         "case \"$4\" in\n"
         "  pvn-control-db.service|ovn-ovsdb-server-nb.service|ovn-ovsdb-server-sb.service) echo active ;;\n"
-        "  pvn-central.target|ovn-northd.service|pvn-manager.service|pvn-agent.service|ovn-controller.service) echo inactive ;;\n"
+        "  pvn-node.target|pvn-node-ready.service|pvn-central.target|ovn-northd.service|pvn-manager.service|pvn-agent.service|ovn-controller.service) echo inactive ;;\n"
         "  *) exit 2 ;;\n"
         "esac\n",
         encoding="ascii",
@@ -455,6 +455,17 @@ else:
         pre_restore["voters"] == sorted(status_paths),
         "pre-restore did not retain exact voter labels",
     )
+
+    for active_node_unit in ("pvn-node.target", "pvn-node-ready.service"):
+        reset_status()
+        unit_override.write_text(f"{active_node_unit} active\n", encoding="ascii")
+        result = invoke(*pre_restore_arguments())
+        check(
+            result.returncode != 0
+            and f"{active_node_unit} inactive" in result.stderr,
+            f"pre-restore accepted active {active_node_unit}",
+        )
+        unit_override.unlink()
 
     reset_status()
     result = invoke(*pre_restore_arguments(expected_sha256="0" * 64))
