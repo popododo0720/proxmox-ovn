@@ -2,7 +2,7 @@
 
 Status snapshot for follow-up work. Reflects the intended v1 feature set in
 `README.md` / `docs/architecture.md`, the live three-node lab evidence through
-v0.2.12, and gaps that still need implementation or destructive recovery tests.
+v0.2.13, and gaps that still need implementation or destructive recovery tests.
 
 **How to use:** treat “v1 must-pass” as release gates; everything else is
 prioritized backlog. Update this file when items ship or scope changes.
@@ -88,7 +88,8 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 - [ ] DNS integration (guest resolver via DHCP options and/or project DNS)
 - [ ] Static / extra routes beyond basic router interfaces
 - [ ] Better multi-exit / gateway HA story (beyond single centralized SNAT model)
-- [ ] Port / chassis / binding diagnostics in UI or `pvnctl` (why is link down?)
+- [x] Port / chassis / binding diagnostics in UI (control, PVE NIC, runtime
+      resolver, and unrestricted-policy warnings; raw IDs stay in Details)
 - [ ] SG / ACL deny visibility (logging or counters for debug)
 
 ### Multitenancy & safety
