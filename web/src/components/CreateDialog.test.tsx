@@ -38,9 +38,9 @@ describe('CreateDialog resource references', () => {
       </ApiProvider>,
     );
 
-    await screen.findByRole('option', { name: 'tenant-a · project-1' });
+    await screen.findByRole('option', { name: 'tenant-a' });
     fireEvent.change(screen.getByRole('combobox', { name: 'Project' }), { target: { value: 'project-1' } });
-    await screen.findByRole('option', { name: 'web · sg-1' });
+    await screen.findByRole('option', { name: 'web' });
 
     const securityGroups = screen.getByRole('listbox', { name: 'Security groups' }) as HTMLSelectElement;
     for (const option of Array.from(securityGroups.options)) {

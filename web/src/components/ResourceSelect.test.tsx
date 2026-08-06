@@ -28,7 +28,7 @@ describe('ResourceSelect', () => {
       </ApiProvider>,
     );
 
-    const option = await screen.findByRole('option', { name: 'application · network-aaaaaaaa' });
+    const option = await screen.findByRole('option', { name: 'application' });
     expect(screen.queryByRole('option', { name: /database/ })).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'network-aaaaaaaa' } });
 
@@ -56,7 +56,7 @@ describe('ResourceSelect', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('manager unavailable');
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
-    await screen.findByRole('option', { name: 'tenant-a · project-1' });
+    await screen.findByRole('option', { name: 'tenant-a' });
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
   });
 
@@ -77,10 +77,28 @@ describe('ResourceSelect', () => {
     );
 
     expect(screen.getByRole('combobox')).toHaveValue('provider-exact-id');
-    expect(screen.getByRole('option', { name: 'provider-exact-id · current value unavailable' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Current value unavailable' })).toBeInTheDocument();
+    expect(screen.queryByText('provider-exact-id')).not.toBeInTheDocument();
     resolveList?.({ items: [{ id: 'provider-exact-id', name: 'public' }] });
 
-    await screen.findByRole('option', { name: 'public · provider-exact-id' });
+    await screen.findByRole('option', { name: 'public' });
     expect(screen.getByRole('combobox')).toHaveValue('provider-exact-id');
+  });
+
+  it('coalesces identical endpoint loads across multiple selectors', async () => {
+    const list = vi.fn().mockResolvedValue({
+      items: [{ id: 'project-1', name: 'Tenant A' }],
+    });
+
+    render(
+      <ApiProvider client={{ list } as unknown as ApiClient}>
+        <ResourceSelect id="project-a" name="project_a" active source={{ endpoint: '/projects' }} />
+        <ResourceSelect id="project-b" name="project_b" active source={{ endpoint: '/projects' }} />
+      </ApiProvider>,
+    );
+
+    expect(await screen.findAllByRole('option', { name: 'Tenant A' })).toHaveLength(2);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(list).toHaveBeenCalledWith('/projects');
   });
 });

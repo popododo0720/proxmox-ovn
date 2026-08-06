@@ -104,7 +104,7 @@ tbody tr:hover td { background: rgba(255,255,255,.012); }
 td strong { color: #edf4f8; font-weight: 650; }
 .mono-cell { max-width: 220px; color: #a5b5c0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10.5px; overflow-wrap: anywhere; }
 .error-cell { max-width: 260px; color: var(--danger); }
-.actions-column { width: 112px; text-align: right; }
+.actions-column { width: 156px; text-align: right; }
 .table-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .table-action { border: 0; background: transparent; color: var(--muted); font-size: 10px; font-weight: 700; cursor: pointer; }
 .table-action:hover { color: var(--accent); }
@@ -165,6 +165,8 @@ td strong { color: #edf4f8; font-weight: 650; }
 .form-field small, .checkbox-field small { color: #758692; font-size: 9px; line-height: 1.45; }
 .reference-error { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #ffabb0; font-size: 9px; line-height: 1.4; }
 .reference-error button { padding: 0; border: 0; color: var(--accent); background: transparent; font-size: 9px; font-weight: 700; cursor: pointer; }
+.reference-label { display: inline-flex; flex-wrap: wrap; gap: 4px 8px; color: #d5e0e6; }
+.reference-label > span:not(:last-child)::after { content: ","; color: var(--muted); }
 .copyable-id { display: inline-flex; max-width: 260px; align-items: center; gap: 7px; }
 .copyable-id code { min-width: 0; overflow-wrap: anywhere; color: #a5b5c0; font: inherit; }
 .copyable-id button { flex: none; padding: 2px 5px; border: 1px solid #354551; border-radius: 5px; color: #8194a2; background: #121b22; font-size: 8px; font-weight: 750; cursor: pointer; }
@@ -178,6 +180,16 @@ td strong { color: #edf4f8; font-weight: 650; }
 .resource-dialog { width: min(500px, calc(100vw - 32px)); max-height: calc(100vh - 42px); padding: 0; overflow: auto; color: var(--text); background: var(--surface); border: 1px solid #3b4b57; border-radius: 12px; box-shadow: 0 28px 90px rgba(0,0,0,.65); }
 .resource-dialog::backdrop { background: rgba(3,8,12,.72); backdrop-filter: blur(3px); }
 .resource-dialog form { padding: 22px; }
+.resource-details-dialog { width: min(680px, calc(100vw - 32px)); }
+.resource-details-content { padding: 22px; }
+.resource-details, .nested-details { margin: 0; }
+.resource-details > div { display: grid; grid-template-columns: minmax(130px, .45fr) minmax(0, 1fr); gap: 16px; padding: 11px 0; border-top: 1px solid var(--line-soft); }
+.resource-details > div:first-child { border-top: 0; }
+.resource-details dt, .nested-details dt { color: #7f919e; font-size: 9px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+.resource-details dd, .nested-details dd { min-width: 0; margin: 0; color: #c6d2da; font-size: 11px; overflow-wrap: anywhere; }
+.nested-details { display: grid; gap: 8px; }
+.nested-details > div { display: grid; grid-template-columns: minmax(100px, .35fr) minmax(0, 1fr); gap: 10px; }
+.detail-list { display: grid; gap: 6px; }
 .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 20px; }
 .dialog-heading h2 { margin: 6px 0 0; font-size: 21px; font-weight: 620; }
 .icon-button { width: 32px; height: 32px; border: 1px solid #34434f; border-radius: 7px; color: #9babb6; background: #121a21; cursor: pointer; }

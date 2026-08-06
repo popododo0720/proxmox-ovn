@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { useApi } from '../api/context';
 import type { BaseResource } from '../api/types';
-import { CopyableID } from './CopyableID';
 import { CreateDialog, type FormField } from './CreateDialog';
 import { EmptyState } from './EmptyState';
 import { ErrorState } from './ErrorState';
 import { LoadingState } from './LoadingState';
+import { ReferenceLabel } from './ReferenceLabel';
+import { useResourceCatalog } from './ResourceCatalog';
+import { ResourceDetailsDialog } from './ResourceDetailsDialog';
+import type { ResourceReference } from './ResourceSelect';
 import { StatusPill } from './StatusPill';
 
 export interface Column<T> {
@@ -13,6 +16,7 @@ export interface Column<T> {
   label: string;
   render?: (item: T) => ReactNode;
   className?: string;
+  reference?: ResourceReference | ((item: T) => ResourceReference | undefined);
 }
 
 export interface ResourcePageProps<T extends BaseResource> {
@@ -54,6 +58,14 @@ export function formatValue(value: unknown): ReactNode {
   return String(value);
 }
 
+function resourceLabel(resource: BaseResource): string {
+  for (const key of ['name', 'address', 'cidr']) {
+    const value = resource[key];
+    if (value !== null && value !== undefined && value !== '') return String(value);
+  }
+  return 'resource';
+}
+
 export function ResourcePage<T extends BaseResource>({
   title,
   description,
@@ -70,34 +82,15 @@ export function ResourcePage<T extends BaseResource>({
   emptyMessage = 'Create the first resource when the cluster is ready.',
 }: ResourcePageProps<T>) {
   const api = useApi();
-  const [items, setItems] = useState<T[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const catalog = useResourceCatalog(endpoint);
+  const items = catalog.items as unknown as T[];
+  const [actionError, setActionError] = useState('');
   const [query, setQuery] = useState('');
-  const [reloadKey, setReloadKey] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [editing, setEditing] = useState<T | null>(null);
+  const [viewing, setViewing] = useState<T | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
-  const tableColumns: Column<T>[] = columns.some((column) => String(column.key) === 'id')
-    ? columns
-    : [...columns, { key: 'id', label: 'ID', className: 'mono-cell' }];
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const result = await api.list<T>(endpoint);
-      setItems(result.items);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Unexpected API response');
-    } finally {
-      setLoading(false);
-    }
-  }, [api, endpoint]);
-
-  useEffect(() => {
-    void load();
-  }, [load, reloadKey]);
+  const error = actionError || catalog.error;
 
   const visibleItems = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -106,15 +99,16 @@ export function ResourcePage<T extends BaseResource>({
   }, [items, query]);
 
   async function remove(item: T) {
-    const label = item.name || item.id;
+    const label = resourceLabel(item);
     if (!window.confirm(`Delete ${label}? This request is reconciled through OVN.`)) return;
     setDeleting(item.id);
+    setActionError('');
     try {
       if (deleteResource) await deleteResource(item);
       else await api.remove(endpoint, item.id, item.revision);
-      await load();
+      catalog.invalidate();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Delete failed');
+      setActionError(reason instanceof Error ? reason.message : 'Delete failed');
     } finally {
       setDeleting(null);
     }
@@ -129,7 +123,16 @@ export function ResourcePage<T extends BaseResource>({
           <p>{description}</p>
         </div>
         <div className="heading-actions">
-          <button className="button button-secondary" onClick={() => setReloadKey((value) => value + 1)} disabled={loading}>
+          <button
+            className="button button-secondary"
+            onClick={() => {
+              setActionError('');
+              void catalog.retry().catch((reason: unknown) => {
+                setActionError(reason instanceof Error ? reason.message : 'Refresh failed');
+              });
+            }}
+            disabled={catalog.loading}
+          >
             Refresh
           </button>
           {createFields && (
@@ -140,8 +143,14 @@ export function ResourcePage<T extends BaseResource>({
         </div>
       </div>
 
-      {loading ? <LoadingState label={`Loading ${title.toLowerCase()}`} /> : error ? (
-        <ErrorState message={error} onRetry={() => setReloadKey((value) => value + 1)} />
+      {catalog.loading ? <LoadingState label={`Loading ${title.toLowerCase()}`} /> : error ? (
+        <ErrorState
+          message={error}
+          onRetry={() => {
+            setActionError('');
+            void catalog.retry().catch(() => undefined);
+          }}
+        />
       ) : items.length === 0 ? (
         <EmptyState title={`No ${title.toLowerCase()} yet`} message={emptyMessage} />
       ) : (
@@ -157,39 +166,43 @@ export function ResourcePage<T extends BaseResource>({
             <table>
               <thead>
                 <tr>
-                  {tableColumns.map((column) => <th className={column.className} key={String(column.key)}>{column.label}</th>)}
-                  {(editFields || allowDelete) && <th className="actions-column"><span className="sr-only">Actions</span></th>}
+                  {columns.map((column) => <th className={column.className} key={String(column.key)}>{column.label}</th>)}
+                  <th className="actions-column"><span className="sr-only">Actions</span></th>
                 </tr>
               </thead>
               <tbody>
                 {visibleItems.map((item) => (
                   <tr key={item.id}>
-                    {tableColumns.map((column) => {
+                    {columns.map((column) => {
                       const value = readPath(item, String(column.key));
+                      const reference = typeof column.reference === 'function'
+                        ? column.reference(item)
+                        : column.reference;
                       return (
                         <td className={column.className} key={String(column.key)}>
-                          {String(column.key) === 'id'
-                            ? <CopyableID value={item.id} />
-                            : column.render
-                              ? column.render(item)
+                          {column.render
+                            ? column.render(item)
+                            : column.reference !== undefined
+                              ? reference
+                                ? <ReferenceLabel value={value} source={reference} />
+                                : <span className="muted">Unavailable</span>
                               : /^(status|state)$/.test(String(column.key))
                                 ? <StatusPill value={value} />
                                 : formatValue(value)}
                         </td>
                       );
                     })}
-                    {(editFields || allowDelete) && (
-                      <td className="actions-column">
-                        <span className="table-actions">
-                          {editFields && <button className="table-action" disabled={deleting === item.id} onClick={() => setEditing(item)}>Edit</button>}
-                          {allowDelete && (
-                            <button className="table-action danger" disabled={deleting === item.id} onClick={() => void remove(item)}>
-                              {deleting === item.id ? 'Deleting…' : 'Delete'}
-                            </button>
-                          )}
-                        </span>
-                      </td>
-                    )}
+                    <td className="actions-column">
+                      <span className="table-actions">
+                        <button className="table-action" disabled={deleting === item.id} onClick={() => setViewing(item)}>Details</button>
+                        {editFields && <button className="table-action" disabled={deleting === item.id} onClick={() => setEditing(item)}>Edit</button>}
+                        {allowDelete && (
+                          <button className="table-action danger" disabled={deleting === item.id} onClick={() => void remove(item)}>
+                            {deleting === item.id ? 'Deleting…' : 'Delete'}
+                          </button>
+                        )}
+                      </span>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -208,14 +221,14 @@ export function ResourcePage<T extends BaseResource>({
           onSubmit={async (payload) => {
             if (createResource) await createResource(payload);
             else await api.create<T>(endpoint, payload);
-            await load();
+            catalog.invalidate();
           }}
         />
       )}
       {editFields && editing && (
         <CreateDialog
           key={`${editing.id}-${editing.revision || 0}`}
-          title={`Edit ${editing.name || editing.id}`}
+          title={`Edit ${resourceLabel(editing)}`}
           fields={editFields}
           values={editing}
           mode="edit"
@@ -224,10 +237,11 @@ export function ResourcePage<T extends BaseResource>({
           onSubmit={async (payload) => {
             if (updateResource) await updateResource(editing, payload);
             else await api.update<T>(endpoint, editing.id, { ...editing, ...payload }, editing.revision);
-            await load();
+            catalog.invalidate();
           }}
         />
       )}
+      {viewing && <ResourceDetailsDialog resource={viewing} onClose={() => setViewing(null)} />}
     </section>
   );
 }

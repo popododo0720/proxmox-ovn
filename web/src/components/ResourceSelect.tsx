@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useApi } from '../api/context';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { BaseResource } from '../api/types';
+import { useResourceCatalog } from './ResourceCatalog';
 
 export interface ResourceMatch {
   formField: string;
@@ -12,6 +12,7 @@ export interface ResourceReference {
   endpoint: string;
   labelKeys?: string[];
   detailKeys?: string[];
+  fallbackLabel?: string;
   where?: Record<string, unknown>;
   matches?: ResourceMatch[];
   emptyLabel?: string;
@@ -50,11 +51,11 @@ function firstText(resource: BaseResource, keys: string[]): string {
 }
 
 export function resourceOptionLabel(resource: BaseResource, source: ResourceReference): string {
-  const primary = firstText(resource, source.labelKeys || ['name', 'address', 'cidr']);
+  const primary = firstText(resource, source.labelKeys || ['name', 'address', 'cidr', 'management_address']);
   const details = (source.detailKeys || [])
     .map((key) => firstText(resource, [key]))
     .filter((value, index, values) => value && value !== primary && values.indexOf(value) === index);
-  return [primary, ...details, resource.id]
+  return [primary || source.fallbackLabel || 'Unnamed resource', ...details]
     .filter((value, index, values) => value && values.indexOf(value) === index)
     .join(' · ');
 }
@@ -81,11 +82,6 @@ export function ResourceSelect({
   formValues = {},
   onChange,
 }: ResourceSelectProps) {
-  const api = useApi();
-  const [items, setItems] = useState<BaseResource[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [reloadKey, setReloadKey] = useState(0);
   const [selection, setSelection] = useState<string | string[]>(() => selectionValue(defaultValue, multiple));
   const wasActive = useRef(false);
 
@@ -98,6 +94,10 @@ export function ResourceSelect({
     .map((match) => String(formValues[match.formField] ?? ''))
     .join('\u0000');
   const previousDependency = useRef(dependencyKey);
+  const { items, loading, error, retry } = useResourceCatalog(
+    source.endpoint,
+    active && !missingDependency,
+  );
 
   useEffect(() => {
     if (active && !wasActive.current) setSelection(selectionValue(defaultValue, multiple));
@@ -115,28 +115,6 @@ export function ResourceSelect({
     setSelection(cleared);
     onChange?.(cleared);
   }, [active, dependencyKey, multiple, onChange]);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const result = await api.list<BaseResource>(source.endpoint);
-      setItems(result.items);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not load choices');
-    } finally {
-      setLoading(false);
-    }
-  }, [api, source.endpoint]);
-
-  useEffect(() => {
-    if (!active || missingDependency) return;
-    let current = true;
-    void load().catch(() => {
-      if (current) setError('Could not load choices');
-    });
-    return () => { current = false; };
-  }, [active, load, missingDependency?.formField, reloadKey]);
 
   const options = useMemo(
     () => items.filter((item) => matchesSource(item, source, formValues)),
@@ -177,7 +155,7 @@ export function ResourceSelect({
         {!multiple && <option value="">{placeholder}</option>}
         {multiple && options.length === 0 && <option value="" disabled>{placeholder}</option>}
         {unavailableSelectedIDs.map((value) => (
-          <option value={value} key={`current-${value}`}>{value} · current value unavailable</option>
+          <option value={value} key={`current-${value}`}>Current value unavailable</option>
         ))}
         {options.map((item) => (
           <option value={item.id} key={item.id}>{resourceOptionLabel(item, source)}</option>
@@ -187,7 +165,7 @@ export function ResourceSelect({
       {error && (
         <span className="reference-error" role="alert">
           {error}
-          <button type="button" onClick={() => setReloadKey((value) => value + 1)}>Retry</button>
+          <button type="button" onClick={() => void retry().catch(() => undefined)}>Retry</button>
         </span>
       )}
     </>
