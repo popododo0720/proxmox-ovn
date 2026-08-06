@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,8 +21,11 @@ import (
 	"github.com/popododo0720/proxmox-ovn/internal/diagnostic"
 	"github.com/popododo0720/proxmox-ovn/internal/hostconfig"
 	"github.com/popododo0720/proxmox-ovn/internal/nodestate"
+	"github.com/popododo0720/proxmox-ovn/internal/ovnnb"
+	"github.com/popododo0720/proxmox-ovn/internal/ovsdbstore"
 	"github.com/popododo0720/proxmox-ovn/internal/pki"
 	"github.com/popododo0720/proxmox-ovn/internal/raftstatus"
+	"github.com/popododo0720/proxmox-ovn/internal/reconcile"
 )
 
 func main() {
@@ -44,9 +49,157 @@ func run(args []string) error {
 		return nodeCommand(args[1:])
 	case "pki":
 		return pkiCommand(args[1:])
+	case "recovery":
+		return recoveryCommand(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+type forcedReconciler interface {
+	ReconcileAll(context.Context) error
+}
+
+type recoveryRuntime struct {
+	reconciler forcedReconciler
+	close      func()
+}
+
+type recoveryDependencies struct {
+	getEUID    func() int
+	loadConfig func(string) (config.Config, error)
+	open       func(context.Context, config.Config) (recoveryRuntime, error)
+	output     io.Writer
+}
+
+func recoveryCommand(args []string) error {
+	return recoveryCommandWith(args, recoveryDependencies{
+		getEUID:    os.Geteuid,
+		loadConfig: config.Load,
+		open:       openRecoveryRuntime,
+		output:     os.Stdout,
+	})
+}
+
+func recoveryCommandWith(args []string, dependencies recoveryDependencies) error {
+	if len(args) == 0 {
+		return errors.New("usage: pvnctl recovery reconcile-ovn")
+	}
+	if args[0] != "reconcile-ovn" {
+		return fmt.Errorf("unknown recovery command %q", args[0])
+	}
+	flags := flag.NewFlagSet("recovery reconcile-ovn", flag.ContinueOnError)
+	configPath := flags.String("config", config.DefaultPath, "PVN config path")
+	confirmation := flags.String("confirm", "", "exact PVN cluster ID")
+	apply := flags.Bool("apply", false, "perform a forced OVN Northbound reconciliation")
+	timeout := flags.Duration("timeout", 10*time.Minute, "maximum reconciliation duration")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("recovery reconcile-ovn does not accept positional arguments")
+	}
+	if dependencies.getEUID == nil || dependencies.getEUID() != 0 {
+		return errors.New("recovery reconcile-ovn must run as root")
+	}
+	if !*apply {
+		return errors.New("recovery reconciliation writes OVN; freeze every manager and pass --apply")
+	}
+	if *timeout < time.Minute || *timeout > 30*time.Minute {
+		return errors.New("--timeout must be between 1m and 30m")
+	}
+	if dependencies.loadConfig == nil || dependencies.open == nil || dependencies.output == nil {
+		return errors.New("recovery dependencies are incomplete")
+	}
+	cfg, err := dependencies.loadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *confirmation == "" || *confirmation != cfg.Cluster.ID {
+		return errors.New("--confirm must exactly match cluster.id")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	runtime, err := dependencies.open(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("open recovery control plane: %w", err)
+	}
+	if runtime.close != nil {
+		defer runtime.close()
+	}
+	if runtime.reconciler == nil {
+		return errors.New("recovery reconciler is unavailable")
+	}
+	if err := runtime.reconciler.ReconcileAll(ctx); err != nil {
+		return fmt.Errorf("force OVN Northbound reconciliation: %w", err)
+	}
+	return writeJSON(dependencies.output, map[string]string{
+		"action":  "reconcile-ovn",
+		"cluster": cfg.Cluster.ID,
+		"status":  "succeeded",
+	})
+}
+
+func openRecoveryRuntime(ctx context.Context, cfg config.Config) (recoveryRuntime, error) {
+	var controlTLS *tls.Config
+	if endpointsUseSSL(cfg.OVN.ControlDB) {
+		var err error
+		controlTLS, err = loadRecoveryMutualTLS(cfg.OVN.TLSCA, cfg.OVN.TLSCert, cfg.OVN.TLSKey)
+		if err != nil {
+			return recoveryRuntime{}, err
+		}
+	}
+	store, err := ovsdbstore.Open(ctx, ovsdbstore.Config{Endpoints: cfg.OVN.ControlDB, TLSConfig: controlTLS})
+	if err != nil {
+		return recoveryRuntime{}, fmt.Errorf("open PVN control store: %w", err)
+	}
+	client, err := ovnnb.NewClient(ovnnb.ClientConfig{
+		Database: cfg.OVN.Northbound, TLSCA: cfg.OVN.TLSCA,
+		TLSCert: cfg.OVN.TLSCert, TLSKey: cfg.OVN.TLSKey, Timeout: 30,
+	})
+	if err != nil {
+		store.Close()
+		return recoveryRuntime{}, fmt.Errorf("configure OVN Northbound client: %w", err)
+	}
+	if err := client.Probe(ctx); err != nil {
+		store.Close()
+		return recoveryRuntime{}, err
+	}
+	renderer, err := ovnnb.NewRenderer(client, store)
+	if err != nil {
+		store.Close()
+		return recoveryRuntime{}, err
+	}
+	controller := reconcile.NewController(store, renderer, reconcile.WithLeaseDuration(cfg.Cluster.OrphanGrace))
+	return recoveryRuntime{reconciler: controller, close: store.Close}, nil
+}
+
+func endpointsUseSSL(endpoints []string) bool {
+	for _, endpoint := range endpoints {
+		if strings.HasPrefix(endpoint, "ssl:") {
+			return true
+		}
+	}
+	return false
+}
+
+func loadRecoveryMutualTLS(caPath, certificatePath, keyPath string) (*tls.Config, error) {
+	caPEM, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("read OVN CA certificate %q: %w", caPath, err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("OVN CA certificate %q contains no certificates", caPath)
+	}
+	certificate, err := tls.LoadX509KeyPair(certificatePath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load OVN client certificate: %w", err)
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12, RootCAs: roots,
+		Certificates: []tls.Certificate{certificate},
+	}, nil
 }
 
 func pkiCommand(args []string) error {
