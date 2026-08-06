@@ -260,10 +260,7 @@ func openRecoveryRuntime(ctx context.Context, cfg config.Config) (recoveryRuntim
 	if err != nil {
 		return recoveryRuntime{}, fmt.Errorf("open PVN control store: %w", err)
 	}
-	client, err := ovnnb.NewClient(ovnnb.ClientConfig{
-		Database: cfg.OVN.Northbound, TLSCA: cfg.OVN.TLSCA,
-		TLSCert: cfg.OVN.TLSCert, TLSKey: cfg.OVN.TLSKey, Timeout: 30,
-	})
+	client, err := ovnnb.NewClient(recoveryOVNClientConfig(cfg))
 	if err != nil {
 		store.Close()
 		return recoveryRuntime{}, fmt.Errorf("configure OVN Northbound client: %w", err)
@@ -283,6 +280,14 @@ func openRecoveryRuntime(ctx context.Context, cfg config.Config) (recoveryRuntim
 		auditor:    renderer,
 		close:      store.Close,
 	}, nil
+}
+
+func recoveryOVNClientConfig(cfg config.Config) ovnnb.ClientConfig {
+	return ovnnb.ClientConfig{
+		Database: cfg.OVN.Northbound, TLSCA: cfg.OVN.TLSCA,
+		TLSCert: cfg.OVN.TLSCert, TLSKey: cfg.OVN.TLSKey, Timeout: 30,
+		WaitForSync: true,
+	}
 }
 
 func endpointsUseSSL(endpoints []string) bool {

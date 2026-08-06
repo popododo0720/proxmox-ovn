@@ -39,10 +39,11 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	runner      Runner
-	binary      string
-	base        []string
-	waitForSync bool
+	runner           Runner
+	binary           string
+	base             []string
+	reachabilityBase []string
+	waitForSync      bool
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -98,6 +99,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 			"--private-key="+config.TLSKey,
 		)
 	}
+	reachabilityBase := append([]string(nil), base...)
 	if config.WaitForSync {
 		base = append(base, "--wait=sb")
 	}
@@ -106,13 +108,23 @@ func NewClient(config ClientConfig) (*Client, error) {
 		runner = ExecRunner{}
 	}
 	return &Client{
-		runner: runner, binary: binary, base: base, waitForSync: config.WaitForSync,
+		runner: runner, binary: binary, base: base,
+		reachabilityBase: reachabilityBase, waitForSync: config.WaitForSync,
 	}, nil
 }
 
 func (client *Client) run(ctx context.Context, arguments ...string) ([]byte, error) {
 	args := append(append([]string(nil), client.base...), arguments...)
-	output, err := client.runner.Run(ctx, client.binary, args...)
+	return client.runArguments(ctx, args)
+}
+
+func (client *Client) runReachability(ctx context.Context, arguments ...string) ([]byte, error) {
+	args := append(append([]string(nil), client.reachabilityBase...), arguments...)
+	return client.runArguments(ctx, args)
+}
+
+func (client *Client) runArguments(ctx context.Context, arguments []string) ([]byte, error) {
+	output, err := client.runner.Run(ctx, client.binary, arguments...)
 	if err != nil {
 		detail := strings.TrimSpace(string(output))
 		if detail == "" {
@@ -140,6 +152,25 @@ func (client *Client) sync(ctx context.Context) error {
 	return nil
 }
 
+// ProbeReachable verifies that the configured Northbound cluster is readable
+// without waiting for northd. Manager startup uses this narrower probe during
+// a marker-scoped rolling northd transition; operational health and every OVN
+// mutation continue to use the synchronization fence.
+func (client *Client) ProbeReachable(ctx context.Context) error {
+	if client == nil {
+		return errors.New("OVN Northbound client is nil")
+	}
+	if _, err := client.runReachability(ctx, "--bare", "--columns=name", "list", "NB_Global"); err != nil {
+		return fmt.Errorf("probe OVN Northbound reachability: %w", err)
+	}
+	return nil
+}
+
+func (client *Client) probeReachable(ctx context.Context) error {
+	_, err := client.run(ctx, "--bare", "--columns=name", "list", "NB_Global")
+	return err
+}
+
 // Probe verifies that the configured Northbound cluster is reachable. When
 // WaitForSync is enabled this also waits for northd to report Southbound sync.
 func (client *Client) Probe(ctx context.Context) error {
@@ -149,7 +180,7 @@ func (client *Client) Probe(ctx context.Context) error {
 	if err := client.sync(ctx); err != nil {
 		return fmt.Errorf("probe OVN Northbound: %w", err)
 	}
-	if _, err := client.run(ctx, "--bare", "--columns=name", "list", "NB_Global"); err != nil {
+	if err := client.probeReachable(ctx); err != nil {
 		return fmt.Errorf("probe OVN Northbound: %w", err)
 	}
 	return nil

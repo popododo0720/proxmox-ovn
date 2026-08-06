@@ -17,6 +17,20 @@ type probeRunner struct {
 	err       error
 }
 
+type transitionProbeRunner struct {
+	calls   [][]string
+	syncErr error
+	readErr error
+}
+
+func (runner *transitionProbeRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
+	runner.calls = append(runner.calls, append([]string(nil), arguments...))
+	if arguments[len(arguments)-1] == "sync" {
+		return nil, runner.syncErr
+	}
+	return nil, runner.readErr
+}
+
 func (runner *probeRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
 	runner.arguments = append([]string(nil), arguments...)
 	runner.calls = append(runner.calls, append([]string(nil), arguments...))
@@ -109,6 +123,54 @@ func TestClientProbeUsesConfiguredClusterAndWaitsForSync(t *testing.T) {
 	runner.err = errors.New("unreachable")
 	if err := client.Probe(context.Background()); err == nil || !strings.Contains(err.Error(), "probe OVN Northbound") {
 		t.Fatalf("probe error = %v", err)
+	}
+}
+
+func TestClientReachabilityProbeDoesNotWaitForSouthboundSync(t *testing.T) {
+	runner := &transitionProbeRunner{syncErr: errors.New("northd transition is pending")}
+	client, err := NewClient(ClientConfig{
+		Runner: runner,
+		Database: []string{
+			"ssl:192.0.2.11:6641", "ssl:192.0.2.12:6641", "ssl:192.0.2.13:6641",
+		},
+		TLSCA: "/etc/pvn/ca.pem", TLSCert: "/etc/pvn/node.pem", TLSKey: "/etc/pvn/key.pem",
+		WaitForSync: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ProbeReachable(context.Background()); err != nil {
+		t.Fatalf("reachability probe depended on Southbound sync: %v", err)
+	}
+	if len(runner.calls) != 1 || runner.calls[0][len(runner.calls[0])-1] != "NB_Global" {
+		t.Fatalf("reachability probe calls=%v", runner.calls)
+	}
+	if !strings.Contains(strings.Join(runner.calls[0], " "),
+		"--db=ssl:192.0.2.11:6641,ssl:192.0.2.12:6641,ssl:192.0.2.13:6641") {
+		t.Fatalf("reachability probe did not retain the full voter set: %v", runner.calls[0])
+	}
+	if slices.Contains(runner.calls[0], "--wait=sb") {
+		t.Fatalf("reachability probe retained the Southbound wait option: %v", runner.calls[0])
+	}
+	for _, option := range []string{
+		"--timeout=15", "--ca-cert=/etc/pvn/ca.pem",
+		"--certificate=/etc/pvn/node.pem", "--private-key=/etc/pvn/key.pem",
+	} {
+		if !slices.Contains(runner.calls[0], option) {
+			t.Fatalf("reachability probe lost %s: %v", option, runner.calls[0])
+		}
+	}
+	if err := client.Probe(context.Background()); err == nil || !strings.Contains(err.Error(), "sync OVN Northbound to Southbound") {
+		t.Fatalf("operational probe bypassed failed sync: %v", err)
+	}
+	if len(runner.calls) != 2 || runner.calls[1][len(runner.calls[1])-1] != "sync" {
+		t.Fatalf("operational probe did not fail at its sync fence: %v", runner.calls)
+	}
+
+	runner.syncErr = nil
+	runner.readErr = errors.New("Northbound quorum unavailable")
+	if err := client.ProbeReachable(context.Background()); err == nil || !strings.Contains(err.Error(), "OVN Northbound reachability") {
+		t.Fatalf("reachability failure was not preserved: %v", err)
 	}
 }
 

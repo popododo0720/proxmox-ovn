@@ -40,6 +40,17 @@ func (renderer *Renderer) Render(ctx context.Context, resource model.Resource) e
 	if err := resource.Validate(); err != nil {
 		return fmt.Errorf("invalid %s %q: %w", resource.ResourceKind(), resource.GetMetadata().ID, err)
 	}
+	backed, err := ovnBackedResource(resource)
+	if err != nil || !backed {
+		return err
+	}
+	// The post-transaction fence below proves that this exact desired state
+	// reached Southbound. This pre-transaction fence additionally prevents a
+	// manager restarted during a rolling northd transition from writing into
+	// Northbound while the old split northd processes cannot synchronize it.
+	if err := renderer.client.sync(ctx); err != nil {
+		return err
+	}
 	var renderErr error
 	switch value := resource.(type) {
 	case *model.Network:
@@ -60,10 +71,6 @@ func (renderer *Renderer) Render(ctx context.Context, resource model.Resource) e
 		renderErr = renderer.securityGroup(ctx, value)
 	case *model.SecurityGroupRule:
 		renderErr = renderer.securityGroupRule(ctx, value)
-	case *model.Project, *model.ProviderNetwork, *model.IPAllocation, *model.Node, *model.Operation:
-		return nil
-	default:
-		return fmt.Errorf("unsupported resource type %T", resource)
 	}
 	if renderErr != nil {
 		return renderErr
@@ -79,6 +86,13 @@ func (renderer *Renderer) Delete(ctx context.Context, resource model.Resource) e
 		return errors.New("cannot delete a nil resource")
 	}
 	if err := safeID(resource.GetMetadata().ID); err != nil {
+		return err
+	}
+	backed, err := ovnBackedResource(resource)
+	if err != nil || !backed {
+		return err
+	}
+	if err := renderer.client.sync(ctx); err != nil {
 		return err
 	}
 	var deleteErr error
@@ -137,15 +151,25 @@ func (renderer *Renderer) Delete(ctx context.Context, resource model.Resource) e
 		deleteErr = wrapRender("delete security group", value.ID, err)
 	case *model.SecurityGroupRule:
 		deleteErr = renderer.deleteACL(ctx, value.ID)
-	case *model.Project, *model.ProviderNetwork, *model.IPAllocation, *model.Node, *model.Operation:
-		return nil
-	default:
-		return fmt.Errorf("unsupported resource type %T", resource)
 	}
 	if deleteErr != nil {
 		return deleteErr
 	}
 	return renderer.client.sync(ctx)
+}
+
+func ovnBackedResource(resource model.Resource) (bool, error) {
+	switch resource.(type) {
+	case *model.Network, *model.Subnet, *model.Port, *model.Router,
+		*model.RouterInterface, *model.FloatingIP, *model.ProviderSegment,
+		*model.SecurityGroup, *model.SecurityGroupRule:
+		return true, nil
+	case *model.Project, *model.ProviderNetwork, *model.IPAllocation,
+		*model.Node, *model.Operation:
+		return false, nil
+	default:
+		return false, fmt.Errorf("unsupported resource type %T", resource)
+	}
 }
 
 func (renderer *Renderer) deleteFloatingIP(ctx context.Context, floatingIP *model.FloatingIP) error {

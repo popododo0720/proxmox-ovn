@@ -159,7 +159,7 @@ func run(arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("configure OVN Northbound client: %w", err)
 	}
-	if err := ovnClient.Probe(startupContext); err != nil {
+	if err := ovnClient.ProbeReachable(startupContext); err != nil {
 		return err
 	}
 	southboundProbe, err := ovnnb.NewSouthboundProbe(ovnnb.SouthboundProbeConfig{

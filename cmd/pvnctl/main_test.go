@@ -42,6 +42,20 @@ type recoverySnapshotterStub struct {
 	calls     int
 }
 
+func TestRecoveryOVNClientAlwaysWaitsForSouthboundSync(t *testing.T) {
+	cfg := config.Config{OVN: config.OVNConfig{
+		Northbound: []string{"ssl:192.0.2.11:6641", "ssl:192.0.2.12:6641", "ssl:192.0.2.13:6641"},
+		TLSCA:      "/etc/pvn/ca.pem", TLSCert: "/etc/pvn/node.pem", TLSKey: "/etc/pvn/key.pem",
+	}}
+	clientConfig := recoveryOVNClientConfig(cfg)
+	if !clientConfig.WaitForSync || clientConfig.Timeout != 30 {
+		t.Fatalf("recovery client can bypass the sync fence: %+v", clientConfig)
+	}
+	if len(clientConfig.Database) != 3 || clientConfig.Database[1] != cfg.OVN.Northbound[1] {
+		t.Fatalf("recovery client lost the full Northbound voter set: %+v", clientConfig.Database)
+	}
+}
+
 func (stub *recoverySnapshotterStub) Snapshot(context.Context, []model.Kind, controlstore.ListOptions) (controlstore.ResourceSnapshot, error) {
 	index := stub.calls
 	stub.calls++

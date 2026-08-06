@@ -836,14 +836,25 @@ func TestRendererExplicitSyncFencesIdempotentRetryAndDelete(t *testing.T) {
 	if runner.syncs != 2 {
 		t.Fatalf("idempotent retry sync count=%d, want 2", runner.syncs)
 	}
+	for _, call := range runner.calls {
+		if call[len(call)-1] != "sync" {
+			t.Fatalf("renderer mutated OVN after a failed pre-transaction sync: %v", runner.calls)
+		}
+	}
 
 	runner.failSync = false
 	if err := renderer.Render(context.Background(), network); err != nil {
 		t.Fatalf("render after convergence: %v", err)
 	}
+	if runner.syncs != 4 {
+		t.Fatalf("successful render sync count=%d, want pre- and post-transaction fences", runner.syncs)
+	}
 	runner.failSync = true
 	if err := renderer.Delete(context.Background(), network); err == nil || !strings.Contains(err.Error(), "sync OVN Northbound to Southbound") {
 		t.Fatalf("delete bypassed failed sync: %v", err)
+	}
+	if runner.syncs != 5 {
+		t.Fatalf("failed delete sync count=%d, want failed pre-transaction fence", runner.syncs)
 	}
 }
 
