@@ -408,12 +408,15 @@ once:
 pvnctl recovery reconcile-ovn --apply --confirm "$pvn_cluster_id"
 ```
 
-This performs one forced `PVN_Control` to `OVN_Northbound` reconciliation. It
-is required after `PVN_Control` or Northbound reconstruction; running it for a
-Southbound-only reconstruction also verifies PVN-owned Northbound state before
-northd repopulates Southbound. It deliberately writes Northbound, which is why
-normal managers must remain frozen. On failure, keep the freeze and investigate
-instead of starting a second restore.
+This performs one forced `PVN_Control` to `OVN_Northbound` reconciliation and
+records the resulting operation state in `PVN_Control`. It returns
+`"status":"succeeded"` only after every current desired revision is ready,
+applied, and has exactly one successful reconcile operation completed by this
+pass. It is required after `PVN_Control` or Northbound reconstruction; running
+it for a Southbound-only reconstruction also verifies PVN-owned Northbound
+state before northd repopulates Southbound. It deliberately writes both PVN
+Control and Northbound, which is why normal managers must remain frozen. On
+failure, keep the freeze and investigate instead of starting a second restore.
 
 ### 7. Restart through the targets and validate
 
