@@ -7,6 +7,8 @@ proxmox-ovn (0.2.13) unstable; urgency=medium
   * Add independently verified PVN Control and OVN database backups.
   * Apply a reserved Neutron-style default policy to new project ports.
   * Add a revision-safe UI backfill for legacy unrestricted ports.
+  * Bind backfill apply to the exact previewed port revisions.
+  * Mark the reserved policy objects as managed and read-only in the UI.
 
  -- PVN Project <root@localhost>  Thu, 06 Aug 2026 01:34:37 +0000
 
