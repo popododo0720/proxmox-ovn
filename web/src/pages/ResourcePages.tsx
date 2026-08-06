@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useState } from 'react';
 import { useApi } from '../api/context';
 import type {
   FloatingIP,
@@ -24,6 +25,8 @@ import { useResourceCatalog } from '../components/ResourceCatalog';
 import { ResourcePage, formatValue, type Column } from '../components/ResourcePage';
 import { StatusPill } from '../components/StatusPill';
 import { operationErrorSummary } from '../diagnostics/operation';
+import { redactResourceIDs } from '../diagnostics/display';
+import { pveBridge, type PveBridge, type PveQemuVM } from '../pve/bridge';
 import {
   currentProviderSegmentReference,
   externalNetworkReference,
@@ -212,9 +215,31 @@ export function RoutersPage() {
   </div>;
 }
 
-export function PortsPage() {
+function vmNamesByID(vms: PveQemuVM[]): Map<number, string> {
+  return new Map(vms.flatMap((vm) => vm.name ? [[vm.vmid, redactResourceIDs(vm.name)] as const] : []));
+}
+
+export function PortsPage({
+  vmBridge = pveBridge,
+}: {
+  vmBridge?: Pick<PveBridge, 'available' | 'listQemuVMs'>;
+} = {}) {
   const api = useApi();
   const portCatalog = useResourceCatalog('/ports', false);
+  const [vms, setVMs] = useState<PveQemuVM[]>([]);
+  const vmNames = useMemo(() => vmNamesByID(vms), [vms]);
+
+  useEffect(() => {
+    if (!vmBridge.available) {
+      setVMs([]);
+      return;
+    }
+    let current = true;
+    void vmBridge.listQemuVMs()
+      .then((items) => { if (current) setVMs(items); })
+      .catch(() => { if (current) setVMs([]); });
+    return () => { current = false; };
+  }, [vmBridge]);
 
   return <div className="stacked-pages">
     <ResourcePage<Port>
@@ -227,7 +252,7 @@ export function PortsPage() {
         { key: 'mac_address', label: 'MAC address', className: 'mono-cell' },
         { key: 'fixed_ips', label: 'Fixed IPs', render: (item) => <FixedIPList fixedIPs={item.fixed_ips} /> },
         { key: 'vmid', label: 'VM / node', render: (item) => item.vmid
-          ? <span className="port-attachment-label"><span>VM {item.vmid} · {item.nic || '?'}</span><span>on</span><ReferenceLabel value={item.node_id} source={nodeReference} /></span>
+          ? <span className="port-attachment-label"><span>{vmNames.get(item.vmid) ? `${vmNames.get(item.vmid)} (VM ${item.vmid})` : `VM ${item.vmid}`} · {item.nic || '?'}</span><span>on</span><ReferenceLabel value={item.node_id} source={nodeReference} /></span>
           : formatValue(undefined) },
         { key: 'binding_status', label: 'Binding', render: (item) => <StatusPill value={item.binding_status || item.state} /> },
         { key: 'last_error', label: 'Diagnosis', render: (item) => <PortDiagnosticCell port={item} /> },

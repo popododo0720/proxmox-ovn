@@ -123,6 +123,14 @@
 
     function requestParams(message) {
         if (message.method === 'GET') {
+            if (message.path === '/cluster/resources') {
+                if (!isPlainObject(message.params) ||
+                    Object.keys(message.params).length !== 1 ||
+                    message.params.type !== 'vm') {
+                    throw new Error('GET VM inventory requests require type=vm');
+                }
+                return { type: 'vm' };
+            }
             if (message.params === undefined) {
                 return {};
             }
@@ -185,6 +193,7 @@
                 /^\/nodes\/[A-Za-z0-9._-]+\/qemu\/[1-9][0-9]*\/config$/.test(message.path);
             var statusPath = message && typeof message.path === 'string' &&
                 /^\/nodes\/[A-Za-z0-9._-]+\/qemu\/[1-9][0-9]*\/status\/current$/.test(message.path);
+            var vmInventoryPath = message && message.path === '/cluster/resources';
             if (!validMessageShape(message) ||
                 message.source !== SOURCE_UI ||
                 message.type !== REQUEST_TYPE ||
@@ -193,8 +202,8 @@
                 typeof message.id !== 'string' ||
                 !/^[A-Za-z0-9_-]{1,128}$/.test(message.id) ||
                 (message.method !== 'GET' && message.method !== 'PUT') ||
-                (!configPath && !statusPath) ||
-                (statusPath && message.method !== 'GET')) {
+                (!configPath && !statusPath && !vmInventoryPath) ||
+                ((statusPath || vmInventoryPath) && message.method !== 'GET')) {
                 return;
             }
             if (!window.Proxmox || !window.Proxmox.Utils || typeof window.Proxmox.Utils.API2Request !== 'function') {

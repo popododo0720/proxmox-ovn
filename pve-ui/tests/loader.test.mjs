@@ -192,6 +192,44 @@ test('bridge permits read-only QEMU status but never status mutations', () => {
   assert.equal(apiRequests.length, 1);
 });
 
+test('bridge permits only the exact read-only QEMU VM inventory query', () => {
+  const { DatacenterConfig, frames, listeners, apiRequests } = harness();
+  const config = new DatacenterConfig();
+  config.initComponent();
+  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
+  panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
+  const frame = frames[0];
+  const url = new URL(frame.src);
+  const base = {
+    source: 'pvn-ui', type: 'pvn:pve:request', version: 1,
+    nonce: url.searchParams.get('pveBridgeNonce'),
+    path: '/cluster/resources',
+  };
+
+  [
+    { id: 'inventory-no-filter', method: 'GET' },
+    { id: 'inventory-all', method: 'GET', params: { type: 'vm', full: 1 } },
+    { id: 'inventory-node', method: 'GET', params: { type: 'node' } },
+    { id: 'inventory-write', method: 'PUT', params: { type: 'vm' } },
+  ].forEach((request) => listeners.get('message')({
+    origin: url.origin,
+    source: frame.contentWindow,
+    data: { ...base, ...request },
+  }));
+  assert.equal(apiRequests.length, 0);
+
+  listeners.get('message')({
+    origin: url.origin,
+    source: frame.contentWindow,
+    data: { ...base, id: 'inventory-read', method: 'GET', params: { type: 'vm' } },
+  });
+  assert.equal(apiRequests.length, 1);
+  assert.equal(apiRequests[0].url, '/cluster/resources');
+  assert.equal(apiRequests[0].method, 'GET');
+  assert.equal(Object.keys(apiRequests[0].params).length, 1);
+  assert.equal(apiRequests[0].params.type, 'vm');
+});
+
 test('bridge sends a nonce-bound response only to the manager origin', () => {
   const { DatacenterConfig, frames, listeners, apiRequests } = harness();
   const config = new DatacenterConfig();

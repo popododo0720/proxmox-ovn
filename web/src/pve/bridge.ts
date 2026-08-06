@@ -44,6 +44,24 @@ export interface PveQemuStatus {
   [key: string]: unknown;
 }
 
+export interface PveQemuVM {
+  vmid: number;
+  name?: string;
+  node: string;
+}
+
+export function normalizeQemuVMs(value: unknown): PveQemuVM[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const resource = item as Record<string, unknown>;
+    if (resource.type !== 'qemu' || !Number.isSafeInteger(resource.vmid) || Number(resource.vmid) <= 0) return [];
+    if (typeof resource.node !== 'string' || !/^[A-Za-z0-9._-]+$/.test(resource.node)) return [];
+    const name = typeof resource.name === 'string' ? resource.name.trim() : '';
+    return [{ vmid: Number(resource.vmid), node: resource.node, ...(name ? { name } : {}) }];
+  });
+}
+
 export function readPveBridgeBootstrap(
   locationValue: Pick<Location, 'search'> = window.location,
   referrer = document.referrer,
@@ -91,6 +109,10 @@ export class PveBridge {
 
   getQemuStatus(node: string, vmid: number): Promise<PveQemuStatus> {
     return this.request('GET', this.qemuStatusPath(node, vmid)) as Promise<PveQemuStatus>;
+  }
+
+  async listQemuVMs(): Promise<PveQemuVM[]> {
+    return normalizeQemuVMs(await this.request('GET', '/cluster/resources', { type: 'vm' }));
   }
 
   setQemuNic(node: string, vmid: number, update: PveNicUpdate): Promise<unknown> {

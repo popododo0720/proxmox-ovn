@@ -68,6 +68,10 @@ describe('resource reference UX', () => {
 
   it('shares port and node endpoint loads across tables, references, and attachment selects', async () => {
     const defaultSecurityGroupBackfillPlan = vi.fn().mockRejectedValue(new ApiError('not authorized', 403));
+    const vmBridge = {
+      available: true,
+      listQemuVMs: vi.fn().mockResolvedValue([{ vmid: 100, name: 'frontend', node: 'pve-a' }]),
+    };
     const list = vi.fn(async (endpoint: string) => {
       if (endpoint === '/ports') return { items: [{
         id: 'port-aaaaaaaa',
@@ -91,13 +95,14 @@ describe('resource reference UX', () => {
 
     render(
       <ApiProvider client={{ list, defaultSecurityGroupBackfillPlan } as unknown as ApiClient}>
-        <PortsPage />
+        <PortsPage vmBridge={vmBridge} />
       </ApiProvider>,
     );
 
     const table = await screen.findByRole('table');
     expect(await within(table).findByText('application')).toBeInTheDocument();
     expect(await within(table).findByText('pve-a')).toBeInTheDocument();
+    expect(await within(table).findByText(/frontend \(VM 100\)/)).toBeInTheDocument();
     expect(await within(table).findByText('matched')).toBeInTheDocument();
     expect(within(table).getByText('The local agent confirmed the OVN binding.')).toBeInTheDocument();
     expect(within(table).getByText('Legacy unrestricted port: no security group is attached. Migrate it with the default security-group backfill.')).toBeInTheDocument();
@@ -108,6 +113,7 @@ describe('resource reference UX', () => {
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/nodes')).toHaveLength(1);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/networks')).toHaveLength(1);
     expect(defaultSecurityGroupBackfillPlan).toHaveBeenCalledOnce();
+    expect(vmBridge.listQemuVMs).toHaveBeenCalledOnce();
 
     fireEvent.click(screen.getByRole('button', { name: '+ Tenant port' }));
     expect(screen.getByText("Optional. Leave empty to apply the project's reserved default security group automatically. Any selections replace that default.")).toBeInTheDocument();
