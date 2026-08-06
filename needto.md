@@ -1,9 +1,9 @@
 # PVN — shipped, verified, and still needed
 
 Status snapshot for follow-up work. Reflects the intended v1 feature set in
-`README.md` / `docs/architecture.md`, source-ready work for v0.2.17, the live
-three-node lab state with prox1/prox3 on v0.2.15 and prox2 interrupted during
-v0.2.16 configuration, and gaps that still need live recovery proof.
+`README.md` / `docs/architecture.md`, published v0.2.17, and the live three-node
+PVE 9 lab after uniform rollout, topology schema-2/control-snapshot repin, full
+E2E validation, and independent database recovery drills.
 
 **How to use:** treat “v1 must-pass” as release gates; everything else is
 prioritized backlog. Update this file when items ship or scope changes.
@@ -44,11 +44,11 @@ These are not new product features so much as **proof the current code works**.
 - [x] Security group allow / deny behaves as expected
 - [x] Node reboot: agent re-binds; guests recover or fail closed as designed
 - [x] Normal active-node package upgrade (fail-closed / safe path)
-- [ ] Backup/restore drill: in a separate window for each database, freeze all
+- [x] Backup/restore drill: in a separate window for each database, freeze all
       writers and independently copy / verify a fresh set, then restore exactly
-      one of PVN_Control, OVN NB, or OVN SB; prove 3/3 Raft/CID, reconcile,
-      security policy, and dataplane health after each (no cross-DB transaction
-      assumption)
+      one database per window—PVN_Control, OVN NB, then OVN SB—and prove 3/3
+      Raft/CID, reconcile, security policy, and dataplane health after each (no
+      cross-DB transaction assumption)
 
 ### Operator prerequisites (document + checklist in runbooks)
 
@@ -67,6 +67,12 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
       `pvn-cluster-update`, `pvn-cluster-lease`, and `SHA256SUMS`
 - [x] Reject tag/changelog/bootstrap version mismatch, checksum failure, and
       missing or extra GitHub release assets before upload
+- [x] Pin the future canonical publisher image, toolchains, action SHAs,
+      tag-derived metadata, and deterministic compression; cover those gates
+      with release-check tests
+- [ ] Obtain a hosted-runner CI green run for the pinned canonical publisher
+      path (the latest run was cancelled before any step during a GitHub Actions
+      outage)
 
 ### Current product work
 
@@ -83,14 +89,15 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 - [x] Bound package transitions to a durable same-version node restart intent,
       the original four central PIDs, startup-only NB reachability, and strict
       mutation/recovery synchronization fences
-- [ ] Forward-recover the captured prox2 v0.2.16 half-configured state, then
+- [x] Forward-recover the captured prox2 v0.2.16 half-configured state, then
       complete a uniform v0.2.17 rolling rollout without restarting central
       processes during package installation
-- [ ] Prove the active topology schema-1 to schema-2 ledger-only migration on
-      both a standalone 1/1 node and an odd clustered deployment; it must
-      preserve host networking and activation state and reject mixed/drifted
-      ledgers
-- [ ] Run the full upgrade order with every central restart marker preserved:
+- [x] Prove the active topology schema-1 to schema-2 ledger-only migration on
+      the live odd 3/3 cluster while preserving host networking and activation
+      state; mixed/drifted rejection remains covered by automated tests
+- [ ] Repeat the active topology schema-1 to schema-2 migration proof on a real
+      standalone 1/1 PVE host
+- [x] Run the full upgrade order with every central restart marker preserved:
       uniform package rollout → active topology schema migration → combined
       topology/package control-plane repin → guarded standalone or one-voter-
       at-a-time central restart
@@ -168,4 +175,4 @@ Do not block v1 on these unless product goals change:
 
 ---
 
-*Last written for the validation phase around PVN 0.2.x; revise as features land.*
+*Live validation snapshot: PVN 0.2.17 on the three-node PVE 9 lab, 2026-08-07.*

@@ -92,9 +92,9 @@ make package-check
 make deb
 ```
 
-`make deb` is for local validation only. Canonical public releases are built
-and published exclusively by the tag-triggered GitHub Actions workflow; see
-[canonical releases](docs/development.md#canonical-releases).
+`make deb` is for local validation only. The canonical public-release path
+builds and publishes exclusively through the tag-triggered GitHub Actions
+workflow; see [canonical releases](docs/development.md#canonical-releases).
 
 See [architecture](docs/architecture.md), [operations](docs/operations.md),
 and [development](docs/development.md) for the concrete topology, voter
