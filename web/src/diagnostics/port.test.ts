@@ -61,7 +61,7 @@ describe('port diagnostics', () => {
     expect(stuck.tone).toBe('bad');
   });
 
-  it('detects chassis mismatch and redacts raw IDs from errors', () => {
+  it('detects chassis mismatch and maps known error IDs to names', () => {
     const mismatch = diagnosePort({ ...port, requested_chassis: 'chassis-b' }, node);
     expect(mismatch).toMatchObject({ chassis: 'mismatch', tone: 'bad' });
     expect(mismatch.reason).not.toContain('chassis-a');
@@ -72,7 +72,7 @@ describe('port diagnostics', () => {
       state: 'error',
       last_error: `failed to reconcile ${port.id} on ${node.id}`,
     }, node);
-    expect(failed.reason).toBe('failed to reconcile [resource ID] on [resource ID]');
+    expect(failed.reason).toBe('failed to reconcile web-01 on pve-a');
   });
 
   it('extracts a human VM name and live NIC evidence', () => {

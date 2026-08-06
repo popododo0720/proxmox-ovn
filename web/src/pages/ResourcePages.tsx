@@ -23,6 +23,7 @@ import type { FormField } from '../components/CreateDialog';
 import { ReferenceLabel } from '../components/ReferenceLabel';
 import { useResourceCatalog } from '../components/ResourceCatalog';
 import { ResourcePage, formatValue, type Column } from '../components/ResourcePage';
+import { resourceOptionLabel } from '../components/ResourceSelect';
 import { StatusPill } from '../components/StatusPill';
 import { operationErrorSummary } from '../diagnostics/operation';
 import { redactResourceIDs } from '../diagnostics/display';
@@ -484,8 +485,16 @@ export function OperationsPage() {
       { key: 'status', label: 'State' },
       { key: 'started_at', label: 'Started' },
       { key: 'completed_at', label: 'Completed' },
-      { key: 'error', label: 'Error', className: 'error-cell', render: (item) => formatValue(operationErrorSummary(item)) },
+      { key: 'error', label: 'Error', className: 'error-cell', render: (item) => <OperationErrorCell operation={item} /> },
     ]}
     emptyMessage="PVN operations will appear here when resources are reconciled."
   />;
+}
+
+function OperationErrorCell({ operation }: { operation: Operation }) {
+  const source = operationTargetReference(operation.target_kind);
+  const catalog = useResourceCatalog(source?.endpoint || '', Boolean(source && operation.error && operation.target_id));
+  const target = catalog.items.find((item) => item.id === operation.target_id);
+  const targetName = source && target ? resourceOptionLabel(target, source) : undefined;
+  return <>{formatValue(operationErrorSummary(operation, targetName))}</>;
 }

@@ -27,15 +27,17 @@ describe('floatingIPDisplayStatus', () => {
 
 describe('resource reference UX', () => {
   it('resolves polymorphic operation targets and handles an unknown kind neutrally', async () => {
-    const rawError = 'failed to reconcile network-aaaaaaaa through 9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const targetID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const unrelatedID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
+    const rawError = `failed to reconcile ${targetID} through ${unrelatedID}`;
     const list = vi.fn(async (endpoint: string) => {
       if (endpoint === '/operations') {
         return { items: [
-          { id: 'operation-known', action: 'update', target_kind: 'network', target_id: 'network-aaaaaaaa', status: 'error', error: rawError },
+          { id: 'operation-known', action: 'update', target_kind: 'network', target_id: targetID, status: 'error', error: rawError },
           { id: 'operation-unknown', action: 'inspect', target_kind: 'future-kind', target_id: 'future-aaaaaaaa', status: 'ready' },
         ] };
       }
-      if (endpoint === '/networks') return { items: [{ id: 'network-aaaaaaaa', name: 'application' }] };
+      if (endpoint === '/networks') return { items: [{ id: targetID, name: 'application' }] };
       return { items: [] };
     });
 
@@ -50,9 +52,10 @@ describe('resource reference UX', () => {
     expect(knownRow).not.toBeNull();
     expect(unknownRow).not.toBeNull();
     expect(await within(knownRow!).findByText('application')).toBeInTheDocument();
-    expect(within(knownRow!).queryByText('network-aaaaaaaa')).not.toBeInTheDocument();
-    expect(within(knownRow!).getByText('failed to reconcile [resource] through [resource]')).toBeInTheDocument();
-    expect(knownRow).not.toHaveTextContent('9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a');
+    expect(within(knownRow!).queryByText(targetID)).not.toBeInTheDocument();
+    expect(within(knownRow!).getByText('failed to reconcile application through [resource]')).toBeInTheDocument();
+    expect(knownRow).not.toHaveTextContent(targetID);
+    expect(knownRow).not.toHaveTextContent(unrelatedID);
     expect(within(unknownRow!).getByText('Unavailable')).toBeInTheDocument();
     expect(within(unknownRow!).queryByText('future-aaaaaaaa')).not.toBeInTheDocument();
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/networks')).toHaveLength(1);

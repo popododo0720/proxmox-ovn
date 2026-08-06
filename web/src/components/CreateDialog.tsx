@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'react';
-import { uiErrorMessage } from '../diagnostics/display';
+import { type ResourceAlias, uiErrorMessage } from '../diagnostics/display';
 import { ResourceSelect, type ResourceReference } from './ResourceSelect';
 
 export interface FormField {
@@ -25,6 +25,17 @@ function defaultFormValues(fields: FormField[], values: Record<string, unknown>)
     }
   }
   return result;
+}
+
+function selectedResourceAliases(form: HTMLFormElement, fields: FormField[]): ResourceAlias[] {
+  return fields.flatMap((field) => {
+    if (field.type !== 'resource-select') return [];
+    const select = form.elements.namedItem(field.name);
+    if (!(select instanceof HTMLSelectElement)) return [];
+    return Array.from(select.selectedOptions)
+      .filter((option) => option.value)
+      .map((option) => ({ id: option.value, name: option.textContent }));
+  });
 }
 
 export function CreateDialog({
@@ -68,6 +79,7 @@ export function CreateDialog({
     setSubmitting(true);
     setError('');
     const form = new FormData(formElement);
+    const resourceAliases = selectedResourceAliases(formElement, fields);
     const payload: Record<string, unknown> = {};
     for (const field of fields) {
       if (field.type === 'checkbox') {
@@ -90,10 +102,10 @@ export function CreateDialog({
       onClose();
     } catch (reason) {
       const fallback = `The resource could not be ${mode === 'edit' ? 'updated' : 'created'}`;
-      setError(uiErrorMessage(reason, fallback, [{
-        id: values.id,
-        name: values.name || values.address || values.cidr,
-      }]));
+      setError(uiErrorMessage(reason, fallback, [
+        ...resourceAliases,
+        { id: values.id, name: values.name || values.address || values.cidr },
+      ]));
     } finally {
       setSubmitting(false);
     }

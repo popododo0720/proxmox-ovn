@@ -81,12 +81,16 @@ export function chassisDiagnostic(port: Port, node: NodeStatus | undefined): Cha
 }
 
 function safeReason(message: string, port: Port, node: NodeStatus | undefined): string {
-  let result = message.trim();
-  const sensitive = [port.id, port.node_id, port.requested_chassis, port.lsp_name, node?.id, node?.chassis_id]
-    .filter((value): value is string => Boolean(value && value.length > 3))
-    .sort((left, right) => right.length - left.length);
-  for (const value of sensitive) result = result.split(value).join('[resource ID]');
-  return redactResourceIDs(result).slice(0, 300);
+  const portName = portDisplayName(port);
+  const nodeName = nodeDisplayName(node);
+  return redactResourceIDs(message.trim(), [
+    { id: port.id, name: portName },
+    { id: port.lsp_name, name: portName },
+    { id: port.node_id, name: node?.id === port.node_id ? nodeName : undefined },
+    { id: port.requested_chassis, name: node?.chassis_id === port.requested_chassis ? nodeName : undefined },
+    { id: node?.id, name: nodeName },
+    { id: node?.chassis_id, name: nodeName },
+  ]).slice(0, 300);
 }
 
 function errorReason(port: Port, node: NodeStatus | undefined, fallback: string): string {

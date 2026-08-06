@@ -82,4 +82,43 @@ describe('CreateDialog resource references', () => {
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith({}));
   });
+
+  it('maps selected resource IDs to their human labels in submit errors', async () => {
+    const projectID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const networkID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
+    const unrelatedID = 'b67beeb6-72ef-4a70-87c4-9f6f4ab9ce82';
+    const list = vi.fn(async (endpoint: string) => ({
+      items: endpoint === '/projects'
+        ? [{ id: projectID, name: 'Tenant A' }]
+        : [{ id: networkID, name: 'application', project_id: projectID }],
+    }));
+    const onSubmit = vi.fn().mockRejectedValue(new Error(
+      `network ${networkID} in project ${projectID} conflicts with ${unrelatedID}`,
+    ));
+
+    render(
+      <ApiProvider client={{ list } as unknown as ApiClient}>
+        <CreateDialog
+          title="Subnet"
+          fields={[
+            { name: 'project_id', label: 'Project', type: 'resource-select', reference: { endpoint: '/projects' }, required: true },
+            { name: 'network_id', label: 'Network', type: 'resource-select', reference: { endpoint: '/networks' }, required: true },
+          ]}
+          open
+          onClose={() => undefined}
+          onSubmit={onSubmit}
+        />
+      </ApiProvider>,
+    );
+
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Project' }), { target: { value: projectID } });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Network' }), { target: { value: networkID } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('network application in project Tenant A conflicts with [resource]');
+    expect(alert).not.toHaveTextContent(projectID);
+    expect(alert).not.toHaveTextContent(networkID);
+    expect(alert).not.toHaveTextContent(unrelatedID);
+  });
 });
