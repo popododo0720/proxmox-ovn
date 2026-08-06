@@ -332,6 +332,17 @@ the marker:
 /usr/lib/pvn/pvn-ovn-northd status
 ```
 
+The central-target `wait` gate and the transport-target `node-ready` gate have
+different transition scopes. `wait` still requires connected NB/SB IDLs and
+synchronized cfg; its marker exception admits only a connected clustered
+standby with `cfg=pending`. Without a marker, `node-ready` is also strict. With
+an exact installed-version marker it accepts only a valid local `active` or
+`standby` role and reports both IDLs as unchecked so an already-running split
+northd cannot deadlock a node-only package restart. While dpkg is
+`half-configured`, that relaxation additionally requires a matching root-only
+live package lock; stale, unlocked, unsafe, or wrong-version authorization is
+rejected.
+
 The Debian 13 SB vendor unit spells its PID path as `%t/run/ovn/ovnsb_db.pid`,
 which expands to `/run/run/ovn/ovnsb_db.pid`. The PVN drop-in pins the actual
 process path, `/run/ovn/ovnsb_db.pid`, so systemd can track SB startup exactly.
@@ -362,6 +373,12 @@ systemctl --no-pager --full status \
   pvn-node.target pvn-node-ready pvn-manager pvn-agent ovn-controller
 ```
 
+Every supported active deployment keeps the two local roles paired:
+`pvn-node.target` may be active only while `pvn-central.target` is already
+active on the same PVE node. Control-plane apply starts all central voters
+before any transport target, and package recovery refuses to resume a node
+against an inactive or transitional central target.
+
 The marker is the explicit local opt-in; enabling the target without it starts
 nothing. `pvn-node-ready.service` allows up to roughly 90 seconds for the
 manager runtime socket, required services, the agent's loopback `/healthz`
@@ -369,9 +386,15 @@ endpoint, OVN controller Southbound status, the installed PVE UI hook, and
 `pvnctl doctor` to become healthy. The controller must report exactly
 `connected`; a running process is insufficient. The agent endpoint remains
 unhealthy until at least one TAP binding scan succeeds; manager socket creation
-also proves its startup PVN Control and OVN NB probes passed. Keep the packaged
-`PVN_HEALTH_LISTEN` and `PVN_AGENT_HEALTH_URL` values unchanged. This is a
-bounded local startup check, not continuous health monitoring.
+also proves that PVN Control opened and that the complete OVN NB voter set
+served a read. This startup-only NB probe intentionally omits `--wait=sb`,
+allowing a node package restart while preserved old northd processes are
+temporarily split. It does not authorize writes: manager `/health`, every
+OVN-backed render/delete before and after mutation, and
+`pvnctl recovery reconcile-ovn` retain the strict NB-to-SB synchronization
+fence. Keep the packaged `PVN_HEALTH_LISTEN` and `PVN_AGENT_HEALTH_URL` values
+unchanged. This is a bounded local startup check, not continuous health
+monitoring.
 
 The full `pvnctl doctor` invocation always reads node-local identity from
 `/etc/pvn/node.env`, even when invoked directly by an operator, the
@@ -544,6 +567,18 @@ the restart marker. Any other mixed/downgraded package, membership/topology
 difference, unexpected progress, CID, marker, database, doctor, or service
 state remains a hard failure; do not edit the ledger to bypass it.
 
+Before stopping an active node stack, `postinst` creates or validates
+`central-restart-pending`, then atomically writes the root-only mode-0600
+`/var/lib/pvn-node/node-restart-pending` intent. The record pins the exact
+package version and the original PVN Control, OVN NB, OVN SB, and northd PIDs.
+Only configuration of that same package may resume an inactive or failed node
+target from the intent. A first install, an intentional clean stop, or a legacy
+failed state without the intent remains inert. Success requires all six node
+units active plus unchanged final central state and PIDs; only then is the
+intent consumed. Failure invalidates node readiness and retains the intent. Do
+not edit or delete it: fix the cause and rerun configuration of the same
+package version.
+
 Package installation restarts only an already-active per-node
 manager/agent/controller stack. The updater deliberately does not restart
 active PVN Control, OVN NB/SB, or northd processes and verifies that their PIDs
@@ -575,6 +610,63 @@ marker still exists. The successful apply repins the durable package snapshot.
 Only then perform the one-voter-at-a-time restart sequence below and consume
 the markers after its global proof; clearing any marker before the repin or
 during the restart wave intentionally makes recovery fail closed.
+
+### One-time v0.2.16 half-configured recovery to v0.2.17
+
+This bridge applies only to the captured v0.2.16 state: dpkg reports
+`half-configured`, `pvn-node.target` is inactive, no
+`node-restart-pending` intent exists, and the still-active central target has
+kept its original four PIDs. The hosted updater correctly rejects this
+incomplete dpkg state. First record those PIDs, download the v0.2.17 DEB and
+manifest from the public release, and verify the exact DEB entry:
+
+```sh
+central_before=$(for unit in pvn-control-db.service \
+  ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service \
+  ovn-northd.service; do
+    systemctl show --property=MainPID --value "$unit"
+  done | paste -sd, -)
+
+curl --fail --show-error --location --remote-name \
+  https://github.com/popododo0720/proxmox-ovn/releases/download/v0.2.17/pvn-node_0.2.17_amd64.deb
+curl --fail --show-error --location --remote-name \
+  https://github.com/popododo0720/proxmox-ovn/releases/download/v0.2.17/SHA256SUMS
+grep '  pvn-node_0.2.17_amd64.deb$' SHA256SUMS | sha256sum --check --strict -
+```
+
+Install that verified package directly. Because this legacy interruption has
+no durable node-restart intent, its `postinst` deliberately leaves the node
+target stopped; explicitly start it after dpkg succeeds:
+
+```sh
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  --only-upgrade --no-remove -- ./pvn-node_0.2.17_amd64.deb
+systemctl start pvn-node.target
+```
+
+Require dpkg to report v0.2.17 fully installed, both targets and every node
+service to be active, `central-restart-pending` to contain exactly v0.2.17,
+and the four central PIDs to equal `central_before`:
+
+```sh
+test "$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}' pvn-node)" = \
+  'ii  0.2.17'
+systemctl is-active --quiet pvn-central.target pvn-node.target \
+  pvn-control-db.service ovn-ovsdb-server-nb.service \
+  ovn-ovsdb-server-sb.service ovn-northd.service ovn-controller.service \
+  pvn-manager.service pvn-agent.service pvn-ovn-host-config.service \
+  pvn-node-ready.service
+test "$(cat /var/lib/pvn-node/central-restart-pending)" = 0.2.17
+central_after=$(for unit in pvn-control-db.service \
+  ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service \
+  ovn-northd.service; do
+    systemctl show --property=MainPID --value "$unit"
+  done | paste -sd, -)
+test "$central_after" = "$central_before"
+```
+
+Do not use this bridge for a v0.2.17-or-newer interruption. Those retries must
+resume only through their matching durable `node-restart-pending` intent.
 
 ### Active v0.2.13 schema-1 upgrade to v0.2.14
 

@@ -1,9 +1,9 @@
 # PVN — shipped, verified, and still needed
 
 Status snapshot for follow-up work. Reflects the intended v1 feature set in
-`README.md` / `docs/architecture.md`, source-tree work for v0.2.14, the live
-three-node lab evidence through v0.2.13, and gaps that still need destructive
-recovery tests.
+`README.md` / `docs/architecture.md`, source-ready work for v0.2.17, the live
+three-node lab state with prox1/prox3 on v0.2.15 and prox2 interrupted during
+v0.2.16 configuration, and gaps that still need live recovery proof.
 
 **How to use:** treat “v1 must-pass” as release gates; everything else is
 prioritized backlog. Update this file when items ship or scope changes.
@@ -43,7 +43,7 @@ These are not new product features so much as **proof the current code works**.
 - [x] SNAT and/or floating IP path to provider network
 - [x] Security group allow / deny behaves as expected
 - [x] Node reboot: agent re-binds; guests recover or fail closed as designed
-- [x] Package upgrade on active node (fail-closed / safe path)
+- [x] Normal active-node package upgrade (fail-closed / safe path)
 - [ ] Backup/restore drill: in a separate window for each database, freeze all
       writers and independently copy / verify a fresh set, then restore exactly
       one of PVN_Control, OVN NB, or OVN SB; prove 3/3 Raft/CID, reconcile,
@@ -80,6 +80,12 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
       safety path, exact persisted/runtime gates, resumable stage boundaries,
       and strict recovery of the uniform v0.2.13 stale-runtime shape before any
       host-network mutation
+- [x] Bound package transitions to a durable same-version node restart intent,
+      the original four central PIDs, startup-only NB reachability, and strict
+      mutation/recovery synchronization fences
+- [ ] Forward-recover the captured prox2 v0.2.16 half-configured state, then
+      complete a uniform v0.2.17 rolling rollout without restarting central
+      processes during package installation
 - [ ] Prove the active topology schema-1 to schema-2 ledger-only migration on
       both a standalone 1/1 node and an odd clustered deployment; it must
       preserve host networking and activation state and reject mixed/drifted
