@@ -1874,59 +1874,6 @@ func (renderer *Renderer) ensureOwnedAttachedRow(ctx context.Context, row ownedR
 	return actual, err
 }
 
-func (renderer *Renderer) ensureRow(ctx context.Context, table, uuid string, assignments []string) error {
-	existing, err := renderer.findUUID(ctx, table, uuid)
-	if err != nil {
-		return err
-	}
-	if existing == "" {
-		args := append([]string{"--", "--id=" + uuid, "create", table}, assignments...)
-		if _, createErr := renderer.client.run(ctx, args...); createErr == nil {
-			return nil
-		} else {
-			// All managers derive the same UUID, so a concurrent winner is safe.
-			found, findErr := renderer.findUUID(ctx, table, uuid)
-			if findErr != nil || found == "" {
-				return createErr
-			}
-		}
-	}
-	args := append([]string{"set", table, uuid}, assignments...)
-	_, err = renderer.client.run(ctx, args...)
-	return err
-}
-
-func (renderer *Renderer) ensureAttachedRow(ctx context.Context, table, uuid string, assignments []string, parentTable, parent, column string) error {
-	existing, err := renderer.findUUID(ctx, table, uuid)
-	if err != nil {
-		return err
-	}
-	args := []string{"--"}
-	if existing == "" {
-		args = append(args, "--id="+uuid, "create", table)
-	} else {
-		args = append(args, "set", table, uuid)
-	}
-	args = append(args, assignments...)
-	args = append(args, "--", "add", parentTable, parent, column, uuid)
-	if _, err := renderer.client.run(ctx, args...); err == nil {
-		return nil
-	} else if existing != "" {
-		return err
-	} else {
-		// A second manager can win the deterministic UUID insert while this
-		// transaction is in flight. Retry only after confirming that exact row.
-		found, findErr := renderer.findUUID(ctx, table, uuid)
-		if findErr != nil || found == "" {
-			return err
-		}
-	}
-	args = append([]string{"--", "set", table, uuid}, assignments...)
-	args = append(args, "--", "add", parentTable, parent, column, uuid)
-	_, err = renderer.client.run(ctx, args...)
-	return err
-}
-
 func metadataAssignments(resource model.Resource, extra map[string]string) []string {
 	metadata := resource.GetMetadata()
 	result := []string{

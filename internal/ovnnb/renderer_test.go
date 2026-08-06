@@ -94,6 +94,12 @@ func (runner *ownedRowLookupRunner) Run(_ context.Context, _ string, arguments .
 func (runner *attachedRaceRunner) Run(_ context.Context, _ string, arguments ...string) ([]byte, error) {
 	runner.calls = append(runner.calls, append([]string(nil), arguments...))
 	joined := strings.Join(arguments, " ")
+	if strings.Contains(joined, "find NAT") {
+		if runner.exists {
+			return []byte(runner.uuid + "\n"), nil
+		}
+		return nil, nil
+	}
 	if strings.Contains(joined, "get NAT "+runner.uuid+" _uuid") {
 		if runner.exists {
 			return []byte(runner.uuid + "\n"), nil
@@ -452,20 +458,38 @@ func TestEnsureAttachedRowRecoversDeterministicUUIDRace(t *testing.T) {
 	parent := deterministicUUID("logical-router:race")
 	runner := &attachedRaceRunner{uuid: uuid}
 	renderer := newTestRenderer(t, runner, controlstore.NewMemory())
-	assignments := []string{stringAssignment("type", "snat"), stringAssignment("logical_ip", "10.42.0.0/24")}
-	if err := renderer.ensureAttachedRow(context.Background(), "NAT", uuid, assignments, "Logical_Router", parent, "nat"); err != nil {
+	row := managedRow(
+		"NAT",
+		uuid,
+		"",
+		mapAssignment("external_ids", "pvn-kind", "race-snat"),
+		mapAssignment("external_ids", "pvn-id", "race"),
+	)
+	assignments := []string{
+		stringAssignment("type", "snat"),
+		stringAssignment("logical_ip", "10.42.0.0/24"),
+		mapAssignment("external_ids", "pvn-managed", "true"),
+		mapAssignment("external_ids", "pvn-kind", "race-snat"),
+		mapAssignment("external_ids", "pvn-id", "race"),
+	}
+	if _, err := renderer.ensureOwnedAttachedRow(context.Background(), row, assignments, "Logical_Router", parent, "nat"); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 4 {
-		t.Fatalf("race calls=%v", runner.calls)
+	var create, retry string
+	for _, call := range runner.calls {
+		joined := strings.Join(call, " ")
+		if strings.Contains(joined, "create NAT") {
+			create = joined
+		}
+		if strings.Contains(joined, "set NAT "+uuid) {
+			retry = joined
+		}
 	}
-	create := strings.Join(runner.calls[1], " ")
-	retry := strings.Join(runner.calls[3], " ")
 	if !strings.Contains(create, "--id="+uuid+" create NAT") || !strings.Contains(create, "add Logical_Router "+parent+" nat "+uuid) {
-		t.Fatalf("create did not atomically attach non-root row: %v", runner.calls[1])
+		t.Fatalf("create did not atomically attach non-root row: %v", runner.calls)
 	}
 	if !strings.Contains(retry, "set NAT "+uuid) || !strings.Contains(retry, "add Logical_Router "+parent+" nat "+uuid) {
-		t.Fatalf("race retry did not update and reattach winner: %v", runner.calls[3])
+		t.Fatalf("race retry did not update and reattach winner: %v", runner.calls)
 	}
 }
 
@@ -1155,6 +1179,179 @@ func TestFloatingIPOnRouterExternalProviderRendersNAT(t *testing.T) {
 	if !runner.contains("create NAT", `type="dnat_and_snat"`, `external_ip="192.0.2.20"`, `logical_ip="10.42.0.10"`, "add Logical_Router "+logicalRouterUUID(fixture.router.ID)) {
 		t.Fatalf("valid floating IP NAT was not rendered: %v", runner.calls)
 	}
+}
+
+func TestRendererAdoptsAndDeletesCompleteRestoredUUIDGraph(t *testing.T) {
+	ctx := context.Background()
+	store, fixture := newNorthSouthFixture(t)
+
+	subnetUpdate := *fixture.internalSubnet
+	subnetUpdate.EnableDHCP = true
+	updatedSubnet, _, err := store.Update(ctx, &subnetUpdate, fixture.internalSubnet.Revision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.internalSubnet = updatedSubnet.(*model.Subnet)
+	group := mustCreate(t, store, &model.SecurityGroup{
+		Metadata: model.Metadata{ID: "sg-restored"}, ProjectID: fixture.project.ID, Name: "restored",
+	}).(*model.SecurityGroup)
+	rule := mustCreate(t, store, &model.SecurityGroupRule{
+		Metadata: model.Metadata{ID: "rule-restored"}, ProjectID: fixture.project.ID, SecurityGroupID: group.ID,
+		Direction: model.DirectionIngress, EtherType: model.EtherTypeIPv4, Protocol: "tcp",
+		PortRangeMin: 443, PortRangeMax: 443, RemoteCIDR: "0.0.0.0/0", Action: model.ActionAllow,
+	}).(*model.SecurityGroupRule)
+	port := mustCreate(t, store, &model.Port{
+		Metadata: model.Metadata{ID: "port-restored"}, ProjectID: fixture.project.ID, NetworkID: fixture.internalNetwork.ID,
+		Name: "vm-restored-net0", MACAddress: "02:00:00:00:00:44",
+		FixedIPs:         []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.44"}},
+		SecurityGroupIDs: []string{group.ID}, AdminStateUp: true, BindingStatus: model.PortBound,
+	}).(*model.Port)
+	floatingIP := mustCreate(t, store, &model.FloatingIP{
+		Metadata: model.Metadata{ID: "fip-restored"}, ProjectID: fixture.project.ID,
+		ProviderNetworkID: fixture.provider.ID, Address: "192.0.2.44", RouterID: fixture.router.ID,
+		PortID: port.ID, FixedIPAddress: "10.42.0.44", FloatingStatus: model.FloatingIPActive,
+	}).(*model.FloatingIP)
+
+	ids := map[string]string{
+		"internal-switch": deterministicUUID("restored:internal-switch"),
+		"external-switch": deterministicUUID("restored:external-switch"),
+		"dhcp":            deterministicUUID("restored:dhcp"),
+		"port":            deterministicUUID("restored:port"),
+		"port-group":      deterministicUUID("restored:port-group"),
+		"router":          deterministicUUID("restored:router"),
+		"route":           deterministicUUID("restored:route"),
+		"snat":            deterministicUUID("restored:snat"),
+		"floating-ip":     deterministicUUID("restored:floating-ip"),
+		"rule-acl":        deterministicUUID("restored:rule-acl"),
+	}
+	defaultACLOwners := []string{
+		group.ID + ":dhcpv4-client",
+		group.ID + ":dhcpv4-server",
+		group.ID + ":default-drop:to-lport",
+		group.ID + ":default-drop:from-lport",
+	}
+	for _, owner := range defaultACLOwners {
+		ids["acl:"+owner] = deterministicUUID("restored:acl:" + owner)
+	}
+
+	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.internalNetwork.ID), ids["internal-switch"])
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), ids["external-switch"])
+	runner.seedOwnedRow(dhcpOptionsOwnedRow(fixture.internalSubnet.ID), ids["dhcp"])
+	runner.seedOwnedRow(logicalSwitchPortOwnedRow(port.ID, port.LSPName), ids["port"])
+	runner.seedOwnedRow(portGroupOwnedRow(group.ID), ids["port-group"])
+	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), ids["router"])
+	runner.seedOwnedRow(routerDefaultRouteOwnedRow(fixture.router.ID), ids["route"])
+	runner.seedOwnedRow(routerSNATOwnedRow(fixture.router.ID, fixture.routerInterface.ID), ids["snat"])
+	runner.seedOwnedRow(floatingIPOwnedRow(floatingIP.ID), ids["floating-ip"])
+	runner.seedOwnedRow(aclOwnedRow(rule.ID), ids["rule-acl"])
+	for _, owner := range defaultACLOwners {
+		runner.seedOwnedRow(aclOwnedRow(owner), ids["acl:"+owner])
+	}
+	renderer := newTestRenderer(t, runner, store)
+
+	for _, resource := range []model.Resource{
+		fixture.internalNetwork,
+		fixture.internalSubnet,
+		group,
+		rule,
+		port,
+		fixture.router,
+		floatingIP,
+	} {
+		if err := renderer.Render(ctx, resource); err != nil {
+			t.Fatalf("render restored %s %q: %v", resource.ResourceKind(), resource.GetMetadata().ID, err)
+		}
+	}
+
+	for _, table := range []string{"Logical_Switch", "DHCP_Options", "Port_Group", "ACL", "Logical_Router", "Logical_Router_Static_Route", "NAT"} {
+		if runner.contains("create " + table) {
+			t.Fatalf("restored %s row was duplicated: %v", table, runner.calls)
+		}
+	}
+	for _, expected := range [][]string{
+		{"set Logical_Switch " + ids["internal-switch"]},
+		{"set DHCP_Options " + ids["dhcp"]},
+		{"dhcp-options-set-options " + ids["dhcp"]},
+		{"lsp-set-dhcpv4-options " + ids["port"] + " " + ids["dhcp"]},
+		{"set Port_Group " + ids["port-group"]},
+		{"set ACL " + ids["rule-acl"], "add Port_Group " + ids["port-group"] + " acls " + ids["rule-acl"]},
+		{"lsp-set-addresses " + ids["port"]},
+		{"get Logical_Switch_Port " + ids["port"]},
+		{"set Logical_Router " + ids["router"]},
+		{"lrp-add " + ids["router"], "lsp-add " + ids["external-switch"]},
+		{"set Logical_Router_Static_Route " + ids["route"], "add Logical_Router " + ids["router"] + " static_routes " + ids["route"]},
+		{"set NAT " + ids["snat"], "add Logical_Router " + ids["router"] + " nat " + ids["snat"]},
+		{"set NAT " + ids["floating-ip"], "add Logical_Router " + ids["router"] + " nat " + ids["floating-ip"]},
+	} {
+		if !runner.contains(expected...) {
+			t.Errorf("restored graph command missing %v", expected)
+		}
+	}
+
+	for _, resource := range []model.Resource{floatingIP, rule, fixture.internalSubnet, port, group, fixture.router, fixture.internalNetwork} {
+		if err := renderer.Delete(ctx, resource); err != nil {
+			t.Fatalf("delete restored %s %q: %v", resource.ResourceKind(), resource.GetMetadata().ID, err)
+		}
+	}
+	for _, expected := range [][]string{
+		{"remove Logical_Router " + ids["router"] + " nat " + ids["floating-ip"], "destroy NAT " + ids["floating-ip"]},
+		{"remove Port_Group " + ids["port-group"] + " acls " + ids["rule-acl"], "destroy ACL " + ids["rule-acl"]},
+		{"destroy DHCP_Options " + ids["dhcp"]},
+		{"lsp-del " + ids["port"]},
+		{"destroy Port_Group " + ids["port-group"]},
+		{"remove Logical_Router " + ids["router"] + " static_routes " + ids["route"], "lr-del " + ids["router"], "destroy Logical_Router_Static_Route " + ids["route"], "destroy NAT " + ids["snat"]},
+		{"ls-del " + ids["internal-switch"]},
+	} {
+		if !runner.contains(expected...) {
+			t.Errorf("restored graph delete missing %v", expected)
+		}
+	}
+}
+
+func TestRendererRejectsRestoredDuplicateAndForeignNonRootRows(t *testing.T) {
+	t.Run("duplicate-snat", func(t *testing.T) {
+		store, fixture := newNorthSouthFixture(t)
+		runner := &recordingRunner{}
+		runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), deterministicUUID("restored:external"))
+		runner.seedOwnedRow(routerDefaultRouteOwnedRow(fixture.router.ID), deterministicUUID("restored:route"))
+		snat := routerSNATOwnedRow(fixture.router.ID, fixture.routerInterface.ID)
+		runner.seedOwnedRow(snat, deterministicUUID("restored:snat-a"))
+		runner.seedOwnedRow(snat, deterministicUUID("restored:snat-b"))
+		renderer := newTestRenderer(t, runner, store)
+
+		err := renderer.Render(context.Background(), fixture.router)
+		if err == nil || !strings.Contains(err.Error(), "duplicate PVN-owned NAT") {
+			t.Fatalf("duplicate restored SNAT error = %v", err)
+		}
+		if runner.contains("set NAT ") || runner.contains("create NAT") {
+			t.Fatalf("duplicate restored SNAT was mutated: %v", runner.calls)
+		}
+	})
+
+	t.Run("foreign-port-group-name", func(t *testing.T) {
+		store := controlstore.NewMemory()
+		project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
+		group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-foreign"}, ProjectID: project.ID, Name: "foreign"}).(*model.SecurityGroup)
+		runner := &recordingRunner{}
+		foreign := managedRow(
+			"Port_Group",
+			deterministicUUID("foreign:port-group"),
+			portGroup(group.ID),
+			mapAssignment("external_ids", "pvn-kind", model.KindNetwork.String()),
+			mapAssignment("external_ids", "pvn-id", "foreign-network"),
+		)
+		runner.seedOwnedRow(foreign, deterministicUUID("restored:foreign-port-group"))
+		renderer := newTestRenderer(t, runner, store)
+
+		err := renderer.Render(context.Background(), group)
+		if err == nil || !strings.Contains(err.Error(), "is occupied") || !strings.Contains(err.Error(), "not owned") {
+			t.Fatalf("foreign Port_Group error = %v", err)
+		}
+		if runner.contains("set Port_Group") || runner.contains("create Port_Group") {
+			t.Fatalf("foreign Port_Group was mutated: %v", runner.calls)
+		}
+	})
 }
 
 func TestDerivedNamesDoNotAliasPunctuation(t *testing.T) {
