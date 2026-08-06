@@ -6,10 +6,11 @@ import vm from 'node:vm';
 
 const loaderSource = await readFile(new URL('../pvn-loader.js', import.meta.url), 'utf8');
 
-function harness() {
+function harness(options = {}) {
   const listeners = new Map();
   const frames = [];
   const apiRequests = [];
+  const openedWindows = [];
 
   function BaseConfig() {}
   BaseConfig.prototype.initComponent = function initComponent() { this.initialized = true; };
@@ -26,7 +27,10 @@ function harness() {
     ['PVE.dc.Config', DatacenterConfig],
   ]);
   const window = {
-    location: { hostname: 'pve.example.test', origin: 'https://pve.example.test:8006' },
+    location: {
+      hostname: options.hostname || 'pve.example.test',
+      origin: options.origin || 'https://pve.example.test:8006',
+    },
     crypto: webcrypto,
     PVE: { panel: { Config: BaseConfig }, dc: { Config: DatacenterConfig } },
     Proxmox: { Utils: { API2Request(options) { apiRequests.push(options); } } },
@@ -36,6 +40,11 @@ function harness() {
     },
     addEventListener(type, callback) { listeners.set(type, callback); },
     removeEventListener(type, callback) { if (listeners.get(type) === callback) listeners.delete(type); },
+    open(url, target, features) {
+      const popup = { opener: window };
+      openedWindows.push({ url, target, features, popup });
+      return popup;
+    },
     setTimeout(callback) { callback(); return 1; },
   };
   window.window = window;
@@ -53,7 +62,7 @@ function harness() {
   };
   const context = vm.createContext({ window, document, URL, Uint32Array, Object, Array, Number, JSON, Error, String });
   vm.runInContext(loaderSource, context);
-  return { window, DatacenterConfig, frames, listeners, apiRequests };
+  return { window, DatacenterConfig, frames, listeners, apiRequests, openedWindows };
 }
 
 test('adds one PVN item to the Datacenter config', () => {
@@ -64,6 +73,58 @@ test('adds one PVN item to the Datacenter config', () => {
   const second = new DatacenterConfig();
   second.initComponent();
   assert.equal(second.items.filter((item) => item.itemId === 'pvn').length, 1);
+});
+
+test('certificate onboarding opens only the same-node manager in an isolated tab', () => {
+  const { DatacenterConfig, openedWindows } = harness();
+  const config = new DatacenterConfig();
+  config.initComponent();
+  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
+  const toolbar = panelConfig.dockedItems.find((item) => item.xtype === 'toolbar');
+  const help = toolbar.items.find((item) => item && item.xtype === 'tbtext');
+  const trust = toolbar.items.find((item) => item && item.itemId === 'pvn-trust-certificate');
+
+  assert.match(help.text, /trust this node's PVN certificate/);
+  assert.equal(trust.text, 'Trust local PVN certificate');
+  assert.match(trust.tooltip, /protected new tab/);
+  trust.handler();
+
+  assert.equal(openedWindows.length, 1);
+  assert.equal(openedWindows[0].url, 'https://pve.example.test:8443/');
+  assert.equal(openedWindows[0].target, '_blank');
+  assert.equal(openedWindows[0].features, 'noopener,noreferrer');
+  assert.equal(openedWindows[0].popup.opener, null);
+});
+
+test('certificate onboarding brackets a same-node IPv6 target', () => {
+  const { DatacenterConfig, openedWindows } = harness({
+    hostname: '[2001:db8::10]',
+    origin: 'https://[2001:db8::10]:8006',
+  });
+  const config = new DatacenterConfig();
+  config.initComponent();
+  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
+  const toolbar = panelConfig.dockedItems[0];
+  toolbar.items.find((item) => item && item.itemId === 'pvn-trust-certificate').handler();
+  assert.equal(openedWindows[0].url, 'https://[2001:db8::10]:8443/');
+});
+
+test('reload keeps the nonce-bound iframe URL and sandbox', () => {
+  const { DatacenterConfig, frames } = harness();
+  const config = new DatacenterConfig();
+  config.initComponent();
+  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
+  panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
+  const frame = frames[0];
+  const originalURL = frame.src;
+  frame.src = 'about:blank';
+
+  const reload = panelConfig.dockedItems[0].items.find((item) => item && item.itemId === 'pvn-reload');
+  reload.handler();
+
+  assert.equal(frame.src, originalURL);
+  assert.equal(frame.sandbox, 'allow-scripts allow-forms allow-downloads allow-same-origin allow-top-navigation-by-user-activation');
+  assert.equal(new URL(frame.src).origin, 'https://pve.example.test:8443');
 });
 
 test('bridge rejects the wrong origin and permits only an exact QEMU config path', () => {

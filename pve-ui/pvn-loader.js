@@ -16,8 +16,17 @@
 
     function managerOrigin() {
         var hostname = window.location.hostname;
-        var host = hostname.indexOf(':') === -1 ? hostname : '[' + hostname + ']';
+        var alreadyBracketed = hostname.charAt(0) === '[' && hostname.charAt(hostname.length - 1) === ']';
+        var host = hostname.indexOf(':') === -1 || alreadyBracketed ? hostname : '[' + hostname + ']';
         return new URL('https://' + host + ':8443').origin;
+    }
+
+    function openCertificatePage() {
+        var url = new URL('/', managerOrigin()).toString();
+        var popup = window.open(url, '_blank', 'noopener,noreferrer');
+        if (popup) {
+            popup.opener = null;
+        }
     }
 
     function randomNonce() {
@@ -220,6 +229,8 @@
     }
 
     function iframePanel() {
+        var frame;
+        var frameURL;
         return {
             xtype: 'panel',
             itemId: 'pvn',
@@ -227,6 +238,32 @@
             iconCls: 'fa fa-sitemap',
             layout: 'fit',
             border: false,
+            dockedItems: [{
+                xtype: 'toolbar',
+                dock: 'top',
+                items: [{
+                    xtype: 'tbtext',
+                    text: "First use: trust this node's PVN certificate before the embedded console can load.",
+                }, '->', {
+                    xtype: 'button',
+                    itemId: 'pvn-trust-certificate',
+                    text: 'Trust local PVN certificate',
+                    iconCls: 'fa fa-external-link',
+                    tooltip: 'Opens this node\'s PVN manager in a protected new tab. Review and accept the certificate warning, then return and reload PVN.',
+                    handler: openCertificatePage,
+                }, {
+                    xtype: 'button',
+                    itemId: 'pvn-reload',
+                    text: 'Reload PVN',
+                    iconCls: 'fa fa-refresh',
+                    tooltip: 'Reloads the embedded PVN console after the certificate is trusted.',
+                    handler: function () {
+                        if (frame && frameURL) {
+                            frame.src = frameURL;
+                        }
+                    },
+                }],
+            }],
             listeners: {
                 afterrender: function (panel) {
                     var origin = managerOrigin();
@@ -240,9 +277,10 @@
                     var url = new URL('/', origin);
                     url.searchParams.set('pveBridgeNonce', nonce);
                     url.searchParams.set('pveOrigin', window.location.origin);
-                    var frame = document.createElement('iframe');
+                    frameURL = url.toString();
+                    frame = document.createElement('iframe');
                     frame.title = 'PVN Network Manager';
-                    frame.src = url.toString();
+                    frame.src = frameURL;
                     frame.referrerPolicy = 'strict-origin';
                     frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-downloads allow-same-origin allow-top-navigation-by-user-activation');
                     frame.style.cssText = 'display:block;width:100%;height:100%;min-height:500px;border:0;background:#0d1319';

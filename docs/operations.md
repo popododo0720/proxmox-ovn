@@ -259,6 +259,14 @@ Raft port 6646. Allow 6643, 6644, and 6646 only among voters; allow 6641, 6642,
 and 6645 only from PVN nodes. Port 8443 is the same-node PVN web/API endpoint.
 No insecure TCP listener is created.
 
+On first use, a browser may trust the PVE UI on port 8006 but still reject the
+embedded manager on port 8443. The PVN panel toolbar provides **Trust local PVN
+certificate**, which opens only the current node's manager origin in a new
+`noopener,noreferrer` tab. Review and accept the certificate warning, return to
+the panel, and select **Reload PVN**. Production clients should trust the PVE CA
+or use a publicly trusted node certificate so this onboarding step is not
+required.
+
 NB/SB client listeners are process-local `ovsdb-server` remotes, applied again
 after every database-process restart. PVN removes only the packaged replicated
 `db:...connections` reference from that process during migration and refuses
