@@ -67,9 +67,15 @@ describe('resource reference UX', () => {
         node_id: 'node-aaaaaaaa',
         vmid: 100,
         nic: 'net0',
+        requested_chassis: 'chassis-a',
         binding_status: 'bound',
+        admin_state_up: true,
+        security_group_ids: [],
+        state: 'ready',
+        revision: 3,
+        applied_revision: 3,
       }] };
-      if (endpoint === '/nodes') return { items: [{ id: 'node-aaaaaaaa', name: 'pve-a', enabled: true }] };
+      if (endpoint === '/nodes') return { items: [{ id: 'node-aaaaaaaa', name: 'pve-a', chassis_id: 'chassis-a', enabled: true, state: 'ready' }] };
       if (endpoint === '/networks') return { items: [{ id: 'network-aaaaaaaa', name: 'application' }] };
       return { items: [] };
     });
@@ -83,6 +89,12 @@ describe('resource reference UX', () => {
     const table = await screen.findByRole('table');
     expect(await within(table).findByText('application')).toBeInTheDocument();
     expect(await within(table).findByText('pve-a')).toBeInTheDocument();
+    expect(await within(table).findByText('matched')).toBeInTheDocument();
+    expect(within(table).getByText('The local agent confirmed the OVN binding.')).toBeInTheDocument();
+    expect(within(table).getByText('No security groups; traffic is unrestricted by PVN policy.')).toBeInTheDocument();
+    expect(table).not.toHaveTextContent('port-aaaaaaaa');
+    expect(table).not.toHaveTextContent('node-aaaaaaaa');
+    expect(table).not.toHaveTextContent('chassis-a');
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/ports')).toHaveLength(1);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/nodes')).toHaveLength(1);
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/networks')).toHaveLength(1);

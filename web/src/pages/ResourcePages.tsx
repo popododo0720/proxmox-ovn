@@ -16,6 +16,7 @@ import type {
   Subnet,
 } from '../api/types';
 import { PortAttachmentPanel } from '../components/PortAttachmentPanel';
+import { PortDiagnosticCell } from '../components/PortDiagnostics';
 import type { FormField } from '../components/CreateDialog';
 import { ReferenceLabel } from '../components/ReferenceLabel';
 import { ResourcePage, formatValue, type Column } from '../components/ResourcePage';
@@ -221,10 +222,11 @@ export function PortsPage() {
         { key: 'network_id', label: 'Network', reference: projectNetworkReference },
         { key: 'mac_address', label: 'MAC address', className: 'mono-cell' },
         { key: 'fixed_ips', label: 'Fixed IPs', render: (item) => <FixedIPList fixedIPs={item.fixed_ips} /> },
-        { key: 'vmid', label: 'Attachment', render: (item) => item.vmid
-          ? <span className="reference-label"><ReferenceLabel value={item.node_id} source={nodeReference} /><span>{item.vmid}/{item.nic || '?'}</span></span>
+        { key: 'vmid', label: 'VM / node', render: (item) => item.vmid
+          ? <span className="port-attachment-label"><span>VM {item.vmid} · {item.nic || '?'}</span><span>on</span><ReferenceLabel value={item.node_id} source={nodeReference} /></span>
           : formatValue(undefined) },
         { key: 'binding_status', label: 'Binding', render: (item) => <StatusPill value={item.binding_status || item.state} /> },
+        { key: 'last_error', label: 'Diagnosis', render: (item) => <PortDiagnosticCell port={item} /> },
       ]}
       createLabel="Tenant port"
       createFields={[

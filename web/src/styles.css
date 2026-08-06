@@ -90,7 +90,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .compact-section { margin-top: 36px; padding-top: 34px; border-top: 1px solid var(--line-soft); }
 .compact-section .page-heading h1 { font-size: 25px; }
 .stacked-pages > .resource-section:last-child { margin-bottom: 0; }
-.table-card, .panel-card, .state-card, .empty-state, .attachment-card, .nic-list { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 1px 1px rgba(0,0,0,.08); }
+.table-card, .panel-card, .state-card, .empty-state, .attachment-card, .nic-list, .port-diagnostic-card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 1px 1px rgba(0,0,0,.08); }
 .table-toolbar { min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; }
 .search-field { width: min(360px, 70%); height: 34px; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: #10171e; border: 1px solid #2d3a45; border-radius: 7px; color: #8193a1; }
 .search-field input { width: 100%; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 12px; }
@@ -167,6 +167,27 @@ td strong { color: #edf4f8; font-weight: 650; }
 .reference-error button { padding: 0; border: 0; color: var(--accent); background: transparent; font-size: 9px; font-weight: 700; cursor: pointer; }
 .reference-label { display: inline-flex; flex-wrap: wrap; gap: 4px 8px; color: #d5e0e6; }
 .reference-label > span:not(:last-child)::after { content: ","; color: var(--muted); }
+.port-attachment-label { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; white-space: nowrap; }
+.port-attachment-label > span:nth-child(2) { color: var(--muted); font-size: 9px; }
+.port-diagnostic-cell { min-width: 270px; display: grid; gap: 7px; font-size: 10px; line-height: 1.45; }
+.diagnostic-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.diagnostic-good > span:not(.status-pill) { color: #9ce7cf; }
+.diagnostic-warning > span:not(.status-pill) { color: #e8c880; }
+.diagnostic-bad > span:not(.status-pill) { color: #ffabb0; }
+.diagnostic-warnings { display: grid; gap: 4px; }
+.diagnostic-warnings span { color: #e8c880; font-size: 10px; line-height: 1.45; }
+.diagnostic-warnings span::before { content: "Warning: "; font-weight: 800; }
+.port-diagnostic-card { margin-top: 12px; padding: 16px; }
+.port-diagnostic-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.port-diagnostic-heading h2 { margin: 5px 0 0; color: var(--text); font-size: 18px; font-weight: 620; }
+.port-diagnostic-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+.port-diagnostic-grid > div { min-width: 0; padding: 11px; background: #101820; border: 1px solid var(--line-soft); border-radius: 7px; }
+.port-diagnostic-grid > div > span:first-child { display: block; margin-bottom: 6px; color: #738692; font-size: 8px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.port-diagnostic-grid strong { display: block; color: #e6eef3; font-size: 11px; overflow-wrap: anywhere; }
+.port-diagnostic-reason { display: grid; grid-template-columns: minmax(150px, .3fr) minmax(0, 1fr); gap: 14px; margin-top: 12px; padding: 12px; background: #121b22; border: 1px solid var(--line-soft); border-radius: 7px; font-size: 10px; line-height: 1.5; }
+.port-diagnostic-reason strong { color: #dce6ec; }
+.port-diagnostic-card > .diagnostic-warnings { margin-top: 10px; }
+.diagnostic-scope { margin: 10px 0 0; color: #738692; font-size: 9px; line-height: 1.5; }
 .copyable-id { display: inline-flex; max-width: 260px; align-items: center; gap: 7px; }
 .copyable-id code { min-width: 0; overflow-wrap: anywhere; color: #a5b5c0; font: inherit; }
 .copyable-id button { flex: none; padding: 2px 5px; border: 1px solid #354551; border-radius: 5px; color: #8194a2; background: #121b22; font-size: 8px; font-weight: 750; cursor: pointer; }
@@ -230,6 +251,7 @@ td strong { color: #edf4f8; font-weight: 650; }
   .attachment-workflow { grid-template-columns: 1fr 1fr; }
   .attachment-port-field, .attachment-actions { grid-column: 1 / -1; }
   .attachment-actions .button { flex: 1; }
+  .port-diagnostic-grid { grid-template-columns: 1fr 1fr; }
   .user-chip div { display: none; }
 }
 
@@ -241,6 +263,7 @@ td strong { color: #edf4f8; font-weight: 650; }
   .hero-card h2 { font-size: 22px; }
   .attachment-workflow { grid-template-columns: 1fr; }
   .attachment-port-field, .attachment-actions { grid-column: auto; }
+  .port-diagnostic-grid, .port-diagnostic-reason { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {
