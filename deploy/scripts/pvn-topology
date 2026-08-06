@@ -35,9 +35,13 @@ PVE_IDENTITY_FILE = Path(
     os.environ.get("PVN_TOPOLOGY_IDENTITY_FILE", "/root/.ssh/id_rsa")
 )
 LOCK_FILE = Path(os.environ.get("PVN_TOPOLOGY_LOCK_FILE", "/run/lock/pvn-topology.lock"))
+COROSYNC_FILE = Path(
+    os.environ.get("PVN_TOPOLOGY_COROSYNC_FILE", "/etc/pve/corosync.conf")
+)
 LEASE_BIN = os.environ.get("PVN_TOPOLOGY_LEASE_BIN", "/usr/lib/pvn/pvn-cluster-lease")
 LEASE_DOMAIN = "mutation"
 SSH_BIN = os.environ.get("PVN_TOPOLOGY_SSH_BIN", "ssh")
+LOCAL_HELPER_BIN = os.environ.get("PVN_TOPOLOGY_LOCAL_HELPER_BIN")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 PROVIDER_ACK = "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP"
@@ -55,6 +59,11 @@ ACTIVATION_UNITS = (
     "ovn-controller.service", "ovn-northd.service",
     "ovn-ovsdb-server-nb.service", "ovn-ovsdb-server-sb.service",
 )
+STANDALONE_DATABASE_SOCKETS = {
+    "PVN_Control": "/run/pvn-control/pvn-control-db.sock",
+    "OVN_Northbound": "/run/ovn/ovnnb_db.sock",
+    "OVN_Southbound": "/run/ovn/ovnsb_db.sock",
+}
 LEDGER_UPGRADE_PROOF_KEYS = (
     "node", "interfaces_sha256", "pending_interfaces_sha256",
     "corosync_sha256", "corosync_text", "corosync_package_version",
@@ -254,13 +263,35 @@ def parse_cidr(value: str, option: str) -> ipaddress.IPv4Network:
     return network
 
 
-def discover_members() -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
+def discover_members() -> tuple[
+    str, str, list[dict[str, Any]], dict[str, Any]
+]:
     try:
         data = json.loads(read_limited(MEMBERS_FILE, 1024 * 1024))
     except json.JSONDecodeError as exc:
         fail(f"invalid {MEMBERS_FILE}: {exc}")
     if not isinstance(data, dict):
         fail(f"{MEMBERS_FILE} must contain a JSON object")
+
+    members_version = data.get("version")
+    local_name = data.get("nodename")
+    if type(members_version) is not int or members_version < 0:
+        fail("PVE membership version is invalid")
+    if not isinstance(local_name, str) or not SAFE_NAME.fullmatch(local_name):
+        fail("local PVE nodename is empty or unsafe")
+    if set(data) == {"nodename", "version"}:
+        if os.path.lexists(str(COROSYNC_FILE)):
+            fail("standalone PVE must not have corosync.conf")
+        return (
+            f"standalone-{local_name}",
+            local_name,
+            [{"name": local_name, "id": 0, "ip": None}],
+            {
+                "mode": "standalone",
+                "cluster_name": f"standalone-{local_name}",
+                "nodename": local_name,
+            },
+        )
 
     cluster = data.get("cluster")
     nodelist = data.get("nodelist")
@@ -271,20 +302,14 @@ def discover_members() -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
         fail("PVE cluster name is empty or unsafe")
     if cluster.get("quorate") not in (1, True, "1"):
         fail("PVE cluster is not quorate")
-    members_version = data.get("version")
     cluster_version = cluster.get("version")
-    if type(members_version) is not int or members_version < 0:
-        fail("PVE membership version is invalid")
     if type(cluster_version) is not int or cluster_version < 0:
         fail("PVE cluster membership version is invalid")
     declared = cluster.get("nodes")
     if not isinstance(declared, int) or declared != len(nodelist):
         fail("PVE cluster node count does not match /etc/pve/.members")
-    local_name = data.get("nodename")
     if (
-        not isinstance(local_name, str)
-        or not SAFE_NAME.fullmatch(local_name)
-        or local_name not in nodelist
+        local_name not in nodelist
     ):
         fail("local PVE nodename is empty, unsafe, or absent from membership")
 
@@ -331,13 +356,25 @@ def discover_members() -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
     return cluster_name, local_name, nodes, membership_snapshot
 
 
+def is_standalone_guard(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"mode", "cluster_name", "nodename"}
+        and value.get("mode") == "standalone"
+    )
+
+
 def assert_membership_unchanged(expected: dict[str, Any], context: str) -> None:
     _cluster_name, _local_name, _nodes, current = discover_members()
     if current != expected:
         fail(f"PVE membership changed {context}; refusing further topology mutation")
 
 
-def validate_ssh_files(nodes: list[dict[str, Any]]) -> None:
+def validate_ssh_files(
+    nodes: list[dict[str, Any]], membership_snapshot: dict[str, Any]
+) -> None:
+    if is_standalone_guard(membership_snapshot):
+        return
     try:
         identity_info = PVE_IDENTITY_FILE.lstat()
     except OSError as exc:
@@ -394,6 +431,14 @@ CONTROL_LEDGER_FILE = LEDGER_DIR / "control-plane.json"
 CENTRAL_RESTART_DIR = Path("/var/lib/pvn-node")
 CENTRAL_RESTART_MARKER = CENTRAL_RESTART_DIR / "central-restart-pending"
 PVNCTL = "/usr/sbin/pvnctl"
+STANDALONE_DATABASES = (
+    ("PVN_Control", Path("/var/lib/pvn/control-db/pvn_control.db"),
+     Path("/run/pvn-control/pvn-control-db.sock")),
+    ("OVN_Northbound", Path("/var/lib/ovn/ovnnb_db.db"),
+     Path("/run/ovn/ovnnb_db.sock")),
+    ("OVN_Southbound", Path("/var/lib/ovn/ovnsb_db.db"),
+     Path("/run/ovn/ovnsb_db.sock")),
+)
 MARKERS = (Path("/etc/pvn/node-enabled"), Path("/etc/pvn/central/enabled"))
 ACTIVATION_UNITS = (
     "pvn-node.target", "pvn-central.target", "pvn-node-ready.service",
@@ -830,17 +875,39 @@ def read_regular(path, limit=4 * 1024 * 1024, root_only=True):
         os.close(descriptor)
 
 
-def verify_membership_snapshot(expected):
-    if not isinstance(expected, dict):
-        abort("expected PVE membership snapshot is missing")
+def verify_membership_snapshot(expected, mode, expected_node):
+    if mode not in ("cluster", "standalone"):
+        abort("expected PVE mode is missing or invalid")
+    if not isinstance(expected_node, str) or not SAFE_NAME.fullmatch(expected_node):
+        abort("expected local PVE node identity is missing or invalid")
     try:
         data = json.loads(read_regular(Path("/etc/pve/.members"), 1024 * 1024))
     except json.JSONDecodeError as exc:
         abort("invalid /etc/pve/.members: %s" % exc)
+    if mode == "standalone":
+        if expected is not None:
+            abort("standalone request unexpectedly carries a cluster membership snapshot")
+        if not isinstance(data, dict) or set(data) != {"nodename", "version"}:
+            abort("standalone .members must contain exactly nodename and version")
+        if (
+            not isinstance(data.get("nodename"), str)
+            or not SAFE_NAME.fullmatch(data["nodename"])
+            or data["nodename"] != expected_node
+            or type(data.get("version")) is not int
+            or data["version"] < 0
+        ):
+            abort("standalone .members identity/version is invalid")
+        if os.path.lexists(str(COROSYNC)):
+            abort("standalone node unexpectedly has corosync.conf")
+        return
+    if not isinstance(expected, dict):
+        abort("expected clustered PVE membership snapshot is missing")
     cluster = data.get("cluster") if isinstance(data, dict) else None
     nodelist = data.get("nodelist") if isinstance(data, dict) else None
     if not isinstance(cluster, dict) or not isinstance(nodelist, dict) or not nodelist:
         abort("/etc/pve/.members does not describe a PVE cluster")
+    if data.get("nodename") != expected_node or expected_node not in nodelist:
+        abort("local PVE node identity differs from the request")
     if cluster.get("quorate") not in (1, True, "1"):
         abort("PVE cluster is not quorate")
     members_version = data.get("version")
@@ -1432,10 +1499,99 @@ def central_restart_pending():
     return lines[0]
 
 
-def active_pvn_readiness():
+def standalone_database_readiness():
+    rows = []
+    for expected_name, database, socket in STANDALONE_DATABASES:
+        try:
+            database_info = database.lstat()
+            socket_before = socket.lstat()
+        except OSError as exc:
+            abort("cannot inspect standalone database %s: %s" % (expected_name, exc))
+        if (
+            stat.S_ISLNK(database_info.st_mode)
+            or not stat.S_ISREG(database_info.st_mode)
+            or database_info.st_nlink != 1
+            or database_info.st_mode & 0o022
+        ):
+            abort("standalone database file is unsafe: %s" % database)
+        if stat.S_ISLNK(socket_before.st_mode) or not stat.S_ISSOCK(socket_before.st_mode):
+            abort("standalone database socket is missing or unsafe: %s" % socket)
+        if run(["/usr/bin/ovsdb-tool", "db-is-standalone", str(database)], check=False).returncode != 0:
+            abort("standalone database is clustered: %s" % database)
+        name = run(["/usr/bin/ovsdb-tool", "db-name", str(database)]).stdout.strip()
+        version = run(["/usr/bin/ovsdb-tool", "db-version", str(database)]).stdout.strip()
+        checksum = run(["/usr/bin/ovsdb-tool", "db-cksum", str(database)]).stdout.strip()
+        if name != expected_name:
+            abort("standalone database name drift: %s" % database)
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._:+~/ -]{1,200}", version)
+            or not re.fullmatch(r"[A-Za-z0-9._:+~/ -]{1,200}", checksum)
+        ):
+            abort("standalone database schema metadata is invalid: %s" % database)
+        schema_result = run([
+            "/usr/bin/ovsdb-client", "--timeout=10", "get-schema",
+            "unix:%s" % socket, expected_name,
+        ])
+        try:
+            schema = json.loads(schema_result.stdout)
+        except json.JSONDecodeError as exc:
+            abort("standalone database returned invalid schema JSON: %s" % exc)
+        if (
+            not isinstance(schema, dict)
+            or schema.get("name") != expected_name
+            or schema.get("version") != version
+            or schema.get("cksum") != checksum
+            or not isinstance(schema.get("tables"), dict)
+            or not schema["tables"]
+        ):
+            abort("standalone database live/offline schema identity drift: %s" % expected_name)
+        try:
+            database_after = database.lstat()
+            socket_after = socket.lstat()
+        except OSError as exc:
+            abort("standalone database or socket disappeared: %s" % exc)
+        if (
+            (database_after.st_dev, database_after.st_ino)
+            != (database_info.st_dev, database_info.st_ino)
+            or stat.S_ISLNK(database_after.st_mode)
+            or not stat.S_ISREG(database_after.st_mode)
+            or database_after.st_nlink != 1
+            or database_after.st_mode & 0o022
+            or (database_after.st_uid, database_after.st_gid,
+                stat.S_IMODE(database_after.st_mode))
+            != (database_info.st_uid, database_info.st_gid,
+                stat.S_IMODE(database_info.st_mode))
+        ):
+            abort("standalone database file changed while being checked: %s" % database)
+        if (
+            (socket_after.st_dev, socket_after.st_ino)
+            != (socket_before.st_dev, socket_before.st_ino)
+            or stat.S_ISLNK(socket_after.st_mode)
+            or not stat.S_ISSOCK(socket_after.st_mode)
+        ):
+            abort("standalone database socket changed while being checked: %s" % socket)
+        rows.append({
+            "database": expected_name,
+            "schema_version": version,
+            "schema_checksum": checksum,
+            "socket": str(socket),
+        })
+    return rows
+
+
+def active_pvn_readiness(mode):
     package_version = installed_package_version("pvn-node")
     restart_pending = central_restart_pending()
     doctor = run([PVNCTL, "doctor"], timeout=30, check=False)
+    if mode == "standalone":
+        return {
+            "package_version": package_version,
+            "central_restart_pending": restart_pending,
+            "doctor": doctor.returncode == 0,
+            "standalone_databases": standalone_database_readiness(),
+        }
+    if mode != "cluster":
+        abort("active PVN readiness mode is invalid")
     central = run([PVNCTL, "central", "status"], timeout=30, check=False)
     try:
         central_status = json.loads(central.stdout)
@@ -1467,6 +1623,21 @@ def validate_journal_for_request(journal, request):
         abort("topology journal does not match this exact request")
     if journal.get("node") != request["node"]:
         abort("topology journal does not match this exact request")
+    mode = request.get("pvn_mode")
+    if mode == "standalone":
+        if (
+            "before_corosync_sha256" not in journal
+            or journal["before_corosync_sha256"] is not None
+        ):
+            abort("standalone topology journal must explicitly pin no Corosync state")
+    elif mode == "cluster":
+        if (
+            not isinstance(journal.get("before_corosync_sha256"), str)
+            or not SHA256.fullmatch(journal["before_corosync_sha256"])
+        ):
+            abort("clustered topology journal has no valid Corosync boundary")
+    else:
+        abort("topology journal request has an invalid PVE mode")
     requested_effective = request.get("effective_underlay_mtu")
     if (
         requested_effective is not None
@@ -1529,47 +1700,95 @@ def resolve_effective_underlay_mtu(request, journal, ledger_text):
 
 
 def build_probe(request):
+    mode = request.get("pvn_mode")
+    if mode not in ("cluster", "standalone"):
+        abort("topology request has an invalid PVE mode")
     activation = activation_state()
-    active_readiness = (
-        active_pvn_readiness() if activation_mode(activation) == "active" else None
-    )
-    require_commands(("ip", "pvecm", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "corosync", "corosync-cfgtool", "corosync-cmapctl", "perl"))
+    if mode == "cluster":
+        require_commands(("ip", "pvecm", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "corosync", "corosync-cfgtool", "corosync-cmapctl", "perl"))
+    else:
+        require_commands(("ip", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "ovsdb-tool", "ovsdb-client", "perl"))
     check_pve_packages()
-    corosync_package_version = installed_package_version("corosync")
-    cluster_status(request["node_count"], request["cluster_name"])
+    active_readiness = (
+        active_pvn_readiness(mode)
+        if activation_mode(activation) == "active"
+        else None
+    )
+    if mode == "cluster":
+        corosync_package_version = installed_package_version("corosync")
+        cluster_status(request["node_count"], request["cluster_name"])
+    else:
+        corosync_package_version = None
 
     node = request["node"]
     if run(["hostname", "-s"]).stdout.strip() != node:
         abort("SSH host is not the expected PVE node %s" % node)
     interfaces_text = read_regular(INTERFACES)
-    corosync_text = read_regular(COROSYNC)
     interfaces_sha = sha_text(interfaces_text)
-    corosync_sha = sha_text(corosync_text)
+    if mode == "cluster":
+        corosync_text = read_regular(COROSYNC)
+        corosync_sha = sha_text(corosync_text)
+    else:
+        if os.path.lexists(str(COROSYNC)):
+            abort("standalone node unexpectedly has corosync.conf")
+        corosync_text = None
+        corosync_sha = None
     links = link_rows()
     address_list = address_rows()
     addresses = addresses_by_interface(address_list)
     routes = route_rows()
     api = network_rows(node)
-    member_rows = request["membership_snapshot"]["nodes"]
-    local_ids = [row["node_id"] for row in member_rows if row["name"] == node]
-    if len(local_ids) != 1:
-        abort("membership snapshot has no unique local node ID")
-    corosync_runtime = corosync_runtime_links(local_ids[0])
-    corosync_runtime["config"] = corosync_runtime_config(
-        local_ids[0], request["cluster_name"], member_rows
-    )
-
-    management_matches = []
-    for ifname, values in addresses.items():
-        for value in values:
-            if value["address"] == request["management_ip"]:
-                management_matches.append((ifname, value))
-    if len(management_matches) != 1:
-        abort("member management IP is not uniquely assigned")
-    management_if, management_addr = management_matches[0]
     defaults = route_signature(routes)
-    if not any(route.get("dev") == management_if for route in defaults):
-        abort("the member management IP does not own a default route")
+    if mode == "cluster":
+        member_rows = request["membership_snapshot"]["nodes"]
+        local_ids = [row["node_id"] for row in member_rows if row["name"] == node]
+        if len(local_ids) != 1:
+            abort("membership snapshot has no unique local node ID")
+        corosync_runtime = corosync_runtime_links(local_ids[0])
+        corosync_runtime["config"] = corosync_runtime_config(
+            local_ids[0], request["cluster_name"], member_rows
+        )
+        management_matches = []
+        for ifname, values in addresses.items():
+            for value in values:
+                if value["address"] == request["management_ip"]:
+                    management_matches.append((ifname, value))
+        if len(management_matches) != 1:
+            abort("member management IP is not uniquely assigned")
+        management_if, management_addr = management_matches[0]
+        if not any(route.get("dev") == management_if for route in defaults):
+            abort("the member management IP does not own a default route")
+    else:
+        corosync_runtime = None
+        default_devices = {
+            route.get("dev") for route in defaults
+            if isinstance(route.get("dev"), str) and route.get("dev")
+        }
+        if len(default_devices) != 1:
+            abort("standalone management requires exactly one default-route device")
+        management_if = next(iter(default_devices))
+        management_addresses = []
+        for value in addresses.get(management_if, []):
+            try:
+                address = ipaddress.ip_address(value.get("address"))
+            except ValueError:
+                continue
+            if (
+                value.get("scope") == "global"
+                and isinstance(address, ipaddress.IPv4Address)
+                and str(address) == value.get("address")
+                and not address.is_unspecified
+                and not address.is_loopback
+                and not address.is_link_local
+                and not address.is_multicast
+            ):
+                management_addresses.append(value)
+        if len(management_addresses) != 1:
+            abort("standalone management device must own exactly one global IPv4 address")
+        management_addr = management_addresses[0]
+        expected_management = request.get("management_ip")
+        if expected_management is not None and management_addr["address"] != expected_management:
+            abort("standalone management IP changed after initial discovery")
 
     geneve_net = ipaddress.ip_network(request["spec"]["geneve_cidr"])
     provider_net = ipaddress.ip_network(request["spec"]["provider_cidr"])
@@ -1759,9 +1978,17 @@ def prepare(request):
         emit(journal=existing, report=report)
         return
     interfaces_text = read_regular(INTERFACES)
-    corosync_text = read_regular(COROSYNC)
     exclusive_backup(backup_dir / "interfaces.before", interfaces_text)
-    exclusive_backup(backup_dir / "corosync.before", corosync_text)
+    if request.get("pvn_mode") == "cluster":
+        corosync_text = read_regular(COROSYNC)
+        before_corosync_sha256 = sha_text(corosync_text)
+        exclusive_backup(backup_dir / "corosync.before", corosync_text)
+    elif request.get("pvn_mode") == "standalone":
+        if os.path.lexists(str(COROSYNC)):
+            abort("standalone node gained corosync.conf before journal creation")
+        before_corosync_sha256 = None
+    else:
+        abort("prepare request has an invalid PVE mode")
     value = {
         "schema": 1,
         "transaction": request["transaction"],
@@ -1772,7 +1999,7 @@ def prepare(request):
         "provider": report["provider"],
         "effective_underlay_mtu": effective_underlay_mtu,
         "before_interfaces_sha256": sha_text(interfaces_text),
-        "before_corosync_sha256": sha_text(corosync_text),
+        "before_corosync_sha256": before_corosync_sha256,
         "desired_interfaces_sha256": None,
         "phase": "prepared",
     }
@@ -2125,7 +2352,10 @@ def verify_network(request):
     if report["geneve"]["interface"] != journal.get("geneve", {}).get("interface"):
         abort("Geneve NIC changed")
     ping_geneve(request)
-    cluster_status(request["node_count"], request["cluster_name"])
+    if request.get("pvn_mode") == "cluster":
+        cluster_status(request["node_count"], request["cluster_name"])
+    elif request.get("pvn_mode") != "standalone":
+        abort("network verification request has an invalid PVE mode")
     check_activation_absent()
     emit(verified=True, report=report)
 
@@ -2326,7 +2556,10 @@ def main():
         "rollback-network", "discard-stage", "restore-ledger",
     }
     if action not in cleanup_actions:
-        verify_membership_snapshot(request.get("membership_snapshot"))
+        verify_membership_snapshot(
+            request.get("membership_snapshot"), request.get("pvn_mode"),
+            request.get("node"),
+        )
     handlers = {
         "probe": lambda: emit(report=build_probe(request)),
         "prepare": lambda: prepare(request),
@@ -2359,34 +2592,61 @@ except RemoteFailure as exc:
 '''
 
 
+def local_helper_argv(action: str) -> list[str]:
+    if LOCAL_HELPER_BIN is None:
+        return [sys.executable, "-c", REMOTE_HELPER, action]
+    path = Path(LOCAL_HELPER_BIN)
+    if not path.is_absolute() or path != Path(os.path.normpath(str(path))):
+        fail("PVN_TOPOLOGY_LOCAL_HELPER_BIN must be a clean absolute path")
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect local topology helper {path}: {exc}")
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or not info.st_mode & stat.S_IXUSR
+    ):
+        fail("local topology helper must be root-owned, executable, and non-writable by group/world")
+    return [str(path), action]
+
+
 def ssh_request(node: dict[str, Any], action: str, request: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
     payload = canonical_json(request)
     if len(payload.encode("utf-8")) > REMOTE_REQUEST_LIMIT:
         fail(f"{node['name']} {action} request exceeds the bounded input limit")
-    remote_command = "python3 -c %s %s" % (shlex.quote(REMOTE_HELPER), shlex.quote(action))
-    argv = [
-        SSH_BIN,
-        "-F", "/dev/null",
-        "-e", "none",
-        "-i", str(PVE_IDENTITY_FILE),
-        "-o", "BatchMode=yes",
-        "-o", "PasswordAuthentication=no",
-        "-o", "KbdInteractiveAuthentication=no",
-        "-o", "PubkeyAuthentication=yes",
-        "-o", "PreferredAuthentications=publickey",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "NumberOfPasswordPrompts=0",
-        "-o", "StrictHostKeyChecking=yes",
-        "-o", "CheckHostIP=no",
-        "-o", "VerifyHostKeyDNS=no",
-        "-o", "UpdateHostKeys=no",
-        "-o", "GlobalKnownHostsFile=/dev/null",
-        "-o", f"UserKnownHostsFile={PVE_NODES_DIR / node['name'] / 'ssh_known_hosts'}",
-        "-o", f"HostKeyAlias={node['name']}",
-        "-o", "ConnectTimeout=10",
-        "-o", "ConnectionAttempts=1",
-        "--", f"root@{node['ip']}", remote_command,
-    ]
+    if node.get("id") == 0:
+        argv = local_helper_argv(action)
+    else:
+        remote_command = "python3 -c %s %s" % (
+            shlex.quote(REMOTE_HELPER), shlex.quote(action)
+        )
+        argv = [
+            SSH_BIN,
+            "-F", "/dev/null",
+            "-e", "none",
+            "-i", str(PVE_IDENTITY_FILE),
+            "-o", "BatchMode=yes",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "PubkeyAuthentication=yes",
+            "-o", "PreferredAuthentications=publickey",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "NumberOfPasswordPrompts=0",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "CheckHostIP=no",
+            "-o", "VerifyHostKeyDNS=no",
+            "-o", "UpdateHostKeys=no",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", f"UserKnownHostsFile={PVE_NODES_DIR / node['name'] / 'ssh_known_hosts'}",
+            "-o", f"HostKeyAlias={node['name']}",
+            "-o", "ConnectTimeout=10",
+            "-o", "ConnectionAttempts=1",
+            "--", f"root@{node['ip']}", remote_command,
+        ]
     result = run_bounded_process(argv, payload, timeout)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
@@ -2411,6 +2671,7 @@ def common_request(
     transaction: str,
     membership_snapshot: dict[str, Any],
 ) -> dict[str, Any]:
+    standalone = is_standalone_guard(membership_snapshot)
     request = {
         "cluster_name": cluster_name,
         "node": node["name"],
@@ -2418,7 +2679,8 @@ def common_request(
         "management_ip": node["ip"],
         "spec": spec,
         "transaction": transaction,
-        "membership_snapshot": membership_snapshot,
+        "membership_snapshot": None if standalone else membership_snapshot,
+        "pvn_mode": "standalone" if standalone else "cluster",
     }
     effective_underlay_mtu = spec.get("effective_underlay_mtu")
     if effective_underlay_mtu is not None:
@@ -2448,19 +2710,22 @@ def activation_report_mode(value: Any) -> str:
     return "mixed"
 
 
-def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(report, dict) or report.get("node") != node["name"]:
-        fail(f"malformed topology report from {node['name']}")
-    for key in ("interfaces_sha256", "corosync_sha256"):
-        if not isinstance(report.get(key), str) or not SHA256.fullmatch(report[key]):
-            fail(f"invalid {key} from {node['name']}")
+def validate_cluster_corosync_report(
+    report: dict[str, Any], node: dict[str, Any], spec: dict[str, Any]
+) -> None:
+    if not isinstance(report.get("corosync_sha256"), str) or not SHA256.fullmatch(
+        report["corosync_sha256"]
+    ):
+        fail(f"invalid corosync_sha256 from {node['name']}")
     package_version = report.get("corosync_package_version")
     if (
         not isinstance(package_version, str)
         or not re.fullmatch(r"[A-Za-z0-9.+:~_-]{1,200}", package_version)
     ):
         fail(f"invalid Corosync package version from {node['name']}")
-    if not isinstance(report.get("corosync_text"), str) or len(report["corosync_text"]) > 4 * 1024 * 1024:
+    if not isinstance(report.get("corosync_text"), str) or len(
+        report["corosync_text"]
+    ) > 4 * 1024 * 1024:
         fail(f"invalid corosync.conf from {node['name']}")
     if digest_text(report["corosync_text"]) != report["corosync_sha256"]:
         fail(f"corosync.conf hash mismatch from {node['name']}")
@@ -2505,7 +2770,10 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
     cmap_nodes = runtime_config.get("nodes")
     cmap_members = runtime_config.get("members")
     cmap_binds = runtime_config.get("bind_addresses")
-    if not all(isinstance(value, dict) and value for value in (cmap_nodes, cmap_members, cmap_binds)):
+    if not all(
+        isinstance(value, dict) and value
+        for value in (cmap_nodes, cmap_members, cmap_binds)
+    ):
         fail(f"incomplete Corosync cmap from {node['name']}")
     for name, row in cmap_nodes.items():
         if (
@@ -2537,6 +2805,26 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
         for raw_ring, value in cmap_binds.items()
     ):
         fail(f"invalid Corosync cmap bind addresses from {node['name']}")
+
+
+def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(report, dict) or report.get("node") != node["name"]:
+        fail(f"malformed topology report from {node['name']}")
+    if not isinstance(report.get("interfaces_sha256"), str) or not SHA256.fullmatch(
+        report["interfaces_sha256"]
+    ):
+        fail(f"invalid interfaces_sha256 from {node['name']}")
+    if node.get("id") == 0:
+        if any(
+            report.get(key) is not None
+            for key in (
+                "corosync_sha256", "corosync_text",
+                "corosync_package_version", "corosync_runtime",
+            )
+        ):
+            fail(f"standalone node {node['name']} unexpectedly reported Corosync state")
+    else:
+        validate_cluster_corosync_report(report, node, spec)
     if report.get("network_state") not in ("initial", "desired"):
         fail(f"unsafe topology state reported by {node['name']}")
     activation_mode = activation_report_mode(report.get("activation"))
@@ -2546,10 +2834,16 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
         fail(f"inconsistent PVN activation report from {node['name']}")
     active_readiness = report.get("active_readiness")
     if activation_mode == "active":
-        readiness_keys = {
-            "package_version", "central_restart_pending", "doctor",
-            "central_status_ok", "central_status",
-        }
+        if node.get("id") == 0:
+            readiness_keys = {
+                "package_version", "central_restart_pending", "doctor",
+                "standalone_databases",
+            }
+        else:
+            readiness_keys = {
+                "package_version", "central_restart_pending", "doctor",
+                "central_status_ok", "central_status",
+            }
         if not isinstance(active_readiness, dict) or set(active_readiness) != readiness_keys:
             fail(f"malformed active PVN readiness report from {node['name']}")
         version = active_readiness.get("package_version")
@@ -2565,13 +2859,40 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
                 )
             )
             or type(active_readiness.get("doctor")) is not bool
-            or type(active_readiness.get("central_status_ok")) is not bool
+        ):
+            fail(f"invalid active PVN readiness report from {node['name']}")
+        if node.get("id") == 0:
+            databases = active_readiness.get("standalone_databases")
+            if (
+                not isinstance(databases, list)
+                or len(databases) != len(STANDALONE_DATABASE_SOCKETS)
+                or any(not isinstance(row, dict) for row in databases)
+                or [row.get("database") for row in databases]
+                != list(STANDALONE_DATABASE_SOCKETS)
+            ):
+                fail(f"invalid standalone database readiness from {node['name']}")
+            for row in databases:
+                if (
+                    set(row)
+                    != {"database", "schema_version", "schema_checksum", "socket"}
+                    or row.get("socket")
+                    != STANDALONE_DATABASE_SOCKETS[row["database"]]
+                    or not isinstance(row.get("schema_version"), str)
+                    or not 1 <= len(row["schema_version"]) <= 200
+                    or "\n" in row["schema_version"]
+                    or not isinstance(row.get("schema_checksum"), str)
+                    or not 1 <= len(row["schema_checksum"]) <= 200
+                    or "\n" in row["schema_checksum"]
+                ):
+                    fail(f"invalid standalone database identity from {node['name']}")
+        elif (
+            type(active_readiness.get("central_status_ok")) is not bool
             or (
                 active_readiness.get("central_status") is not None
                 and not isinstance(active_readiness.get("central_status"), dict)
             )
         ):
-            fail(f"invalid active PVN readiness report from {node['name']}")
+            fail(f"invalid clustered central readiness from {node['name']}")
     elif active_readiness is not None:
         fail(f"inactive node {node['name']} unexpectedly reported active PVN readiness")
     journal = report.get("journal")
@@ -2633,8 +2954,29 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
         ):
             fail(f"invalid configured MTU on {node['name']} {role}")
     management = report.get("management")
-    if not isinstance(management, dict) or not management.get("default_routes"):
+    if (
+        not isinstance(management, dict)
+        or set(management) != {"interface", "address", "default_routes"}
+        or not isinstance(management.get("interface"), str)
+        or not SAFE_NAME.fullmatch(management["interface"])
+        or not isinstance(management.get("address"), str)
+        or not isinstance(management.get("default_routes"), list)
+        or not management["default_routes"]
+        or any(not isinstance(route, dict) for route in management["default_routes"])
+    ):
         fail(f"invalid management/default-route report from {node['name']}")
+    try:
+        management_address = ipaddress.ip_interface(management.get("address"))
+    except ValueError:
+        fail(f"invalid management address from {node['name']}")
+    if (
+        not isinstance(management_address, ipaddress.IPv4Interface)
+        or (
+            node.get("ip") is not None
+            and str(management_address.ip) != node["ip"]
+        )
+    ):
+        fail(f"management address differs from PVE membership on {node['name']}")
     if report["geneve"]["interface"] == report["provider"]["interface"]:
         fail(f"Geneve and provider use the same NIC on {node['name']}")
     return report
@@ -3083,6 +3425,47 @@ def unused_corosync_ring(rings: dict[int, Any]) -> int:
 def build_plan(
     cluster_name: str, nodes: list[dict[str, Any]], reports: list[dict[str, Any]], spec: dict[str, Any]
 ) -> dict[str, Any]:
+    if len(nodes) == 1 and nodes[0].get("id") == 0:
+        if len(reports) != 1 or any(
+            reports[0].get(key) is not None
+            for key in (
+                "corosync_sha256", "corosync_text",
+                "corosync_package_version", "corosync_runtime",
+            )
+        ):
+            fail("standalone topology unexpectedly exposes Corosync state")
+        for role in ("geneve", "provider"):
+            value = reports[0][role]
+            configured = value.get("configured_mtu")
+            restorable = min(value["mtu"], value["max_mtu"])
+            if configured is not None and configured > restorable:
+                fail(
+                    f"configured MTU {configured} on {reports[0]['node']} {role} NIC "
+                    f"{value['interface']} exceeds its live-restorable MTU {restorable}; "
+                    "normalize the original PVE interface MTU before apply"
+                )
+        effective = min(
+            reports[0][role]["mtu"] for role in ("geneve", "provider")
+        )
+        requested_effective = spec.get("effective_underlay_mtu")
+        if requested_effective is not None and requested_effective != effective:
+            fail(
+                f"effective underlay MTU changed from {requested_effective} to "
+                f"{effective} after preflight"
+            )
+        ceiling = effective - 100
+        default_guest = (ceiling // 100) * 100
+        if default_guest < 1280:
+            fail(
+                f"effective underlay MTU {effective} cannot support a safe overlay guest MTU"
+            )
+        return {
+            "corosync": None,
+            "corosync_package_version": None,
+            "effective_underlay_mtu": effective,
+            "guest_mtu_ceiling": ceiling,
+            "default_guest_mtu": default_guest,
+        }
     validate_corosync_node_count(len(nodes))
     corosync_package_versions = {
         report["corosync_package_version"] for report in reports
@@ -3377,7 +3760,17 @@ def topology_corosync_pin(
     cluster_name: str,
     nodes: list[dict[str, Any]],
     reports: list[dict[str, Any]],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
+    if len(nodes) == 1 and nodes[0].get("id") == 0:
+        if len(reports) != 1 or any(
+            reports[0].get(key) is not None
+            for key in (
+                "corosync_sha256", "corosync_text",
+                "corosync_package_version", "corosync_runtime",
+            )
+        ):
+            fail("standalone topology unexpectedly exposes Corosync state")
+        return None
     text = reports[0]["corosync_text"]
     sha256 = reports[0]["corosync_sha256"]
     if any(
@@ -3471,7 +3864,7 @@ def validate_active_control_ledger(
     reports: list[dict[str, Any]],
     membership_guard: dict[str, Any],
     topology_schema: int,
-    corosync: dict[str, Any],
+    corosync: dict[str, Any] | None,
     journal_bridge_exact: bool,
     candidate_corosync_exact: bool,
     expected_legacy: dict[str, Any],
@@ -3525,17 +3918,22 @@ def validate_active_control_ledger(
             or any(not isinstance(value, str) or not SHA256.fullmatch(value) for value in pins.values())
         ):
             fail("active control-plane certificate pins are malformed")
+    standalone = is_standalone_guard(membership_guard)
     control_id = ledger.get("control_db_cluster_id")
     db_ids = ledger.get("db_cluster_ids")
-    expected_dbs = {"PVN_Control", "OVN_Northbound", "OVN_Southbound"}
-    if (
-        not canonical_uuid(control_id)
-        or not isinstance(db_ids, dict)
-        or set(db_ids) != expected_dbs
-        or db_ids.get("PVN_Control") != control_id
-        or any(not canonical_uuid(value) for value in db_ids.values())
-    ):
-        fail("active control-plane database identities are incomplete")
+    if standalone:
+        if control_id is not None or db_ids != {}:
+            fail("standalone control-plane ledger unexpectedly pins Raft identities")
+    else:
+        expected_dbs = {"PVN_Control", "OVN_Northbound", "OVN_Southbound"}
+        if (
+            not canonical_uuid(control_id)
+            or not isinstance(db_ids, dict)
+            or set(db_ids) != expected_dbs
+            or db_ids.get("PVN_Control") != control_id
+            or any(not canonical_uuid(value) for value in db_ids.values())
+        ):
+            fail("active control-plane database identities are incomplete")
     snapshot = ledger.get("snapshot")
     snapshot_keys = {
         "mode", "confirmation", "cluster_name", "members_version",
@@ -3543,33 +3941,48 @@ def validate_active_control_ledger(
     }
     if not isinstance(snapshot, dict) or set(snapshot) != snapshot_keys:
         fail("active control-plane snapshot is missing")
-    live_cluster_version = membership_guard.get("cluster_version")
     pinned_cluster_version = snapshot.get("cluster_version")
-    legacy_version_bridge = (
-        topology_schema in {1, 2}
-        and snapshot.get("topology_sha256") == legacy_sha256
-        and type(pinned_cluster_version) is int
-        and pinned_cluster_version >= 0
-        and type(live_cluster_version) is int
-        and live_cluster_version == pinned_cluster_version + 1
-        and corosync.get("config_version") == live_cluster_version
-        and journal_bridge_exact
-        and candidate_corosync_exact
-    )
-    if (
-        membership_guard.get("mode") != "cluster"
-        or snapshot.get("mode") != "raft"
-        or snapshot.get("confirmation") != cluster_name
-        or snapshot.get("cluster_name") != cluster_name
-        or type(snapshot.get("members_version")) is not int
-        or snapshot["members_version"] < 0
-        or (
-            pinned_cluster_version != live_cluster_version
-            and not legacy_version_bridge
+    if standalone:
+        legacy_version_bridge = False
+        snapshot_identity_exact = (
+            snapshot.get("mode") == "standalone"
+            and snapshot.get("confirmation") == cluster_name
+            and snapshot.get("cluster_name") == cluster_name
+            and type(snapshot.get("members_version")) is int
+            and snapshot["members_version"] >= 0
+            and pinned_cluster_version == 0
+            and snapshot.get("guest_mtu") == expected_legacy["guest_mtu"]
+            and snapshot.get("physnet") == expected_legacy["physnet"]
         )
-        or snapshot.get("guest_mtu") != expected_legacy["guest_mtu"]
-        or snapshot.get("physnet") != expected_legacy["physnet"]
-    ):
+    else:
+        live_cluster_version = membership_guard.get("cluster_version")
+        legacy_version_bridge = (
+            topology_schema in {1, 2}
+            and snapshot.get("topology_sha256") == legacy_sha256
+            and type(pinned_cluster_version) is int
+            and pinned_cluster_version >= 0
+            and type(live_cluster_version) is int
+            and live_cluster_version == pinned_cluster_version + 1
+            and isinstance(corosync, dict)
+            and corosync.get("config_version") == live_cluster_version
+            and journal_bridge_exact
+            and candidate_corosync_exact
+        )
+        snapshot_identity_exact = (
+            membership_guard.get("mode") == "cluster"
+            and snapshot.get("mode") == "raft"
+            and snapshot.get("confirmation") == cluster_name
+            and snapshot.get("cluster_name") == cluster_name
+            and type(snapshot.get("members_version")) is int
+            and snapshot["members_version"] >= 0
+            and (
+                pinned_cluster_version == live_cluster_version
+                or legacy_version_bridge
+            )
+            and snapshot.get("guest_mtu") == expected_legacy["guest_mtu"]
+            and snapshot.get("physnet") == expected_legacy["physnet"]
+        )
+    if not snapshot_identity_exact:
         fail("active control-plane snapshot differs from the topology identity")
     if snapshot.get("topology_sha256") not in {legacy_sha256, candidate_sha256}:
         fail("active control-plane snapshot does not pin the legacy/candidate topology")
@@ -3638,6 +4051,44 @@ ACTIVE_DATABASE_PORTS = {
 }
 
 
+def package_rollout_readiness_issues(
+    readiness: list[dict[str, Any]],
+    topology_schema: int,
+    control_state: dict[str, Any],
+    live_version: str | None,
+) -> list[str]:
+    issues: list[str] = []
+    pinned_version = control_state["package_version"]
+    topology_pin = control_state["topology_pin"]
+    markers = [item["central_restart_pending"] for item in readiness]
+    markers_pending = live_version is not None and all(
+        marker == live_version for marker in markers
+    )
+    markers_consumed = all(marker is None for marker in markers)
+    live_is_newer = (
+        live_version is not None
+        and debian_version_greater(live_version, pinned_version)
+    )
+    if topology_schema == 1:
+        if topology_pin != "legacy":
+            issues.append("schema 1 topology is not pinned as the legacy control snapshot")
+        if not live_is_newer:
+            issues.append("installed pvn-node is not uniformly newer than the control snapshot")
+        if not markers_pending:
+            issues.append("every central restart marker must pin the installed newer package")
+    elif live_is_newer:
+        if not markers_pending:
+            issues.append("schema 2 package rollout requires every central restart marker")
+    elif live_version == pinned_version:
+        if topology_pin != "candidate":
+            issues.append("equal-package schema 2 requires the candidate control snapshot pin")
+        if not (markers_pending or markers_consumed):
+            issues.append("post-repin restart markers are neither all pending nor all consumed")
+    else:
+        issues.append("schema 2 installed package is mixed, older, or unrelated to its control pin")
+    return issues
+
+
 def active_upgrade_readiness_issues(
     nodes: list[dict[str, Any]],
     reports: list[dict[str, Any]],
@@ -3653,6 +4104,28 @@ def active_upgrade_readiness_issues(
     live_version = next(iter(live_versions)) if len(live_versions) == 1 else None
     if live_version is None:
         issues.append("installed pvn-node versions are not uniform across every node")
+
+    standalone = len(nodes) == 1 and nodes[0].get("id") == 0
+    if standalone:
+        item = readiness[0]
+        if item["doctor"] is not True:
+            issues.append(f"fresh pvnctl doctor failed on {nodes[0]['name']}")
+        databases = item["standalone_databases"]
+        if (
+            [row.get("database") for row in databases]
+            != list(STANDALONE_DATABASE_SOCKETS)
+            or any(
+                row.get("socket") != STANDALONE_DATABASE_SOCKETS[row["database"]]
+                for row in databases
+            )
+        ):
+            issues.append(
+                f"standalone database identity drifted on {nodes[0]['name']}"
+            )
+        issues.extend(package_rollout_readiness_issues(
+            readiness, topology_schema, control_state, live_version,
+        ))
+        return issues
 
     for node, item in zip(nodes, readiness):
         if item["doctor"] is not True:
@@ -3748,34 +4221,9 @@ def active_upgrade_readiness_issues(
                     f"{database} follower {follower_node['name']} reports a different leader"
                 )
 
-    pinned_version = control_state["package_version"]
-    topology_pin = control_state["topology_pin"]
-    markers = [item["central_restart_pending"] for item in readiness]
-    markers_pending = live_version is not None and all(
-        marker == live_version for marker in markers
-    )
-    markers_consumed = all(marker is None for marker in markers)
-    live_is_newer = (
-        live_version is not None
-        and debian_version_greater(live_version, pinned_version)
-    )
-    if topology_schema == 1:
-        if topology_pin != "legacy":
-            issues.append("schema 1 topology is not pinned as the legacy control snapshot")
-        if not live_is_newer:
-            issues.append("installed pvn-node is not uniformly newer than the control snapshot")
-        if not markers_pending:
-            issues.append("every central restart marker must pin the installed newer package")
-    elif live_is_newer:
-        if not markers_pending:
-            issues.append("schema 2 package rollout requires every central restart marker")
-    elif live_version == pinned_version:
-        if topology_pin != "candidate":
-            issues.append("equal-package schema 2 requires the candidate control snapshot pin")
-        if not (markers_pending or markers_consumed):
-            issues.append("post-repin restart markers are neither all pending nor all consumed")
-    else:
-        issues.append("schema 2 installed package is mixed, older, or unrelated to its control pin")
+    issues.extend(package_rollout_readiness_issues(
+        readiness, topology_schema, control_state, live_version,
+    ))
     return issues
 
 
@@ -3794,7 +4242,7 @@ def build_active_ledger_upgrade_plan(
         fail("active PVN requires Corosync migration; deactivate it before topology repair")
     expected_package = topology_plan["corosync_package_version"]
     if {report["corosync_package_version"] for report in reports} != {expected_package}:
-        fail("active Corosync package versions are not one exact value")
+        fail("active topology package boundary is not one exact value")
     corosync = topology_corosync_pin(cluster_name, nodes, reports)
     for node, report in zip(nodes, reports):
         journal = report.get("journal")
@@ -3810,6 +4258,7 @@ def build_active_ledger_upgrade_plan(
             or journal.get("management") != report["management"]
             or journal.get("geneve") != report["geneve"]
             or journal.get("provider") != report["provider"]
+            or "before_corosync_sha256" not in journal
             or journal.get("before_corosync_sha256") != report["corosync_sha256"]
             or journal.get("desired_interfaces_sha256") != report["interfaces_sha256"]
             or report.get("pending_interfaces_sha256") is not None
@@ -3846,6 +4295,8 @@ def build_active_ledger_upgrade_plan(
         upgrade_required = True
     elif schema == 2:
         projection = copy.deepcopy(previous)
+        if "corosync" not in projection:
+            fail("schema 2 topology ledger has no explicit Corosync pin")
         pinned = projection.pop("corosync", None)
         projection["schema"] = 1
         if projection != expected_legacy or pinned != corosync:
@@ -3860,8 +4311,12 @@ def build_active_ledger_upgrade_plan(
         previous_text != candidate_text or previous_sha256 != candidate_sha256
     ):
         fail("schema 2 topology ledger is not the exact canonical candidate")
-    journal_bridge_exact = active_journal_bridge_exact(
-        nodes, reports, spec, transaction, corosync,
+    journal_bridge_exact = (
+        True
+        if corosync is None
+        else active_journal_bridge_exact(
+            nodes, reports, spec, transaction, corosync,
+        )
     )
     control_state = validate_active_control_ledger(
         cluster_name, nodes, reports, membership_guard, schema, corosync,
@@ -3920,7 +4375,9 @@ def print_plan(
             f"hardware-max-mtu={min(report['geneve']['max_mtu'], report['provider']['max_mtu'])} "
             f"state={report['network_state']}"
         )
-    if plan["corosync"]:
+    if len(nodes) == 1 and nodes[0].get("id") == 0:
+        print("  Corosync: standalone (not configured)")
+    elif plan["corosync"]:
         stages = plan["corosync"]["stages"]
         names = " -> ".join(stage["name"] for stage in stages)
         print(
@@ -4134,7 +4591,7 @@ def require_shared_corosync_hash(
 
 
 def require_corosync_package_version(
-    reports: list[dict[str, Any]], expected_version: str
+    reports: list[dict[str, Any]], expected_version: str | None
 ) -> None:
     versions = {report["corosync_package_version"] for report in reports}
     if versions != {expected_version}:
@@ -4503,54 +4960,68 @@ def apply_topology(
     require_corosync_package_version(
         reports, plan["corosync_package_version"]
     )
-    final_corosync_text = reports[0]["corosync_text"]
-    final_corosync_sha256 = reports[0]["corosync_sha256"]
-    if any(
-        report["corosync_text"] != final_corosync_text
-        or report["corosync_sha256"] != final_corosync_sha256
-        for report in reports[1:]
-    ):
-        fail("shared Corosync config drifted before network mutation")
-    if not runtime_matches_config(
-        cluster_name, nodes, reports, final_corosync_text
-    ):
-        fail("Corosync persisted/runtime state is not exact before network mutation")
-    final_corosync_version, final_corosync_rings = parse_corosync(
-        final_corosync_text, {node["name"] for node in nodes}, cluster_name
-    )
-    final_geneve_addresses = {
-        node["name"]: report["geneve"]["address"].split("/", 1)[0]
-        for node, report in zip(nodes, reports)
-    }
-    final_management_addresses = {node["name"]: node["ip"] for node in nodes}
-    management_ring_count = 0
-    for ring, addresses in final_corosync_rings.items():
-        if all(
-            address_matches(
-                addresses[node["name"]], node,
-                final_geneve_addresses[node["name"]],
+    if is_standalone_guard(membership_guard):
+        if any(
+            report.get(key) is not None
+            for report in reports
+            for key in (
+                "corosync_sha256", "corosync_text",
+                "corosync_package_version", "corosync_runtime",
             )
-            for node in nodes
         ):
-            fail(f"Corosync ring{ring} still uses Geneve before network mutation")
-        if all(
-            address_matches(
-                addresses[node["name"]], node,
-                final_management_addresses[node["name"]],
-            )
-            for node in nodes
+            fail("standalone topology gained unexpected Corosync state")
+        final_corosync_text = None
+        final_corosync_sha256 = None
+        final_corosync_ledger = None
+    else:
+        final_corosync_text = reports[0]["corosync_text"]
+        final_corosync_sha256 = reports[0]["corosync_sha256"]
+        if any(
+            report["corosync_text"] != final_corosync_text
+            or report["corosync_sha256"] != final_corosync_sha256
+            for report in reports[1:]
         ):
-            management_ring_count += 1
-    if migration is not None and management_ring_count != 1:
-        fail("Corosync migration did not leave exactly one management ring")
-    final_corosync_ledger = {
-        "sha256": final_corosync_sha256,
-        "config_version": final_corosync_version,
-        "rings": {
-            str(ring): dict(sorted(addresses.items()))
-            for ring, addresses in sorted(final_corosync_rings.items())
-        },
-    }
+            fail("shared Corosync config drifted before network mutation")
+        if not runtime_matches_config(
+            cluster_name, nodes, reports, final_corosync_text
+        ):
+            fail("Corosync persisted/runtime state is not exact before network mutation")
+        final_corosync_version, final_corosync_rings = parse_corosync(
+            final_corosync_text, {node["name"] for node in nodes}, cluster_name
+        )
+        final_geneve_addresses = {
+            node["name"]: report["geneve"]["address"].split("/", 1)[0]
+            for node, report in zip(nodes, reports)
+        }
+        final_management_addresses = {node["name"]: node["ip"] for node in nodes}
+        management_ring_count = 0
+        for ring, addresses in final_corosync_rings.items():
+            if all(
+                address_matches(
+                    addresses[node["name"]], node,
+                    final_geneve_addresses[node["name"]],
+                )
+                for node in nodes
+            ):
+                fail(f"Corosync ring{ring} still uses Geneve before network mutation")
+            if all(
+                address_matches(
+                    addresses[node["name"]], node,
+                    final_management_addresses[node["name"]],
+                )
+                for node in nodes
+            ):
+                management_ring_count += 1
+        if migration is not None and management_ring_count != 1:
+            fail("Corosync migration did not leave exactly one management ring")
+        final_corosync_ledger = {
+            "sha256": final_corosync_sha256,
+            "config_version": final_corosync_version,
+            "rings": {
+                str(ring): dict(sorted(addresses.items()))
+                for ring, addresses in sorted(final_corosync_rings.items())
+            },
+        }
     requests: dict[str, dict[str, Any]] = {}
     for node, report in zip(nodes, reports):
         request = dict(base[node["name"]])
@@ -4632,7 +5103,17 @@ def apply_topology(
         incomplete = [report["node"] for report in final_reports if report["network_state"] != "desired"]
         if incomplete:
             fail("final exact-state sweep failed on: " + ", ".join(incomplete))
-        if any(
+        if is_standalone_guard(membership_guard):
+            if any(
+                report.get(key) is not None
+                for report in final_reports
+                for key in (
+                    "corosync_sha256", "corosync_text",
+                    "corosync_package_version", "corosync_runtime",
+                )
+            ):
+                fail("standalone topology gained Corosync before ledger publication")
+        elif any(
             report["corosync_sha256"] != final_corosync_sha256
             or report["corosync_text"] != final_corosync_text
             for report in final_reports
@@ -4727,7 +5208,7 @@ def main() -> int:
             fail(f"apply requires exact --confirm {cluster_name}")
     elif args.provider_port_ready or args.confirm is not None:
         fail("--provider-port-ready and --confirm are apply-only")
-    validate_ssh_files(nodes)
+    validate_ssh_files(nodes, membership_snapshot)
 
     spec = {
         "cluster_name": cluster_name,
@@ -4750,6 +5231,18 @@ def main() -> int:
         reports = probe_all(
             cluster_name, nodes, spec, transaction, membership_snapshot
         )
+        if is_standalone_guard(membership_snapshot):
+            if len(nodes) != 1 or len(reports) != 1 or nodes[0].get("id") != 0:
+                fail("standalone discovery did not produce exactly one local node")
+            try:
+                management = ipaddress.ip_interface(
+                    reports[0]["management"]["address"]
+                )
+            except ValueError:
+                fail("standalone management probe returned an invalid address")
+            if not isinstance(management, ipaddress.IPv4Interface):
+                fail("standalone management probe did not return IPv4")
+            nodes[0]["ip"] = str(management.ip)
         activation_modes = {
             activation_report_mode(report.get("activation")) for report in reports
         }
@@ -4785,7 +5278,16 @@ def main() -> int:
                 for error in active_upgrade["prerequisite_errors"]:
                     print(f"    - {error}")
             else:
-                print("  Upgrade readiness: READY (package, restart marker, doctor, and Raft N/N)")
+                if is_standalone_guard(membership_snapshot):
+                    print(
+                        "  Upgrade readiness: READY (package, restart marker, "
+                        "doctor, and exact standalone databases)"
+                    )
+                else:
+                    print(
+                        "  Upgrade readiness: READY (package, restart marker, "
+                        "doctor, and Raft N/N)"
+                    )
             if active_upgrade["legacy_cluster_version_bridge"]:
                 print(
                     "  Recovery bridge: control snapshot cluster_version is exactly one "

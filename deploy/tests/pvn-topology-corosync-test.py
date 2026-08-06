@@ -137,7 +137,7 @@ remote["verify_membership_snapshot"]({
         {"name": "prox1", "node_id": 2, "management_ip": "192.168.0.80"},
         {"name": "prox3", "node_id": 3, "management_ip": "192.168.0.78"},
     ],
-})
+}, "cluster", "prox2")
 
 active_state = {
     "markers": {
