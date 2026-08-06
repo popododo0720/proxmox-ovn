@@ -19,6 +19,7 @@ from typing import Any
 
 
 MAX_CONFIG_BYTES = 1024 * 1024
+MAX_MARKER_BYTES = 256
 MAX_COMMAND_OUTPUT = 64 * 1024
 COMMAND_TIMEOUT_SECONDS = 10
 WAIT_SECONDS = 120
@@ -36,6 +37,11 @@ OVN_APPCTL = os.environ.get("PVN_NORTHD_OVN_APPCTL", "/usr/bin/ovn-appctl")
 OVN_NBCTL = os.environ.get("PVN_NORTHD_OVN_NBCTL", "/usr/bin/ovn-nbctl")
 OVN_SBCTL = os.environ.get("PVN_NORTHD_OVN_SBCTL", "/usr/bin/ovn-sbctl")
 SYSTEMCTL = os.environ.get("PVN_NORTHD_SYSTEMCTL", "/usr/bin/systemctl")
+DPKG_QUERY = os.environ.get("PVN_NORTHD_DPKG_QUERY", "/usr/bin/dpkg-query")
+RESTART_STATE_DIRECTORY = pathlib.Path(
+    os.environ.get("PVN_NORTHD_RESTART_STATE_DIR", "/var/lib/pvn-node")
+)
+RESTART_MARKER = RESTART_STATE_DIRECTORY / "central-restart-pending"
 NORTHD_DB_PARAMS = pathlib.Path(
     os.environ.get(
         "PVN_NORTHD_DB_PARAMS", "/etc/ovn/ovn-northd-db-params.conf"
@@ -47,8 +53,16 @@ class NorthdError(RuntimeError):
     pass
 
 
+class FatalNorthdError(NorthdError):
+    pass
+
+
 def fail(message: str) -> "NoReturn":
     raise NorthdError(message)
+
+
+def fatal(message: str) -> "NoReturn":
+    raise FatalNorthdError(message)
 
 
 def duplicate_safe_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -263,6 +277,8 @@ def run_bounded(
         "OVN_SB_DB",
         "OVN_SBCTL_OPTIONS",
         "OVN_SB_DAEMON",
+        "DPKG_ROOT",
+        "DPKG_ADMINDIR",
     ):
         environment.pop(key, None)
     try:
@@ -360,10 +376,12 @@ class Status:
     nb_sb_cfg: int
     sb_nb_cfg: int
 
+    @property
+    def synchronized(self) -> bool:
+        return self.nb_cfg == self.nb_sb_cfg and self.nb_cfg == self.sb_nb_cfg
 
-def check_status(
-    config: Connections, deadline: float | None = None
-) -> Status:
+
+def check_local_status(deadline: float | None = None) -> str:
     run_bounded(
         [SYSTEMCTL, "is-active", "--quiet", "ovn-northd.service"],
         command_timeout(deadline),
@@ -390,7 +408,13 @@ def check_status(
     )
     if raw_status not in {"Status: active", "Status: standby"}:
         fail(f"northd reported an invalid active/standby status: {raw_status!r}")
-    role = raw_status.removeprefix("Status: ")
+    return raw_status.removeprefix("Status: ")
+
+
+def observe_status(
+    config: Connections, deadline: float | None = None
+) -> Status:
+    role = check_local_status(deadline)
     nb_base = [
         OVN_NBCTL,
         "--timeout=10",
@@ -418,13 +442,231 @@ def check_status(
         "SB_Global.nb_cfg",
         deadline,
     )
-    if nb_cfg != nb_sb_cfg or nb_cfg != sb_nb_cfg:
-        fail(
-            "northd configuration synchronization is incomplete: "
-            f"NB_Global.nb_cfg={nb_cfg} NB_Global.sb_cfg={nb_sb_cfg} "
-            f"SB_Global.nb_cfg={sb_nb_cfg}"
+    return Status(
+        role=role,
+        nb_cfg=nb_cfg,
+        nb_sb_cfg=nb_sb_cfg,
+        sb_nb_cfg=sb_nb_cfg,
+    )
+
+
+def synchronization_error(status: Status) -> str:
+    return (
+        "northd configuration synchronization is incomplete: "
+        f"NB_Global.nb_cfg={status.nb_cfg} "
+        f"NB_Global.sb_cfg={status.nb_sb_cfg} "
+        f"SB_Global.nb_cfg={status.sb_nb_cfg}"
+    )
+
+
+def check_status(
+    config: Connections, deadline: float | None = None
+) -> Status:
+    status = observe_status(config, deadline)
+    if not status.synchronized:
+        fail(synchronization_error(status))
+    return status
+
+
+def validate_restart_directory(metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        fatal(f"restart state must be a real directory: {RESTART_STATE_DIRECTORY}")
+    if (
+        metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fatal(
+            "restart state must be root:root mode 0700: "
+            f"{RESTART_STATE_DIRECTORY}"
         )
-    return Status(role=role, nb_cfg=nb_cfg, nb_sb_cfg=nb_sb_cfg, sb_nb_cfg=sb_nb_cfg)
+
+
+def validate_restart_marker(metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fatal(f"restart marker must be a regular non-symlink file: {RESTART_MARKER}")
+    if metadata.st_nlink != 1:
+        fatal(f"restart marker must have exactly one hard link: {RESTART_MARKER}")
+    if (
+        metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        fatal(f"restart marker must be root:root mode 0600: {RESTART_MARKER}")
+    if metadata.st_size > MAX_MARKER_BYTES:
+        fatal(f"restart marker exceeds {MAX_MARKER_BYTES} bytes: {RESTART_MARKER}")
+
+
+def read_restart_marker() -> str | None:
+    try:
+        directory_before = RESTART_STATE_DIRECTORY.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        fatal(f"cannot inspect restart state {RESTART_STATE_DIRECTORY}: {error}")
+    validate_restart_directory(directory_before)
+    directory_identity = (directory_before.st_dev, directory_before.st_ino)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    try:
+        directory_descriptor = os.open(RESTART_STATE_DIRECTORY, directory_flags)
+    except OSError as error:
+        fatal(f"cannot open restart state {RESTART_STATE_DIRECTORY}: {error}")
+    try:
+        directory_opened = os.fstat(directory_descriptor)
+        validate_restart_directory(directory_opened)
+        if (directory_opened.st_dev, directory_opened.st_ino) != directory_identity:
+            fatal(f"restart state changed identity: {RESTART_STATE_DIRECTORY}")
+        try:
+            marker_before = os.stat(
+                RESTART_MARKER.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                directory_after_missing = RESTART_STATE_DIRECTORY.lstat()
+            except OSError as error:
+                fatal(
+                    "restart state changed while checking for its marker: "
+                    f"{error}"
+                )
+            validate_restart_directory(directory_after_missing)
+            if (
+                directory_after_missing.st_dev,
+                directory_after_missing.st_ino,
+            ) != directory_identity:
+                fatal(f"restart state changed identity: {RESTART_STATE_DIRECTORY}")
+            return None
+        except OSError as error:
+            fatal(f"cannot inspect restart marker {RESTART_MARKER}: {error}")
+        validate_restart_marker(marker_before)
+        marker_identity = (marker_before.st_dev, marker_before.st_ino)
+        marker_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            marker_flags |= os.O_NOFOLLOW
+        try:
+            marker_descriptor = os.open(
+                RESTART_MARKER.name,
+                marker_flags,
+                dir_fd=directory_descriptor,
+            )
+        except OSError as error:
+            fatal(f"cannot open restart marker {RESTART_MARKER}: {error}")
+        try:
+            marker_opened = os.fstat(marker_descriptor)
+            validate_restart_marker(marker_opened)
+            if (marker_opened.st_dev, marker_opened.st_ino) != marker_identity:
+                fatal(f"restart marker changed identity: {RESTART_MARKER}")
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = os.read(
+                    marker_descriptor,
+                    min(4096, MAX_MARKER_BYTES + 1 - size),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_MARKER_BYTES:
+                    fatal(
+                        f"restart marker exceeds {MAX_MARKER_BYTES} bytes: "
+                        f"{RESTART_MARKER}"
+                    )
+            marker_after = os.stat(
+                RESTART_MARKER.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            validate_restart_marker(marker_after)
+            if (marker_after.st_dev, marker_after.st_ino) != marker_identity:
+                fatal(f"restart marker changed while being read: {RESTART_MARKER}")
+        except OSError as error:
+            fatal(f"cannot read restart marker {RESTART_MARKER}: {error}")
+        finally:
+            os.close(marker_descriptor)
+        try:
+            path_after = RESTART_MARKER.lstat()
+            directory_after = RESTART_STATE_DIRECTORY.lstat()
+        except OSError as error:
+            fatal(f"restart marker path changed while being read: {error}")
+        validate_restart_marker(path_after)
+        validate_restart_directory(directory_after)
+        if (path_after.st_dev, path_after.st_ino) != marker_identity:
+            fatal(f"restart marker path changed identity: {RESTART_MARKER}")
+        if (directory_after.st_dev, directory_after.st_ino) != directory_identity:
+            fatal(f"restart state changed identity: {RESTART_STATE_DIRECTORY}")
+    finally:
+        os.close(directory_descriptor)
+    try:
+        raw = b"".join(chunks).decode("ascii")
+    except UnicodeError as error:
+        fatal(f"restart marker is not ASCII: {RESTART_MARKER}: {error}")
+    lines = raw.splitlines()
+    if len(lines) != 1 or raw != lines[0] + "\n":
+        fatal(f"restart marker must contain exactly one version line: {RESTART_MARKER}")
+    version = lines[0]
+    if not re.fullmatch(r"[A-Za-z0-9.+:~_-]{1,128}", version):
+        fatal(f"restart marker contains an unsafe version: {RESTART_MARKER}")
+    return version
+
+
+def installed_package_version(deadline: float | None = None) -> str:
+    try:
+        output = run_bounded(
+            [
+                DPKG_QUERY,
+                "-W",
+                "-f=${Status}\\t${Version}\\n",
+                "pvn-node",
+            ],
+            command_timeout(deadline),
+        )
+    except NorthdError as error:
+        fatal(f"cannot verify the installed pvn-node version: {error}")
+    match = re.fullmatch(
+        r"install ok installed\t([A-Za-z0-9.+:~_-]{1,128})\n",
+        output,
+    )
+    if match is None:
+        fatal("dpkg-query returned an invalid installed pvn-node record")
+    return match.group(1)
+
+
+def transition_marker_matches(deadline: float | None = None) -> bool:
+    marker_version = read_restart_marker()
+    if marker_version is None:
+        return False
+    installed_version = installed_package_version(deadline)
+    if marker_version != installed_version:
+        fatal(
+            "restart marker does not match installed pvn-node: "
+            f"marker={marker_version!r} installed={installed_version!r}"
+        )
+    return True
+
+
+def transition_standby_ready(
+    config: Connections,
+    status: Status,
+    deadline: float | None = None,
+) -> bool:
+    if len(config.northbound) < 3 or status.role != "standby":
+        return False
+    if not transition_marker_matches(deadline):
+        return False
+    # Close the useful race window between observing a standby and accepting
+    # transition-only readiness.  A role change to active returns to the
+    # strict cfg gate on the next wait iteration.
+    if check_local_status(deadline) != "standby":
+        return False
+    if not transition_marker_matches(deadline):
+        return False
+    return check_local_status(deadline) == "standby"
 
 
 def start(config: Connections) -> "NoReturn":
@@ -457,14 +699,29 @@ def emit_status(status: Status) -> None:
     )
 
 
+def emit_transition_status(status: Status) -> None:
+    print(
+        "PVN_NORTHD "
+        f"role={status.role} nb=connected sb=connected "
+        "cfg=pending transition=central-restart-pending"
+    )
+
+
 def wait_ready(config: Connections) -> None:
     deadline = time.monotonic() + WAIT_SECONDS
     last_error = "northd readiness has not been checked"
     while True:
         try:
-            status = check_status(config, deadline)
-            emit_status(status)
-            return
+            status = observe_status(config, deadline)
+            if status.synchronized:
+                emit_status(status)
+                return
+            if transition_standby_ready(config, status, deadline):
+                emit_transition_status(status)
+                return
+            fail(synchronization_error(status))
+        except FatalNorthdError:
+            raise
         except NorthdError as error:
             last_error = str(error)
         remaining = deadline - time.monotonic()

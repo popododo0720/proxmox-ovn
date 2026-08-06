@@ -12,6 +12,7 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 HELPER = REPO / "deploy/scripts/pvn-ovn-northd"
+HELPER_SOURCE = HELPER.read_text(encoding="utf-8")
 
 
 def check(condition: bool, message: str) -> None:
@@ -43,6 +44,11 @@ with tempfile.TemporaryDirectory() as temporary:
     appctl = root / "ovn-appctl"
     nbctl = root / "ovn-nbctl"
     sbctl = root / "ovn-sbctl"
+    dpkg_query = root / "dpkg-query"
+    role_counter = root / "role-counter"
+    restart_directory = root / "pvn-node"
+    restart_directory.mkdir(mode=0o700)
+    restart_marker = restart_directory / "central-restart-pending"
     db_params = root / "ovn-northd-db-params.conf"
 
     write_executable(
@@ -61,14 +67,28 @@ pathlib.Path(os.environ["FAKE_START_CALLS"]).write_text(json.dumps(sys.argv[1:])
     )
     write_executable(
         appctl,
-        """#!/bin/sh
-[ "$1 $2" = "-t ovn-northd" ] || exit 2
-case "$3" in
-  nb-connection-status) printf '%s\n' "${FAKE_NB_CONNECTION:-connected}" ;;
-  sb-connection-status) printf '%s\n' "${FAKE_SB_CONNECTION:-connected}" ;;
-  status) printf 'Status: %s\n' "${FAKE_ROLE:-active}" ;;
-  *) exit 2 ;;
-esac
+        """#!/usr/bin/python3
+import os, pathlib, sys
+if sys.argv[1:3] != ["-t", "ovn-northd"] or len(sys.argv) != 4:
+    raise SystemExit(2)
+command = sys.argv[3]
+if command == "nb-connection-status":
+    print(os.environ.get("FAKE_NB_CONNECTION", "connected"))
+elif command == "sb-connection-status":
+    print(os.environ.get("FAKE_SB_CONNECTION", "connected"))
+elif command == "status":
+    sequence = os.environ.get("FAKE_ROLE_SEQUENCE", "")
+    if sequence:
+        roles = sequence.split(",")
+        counter = pathlib.Path(os.environ["FAKE_ROLE_COUNTER"])
+        index = int(counter.read_text(encoding="ascii")) if counter.exists() else 0
+        role = roles[min(index, len(roles) - 1)]
+        counter.write_text(str(index + 1), encoding="ascii")
+    else:
+        role = os.environ.get("FAKE_ROLE", "active")
+    print(f"Status: {role}")
+else:
+    raise SystemExit(2)
 """,
     )
     query_program = """#!/usr/bin/python3
@@ -91,6 +111,21 @@ print(value)
 """
     write_executable(nbctl, query_program)
     write_executable(sbctl, query_program)
+    write_executable(
+        dpkg_query,
+        """#!/usr/bin/python3
+import os, sys
+if sys.argv[1:] != ["-W", r"-f=${Status}\\t${Version}\\n", "pvn-node"]:
+    raise SystemExit(2)
+for name in ("DPKG_ROOT", "DPKG_ADMINDIR"):
+    if name in os.environ:
+        raise SystemExit(9)
+if os.environ.get("FAKE_DPKG_FAILURE") == "yes":
+    raise SystemExit(3)
+version = os.environ.get("FAKE_INSTALLED_VERSION", "0.2.16")
+print(f"install ok installed\\t{version}")
+""",
+    )
 
     environment = os.environ.copy()
     environment.update(
@@ -101,15 +136,20 @@ print(value)
             "PVN_NORTHD_OVN_NBCTL": str(nbctl),
             "PVN_NORTHD_OVN_SBCTL": str(sbctl),
             "PVN_NORTHD_SYSTEMCTL": str(systemctl),
+            "PVN_NORTHD_DPKG_QUERY": str(dpkg_query),
+            "PVN_NORTHD_RESTART_STATE_DIR": str(restart_directory),
             "PVN_NORTHD_DB_PARAMS": str(db_params),
             "FAKE_START_CALLS": str(calls),
             "FAKE_QUERY_CALLS": str(query_calls),
+            "FAKE_ROLE_COUNTER": str(role_counter),
             "OVN_NB_DB": "unix:/poisoned-nb.sock",
             "OVN_NBCTL_OPTIONS": "--db=unix:/poisoned-nb.sock",
             "OVN_NB_DAEMON": "poisoned",
             "OVN_SB_DB": "unix:/poisoned-sb.sock",
             "OVN_SBCTL_OPTIONS": "--db=unix:/poisoned-sb.sock",
             "OVN_SB_DAEMON": "poisoned",
+            "DPKG_ROOT": "/poisoned-root",
+            "DPKG_ADMINDIR": "/poisoned-admindir",
         }
     )
 
@@ -141,6 +181,31 @@ print(value)
             check=False,
             timeout=5,
         )
+
+    def wait_stays_blocked(extra: dict[str, str]) -> None:
+        current = environment.copy()
+        current.update(extra)
+        try:
+            subprocess.run(
+                [str(HELPER), "wait"],
+                env=current,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=0.35,
+            )
+        except subprocess.TimeoutExpired:
+            return
+        raise AssertionError("readiness wait unexpectedly completed")
+
+    def write_marker(version: str = "0.2.16") -> None:
+        restart_marker.unlink(missing_ok=True)
+        restart_marker.write_text(version + "\n", encoding="ascii")
+        restart_marker.chmod(0o600)
+
+    def remove_marker() -> None:
+        restart_marker.unlink(missing_ok=True)
+        role_counter.unlink(missing_ok=True)
 
     standalone_hosts = ["192.0.2.10"]
     write_config(config(standalone_hosts))
@@ -272,5 +337,200 @@ print(value)
 
     waiting = run("wait", {"FAKE_ROLE": "standby"})
     check(waiting.returncode == 0 and "role=standby" in waiting.stdout, "readiness wait rejected an immediately healthy standby")
+
+    write_config(config(raft_hosts))
+    write_marker()
+    transition_wait = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        transition_wait.returncode == 0
+        and transition_wait.stdout.strip()
+        == "PVN_NORTHD role=standby nb=connected sb=connected cfg=pending transition=central-restart-pending",
+        f"matching restart marker did not admit a connected clustered standby: {transition_wait.stderr}",
+    )
+    strict_during_transition = run(
+        "status",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        strict_during_transition.returncode != 0
+        and "synchronization is incomplete" in strict_during_transition.stderr,
+        "strict status accepted cfg drift merely because a restart marker existed",
+    )
+
+    already_synchronized = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_DPKG_FAILURE": "yes"},
+    )
+    check(
+        already_synchronized.returncode == 0
+        and already_synchronized.stdout.strip()
+        == "PVN_NORTHD role=standby nb=connected sb=connected cfg=42",
+        "synchronized wait unnecessarily depended on transition marker validation",
+    )
+
+    wait_stays_blocked({"FAKE_ROLE": "active", "FAKE_NB_CFG": "43"})
+    wait_stays_blocked(
+        {
+            "FAKE_ROLE": "standby",
+            "FAKE_NB_CFG": "43",
+            "FAKE_NB_CONNECTION": "not connected",
+        }
+    )
+    wait_stays_blocked(
+        {
+            "FAKE_ROLE": "standby",
+            "FAKE_SB_NB_CFG": "[42]",
+        }
+    )
+
+    role_counter.unlink(missing_ok=True)
+    wait_stays_blocked(
+        {
+            "FAKE_ROLE_SEQUENCE": "standby,standby,active",
+            "FAKE_NB_CFG": "43",
+        }
+    )
+
+    write_config(config(standalone_hosts))
+    wait_stays_blocked({"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"})
+    write_config(config(raft_hosts))
+
+    remove_marker()
+    wait_stays_blocked({"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"})
+
+    write_marker("0.2.15")
+    wrong_version = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        wrong_version.returncode != 0
+        and "does not match installed" in wrong_version.stderr,
+        "wait accepted a restart marker for another installed version",
+    )
+
+    write_marker()
+    dpkg_failure = run(
+        "wait",
+        {
+            "FAKE_ROLE": "standby",
+            "FAKE_NB_CFG": "43",
+            "FAKE_DPKG_FAILURE": "yes",
+        },
+    )
+    check(
+        dpkg_failure.returncode != 0
+        and "cannot verify the installed" in dpkg_failure.stderr,
+        "wait relaxed readiness without a valid installed package record",
+    )
+
+    write_marker()
+    restart_marker.chmod(0o640)
+    wrong_mode = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        wrong_mode.returncode != 0 and "mode 0600" in wrong_mode.stderr,
+        "wait accepted an incorrectly protected restart marker",
+    )
+
+    write_marker()
+    restart_marker.write_text("0.2.16\nsecond-line\n", encoding="ascii")
+    multiline = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        multiline.returncode != 0 and "exactly one version line" in multiline.stderr,
+        "wait accepted a multiline restart marker",
+    )
+
+    write_marker()
+    restart_marker.write_bytes(b"1" * 257)
+    oversized = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        oversized.returncode != 0 and "exceeds 256 bytes" in oversized.stderr,
+        "wait accepted an oversized restart marker",
+    )
+
+    write_marker()
+    os.chown(restart_marker, 1, 1)
+    wrong_owner = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        wrong_owner.returncode != 0 and "root:root" in wrong_owner.stderr,
+        "wait accepted a non-root restart marker",
+    )
+
+    restart_marker.unlink()
+    restart_marker.mkdir(mode=0o700)
+    nonregular = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        nonregular.returncode != 0 and "regular non-symlink" in nonregular.stderr,
+        "wait accepted a non-regular restart marker",
+    )
+    restart_marker.rmdir()
+
+    write_marker()
+    hardlink = root / "marker-hardlink"
+    os.link(restart_marker, hardlink)
+    hardlinked = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        hardlinked.returncode != 0 and "exactly one hard link" in hardlinked.stderr,
+        "wait accepted a hardlinked restart marker",
+    )
+    hardlink.unlink()
+
+    target = root / "marker-target"
+    target.write_text("0.2.16\n", encoding="ascii")
+    target.chmod(0o600)
+    restart_marker.unlink()
+    restart_marker.symlink_to(target)
+    symlinked = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        symlinked.returncode != 0 and "non-symlink" in symlinked.stderr,
+        "wait accepted a symlinked restart marker",
+    )
+    restart_marker.unlink()
+
+    write_marker()
+    restart_directory.chmod(0o750)
+    unsafe_directory = run(
+        "wait",
+        {"FAKE_ROLE": "standby", "FAKE_NB_CFG": "43"},
+    )
+    check(
+        unsafe_directory.returncode != 0 and "mode 0700" in unsafe_directory.stderr,
+        "wait accepted an unsafe restart state directory",
+    )
+    restart_directory.chmod(0o700)
+    remove_marker()
+
+for required in (
+    'hasattr(os, "O_NOFOLLOW")',
+    "os.fstat(marker_descriptor)",
+    "marker_after = os.stat(",
+    "path_after = RESTART_MARKER.lstat()",
+    "marker_identity",
+):
+    check(required in HELPER_SOURCE, f"restart marker TOCTOU gate omits {required}")
 
 print("pvn-ovn-northd tests passed")

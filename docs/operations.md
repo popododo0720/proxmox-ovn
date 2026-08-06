@@ -320,8 +320,13 @@ even-sized, differently ordered Control/NB/SB voter sets and the vendor
 `ovn-northd-db-params.conf` bypass. `pvn-ovn-northd-ready.service` blocks
 `pvn-central.target` readiness until local northd reports both IDLs connected,
 an `active` or `standby` role, and exact equality of `NB_Global.nb_cfg`,
-`NB_Global.sb_cfg`, and `SB_Global.nb_cfg`. The same bounded read-only check is
-available for diagnosis:
+`NB_Global.sb_cfg`, and `SB_Global.nb_cfg`. There is one bounded rolling-upgrade
+exception: while a root-only `central-restart-pending` marker safely matches the
+installed package, the readiness unit may admit a connected clustered
+`standby` with `cfg=pending`. It never admits an active northd, a standalone
+node, an unreadable cfg value, or an unsafe/mismatched marker through that
+exception. The diagnostic `status` action is always strict and never consults
+the marker:
 
 ```sh
 /usr/lib/pvn/pvn-ovn-northd status
@@ -546,25 +551,30 @@ did not change. The package records a root-only durable restart-required marker
 at `/var/lib/pvn-node/central-restart-pending` for each active central target,
 and both plan/apply report the affected nodes.
 After the package rollout and full Raft convergence, restart those central
-services separately, one healthy voter at a time, then clear the marker only
-after verifying that voter. Never activate a previously inactive target or
-restart enough voters concurrently to lose quorum. Mixed-version compatibility
-is required for the duration of this rolling window; use a maintenance window
-for releases that declare a breaking database or wire-protocol change.
+services separately, one healthy voter at a time. Dynamically restart every
+current standby before the current active northd, and retain **every** restart
+marker until the complete restart wave passes the all-node strict northd gate.
+Never activate a previously inactive target or restart enough voters
+concurrently to lose quorum. Mixed-version compatibility is required for the
+duration of this rolling window; use a maintenance window for releases that
+declare a breaking database or wire-protocol change.
 
 While a restart marker exists, updater probes deliberately preserve and inspect
 the old central PID instead of requiring the newly installed northd launcher;
 this keeps the package/schema repin prerequisite acyclic. The subsequent
-central restart must pass `pvn-ovn-northd-ready.service`. Once no active voter
-has a restart marker, the all-node updater health sweep additionally requires
-exactly one `active` northd role and every remaining northd in `standby`.
+central restart must pass `pvn-ovn-northd-ready.service`. Its marker-scoped
+standby exception exists only to move the standby voters onto clustered
+endpoints before the old active northd releases the SB lock. Once no active
+voter has a restart marker, the all-node updater health sweep additionally
+requires strict cfg synchronization, exactly one `active` northd role, and
+every remaining northd in `standby`.
 
 For an already `complete` schema-2 ledger, run `pvn-control-plane plan` and its
 confirmed `apply` immediately after the package rollout, while every restart
 marker still exists. The successful apply repins the durable package snapshot.
 Only then perform the one-voter-at-a-time restart sequence below and consume
-each marker; clearing or consuming a marker before the repin intentionally
-makes recovery fail closed.
+the markers after its global proof; clearing any marker before the repin or
+during the restart wave intentionally makes recovery fail closed.
 
 ### Active v0.2.13 schema-1 upgrade to v0.2.14
 
@@ -623,11 +633,112 @@ This is not a general `current = pinned + 1` exception. A different package
 pair, version jump, topology projection, journal, membership, or control phase
 fails closed and requires operator investigation.
 
-Do not clear the marker while a voter still runs the old process. Once every
-database has converged beyond the one-member seed, use this sequence on exactly
-one voter at a time. The JSON guard proves that the remaining connected members
-can still form quorum without the local voter; run the same guard again after
-the restart before moving to the next voter:
+Do not clear **any** marker while any voter still runs an old central process.
+Once every database has converged beyond the one-member seed, write each exact
+voter name and management IP into `PVN_VOTERS`. Before each restart, collect a fresh
+`ovn-appctl -t ovn-northd status` from every voter and require exactly one
+active role. Restart an as-yet-unrestarted standby, re-read all roles, and
+repeat. Restart the then-current active voter only after every other voter has
+completed. A role change changes the order; a stale initial list never
+authorizes restarting the new active early.
+
+```sh
+PVN_VOTERS='EXACT_VOTER_1=MANAGEMENT_IP_1 EXACT_VOTER_2=MANAGEMENT_IP_2 EXACT_VOTER_3=MANAGEMENT_IP_3'
+pvn_voter_ssh() {
+  voter=$1
+  shift
+  node=${voter%%=*}
+  address=${voter#*=}
+  [ "$node" != "$voter" ] && [ -n "$node" ] && [ -n "$address" ] || return 1
+  timeout 150 ssh -q -F /dev/null -i /root/.ssh/id_rsa \
+    -o BatchMode=yes -o PasswordAuthentication=no \
+    -o KbdInteractiveAuthentication=no -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o CheckHostIP=no \
+    -o "HostKeyAlias=$node" \
+    -o "UserKnownHostsFile=/etc/pve/nodes/$node/ssh_known_hosts" \
+    -o GlobalKnownHostsFile=none -o ConnectTimeout=10 \
+    "root@$address" "$@"
+}
+transition_roles() {
+  transition_records=$(
+    for voter in $PVN_VOTERS; do
+      node=${voter%%=*}
+      role=$(pvn_voter_ssh "$voter" /usr/bin/ovn-appctl -t ovn-northd status) || exit
+      printf '%s %s\n' "$node" "$role"
+    done
+  ) || return
+  PVN_TRANSITION_RECORDS="$transition_records" python3 - "$PVN_VOTERS" <<'PY'
+import os, re, sys
+entries = sys.argv[1].split()
+if len(entries) < 3 or len(entries) % 2 == 0:
+    raise SystemExit("transition requires the exact odd voter set")
+names = []
+addresses = []
+for entry in entries:
+    if entry.count("=") != 1:
+        raise SystemExit("voter mapping must contain exact name=management-IP pairs")
+    name, address = entry.split("=", 1)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) or not address:
+        raise SystemExit("unsafe voter mapping")
+    names.append(name)
+    addresses.append(address)
+if len(set(names)) != len(names) or len(set(addresses)) != len(addresses):
+    raise SystemExit("duplicate voter name or management IP")
+roles = {}
+for line in os.environ.get("PVN_TRANSITION_RECORDS", "").splitlines():
+    fields = line.split()
+    if len(fields) != 3 or fields[1] != "Status:" or fields[2] not in {"active", "standby"}:
+        raise SystemExit(f"invalid northd transition role: {line!r}")
+    if fields[0] in roles:
+        raise SystemExit(f"duplicate northd transition role: {fields[0]}")
+    roles[fields[0]] = fields[2]
+if set(roles) != set(names) or list(roles.values()).count("active") != 1:
+    raise SystemExit("transition requires exact voter coverage and one active")
+for name in names:
+    print(f"{name}={roles[name]}")
+PY
+}
+transition_selection_gate() {
+  selected=$1
+  completed=$2
+  roles=$(transition_roles) || return
+  PVN_TRANSITION_ROLES="$roles" python3 - "$PVN_VOTERS" "$selected" "$completed" <<'PY'
+import os, sys
+names = [entry.split("=", 1)[0] for entry in sys.argv[1].split()]
+selected = sys.argv[2]
+completed = sys.argv[3].split()
+if len(completed) != len(set(completed)) or not set(completed) <= set(names):
+    raise SystemExit("completed voter list is invalid")
+if selected not in names or selected in completed:
+    raise SystemExit("selected voter is unknown or already completed")
+roles = dict(line.split("=", 1) for line in os.environ["PVN_TRANSITION_ROLES"].splitlines())
+unfinished = [name for name in names if name not in completed]
+unfinished_standbys = [name for name in unfinished if roles[name] == "standby"]
+unfinished_active = [name for name in unfinished if roles[name] == "active"]
+eligible = unfinished_standbys or unfinished_active
+if selected not in eligible:
+    raise SystemExit(
+        f"selected {selected} is not in the next eligible set: {eligible}"
+    )
+print(
+    f"PVN transition selection: node={selected} role={roles[selected]} "
+    f"unfinished={len(unfinished)}"
+)
+PY
+}
+
+PVN_COMPLETED=
+transition_roles
+# Before each voter, set its exact name and require this gate to pass:
+PVN_SELECTED=EXACT_NEXT_VOTER
+transition_selection_gate "$PVN_SELECTED" "$PVN_COMPLETED"
+```
+
+On the selected voter, use this sequence. The JSON guard proves that the
+remaining connected members can still form quorum without it. All four PID
+checks must pass individually, proving that PVN Control, NB, SB, and northd
+each executed the installed unit. The marker is checked but deliberately not
+removed:
 
 ```sh
 raft_drain_check() {
@@ -654,26 +765,222 @@ central_pids() {
     systemctl show --property=MainPID --value "$unit"
   done | paste -sd, -
 }
+central_pid_change_check() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+names = ("PVN Control", "OVN NB", "OVN SB", "ovn-northd")
+before = sys.argv[1].split(",")
+after = sys.argv[2].split(",")
+if len(before) != 4 or len(after) != 4:
+    raise SystemExit("expected four central PIDs before and after restart")
+for name, old, new in zip(names, before, after):
+    if not old.isdigit() or old == "0" or not new.isdigit() or new == "0":
+        raise SystemExit(f"{name} returned an invalid PID: {old!r} -> {new!r}")
+    if old == new:
+        raise SystemExit(f"{name} PID did not change: {old}")
+PY
+}
+marker_check() {
+  marker=/var/lib/pvn-node/central-restart-pending
+  [ -d /var/lib/pvn-node ] && [ ! -L /var/lib/pvn-node ] || return 1
+  [ "$(stat -c '%u:%g:%a' /var/lib/pvn-node)" = 0:0:700 ] || return 1
+  installed=$(dpkg-query -W -f='${Version}' pvn-node) || return 1
+  python3 - "$marker" "$installed" <<'PY'
+import os, pathlib, stat, sys
+path = pathlib.Path(sys.argv[1])
+expected = (sys.argv[2] + "\n").encode("ascii")
+before = path.lstat()
+identity = (before.st_dev, before.st_ino)
+if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1 or before.st_uid != 0 or before.st_gid != 0
+        or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 256):
+    raise SystemExit("unsafe central restart marker")
+flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != identity:
+        raise SystemExit("central restart marker changed before open")
+    raw = os.read(descriptor, 257)
+    if os.read(descriptor, 1) or len(raw) > 256:
+        raise SystemExit("central restart marker is oversized")
+finally:
+    os.close(descriptor)
+after = path.lstat()
+if (after.st_dev, after.st_ino) != identity or raw != expected:
+    raise SystemExit("central restart marker changed or has the wrong version")
+PY
+}
 
+marker_check
 raft_drain_check
 before=$(central_pids)
 systemctl restart pvn-central.target
 pvnctl central status
 raft_drain_check
 after=$(central_pids)
-[ "$before" != "$after" ] || { echo "central PIDs did not change" >&2; exit 1; }
-
-marker=/var/lib/pvn-node/central-restart-pending
-[ -f "$marker" ] && [ ! -L "$marker" ] || exit 1
-[ "$(stat -c '%u:%g:%a' "$marker")" = 0:0:600 ] || exit 1
-[ "$(cat "$marker")" = "$(dpkg-query -W -f='${Version}' pvn-node)" ] || exit 1
-rm -f -- "$marker"
+central_pid_change_check "$before" "$after"
+marker_check
 ```
 
-Stop at the first failed command. Repeat only after the restarted voter and all
-three databases pass the guard. The marker lives outside `/var/lib/pvn`
-because that standard service state directory is writable by the unprivileged
-`pvn` account; restart authorization state must remain root-only.
+Stop at the first failed command. Keep every marker and repeat only after the
+restarted voter and all three databases pass the guard. Back on the
+coordinating node, append the completed voter exactly once and immediately
+rerun the parsed role proof before selecting the next voter:
+
+```sh
+PVN_COMPLETED="${PVN_COMPLETED:+$PVN_COMPLETED }$PVN_SELECTED"
+transition_roles
+```
+
+Once every voter has
+completed, run this bounded all-node gate from a PVE node. It requires the
+normal strict `status` output on every voter, one active role, all other roles
+standby, and one common synchronized cfg value:
+
+```sh
+strict_northd_proof() {
+  strict_records=$(
+    for voter in $PVN_VOTERS; do
+      node=${voter%%=*}
+      record=$(pvn_voter_ssh "$voter" /usr/lib/pvn/pvn-ovn-northd status) || exit
+      printf '%s %s\n' "$node" "$record"
+    done
+  ) || return
+  PVN_STRICT_RECORDS="$strict_records" python3 - "$PVN_VOTERS" <<'PY'
+import os, re, sys
+entries = sys.argv[1].split()
+if any(entry.count("=") != 1 for entry in entries):
+    raise SystemExit("voter mapping must contain exact name=management-IP pairs")
+expected = [entry.split("=", 1)[0] for entry in entries]
+records = os.environ.get("PVN_STRICT_RECORDS", "").splitlines()
+if len(expected) < 3 or len(expected) % 2 == 0 or len(records) != len(expected):
+    raise SystemExit("strict proof does not cover the exact odd voter set")
+roles = []
+cfgs = []
+seen = set()
+for line in records:
+    fields = line.split()
+    if len(fields) != 6 or fields[1] != "PVN_NORTHD":
+        raise SystemExit(f"malformed strict status: {line!r}")
+    node = fields[0]
+    values = dict(field.split("=", 1) for field in fields[2:])
+    if node in seen or set(values) != {"role", "nb", "sb", "cfg"}:
+        raise SystemExit(f"duplicate node or fields: {line!r}")
+    if values["nb"] != "connected" or values["sb"] != "connected":
+        raise SystemExit(f"disconnected northd: {line!r}")
+    if values["role"] not in {"active", "standby"}:
+        raise SystemExit(f"invalid northd role: {line!r}")
+    if not re.fullmatch(r"0|[1-9][0-9]*", values["cfg"]):
+        raise SystemExit(f"invalid synchronized cfg: {line!r}")
+    seen.add(node)
+    roles.append(values["role"])
+    cfgs.append(values["cfg"])
+if seen != set(expected) or roles.count("active") != 1:
+    raise SystemExit("strict proof requires exactly one active over every voter")
+if roles.count("standby") != len(expected) - 1 or len(set(cfgs)) != 1:
+    raise SystemExit("strict proof requires all remaining standbys and one cfg")
+print(f"PVN northd strict proof: voters={len(expected)} cfg={cfgs[0]}")
+PY
+}
+strict_deadline=$(($(date +%s) + 150))
+until strict_northd_proof; do
+  [ "$(date +%s)" -lt "$strict_deadline" ] || {
+    echo "northd did not reach one strict synchronized role set in 150s" >&2
+    exit 1
+  }
+  sleep 2
+done
+```
+
+Only after that proof may the markers be consumed. Remove all of them, not one
+during the restart wave, and immediately rerun the hosted updater in plan mode
+so its no-marker health path independently repeats strict cfg and one-active
+validation:
+
+```sh
+for voter in $PVN_VOTERS; do
+  pvn_voter_ssh "$voter" /usr/bin/python3 - <<'PVN_REMOVE_MARKER' || exit
+import os, pathlib, re, stat, subprocess
+directory = pathlib.Path("/var/lib/pvn-node")
+marker = directory / "central-restart-pending"
+directory_metadata = directory.lstat()
+if (not stat.S_ISDIR(directory_metadata.st_mode)
+        or stat.S_ISLNK(directory_metadata.st_mode)
+        or directory_metadata.st_uid != 0 or directory_metadata.st_gid != 0
+        or stat.S_IMODE(directory_metadata.st_mode) != 0o700):
+    raise SystemExit("unsafe restart state directory")
+directory_fd = os.open(
+    directory,
+    os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    try:
+        before = os.stat(marker.name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        print("restart marker already consumed")
+        raise SystemExit(0)
+    if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+            or before.st_nlink != 1 or before.st_uid != 0 or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 256):
+        raise SystemExit("unsafe central restart marker")
+    result = subprocess.run(
+        ["/usr/bin/dpkg-query", "-W", "-f=${Status}\\t${Version}\\n", "pvn-node"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=10, check=False, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+    )
+    match = re.fullmatch(
+        rb"install ok installed\t([A-Za-z0-9.+~_-]{1,128})\n", result.stdout
+    )
+    if result.returncode != 0 or match is None:
+        raise SystemExit("cannot prove the exact installed pvn-node version")
+    marker_fd = os.open(
+        marker.name,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        opened = os.fstat(marker_fd)
+        identity = (before.st_dev, before.st_ino)
+        if (opened.st_dev, opened.st_ino) != identity:
+            raise SystemExit("central restart marker changed before open")
+        raw = os.read(marker_fd, 257)
+        if os.read(marker_fd, 1) or len(raw) > 256:
+            raise SystemExit("central restart marker is oversized")
+    finally:
+        os.close(marker_fd)
+    after = os.stat(marker.name, dir_fd=directory_fd, follow_symlinks=False)
+    if (after.st_dev, after.st_ino) != identity or raw != match.group(1) + b"\n":
+        raise SystemExit("central restart marker changed or has the wrong version")
+    os.unlink(marker.name, dir_fd=directory_fd)
+finally:
+    os.close(directory_fd)
+PVN_REMOVE_MARKER
+done
+pvn_version=$(dpkg-query -W -f='${Version}' pvn-node)
+case "$pvn_version" in ''|*[!A-Za-z0-9.+~_-]*) exit 1 ;; esac
+for voter in $PVN_VOTERS; do
+  remote_version=$(pvn_voter_ssh "$voter" /bin/sh -s <<'PVN_REMOTE_VERSION'
+exec /usr/bin/dpkg-query -W -f='${Version}' pvn-node
+PVN_REMOTE_VERSION
+  ) || exit
+  [ "$remote_version" = "$pvn_version" ] || exit
+done
+pvn_bootstrap=$(curl -fsSL \
+  "https://github.com/popododo0720/proxmox-ovn/releases/download/v$pvn_version/pvn-update.sh") && \
+  PVN_VERSION="$pvn_version" PVN_PHASE=plan bash -c "$pvn_bootstrap"
+```
+
+If marker removal stops after only some voters, do not continue from the
+failed command alone. Re-run the complete all-node strict proof, verify that
+already-consumed markers are absent and every remaining marker still safely
+matches the same installed version, and only then rerun the idempotent removal
+loop; an absent marker is counted as already completed.
+
+The marker lives outside `/var/lib/pvn` because that standard service state
+directory is writable by the unprivileged `pvn` account; restart authorization
+state must remain root-only.
 
 A hard power loss can leave the cluster mutation lease for operator review.
 Inspect it with `pvn-cluster-lease show mutation`; never remove a lease until

@@ -5,6 +5,7 @@ repo=$(CDPATH= cd -P "$(dirname "$0")/../.." && pwd)
 cd "$repo"
 
 for script in deploy/scripts/*; do
+    [ -f "$script" ] || continue
     case "$(sed -n '1p' "$script")" in
         *python3*)
             python3 - "$script" <<'PY'
@@ -169,7 +170,32 @@ grep -q '^ExecStart=/usr/lib/pvn/pvn-ovn-northd start$' deploy/systemd/ovn-north
     exit 1
 }
 grep -q '^ExecStart=/usr/lib/pvn/pvn-ovn-northd wait$' deploy/systemd/pvn-ovn-northd-ready.service || {
-    echo "PVN central readiness must wait for northd connectivity and cfg sync" >&2
+    echo "PVN central readiness must use the bounded northd wait gate" >&2
+    exit 1
+}
+grep -q 'transition=central-restart-pending' deploy/scripts/pvn-ovn-northd || {
+    echo "PVN northd wait must identify its marker-scoped standby transition" >&2
+    exit 1
+}
+grep -q 'def installed_package_version' deploy/scripts/pvn-ovn-northd || {
+    echo "PVN northd transition must verify the installed package version" >&2
+    exit 1
+}
+grep -q 'class FatalNorthdError' deploy/scripts/pvn-ovn-northd || {
+    echo "PVN northd wait must not retry unsafe restart authorization" >&2
+    exit 1
+}
+grep -q '^transition_roles() {$' docs/operations.md || {
+    echo "rolling central runbook must parse the complete northd role set" >&2
+    exit 1
+}
+grep -q '^transition_selection_gate() {$' docs/operations.md || {
+    echo "rolling central runbook must gate dynamic standby-first selection" >&2
+    exit 1
+}
+grep -q 'unfinished_standbys =' docs/operations.md &&
+    grep -q 'eligible = unfinished_standbys or unfinished_active' docs/operations.md || {
+    echo "rolling central runbook must select any unfinished standby before an active" >&2
     exit 1
 }
 grep -q 'pvn-ovn-northd-ready.service' deploy/systemd/pvn-central.target || {

@@ -212,6 +212,56 @@ pending_second = module.parse_probe(
     snapshot,
 )
 module.gate_northd_roles({nodes[0].name: pending_active, nodes[1].name: pending_second})
+module.validate_rollout_versions(
+    {nodes[0].name: pending_active, nodes[1].name: pending_second},
+    "0.2.1",
+)
+
+old_pending = module.parse_probe(
+    nodes[0],
+    probe_line(
+        snapshot,
+        nodes[0],
+        "0.1.0",
+        central="active",
+        central_pending="0.1.0",
+    ),
+    snapshot,
+)
+marker_mismatch = module.parse_probe(
+    nodes[0],
+    probe_line(
+        snapshot,
+        nodes[0],
+        "0.2.1",
+        central="active",
+        central_pending="0.2.0",
+    ),
+    snapshot,
+)
+inactive_pending_probe = module.parse_probe(
+    nodes[1],
+    probe_line(
+        snapshot,
+        nodes[1],
+        "0.2.1",
+        node_state="inactive",
+        central="inactive",
+        central_pending="0.2.1",
+    ),
+    snapshot,
+)
+for invalid_probe, target, message in (
+    (old_pending, "0.2.1", "updater chained a new target over an old marker"),
+    (marker_mismatch, "0.2.1", "updater accepted marker/package mismatch"),
+    (inactive_pending_probe, "0.2.1", "inactive central accepted a restart marker"),
+):
+    try:
+        module.validate_rollout_versions({invalid_probe.node.name: invalid_probe}, target)
+    except module.UpdateError:
+        pass
+    else:
+        raise AssertionError(message)
 
 
 def exercise_embedded_remote(
@@ -437,6 +487,7 @@ def exercise_remote_central_health(
     database_modes: tuple[str, str, str] | None = None,
     schema_drift: bool = False,
     restart_pending: bool = False,
+    marker_variant: str = "safe",
     helper_failure: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     if database_modes is None:
@@ -469,6 +520,14 @@ def exercise_remote_central_health(
             marker = restart_directory / "central-restart-pending"
             marker.write_text("0.2.1\n", encoding="ascii")
             marker.chmod(0o600)
+            if marker_variant == "hardlink":
+                os.link(marker, root / "marker-hardlink")
+            elif marker_variant == "symlink":
+                target = root / "marker-target"
+                marker.replace(target)
+                marker.symlink_to(target)
+            elif marker_variant != "safe":
+                raise AssertionError(f"unknown marker variant: {marker_variant}")
         tool = root / "ovsdb-tool"
         tool.write_text(
             """#!/bin/sh
@@ -584,6 +643,21 @@ pending_helper = exercise_remote_central_health(
 check(
     pending_helper.returncode == 0,
     "pending package/schema repin was made dependent on restarting northd",
+)
+hardlinked_marker = exercise_remote_central_health(
+    "raft", restart_pending=True, marker_variant="hardlink"
+)
+check(
+    hardlinked_marker.returncode != 0
+    and "exactly one hard link" in hardlinked_marker.stderr,
+    "updater accepted a hardlinked central restart marker",
+)
+symlinked_marker = exercise_remote_central_health(
+    "raft", restart_pending=True, marker_variant="symlink"
+)
+check(
+    symlinked_marker.returncode != 0 and "non-symlink" in symlinked_marker.stderr,
+    "updater accepted a symlinked central restart marker",
 )
 try:
     module.parse_probe(
@@ -992,6 +1066,7 @@ check(not any(event.startswith("apply:") for event in resume_events), "doctor ga
 
 source = SCRIPT.read_text(encoding="utf-8")
 postinst_source = (REPO / "packaging/debian/pvn-node.postinst").read_text(encoding="utf-8")
+operations_source = (REPO / "docs/operations.md").read_text(encoding="utf-8")
 for required in (
     "apt-get install -y --only-upgrade --no-remove",
     "/usr/sbin/pvnctl central status",
@@ -1011,8 +1086,91 @@ for required in (
     "embedded_corosync_snapshot",
     "pvn-topology active schema migration",
     "combined package/schema repin",
+    "restart current standby voters first",
+    "exactly one active before consuming any marker",
+    "must finish and consume its pvn-node",
 ):
     check(required in source, f"missing fail-closed updater behavior: {required}")
+
+marker_source = source[
+    source.index("central_restart_marker() {") : source.index("\ncentral_configured_mode()")
+]
+for required in (
+    "metadata.st_nlink != 1",
+    'hasattr(os, "O_NOFOLLOW")',
+    "os.fstat(marker_descriptor)",
+    "marker_after = os.stat(",
+    "path_after = marker.lstat()",
+    "marker_identity",
+):
+    check(required in marker_source, f"restart marker reader omits {required}")
+
+for required in (
+    "current standby before the current active",
+    "retain **every** restart",
+    "transition_roles()",
+    "transition_selection_gate()",
+    "unfinished_standbys =",
+    "eligible = unfinished_standbys or unfinished_active",
+    "central_pid_change_check",
+    "pvn-ovn-northd status",
+    'roles.count("active") != 1',
+    "Only after that proof may the markers be consumed",
+    "pvn-update.sh plan",
+):
+    check(required in operations_source, f"rolling restart runbook omits {required}")
+for forbidden in (
+    "then clear the marker only after verifying that voter",
+    '[ "$before" != "$after" ]',
+):
+    check(forbidden not in operations_source, f"stale per-node marker/PID guidance remains: {forbidden}")
+
+selection_source = operations_source.split("transition_selection_gate() {", 1)[1]
+selection_python = selection_source.split("<<'PY'\n", 1)[1].split("\nPY\n}", 1)[0]
+compile(selection_python, "operations.md:transition-selection-gate", "exec")
+voter_mapping = "pve-a=192.0.2.10 pve-b=192.0.2.11 pve-c=192.0.2.12"
+
+
+def run_transition_selection(selected: str, completed: str, roles: str):
+    environment = os.environ.copy()
+    environment["PVN_TRANSITION_ROLES"] = roles
+    return subprocess.run(
+        [sys.executable, "-", voter_mapping, selected, completed],
+        input=selection_python,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+
+
+active_moved_to_completed = run_transition_selection(
+    "pve-a",
+    "pve-b pve-c",
+    "pve-a=standby\npve-b=active\npve-c=standby\n",
+)
+check(
+    active_moved_to_completed.returncode == 0,
+    "transition gate deadlocked after the active role moved to a completed voter",
+)
+unfinished_standby = run_transition_selection(
+    "pve-a",
+    "pve-b",
+    "pve-a=active\npve-b=standby\npve-c=standby\n",
+)
+check(
+    unfinished_standby.returncode != 0,
+    "transition gate selected the active while an unfinished standby remained",
+)
+active_last = run_transition_selection(
+    "pve-a",
+    "pve-b pve-c",
+    "pve-a=active\npve-b=standby\npve-c=standby\n",
+)
+check(
+    active_last.returncode == 0,
+    "transition gate rejected an unfinished active after every standby completed",
+)
 
 postinst_gate = postinst_source.index("\nverify_corosync_runtime\n")
 daemon_reload = postinst_source.index("\nsystemctl daemon-reload")

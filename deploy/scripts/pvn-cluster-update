@@ -511,31 +511,122 @@ PVN_CONFIG_DIGEST
 
 central_restart_marker() {
     python3 - <<'PVN_CENTRAL_RESTART_MARKER'
+import os
 import pathlib
 import stat
 
 directory = pathlib.Path("/var/lib/pvn-node")
 marker = directory / "central-restart-pending"
-if not directory.exists() and not directory.is_symlink():
-    print("none")
-    raise SystemExit(0)
-metadata = directory.lstat()
-if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-    raise SystemExit(f"{directory} must be a real directory")
-if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700:
-    raise SystemExit(f"{directory} must be root:root mode 0700")
-if not marker.exists() and not marker.is_symlink():
-    print("none")
-    raise SystemExit(0)
-metadata = marker.lstat()
-if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-    raise SystemExit(f"{marker} must be a regular non-symlink file")
-if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
-    raise SystemExit(f"{marker} must be root:root mode 0600")
+max_bytes = 256
+
+def validate_directory(metadata):
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"{directory} must be a real directory")
+    if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise SystemExit(f"{directory} must be root:root mode 0700")
+
+def validate_marker(metadata):
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(f"{marker} must be a regular non-symlink file")
+    if metadata.st_nlink != 1:
+        raise SystemExit(f"{marker} must have exactly one hard link")
+    if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SystemExit(f"{marker} must be root:root mode 0600")
+    if metadata.st_size > max_bytes:
+        raise SystemExit(f"{marker} exceeds {max_bytes} bytes")
+
 try:
-    raw = marker.read_text(encoding="ascii")
-except (OSError, UnicodeError) as error:
-    raise SystemExit(f"cannot read {marker}: {error}")
+    directory_before = directory.lstat()
+except FileNotFoundError:
+    print("none")
+    raise SystemExit(0)
+except OSError as error:
+    raise SystemExit(f"cannot inspect {directory}: {error}")
+validate_directory(directory_before)
+directory_identity = (directory_before.st_dev, directory_before.st_ino)
+directory_flags = os.O_RDONLY | os.O_CLOEXEC
+if hasattr(os, "O_DIRECTORY"):
+    directory_flags |= os.O_DIRECTORY
+if hasattr(os, "O_NOFOLLOW"):
+    directory_flags |= os.O_NOFOLLOW
+try:
+    directory_descriptor = os.open(directory, directory_flags)
+except OSError as error:
+    raise SystemExit(f"cannot open {directory}: {error}")
+try:
+    directory_opened = os.fstat(directory_descriptor)
+    validate_directory(directory_opened)
+    if (directory_opened.st_dev, directory_opened.st_ino) != directory_identity:
+        raise SystemExit(f"{directory} changed identity")
+    try:
+        marker_before = os.stat(
+            marker.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        directory_after_missing = directory.lstat()
+        validate_directory(directory_after_missing)
+        if (directory_after_missing.st_dev, directory_after_missing.st_ino) != directory_identity:
+            raise SystemExit(f"{directory} changed identity")
+        print("none")
+        raise SystemExit(0)
+    except OSError as error:
+        raise SystemExit(f"cannot inspect {marker}: {error}")
+    validate_marker(marker_before)
+    marker_identity = (marker_before.st_dev, marker_before.st_ino)
+    marker_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        marker_flags |= os.O_NOFOLLOW
+    try:
+        marker_descriptor = os.open(
+            marker.name,
+            marker_flags,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as error:
+        raise SystemExit(f"cannot open {marker}: {error}")
+    try:
+        marker_opened = os.fstat(marker_descriptor)
+        validate_marker(marker_opened)
+        if (marker_opened.st_dev, marker_opened.st_ino) != marker_identity:
+            raise SystemExit(f"{marker} changed identity")
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(marker_descriptor, min(4096, max_bytes + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > max_bytes:
+                raise SystemExit(f"{marker} exceeds {max_bytes} bytes")
+        marker_after = os.stat(
+            marker.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        validate_marker(marker_after)
+        if (marker_after.st_dev, marker_after.st_ino) != marker_identity:
+            raise SystemExit(f"{marker} changed while being read")
+    except OSError as error:
+        raise SystemExit(f"cannot read {marker}: {error}")
+    finally:
+        os.close(marker_descriptor)
+    path_after = marker.lstat()
+    directory_after = directory.lstat()
+    validate_marker(path_after)
+    validate_directory(directory_after)
+    if (path_after.st_dev, path_after.st_ino) != marker_identity:
+        raise SystemExit(f"{marker} path changed identity")
+    if (directory_after.st_dev, directory_after.st_ino) != directory_identity:
+        raise SystemExit(f"{directory} changed identity")
+finally:
+    os.close(directory_descriptor)
+try:
+    raw = b"".join(chunks).decode("ascii")
+except UnicodeError as error:
+    raise SystemExit(f"cannot decode {marker}: {error}")
 lines = raw.splitlines()
 if len(lines) != 1 or raw != lines[0] + "\n":
     raise SystemExit(f"{marker} must contain exactly one version line")
@@ -1623,6 +1714,22 @@ def compare_versions(left: str, operator: str, right: str) -> bool:
 def validate_rollout_versions(probes: dict[str, Probe], target: str) -> None:
     older: set[str] = set()
     for probe in probes.values():
+        if probe.central_state == "inactive" and probe.central_pending != "none":
+            fail(
+                f"{probe.node.name} has an inactive central target with an unresolved "
+                "restart marker"
+            )
+        if probe.central_pending != "none":
+            if probe.central_pending != probe.version:
+                fail(
+                    f"{probe.node.name} restart marker {probe.central_pending} differs "
+                    f"from installed pvn-node {probe.version}"
+                )
+            if probe.version != target:
+                fail(
+                    f"{probe.node.name} must finish and consume its pvn-node "
+                    f"{probe.version} central restart marker before updating to {target}"
+                )
         if probe.version == target:
             continue
         if not compare_versions(probe.version, "lt", target):
@@ -2009,9 +2116,15 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
             )
         if raft_pending:
             print(
-                "After the required schema/package repin and full Raft convergence, restart these "
-                "voters separately, one healthy voter at a time: "
+                "After the required schema/package repin and full Raft convergence, keep every "
+                "marker and restart current standby voters first, then the dynamically current "
+                "active voter last, one healthy voter at a time: "
                 + " ".join(raft_pending)
+            )
+            print(
+                "Only after every voter has restarted may you require all-node strict northd "
+                "status, one common cfg, and exactly one active; then consume all markers and "
+                "rerun updater plan."
             )
         if inactive_pending:
             print(
@@ -2061,7 +2174,7 @@ def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, 
         print(
             "Plan: required order is pvn-topology active schema migration, then the "
             "pvn-control-plane combined package/schema repin, and only then a guarded "
-            "central restart with marker consumption."
+            "central restart wave; clustered markers remain until its global strict proof."
         )
         standalone_restart = [
             probe.node.name for probe in probes.values()
@@ -2079,9 +2192,15 @@ def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, 
             )
         if raft_restart:
             print(
-                "Plan: after both repins, restart clustered voters only after full Raft "
-                "convergence, one healthy voter at a time: "
+                "Plan: after both repins and full Raft convergence, keep all markers; "
+                "restart current standbys first and the dynamically current active last, "
+                "one healthy voter at a time: "
                 + " ".join(raft_restart)
+            )
+            print(
+                "Plan: after the complete restart wave, require all-node strict northd status, "
+                "one common cfg, and exactly one active before consuming any marker; then "
+                "rerun plan."
             )
     print(f"Re-run with apply --confirm {snapshot.deployment}; no changes made.")
 
