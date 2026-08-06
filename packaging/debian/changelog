@@ -10,6 +10,8 @@ proxmox-ovn (0.2.16) unstable; urgency=medium
     marker-scoped standby-first rolling transition with strict final cfg proof.
   * Freeze every northd, listener, and host-config writer gate during each
     independent PVN Control, OVN NB, or OVN SB recovery window.
+  * Anchor live and recovery snapshot schemas to protected package schemas,
+    including semantic validation of empty-checksum PVN Control snapshots.
   * Build releases from clean deterministic inputs and publish exact seven-file
     draft assets without mutating an existing public release.
 

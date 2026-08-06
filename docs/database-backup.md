@@ -40,6 +40,14 @@ stable cluster IDs and membership, and no membership operation. Snapshots are
 read through each live Unix socket with `ovsdb-client backup`; clustered files
 are never copied directly.
 
+Before and after each snapshot, the command compares the live database to its
+fixed package schema with a timeout-bounded `ovsdb-client needs-conversion` and
+accepts only the exact `no` result. It also brackets the live version/checksum
+reads with that comparison and rejects any package-schema inode, content, or
+permission change. Installed schemas must be real, single-link, root-owned
+files below root-owned, non-writable directories; group/world-writable schema
+files are rejected.
+
 Copy the whole published directory to durable off-host storage and verify that
 copy offline:
 
@@ -48,11 +56,30 @@ pvn-db-backup verify \
   /srv/pvn-backups/pvn-db-backup-YYYYMMDDTHHMMSSZ-NODE-RANDOM8
 ```
 
-Verification checks the manifest, secure paths and modes, size and SHA-256,
-database/schema identity, standalone service model, full log readability, and
-a compacted temporary copy. Current verification also reads legacy v1 sets,
-but only a current v2 `recovery-window` set can pass `pre-restore`. Never edit
-`manifest.json`, rename one snapshot, or separate files in a set.
+Verification checks the manifest, secure paths and modes, stable file identity,
+size and SHA-256, database/schema metadata, standalone service model, full log
+readability, and a compacted temporary copy. For `PVN_Control`, it also parses
+the standalone database's first `OVSDB JSON LENGTH SHA1` record with bounded
+lengths, verifies the exact byte count and SHA-1, rejects duplicate JSON keys,
+and parses the compacted copy's first record independently. Archival
+verification permits `ovsdb-tool compact` to rewrite an equivalent legacy
+schema notation into its current normalized form. Trailing transaction records
+are allowed and remain covered by `ovsdb-tool` structural validation and the
+whole-file SHA-256.
+
+Plain `verify` is an archival integrity check and deliberately does not require
+the snapshot to match the schema installed today. Current verification also
+reads legacy v1 sets, but only a current v2 `recovery-window` set can pass
+`pre-restore`. The strict create and restore gates normalize the installed
+`PVN_Control` schema through a temporary empty OVSDB, compare its canonical
+record separately to the snapshot and compacted copy, and ignore only the
+optional top-level `cksum` member.
+OVS permits that checksum to be absent or empty; the package schema and full
+table/column semantics are therefore the trust anchor. OVN Northbound and
+Southbound retain their required nonempty embedded checksum gates because
+clustered ephemeral-column normalization makes a generic offline JSON-schema
+comparison unsafe. Never edit `manifest.json`, rename one snapshot, or
+separate files in a set.
 
 ## Restore boundary and release gate
 
@@ -87,11 +114,11 @@ identities.
 Use a separate maintenance window and a freshly captured set for each
 database. Never loop over the table or reuse a set from an earlier window.
 
-| Database | Backup key | Snapshot | Live Unix socket | Raft port |
-| --- | --- | --- | --- | --- |
-| `PVN_Control` | `pvn-control` | `pvn-control.ovsdb` | `unix:/run/pvn-control/pvn-control-db.sock` | 6646 |
-| `OVN_Northbound` | `ovn-nb` | `ovn-northbound.ovsdb` | `unix:/run/ovn/ovnnb_db.sock` | 6643 |
-| `OVN_Southbound` | `ovn-sb` | `ovn-southbound.ovsdb` | `unix:/run/ovn/ovnsb_db.sock` | 6644 |
+| Database | Backup key | Snapshot | Live Unix socket | Installed schema | Raft port |
+| --- | --- | --- | --- | --- | --- |
+| `PVN_Control` | `pvn-control` | `pvn-control.ovsdb` | `unix:/run/pvn-control/pvn-control-db.sock` | `/usr/share/pvn/schema/PVN_Control.ovsschema` | 6646 |
+| `OVN_Northbound` | `ovn-nb` | `ovn-northbound.ovsdb` | `unix:/run/ovn/ovnnb_db.sock` | `/usr/share/ovn/ovn-nb.ovsschema` | 6643 |
+| `OVN_Southbound` | `ovn-sb` | `ovn-southbound.ovsdb` | `unix:/run/ovn/ovnsb_db.sock` | `/usr/share/ovn/ovn-sb.ovsschema` | 6644 |
 
 The runbook applies only to clustered Raft deployments and the examples use
 three voters. For another supported odd voter count of at least three, provide
@@ -379,6 +406,14 @@ different cluster IDs, terms, membership counts, or follower leader views;
 anything other than one leader; a source-host mismatch; schema/digest drift;
 or the wrong local service topology. `--status-max-age` can be raised only up
 to 600 seconds, but recollecting is safer.
+
+Unlike archival `verify`, this gate requires the live schema and the embedded
+`PVN_Control` snapshot schema to match the fixed schemas in the currently
+installed package. The check is repeated by `reserve-restore`. After a
+legitimate package schema upgrade, an older set may still pass archival
+integrity verification but cannot be restored under an incompatible package.
+Use only a cluster-wide approved release whose package schema matches the
+intended recovery snapshot; there is no checksum or compatibility override.
 
 Any leadership or term change after capture invalidates this window. Do not
 automatically retry on another node. Unfreeze services as described in step 7,

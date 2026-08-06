@@ -30,6 +30,46 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def encode_ovsdb_record(document: object) -> bytes:
+    body = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    digest = hashlib.sha1(body, usedforsecurity=False).hexdigest()
+    return f"OVSDB JSON {len(body)} {digest}\n".encode("ascii") + body
+
+
+def decode_ovsdb_records(payload: bytes) -> list[dict]:
+    records: list[dict] = []
+    offset = 0
+    while offset < len(payload):
+        header_end = payload.find(b"\n", offset)
+        check(header_end >= 0, "fixture OVSDB record has no header LF")
+        header = payload[offset : header_end + 1]
+        match = re.fullmatch(rb"OVSDB JSON ([1-9][0-9]*) ([0-9a-f]{40})\n", header)
+        check(match is not None, "fixture OVSDB record header is invalid")
+        length = int(match.group(1))
+        start = header_end + 1
+        body = payload[start : start + length]
+        check(len(body) == length, "fixture OVSDB record is truncated")
+        check(
+            hashlib.sha1(body, usedforsecurity=False).hexdigest().encode("ascii")
+            == match.group(2),
+            "fixture OVSDB record hash is invalid",
+        )
+        document = json.loads(body)
+        check(isinstance(document, dict), "fixture OVSDB record is not an object")
+        records.append(document)
+        offset = start + length
+    return records
+
+
+def rewrite_ovsdb_records(path: pathlib.Path, records: list[dict]) -> bytes:
+    payload = b"".join(encode_ovsdb_record(record) for record in records)
+    path.write_bytes(payload)
+    path.chmod(0o600)
+    return payload
+
+
 # The production command deliberately rejects any path component not owned by
 # root.  GitHub Actions checks out under /__w, whose outer directory is owned
 # by the runner account even inside the root container, so keep the isolated
@@ -53,8 +93,18 @@ try:
     sequence_path = state / "status-sequence.json"
     counter_path = state / "status-counter"
     fail_database = state / "fail-database"
+    conversion_override = state / "needs-conversion.json"
+    mutate_on_show_log = state / "mutate-on-show-log"
+    replace_on_show_log = state / "replace-on-show-log"
+    mutate_manifest_on_show_log = state / "mutate-manifest-on-show-log"
+    replace_manifest_on_show_log = state / "replace-manifest-on-show-log"
+    mutate_earlier_snapshot_on_show_log = state / "mutate-earlier-snapshot-on-show-log.json"
+    final_anchor_race = state / "final-anchor-race.json"
+    replace_schema_on_conversion = state / "replace-schema-on-conversion"
+    replace_schema_on_create = state / "replace-schema-on-create"
     unit_override = state / "unit-override"
     age_status_marker = state / "age-status-on-central-read.json"
+    replace_on_central_status = state / "replace-on-central-status.json"
 
     sockets = {
         "PVN_Control": socket_root / "pvn-control.sock",
@@ -101,6 +151,38 @@ try:
         "OVN_Northbound": "2520708261 39034",
         "OVN_Southbound": "2343742948 34719",
     }
+    schema_root = temporary / "schemas"
+    schema_root.mkdir(mode=0o700)
+    schema_paths = {
+        "PVN_Control": schema_root / "PVN_Control.ovsschema",
+        "OVN_Northbound": schema_root / "ovn-nb.ovsschema",
+        "OVN_Southbound": schema_root / "ovn-sb.ovsschema",
+    }
+    installed_schemas = {
+        name: {
+            "name": name,
+            "version": versions[name],
+            "cksum": checksums[name],
+            "tables": {
+                "Fixture": {
+                    "columns": {
+                        "value": {"type": {"key": "string"}},
+                    },
+                    "indexes": [["value"]],
+                }
+            },
+        }
+        for name in versions
+    }
+    normalized_schemas = copy.deepcopy(installed_schemas)
+    for document in normalized_schemas.values():
+        document["tables"]["Fixture"]["columns"]["value"]["type"] = "string"
+    for name, path in schema_paths.items():
+        path.write_text(
+            json.dumps(installed_schemas[name], sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o644)
     base_status = {
         "healthy": True,
         "databases": [
@@ -150,6 +232,7 @@ status = pathlib.Path({str(status_path)!r})
 sequence = pathlib.Path({str(sequence_path)!r})
 counter = pathlib.Path({str(counter_path)!r})
 age_status_marker = pathlib.Path({str(age_status_marker)!r})
+replace_on_central_status = pathlib.Path({str(replace_on_central_status)!r})
 if sys.argv[1:] != ["central", "status"]:
     raise SystemExit(2)
 if sequence.exists():
@@ -163,6 +246,21 @@ if age_status_marker.exists():
     for raw_path in json.loads(age_status_marker.read_text()):
         os.utime(raw_path, (1, 1))
     age_status_marker.unlink()
+if replace_on_central_status.exists():
+    replacement = json.loads(replace_on_central_status.read_text())
+    replacement["remaining"] -= 1
+    if replacement["remaining"] <= 0:
+        target = pathlib.Path(replacement["path"])
+        temporary = target.parent / ("." + target.name + ".replacement-race")
+        if "payload" in replacement:
+            temporary.write_text(replacement["payload"], encoding="utf-8")
+        else:
+            temporary.write_bytes(target.read_bytes())
+        temporary.chmod(target.stat().st_mode & 0o777)
+        os.replace(temporary, target)
+        replace_on_central_status.unlink()
+    else:
+        replace_on_central_status.write_text(json.dumps(replacement))
 print(json.dumps(report))
 """,
         encoding="ascii",
@@ -170,15 +268,26 @@ print(json.dumps(report))
     socket_map = {f"unix:{path}": name for name, path in sockets.items()}
     (fake_bin / "ovsdb-client").write_text(
         f"""#!/usr/bin/python3
+import hashlib
 import json
 import pathlib
 import sys
 
 calls = pathlib.Path({str(calls)!r})
 failure = pathlib.Path({str(fail_database)!r})
+conversion_override = pathlib.Path({str(conversion_override)!r})
+replace_schema_on_conversion = pathlib.Path({str(replace_schema_on_conversion)!r})
 socket_map = {socket_map!r}
+schema_map = {dict((str(path), name) for name, path in schema_paths.items())!r}
+schemas = {normalized_schemas!r}
 versions = {versions!r}
 checksums = {checksums!r}
+
+def record(document):
+    body = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\\n").encode()
+    digest = hashlib.sha1(body, usedforsecurity=False).hexdigest()
+    return f"OVSDB JSON {{len(body)}} {{digest}}\\n".encode() + body
+
 with calls.open("a", encoding="ascii") as log:
     log.write("client " + " ".join(sys.argv[1:]) + "\\n")
 if len(sys.argv) < 4 or not sys.argv[1].startswith("--timeout="):
@@ -190,6 +299,28 @@ if database is None:
     raise SystemExit(2)
 if operation == "list-dbs" and len(sys.argv) == 4:
     print(database)
+elif operation == "needs-conversion" and len(sys.argv) == 5:
+    if schema_map.get(sys.argv[4]) != database:
+        raise SystemExit(2)
+    if replace_schema_on_conversion.exists() and replace_schema_on_conversion.read_text().strip() == sys.argv[4]:
+        schema = pathlib.Path(sys.argv[4])
+        replacement = schema.parent / ("." + schema.name + ".conversion-replacement")
+        replacement.write_bytes(schema.read_bytes())
+        replacement.chmod(schema.stat().st_mode & 0o777)
+        replacement.replace(schema)
+        replace_schema_on_conversion.unlink()
+    overrides = json.loads(conversion_override.read_text()) if conversion_override.exists() else {{}}
+    if database != "PVN_Control":
+        print("fixture clustered schema warning", file=sys.stderr)
+    output = overrides.get(database, "no\\n")
+    if isinstance(output, list):
+        if not output:
+            raise SystemExit(2)
+        selected = output.pop(0)
+        overrides[database] = output
+        conversion_override.write_text(json.dumps(overrides))
+        output = selected
+    sys.stdout.write(output)
 elif operation == "get-schema-version" and sys.argv[4:] == [database]:
     print(versions[database])
 elif operation == "get-schema-cksum" and sys.argv[4:] == [database]:
@@ -198,14 +329,10 @@ elif operation == "backup" and sys.argv[4:] == [database]:
     if failure.exists() and failure.read_text().strip() == database:
         print("injected backup failure", file=sys.stderr)
         raise SystemExit(9)
-    payload = {{
-        "database": database,
-        "version": versions[database],
-        "checksum": checksums[database],
-        "mode": "standalone",
-        "records": [{{"id": database + "-record"}}],
-    }}
-    sys.stdout.write(json.dumps(payload, sort_keys=True) + "\\n")
+    sys.stdout.buffer.write(
+        record(schemas[database])
+        + record({{"_date": 1, "Fixture": {{database + "-record": {{"value": database}}}}}})
+    )
 else:
     raise SystemExit(2)
 """,
@@ -213,40 +340,141 @@ else:
     )
     (fake_bin / "ovsdb-tool").write_text(
         f"""#!/usr/bin/python3
+import hashlib
 import json
 import pathlib
-import shutil
 import sys
 
 calls = pathlib.Path({str(calls)!r})
+mutate_on_show_log = pathlib.Path({str(mutate_on_show_log)!r})
+replace_on_show_log = pathlib.Path({str(replace_on_show_log)!r})
+mutate_manifest_on_show_log = pathlib.Path({str(mutate_manifest_on_show_log)!r})
+replace_manifest_on_show_log = pathlib.Path({str(replace_manifest_on_show_log)!r})
+mutate_earlier_snapshot_on_show_log = pathlib.Path({str(mutate_earlier_snapshot_on_show_log)!r})
+final_anchor_race = pathlib.Path({str(final_anchor_race)!r})
+replace_schema_on_create = pathlib.Path({str(replace_schema_on_create)!r})
+
+def record(document):
+    body = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\\n").encode()
+    digest = hashlib.sha1(body, usedforsecurity=False).hexdigest()
+    return f"OVSDB JSON {{len(body)}} {{digest}}\\n".encode() + body
+
+def records(path):
+    payload = path.read_bytes()
+    result = []
+    offset = 0
+    while offset < len(payload):
+        end = payload.find(b"\\n", offset)
+        if end < 0:
+            raise SystemExit(3)
+        header = payload[offset:end + 1].decode("ascii").split(" ")
+        if len(header) != 4 or header[:2] != ["OVSDB", "JSON"]:
+            raise SystemExit(3)
+        length = int(header[2])
+        start = end + 1
+        body = payload[start:start + length]
+        if len(body) != length or not body.endswith(b"\\n"):
+            raise SystemExit(3)
+        if hashlib.sha1(body, usedforsecurity=False).hexdigest() + "\\n" != header[3]:
+            raise SystemExit(3)
+        result.append(json.loads(body))
+        offset = start + length
+    if not result:
+        raise SystemExit(3)
+    return result
+
 with calls.open("a", encoding="ascii") as log:
     log.write("tool " + " ".join(sys.argv[1:]) + "\\n")
 if len(sys.argv) < 3:
     raise SystemExit(2)
 operation = sys.argv[1]
 source = pathlib.Path(sys.argv[2])
-try:
-    payload = json.loads(source.read_text())
-except Exception:
-    raise SystemExit(3)
-if operation == "compact" and len(sys.argv) == 4:
+if operation == "create" and len(sys.argv) == 4:
+    if source.exists():
+        raise SystemExit(4)
+    schema = json.loads(pathlib.Path(sys.argv[3]).read_text())
+    schema["tables"]["Fixture"]["columns"]["value"]["type"] = "string"
+    if schema.get("cksum") == "":
+        schema.pop("cksum")
+    source.write_bytes(record(schema))
+    source.chmod(0o600)
+    installed = pathlib.Path(sys.argv[3])
+    if replace_schema_on_create.exists() and replace_schema_on_create.read_text().strip() == str(installed):
+        replacement = installed.parent / ("." + installed.name + ".create-replacement")
+        replacement.write_bytes(installed.read_bytes())
+        replacement.chmod(installed.stat().st_mode & 0o777)
+        replacement.replace(installed)
+        replace_schema_on_create.unlink()
+elif operation == "compact" and len(sys.argv) == 4:
+    payload = records(source)
     destination = pathlib.Path(sys.argv[3])
     if destination.exists():
         raise SystemExit(4)
-    shutil.copyfile(source, destination)
+    column = payload[0].get("tables", {{}}).get("Fixture", {{}}).get("columns", {{}}).get("value", {{}})
+    if column.get("type") == {{"key": "string"}}:
+        column["type"] = "string"
+    if payload[0].get("cksum") == "":
+        payload[0].pop("cksum")
+    destination.write_bytes(b"".join(record(document) for document in payload))
     destination.chmod(0o600)
 elif operation == "db-is-standalone" and len(sys.argv) == 3:
-    if payload.get("mode") != "standalone":
-        raise SystemExit(5)
+    payload = records(source)
 elif operation == "db-name" and len(sys.argv) == 3:
-    print(payload.get("database", ""))
+    print(records(source)[0].get("name", ""))
 elif operation == "db-version" and len(sys.argv) == 3:
-    print(payload.get("version", ""))
+    print(records(source)[0].get("version", ""))
 elif operation == "db-cksum" and len(sys.argv) == 3:
-    print(payload.get("checksum", ""))
+    print(records(source)[0].get("cksum", ""))
 elif operation == "show-log" and len(sys.argv) == 3:
-    if not isinstance(payload.get("records"), list):
-        raise SystemExit(6)
+    payload = records(source)
+    if mutate_on_show_log.exists() and source.name == mutate_on_show_log.read_text().strip():
+        with source.open("ab") as output:
+            output.write(record({{"_date": 9, "Fixture": {{"raced": {{"value": "raced"}}}}}}))
+        mutate_on_show_log.unlink()
+    if replace_on_show_log.exists() and source.name == replace_on_show_log.read_text().strip():
+        replacement = source.parent / ("." + source.name + ".show-log-replacement")
+        replacement.write_bytes(source.read_bytes())
+        replacement.chmod(source.stat().st_mode & 0o777)
+        replacement.replace(source)
+        replace_on_show_log.unlink()
+    if mutate_manifest_on_show_log.exists() and source.name == mutate_manifest_on_show_log.read_text().strip():
+        manifest = source.parent / "manifest.json"
+        with manifest.open("ab") as output:
+            output.write(b" ")
+        mutate_manifest_on_show_log.unlink()
+    if replace_manifest_on_show_log.exists() and source.name == replace_manifest_on_show_log.read_text().strip():
+        manifest = source.parent / "manifest.json"
+        replacement = manifest.parent / ".manifest.json.show-log-replacement"
+        replacement.write_bytes(manifest.read_bytes())
+        replacement.chmod(manifest.stat().st_mode & 0o777)
+        replacement.replace(manifest)
+        replace_manifest_on_show_log.unlink()
+    if mutate_earlier_snapshot_on_show_log.exists():
+        mutation = json.loads(mutate_earlier_snapshot_on_show_log.read_text())
+        if source.name == mutation["trigger"]:
+            target = pathlib.Path(mutation["target"])
+            with target.open("ab") as output:
+                output.write(record({{"_date": 10, "Fixture": {{"late": {{"value": "late"}}}}}}))
+            mutate_earlier_snapshot_on_show_log.unlink()
+    if final_anchor_race.exists():
+        race = json.loads(final_anchor_race.read_text())
+        if source.name == race["trigger"]:
+            race["remaining"] -= 1
+            if race["remaining"] <= 0:
+                if race["action"] == "snapshot-append":
+                    with source.open("ab") as output:
+                        output.write(record({{"_date": 11, "Fixture": {{"final": {{"value": "final"}}}}}}))
+                elif race["action"] == "manifest-replace":
+                    manifest = source.parent / "manifest.json"
+                    replacement = manifest.parent / ".manifest.json.final-anchor-replacement"
+                    replacement.write_bytes(manifest.read_bytes())
+                    replacement.chmod(manifest.stat().st_mode & 0o777)
+                    replacement.replace(manifest)
+                else:
+                    raise SystemExit(2)
+                final_anchor_race.unlink()
+            else:
+                final_anchor_race.write_text(json.dumps(race))
 else:
     raise SystemExit(2)
 """,
@@ -273,6 +501,11 @@ else:
         "/run/pvn-control/pvn-control-db.sock": str(sockets["PVN_Control"]),
         "/run/ovn/ovnnb_db.sock": str(sockets["OVN_Northbound"]),
         "/run/ovn/ovnsb_db.sock": str(sockets["OVN_Southbound"]),
+        "/usr/share/pvn/schema/PVN_Control.ovsschema": str(
+            schema_paths["PVN_Control"]
+        ),
+        "/usr/share/ovn/ovn-nb.ovsschema": str(schema_paths["OVN_Northbound"]),
+        "/usr/share/ovn/ovn-sb.ovsschema": str(schema_paths["OVN_Southbound"]),
     }
     for old, new in replacements.items():
         source = source.replace(old, new)
@@ -282,6 +515,122 @@ else:
     )
     tested_script.write_text(source, encoding="utf-8")
     tested_script.chmod(0o755)
+
+    tested_module_name = "pvn_db_backup_isolated_schema_test"
+    tested_loader = importlib.machinery.SourceFileLoader(
+        tested_module_name, str(tested_script)
+    )
+    tested_specification = importlib.util.spec_from_loader(
+        tested_module_name, tested_loader
+    )
+    check(tested_specification is not None, "cannot load isolated backup module")
+    tested_module = importlib.util.module_from_spec(tested_specification)
+    sys.modules[tested_module_name] = tested_module
+    tested_loader.exec_module(tested_module)
+
+    parser_root = temporary / "schema-record-parser"
+    parser_root.mkdir(mode=0o700)
+    parser_database = tested_module.DATABASE_BY_KEY["pvn-control"]
+
+    def record_with_body(body: bytes, *, length: int | None = None, digest: str | None = None) -> bytes:
+        actual_digest = digest or hashlib.sha1(
+            body, usedforsecurity=False
+        ).hexdigest()
+        return (
+            f"OVSDB JSON {len(body) if length is None else length} {actual_digest}\n".encode(
+                "ascii"
+            )
+            + body
+        )
+
+    def expect_schema_record_failure(payload: bytes, expected: str, label: str) -> None:
+        path = parser_root / f"{len(list(parser_root.iterdir())):02d}.ovsdb"
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        try:
+            tested_module.read_standalone_schema_record(
+                path, parser_database, label
+            )
+        except tested_module.BackupError as error:
+            check(
+                expected in str(error),
+                f"{label} returned the wrong error: {error}",
+            )
+            return
+        raise AssertionError(f"{label} was accepted")
+
+    valid_schema_record = encode_ovsdb_record(normalized_schemas["PVN_Control"])
+    valid_with_trailing_transaction = (
+        valid_schema_record
+        + encode_ovsdb_record(
+            {"_date": 3, "Fixture": {"trailing": {"value": "ok"}}}
+        )
+    )
+    valid_parser_path = parser_root / "valid-with-trailing.ovsdb"
+    valid_parser_path.write_bytes(valid_with_trailing_transaction)
+    valid_parser_path.chmod(0o600)
+    tested_module.read_standalone_schema_record(
+        valid_parser_path, parser_database, "valid trailing-transaction snapshot"
+    )
+
+    valid_body = valid_schema_record.split(b"\n", 1)[1]
+    expect_schema_record_failure(
+        b"OVSDB JSON " + b"9" * 130 + b"\n{}\n",
+        "header is too long",
+        "overlong record header",
+    )
+    expect_schema_record_failure(
+        record_with_body(valid_body, digest="0" * 40),
+        "SHA-1 mismatch",
+        "bad record SHA-1",
+    )
+    expect_schema_record_failure(
+        b"OVSDB JSON 3 " + b"0" * 40 + b"{}\n",
+        "invalid OVSDB JSON",
+        "missing record-header LF",
+    )
+    body_without_lf = valid_body[:-1]
+    expect_schema_record_failure(
+        record_with_body(body_without_lf),
+        "does not end with LF",
+        "schema body without terminal LF",
+    )
+    duplicate_body = (
+        b'{"name":"PVN_Control","version":"1.0.0","cksum":"",'
+        b'"tables":{"Fixture":{"columns":{"value":'
+        b'{"type":"string","type":"integer"}}}}}\n'
+    )
+    expect_schema_record_failure(
+        record_with_body(duplicate_body),
+        "duplicate JSON key",
+        "duplicate nested schema key",
+    )
+    expect_schema_record_failure(
+        record_with_body(valid_body, length=len(valid_body) + 10),
+        "truncated",
+        "truncated schema record",
+    )
+    expect_schema_record_failure(
+        record_with_body(
+            b"{}\n", length=tested_module.MAX_SCHEMA + 1
+        ),
+        "too large",
+        "oversized declared schema record",
+    )
+    wrong_name = copy.deepcopy(normalized_schemas["PVN_Control"])
+    wrong_name["name"] = "Wrong_Control"
+    expect_schema_record_failure(
+        encode_ovsdb_record(wrong_name),
+        "does not contain the PVN_Control schema",
+        "wrong schema name",
+    )
+    invalid_checksum = copy.deepcopy(normalized_schemas["PVN_Control"])
+    invalid_checksum["cksum"] = 7
+    expect_schema_record_failure(
+        encode_ovsdb_record(invalid_checksum),
+        "invalid optional schema checksum",
+        "non-string optional checksum",
+    )
 
     def reset_status(status: dict | None = None, sequence: list[dict] | None = None) -> None:
         status_path.write_text(json.dumps(status or base_status), encoding="utf-8")
@@ -379,6 +728,177 @@ else:
     verified = require_success(invoke("verify", str(backup_set)), "offline verify")
     check(verified["verified"] is True, "verify did not report success")
     check("tool compact" in calls.read_text(), "verify did not compact an offline copy")
+    baseline_calls = calls.read_text(encoding="ascii")
+    for remote, database in socket_map.items():
+        expected = (
+            f"client --timeout=10 needs-conversion {remote} "
+            f"{schema_paths[database]}"
+        )
+        check(
+            baseline_calls.count(expected) >= 4,
+            f"{database} was not compatibility-gated around its live backup",
+        )
+    check(
+        f"tool create" in baseline_calls
+        and str(schema_paths["PVN_Control"]) in baseline_calls,
+        "PVN installed schema was not normalized through ovsdb-tool create",
+    )
+    check(
+        not any(
+            f"tool create" in line and str(schema_paths[name]) in line
+            for line in baseline_calls.splitlines()
+            for name in ("OVN_Northbound", "OVN_Southbound")
+        ),
+        "offline installed-schema normalization escaped the PVN_Control scope",
+    )
+
+    database_keys = {
+        "PVN_Control": "pvn-control",
+        "OVN_Northbound": "ovn-nb",
+        "OVN_Southbound": "ovn-sb",
+    }
+    for name, key in database_keys.items():
+        conversion_override.write_text(
+            json.dumps({name: "yes\n"}), encoding="utf-8"
+        )
+        rejected_root = temporary / f"conversion-yes-{key}"
+        reset_status()
+        result = invoke(
+            "create", "--output", str(rejected_root), "--database", key
+        )
+        check(
+            result.returncode != 0
+            and "not exactly the installed package schema" in result.stderr,
+            f"{name} needs-conversion yes was accepted",
+        )
+        check(
+            rejected_root.is_dir() and not list(rejected_root.iterdir()),
+            f"{name} conversion rejection published a backup set",
+        )
+    for index, malformed in enumerate(("no", "maybe\n", "no\nyes\n")):
+        conversion_override.write_text(
+            json.dumps({"PVN_Control": malformed}), encoding="utf-8"
+        )
+        rejected_root = temporary / f"conversion-malformed-{index}"
+        reset_status()
+        result = invoke(
+            "create",
+            "--output",
+            str(rejected_root),
+            "--database",
+            "pvn-control",
+        )
+        check(
+            result.returncode != 0
+            and "not exactly the installed package schema" in result.stderr,
+            f"malformed needs-conversion output {malformed!r} was accepted",
+        )
+        check(
+            rejected_root.is_dir() and not list(rejected_root.iterdir()),
+            "malformed conversion output published a backup set",
+        )
+    conversion_override.write_text(
+        json.dumps({"PVN_Control": ["no\n", "no\n", "yes\n"]}),
+        encoding="utf-8",
+    )
+    post_snapshot_drift_root = temporary / "post-snapshot-schema-drift"
+    reset_status()
+    result = invoke(
+        "create",
+        "--output",
+        str(post_snapshot_drift_root),
+        "--database",
+        "pvn-control",
+    )
+    check(
+        result.returncode != 0
+        and "not exactly the installed package schema" in result.stderr,
+        "schema conversion immediately after snapshot capture was accepted",
+    )
+    check(
+        post_snapshot_drift_root.is_dir()
+        and not list(post_snapshot_drift_root.iterdir()),
+        "post-snapshot schema drift published a backup set",
+    )
+    conversion_override.unlink()
+
+    replace_schema_on_conversion.write_text(
+        str(schema_paths["PVN_Control"]), encoding="utf-8"
+    )
+    conversion_replace_root = temporary / "schema-replaced-during-conversion"
+    reset_status()
+    result = invoke(
+        "create",
+        "--output",
+        str(conversion_replace_root),
+        "--database",
+        "pvn-control",
+    )
+    check(
+        result.returncode != 0
+        and "schema changed during live validation" in result.stderr,
+        "same-bytes installed schema replacement during live validation was accepted",
+    )
+    check(
+        not replace_schema_on_conversion.exists()
+        and conversion_replace_root.is_dir()
+        and not list(conversion_replace_root.iterdir()),
+        "live schema replacement published a backup or left its hook",
+    )
+
+    replace_schema_on_create.write_text(
+        str(schema_paths["PVN_Control"]), encoding="utf-8"
+    )
+    normalization_replace_root = temporary / "schema-replaced-during-normalization"
+    reset_status()
+    result = invoke(
+        "create",
+        "--output",
+        str(normalization_replace_root),
+        "--database",
+        "pvn-control",
+    )
+    check(
+        result.returncode != 0 and "changed during normalization" in result.stderr,
+        "same-bytes installed schema replacement during normalization was accepted",
+    )
+    check(
+        not replace_schema_on_create.exists()
+        and normalization_replace_root.is_dir()
+        and not list(normalization_replace_root.iterdir()),
+        "normalization schema replacement published a backup or left its hook",
+    )
+
+    for action in ("snapshot-append", "manifest-replace"):
+        final_anchor_race.write_text(
+            json.dumps(
+                {
+                    "trigger": "pvn-control.ovsdb",
+                    "remaining": 3,
+                    "action": action,
+                }
+            ),
+            encoding="utf-8",
+        )
+        final_anchor_root = temporary / f"final-anchor-{action}"
+        reset_status()
+        result = invoke(
+            "create",
+            "--output",
+            str(final_anchor_root),
+            "--database",
+            "pvn-control",
+        )
+        check(
+            result.returncode != 0 and "changed" in result.stderr,
+            f"{action} during the final create anchor was accepted",
+        )
+        check(
+            not final_anchor_race.exists()
+            and final_anchor_root.is_dir()
+            and not list(final_anchor_root.iterdir()),
+            f"{action} during the final create anchor published a backup",
+        )
 
     legacy = clone_backup(backup_set, "legacy-v1")
     legacy_manifest_path = legacy / "manifest.json"
@@ -398,6 +918,198 @@ else:
     check(
         legacy_verified["format"] == "pvn-db-backup/v1",
         "legacy manifest format was not preserved",
+    )
+
+    legacy_syntax = clone_backup(legacy, "legacy-equivalent-schema-syntax")
+    legacy_syntax_snapshot = legacy_syntax / "pvn-control.ovsdb"
+    legacy_syntax_records = decode_ovsdb_records(
+        legacy_syntax_snapshot.read_bytes()
+    )
+    legacy_syntax_records[0]["tables"]["Fixture"]["columns"]["value"][
+        "type"
+    ] = {"key": "string"}
+    legacy_syntax_payload = rewrite_ovsdb_records(
+        legacy_syntax_snapshot, legacy_syntax_records
+    )
+    legacy_syntax_manifest_path = legacy_syntax / "manifest.json"
+    legacy_syntax_manifest = json.loads(
+        legacy_syntax_manifest_path.read_text(encoding="utf-8")
+    )
+    legacy_syntax_manifest["databases"][0].update(
+        bytes=len(legacy_syntax_payload),
+        sha256=hashlib.sha256(legacy_syntax_payload).hexdigest(),
+    )
+    legacy_syntax_manifest_path.write_text(
+        json.dumps(legacy_syntax_manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    require_success(
+        invoke("verify", str(legacy_syntax)),
+        "legacy equivalent-schema normalization verify",
+    )
+
+    installed_pvn_before = schema_paths["PVN_Control"].read_bytes()
+    future_installed = copy.deepcopy(installed_schemas["PVN_Control"])
+    future_installed["tables"]["Fixture"]["columns"]["future"] = {
+        "type": "string"
+    }
+    schema_paths["PVN_Control"].write_text(
+        json.dumps(future_installed, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    schema_paths["PVN_Control"].chmod(0o644)
+    try:
+        require_success(
+            invoke("verify", str(legacy)),
+            "archival verify with a newer installed PVN schema",
+        )
+        try:
+            tested_module.verify_backup_set(
+                legacy, require_current_pvn_schema=True
+            )
+        except tested_module.BackupError as error:
+            check(
+                "differs from the installed package schema" in str(error),
+                f"strict legacy compatibility returned the wrong error: {error}",
+            )
+        else:
+            raise AssertionError(
+                "strict compatibility accepted a historical PVN schema"
+            )
+    finally:
+        schema_paths["PVN_Control"].write_bytes(installed_pvn_before)
+        schema_paths["PVN_Control"].chmod(0o644)
+
+    same_metadata_drift = clone_backup(backup_set, "same-metadata-pvn-schema-drift")
+    drift_snapshot = same_metadata_drift / "pvn-control.ovsdb"
+    drift_records = decode_ovsdb_records(drift_snapshot.read_bytes())
+    drift_records[0]["tables"]["Fixture"]["columns"]["shadow"] = {
+        "type": "string"
+    }
+    drift_payload = rewrite_ovsdb_records(drift_snapshot, drift_records)
+    drift_manifest_path = same_metadata_drift / "manifest.json"
+    drift_manifest = json.loads(drift_manifest_path.read_text(encoding="utf-8"))
+    drift_manifest["databases"][0].update(
+        bytes=len(drift_payload), sha256=hashlib.sha256(drift_payload).hexdigest()
+    )
+    drift_manifest_path.write_text(
+        json.dumps(drift_manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    require_success(
+        invoke("verify", str(same_metadata_drift)),
+        "archival same-metadata schema verify",
+    )
+    try:
+        tested_module.verify_backup_set(
+            same_metadata_drift, require_current_pvn_schema=True
+        )
+    except tested_module.BackupError as error:
+        check(
+            "differs from the installed package schema" in str(error),
+            f"same-metadata strict gate returned the wrong error: {error}",
+        )
+    else:
+        raise AssertionError("strict gate accepted same-version empty-cksum PVN drift")
+
+    empty_nb_checksum = clone_backup(backup_set, "empty-northbound-checksum")
+    empty_nb_snapshot = empty_nb_checksum / "ovn-northbound.ovsdb"
+    empty_nb_records = decode_ovsdb_records(empty_nb_snapshot.read_bytes())
+    empty_nb_records[0]["cksum"] = ""
+    empty_nb_payload = rewrite_ovsdb_records(empty_nb_snapshot, empty_nb_records)
+    empty_nb_manifest_path = empty_nb_checksum / "manifest.json"
+    empty_nb_manifest = json.loads(
+        empty_nb_manifest_path.read_text(encoding="utf-8")
+    )
+    empty_nb_manifest["databases"][1].update(
+        bytes=len(empty_nb_payload),
+        sha256=hashlib.sha256(empty_nb_payload).hexdigest(),
+        schema_checksum="",
+    )
+    empty_nb_manifest_path.write_text(
+        json.dumps(empty_nb_manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    result = invoke("verify", str(empty_nb_checksum))
+    check(
+        result.returncode != 0 and "schema checksum is empty for ovn-nb" in result.stderr,
+        "empty OVN Northbound schema checksum was accepted",
+    )
+
+    raced_backup = clone_backup(backup_set, "snapshot-mutated-during-verify")
+    mutate_on_show_log.write_text("pvn-control.ovsdb\n", encoding="ascii")
+    result = invoke("verify", str(raced_backup))
+    check(
+        result.returncode != 0
+        and "snapshot changed during verification" in result.stderr,
+        "snapshot mutation between structural checks was accepted",
+    )
+    check(
+        not mutate_on_show_log.exists(),
+        "snapshot mutation hook was not exercised",
+    )
+    replaced_backup = clone_backup(backup_set, "snapshot-replaced-during-verify")
+    replace_on_show_log.write_text("pvn-control.ovsdb\n", encoding="ascii")
+    result = invoke("verify", str(replaced_backup))
+    check(
+        result.returncode != 0
+        and "snapshot changed during verification" in result.stderr,
+        "same-bytes snapshot replacement during verify was accepted",
+    )
+    check(
+        not replace_on_show_log.exists(),
+        "same-bytes snapshot replacement hook was not exercised",
+    )
+    mutated_manifest_backup = clone_backup(
+        backup_set, "manifest-mutated-during-verify"
+    )
+    mutate_manifest_on_show_log.write_text(
+        "pvn-control.ovsdb\n", encoding="ascii"
+    )
+    result = invoke("verify", str(mutated_manifest_backup))
+    check(
+        result.returncode != 0
+        and "backup manifest changed during verification" in result.stderr,
+        "manifest mutation during verify was accepted",
+    )
+    check(
+        not mutate_manifest_on_show_log.exists(),
+        "manifest mutation hook was not exercised",
+    )
+    replaced_manifest_backup = clone_backup(
+        backup_set, "manifest-replaced-during-verify"
+    )
+    replace_manifest_on_show_log.write_text(
+        "pvn-control.ovsdb\n", encoding="ascii"
+    )
+    result = invoke("verify", str(replaced_manifest_backup))
+    check(
+        result.returncode != 0 and "changed during verification" in result.stderr,
+        "same-bytes manifest replacement during verify was accepted",
+    )
+    check(
+        not replace_manifest_on_show_log.exists(),
+        "same-bytes manifest replacement hook was not exercised",
+    )
+    late_snapshot_backup = clone_backup(
+        backup_set, "earlier-snapshot-mutated-by-later-verify"
+    )
+    mutate_earlier_snapshot_on_show_log.write_text(
+        json.dumps(
+            {
+                "trigger": "ovn-northbound.ovsdb",
+                "target": str(late_snapshot_backup / "pvn-control.ovsdb"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = invoke("verify", str(late_snapshot_backup))
+    check(
+        result.returncode != 0 and "snapshot changed" in result.stderr,
+        "an earlier snapshot mutation during later verification was accepted",
+    )
+    check(
+        not mutate_earlier_snapshot_on_show_log.exists(),
+        "earlier-snapshot mutation hook was not exercised",
     )
 
     reset_status()
@@ -470,6 +1182,256 @@ else:
         "voter-c": write_status_report("voter-c-status.json", follower_c_report),
     }
     selected_entry = selected_manifest["databases"][0]
+
+    pvn_leader_status = copy.deepcopy(base_status)
+    pvn_leader_status["databases"][0].update(role="leader", leader="self")
+    reset_status(pvn_leader_status)
+    pvn_recovery = require_success(
+        invoke(
+            "create",
+            "--output",
+            str(output_root),
+            "--database",
+            "pvn-control",
+            "--recovery-window",
+        ),
+        "PVN recovery-window create",
+    )
+    pvn_recovery_path = pathlib.Path(pvn_recovery["backup_set"])
+    pvn_recovery_manifest = json.loads(
+        (pvn_recovery_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    pvn_recovery_entry = pvn_recovery_manifest["databases"][0]
+    pvn_follower_b = copy.deepcopy(pvn_leader_status)
+    pvn_follower_b["databases"][0].update(
+        server_id="dddddddd-dddd-4ddd-8ddd-dddddddddd01",
+        address="ssl:192.0.2.11:6646",
+        role="follower",
+        leader="aaaa",
+    )
+    pvn_follower_c = copy.deepcopy(pvn_leader_status)
+    pvn_follower_c["databases"][0].update(
+        server_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeee02",
+        address="ssl:192.0.2.12:6646",
+        role="follower",
+        leader="aaaa",
+    )
+    pvn_status_paths = {
+        source_hostname: write_status_report(
+            "pvn-source-status.json", pvn_leader_status
+        ),
+        "pvn-voter-b": write_status_report(
+            "pvn-voter-b-status.json", pvn_follower_b
+        ),
+        "pvn-voter-c": write_status_report(
+            "pvn-voter-c-status.json", pvn_follower_c
+        ),
+    }
+    pvn_current_digest = pvn_recovery_entry["sha256"]
+    pvn_current_gate_arguments = [
+        "pre-restore",
+        str(pvn_recovery_path),
+        "--database",
+        "pvn-control",
+        "--captured-after",
+        pvn_recovery_entry["capture_started_at"],
+        "--expected-sha256",
+        pvn_current_digest,
+    ]
+    for node, path in pvn_status_paths.items():
+        pvn_current_gate_arguments.extend(("--voter-status", f"{node}={path}"))
+    reset_status(pvn_leader_status)
+    pvn_pre_restore = require_success(
+        invoke(*pvn_current_gate_arguments), "current PVN pre-restore"
+    )
+    check(
+        pvn_pre_restore["database_key"] == "pvn-control"
+        and pvn_pre_restore["restore_ready"] is True,
+        "current PVN pre-restore did not traverse the strict schema gate",
+    )
+    reset_status(pvn_leader_status)
+    pvn_reserved = require_success(
+        invoke(
+            "reserve-restore",
+            *pvn_current_gate_arguments[1:],
+            "--confirm",
+            f"RESTORE PVN_Control {pvn_current_digest}",
+        ),
+        "current PVN restore reservation",
+    )
+    pvn_receipt = pathlib.Path(pvn_reserved["receipt_path"])
+    check(
+        pvn_reserved["database_key"] == "pvn-control"
+        and pvn_reserved["snapshot"] == "pvn-control.ovsdb"
+        and pvn_receipt.is_file(),
+        "current PVN reservation did not persist the expected receipt",
+    )
+    pvn_receipt.unlink()
+    receipt_root.rmdir()
+
+    replace_on_central_status.write_text(
+        json.dumps(
+            {"remaining": 2, "path": str(pvn_recovery_path / "pvn-control.ovsdb")}
+        ),
+        encoding="utf-8",
+    )
+    reset_status(pvn_leader_status)
+    result = invoke(
+        "reserve-restore",
+        *pvn_current_gate_arguments[1:],
+        "--confirm",
+        f"RESTORE PVN_Control {pvn_current_digest}",
+    )
+    check(
+        result.returncode != 0 and "recovery snapshot changed" in result.stderr,
+        "late same-bytes recovery snapshot replacement created a reservation",
+    )
+    check(
+        not replace_on_central_status.exists() and not receipt_root.exists(),
+        "late snapshot replacement left a hook or restore receipt",
+    )
+    replace_on_central_status.write_text(
+        json.dumps(
+            {"remaining": 2, "path": str(pvn_recovery_path / "manifest.json")}
+        ),
+        encoding="utf-8",
+    )
+    reset_status(pvn_leader_status)
+    result = invoke(
+        "reserve-restore",
+        *pvn_current_gate_arguments[1:],
+        "--confirm",
+        f"RESTORE PVN_Control {pvn_current_digest}",
+    )
+    check(
+        result.returncode != 0 and "backup manifest changed" in result.stderr,
+        "late same-bytes manifest replacement created a reservation",
+    )
+    check(
+        not replace_on_central_status.exists() and not receipt_root.exists(),
+        "late manifest replacement left a hook or restore receipt",
+    )
+
+    installed_schema_before_switch = schema_paths["PVN_Control"].read_bytes()
+    switched_schema = copy.deepcopy(installed_schemas["PVN_Control"])
+    switched_schema["tables"]["Fixture"]["columns"]["same_metadata_switch"] = {
+        "type": "string"
+    }
+    switched_schema_payload = json.dumps(switched_schema, sort_keys=True) + "\n"
+    replace_on_central_status.write_text(
+        json.dumps(
+            {
+                "remaining": 1,
+                "path": str(schema_paths["PVN_Control"]),
+                "payload": switched_schema_payload,
+            }
+        ),
+        encoding="utf-8",
+    )
+    reset_status(pvn_leader_status)
+    result = invoke(*pvn_current_gate_arguments)
+    check(
+        result.returncode != 0
+        and "differs from the installed package schema" in result.stderr,
+        "pre-restore accepted a same-metadata live/package schema switch",
+    )
+    check(
+        not replace_on_central_status.exists(),
+        "pre-restore schema-switch hook was not exercised",
+    )
+    schema_paths["PVN_Control"].write_bytes(installed_schema_before_switch)
+    schema_paths["PVN_Control"].chmod(0o644)
+
+    replace_on_central_status.write_text(
+        json.dumps(
+            {
+                "remaining": 2,
+                "path": str(schema_paths["PVN_Control"]),
+                "payload": switched_schema_payload,
+            }
+        ),
+        encoding="utf-8",
+    )
+    reset_status(pvn_leader_status)
+    result = invoke(
+        "reserve-restore",
+        *pvn_current_gate_arguments[1:],
+        "--confirm",
+        f"RESTORE PVN_Control {pvn_current_digest}",
+    )
+    check(
+        result.returncode != 0
+        and "differs from the installed package schema" in result.stderr,
+        "restore reservation accepted a final same-metadata schema switch",
+    )
+    check(
+        not replace_on_central_status.exists() and not receipt_root.exists(),
+        "final schema switch left a hook or restore receipt",
+    )
+    schema_paths["PVN_Control"].write_bytes(installed_schema_before_switch)
+    schema_paths["PVN_Control"].chmod(0o644)
+
+    pvn_drift_set = clone_backup(
+        pvn_recovery_path, "pvn-recovery-same-metadata-schema-drift"
+    )
+    pvn_drift_snapshot = pvn_drift_set / "pvn-control.ovsdb"
+    pvn_drift_records = decode_ovsdb_records(pvn_drift_snapshot.read_bytes())
+    pvn_drift_records[0]["tables"]["Fixture"]["columns"]["shadow"] = {
+        "type": "string"
+    }
+    pvn_drift_payload = rewrite_ovsdb_records(
+        pvn_drift_snapshot, pvn_drift_records
+    )
+    pvn_drift_manifest_path = pvn_drift_set / "manifest.json"
+    pvn_drift_manifest = json.loads(
+        pvn_drift_manifest_path.read_text(encoding="utf-8")
+    )
+    pvn_drift_manifest["databases"][0].update(
+        bytes=len(pvn_drift_payload),
+        sha256=hashlib.sha256(pvn_drift_payload).hexdigest(),
+    )
+    pvn_drift_manifest_path.write_text(
+        json.dumps(pvn_drift_manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    pvn_drift_digest = pvn_drift_manifest["databases"][0]["sha256"]
+    require_success(
+        invoke("verify", str(pvn_drift_set)),
+        "archival PVN recovery-window drift verify",
+    )
+    pvn_gate_arguments = [
+        "pre-restore",
+        str(pvn_drift_set),
+        "--database",
+        "pvn-control",
+        "--captured-after",
+        pvn_recovery_entry["capture_started_at"],
+        "--expected-sha256",
+        pvn_drift_digest,
+    ]
+    for node, path in pvn_status_paths.items():
+        pvn_gate_arguments.extend(("--voter-status", f"{node}={path}"))
+    reset_status(pvn_leader_status)
+    result = invoke(*pvn_gate_arguments)
+    check(
+        result.returncode != 0
+        and "differs from the installed package schema" in result.stderr,
+        "PVN pre-restore accepted same-version empty-cksum schema drift",
+    )
+    reset_status(pvn_leader_status)
+    result = invoke(
+        "reserve-restore",
+        *pvn_gate_arguments[1:],
+        "--confirm",
+        f"RESTORE PVN_Control {pvn_drift_digest}",
+    )
+    check(
+        result.returncode != 0
+        and "differs from the installed package schema" in result.stderr,
+        "PVN restore reservation accepted same-version empty-cksum schema drift",
+    )
+    check(not receipt_root.exists(), "rejected PVN schema drift created a receipt")
+    reset_status()
 
     def pre_restore_arguments(
         *,
@@ -729,14 +1691,13 @@ else:
         pathlib.Path(selected["backup_set"]), "same-term-distinct-snapshot"
     )
     distinct_snapshot_path = distinct_snapshot_set / "ovn-northbound.ovsdb"
-    distinct_snapshot_payload = json.loads(
-        distinct_snapshot_path.read_text(encoding="utf-8")
+    distinct_snapshot_records = decode_ovsdb_records(
+        distinct_snapshot_path.read_bytes()
     )
-    distinct_snapshot_payload["records"].append({"id": "different-record"})
-    distinct_snapshot_path.write_text(
-        json.dumps(distinct_snapshot_payload, sort_keys=True) + "\n",
-        encoding="utf-8",
+    distinct_snapshot_records.append(
+        {"_date": 2, "Fixture": {"different-record": {"value": "different"}}}
     )
+    rewrite_ovsdb_records(distinct_snapshot_path, distinct_snapshot_records)
     distinct_digest = hashlib.sha256(distinct_snapshot_path.read_bytes()).hexdigest()
     distinct_manifest_path = distinct_snapshot_set / "manifest.json"
     distinct_manifest = json.loads(distinct_manifest_path.read_text(encoding="utf-8"))
@@ -1107,10 +2068,9 @@ else:
 
     wrong_identity = clone_backup(backup_set, "wrong-identity")
     wrong_snapshot = wrong_identity / "pvn-control.ovsdb"
-    payload = json.loads(wrong_snapshot.read_text())
-    payload["database"] = "Wrong_Control"
-    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode()
-    wrong_snapshot.write_bytes(encoded)
+    wrong_records = decode_ovsdb_records(wrong_snapshot.read_bytes())
+    wrong_records[0]["name"] = "Wrong_Control"
+    encoded = rewrite_ovsdb_records(wrong_snapshot, wrong_records)
     wrong_manifest_path = wrong_identity / "manifest.json"
     wrong_manifest = json.loads(wrong_manifest_path.read_text())
     wrong_manifest["databases"][0]["bytes"] = len(encoded)

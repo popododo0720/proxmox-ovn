@@ -52,6 +52,8 @@ TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 SAFE_HOSTNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 MAX_MANIFEST = 1024 * 1024
 MAX_TEXT_OUTPUT = 1024 * 1024
+MAX_SCHEMA = 16 * 1024 * 1024
+MAX_OVSDB_RECORD_HEADER = 128
 MAX_RECEIPT = 64 * 1024
 MAX_RECOVERY_WINDOW_AGE = 60 * 60
 MAX_STATUS_AGE = 10 * 60
@@ -73,10 +75,20 @@ class Database:
     name: str
     socket_path: pathlib.Path
     filename: str
+    schema_path: pathlib.Path
 
     @property
     def remote(self) -> str:
         return f"unix:{self.socket_path}"
+
+
+@dataclasses.dataclass(frozen=True)
+class SnapshotEvidence:
+    database: Database
+    path: pathlib.Path
+    identity: tuple[int, ...]
+    digest: str
+    size: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,18 +124,21 @@ DATABASES = (
         "PVN_Control",
         pathlib.Path("/run/pvn-control/pvn-control-db.sock"),
         "pvn-control.ovsdb",
+        pathlib.Path("/usr/share/pvn/schema/PVN_Control.ovsschema"),
     ),
     Database(
         "ovn-nb",
         "OVN_Northbound",
         pathlib.Path("/run/ovn/ovnnb_db.sock"),
         "ovn-northbound.ovsdb",
+        pathlib.Path("/usr/share/ovn/ovn-nb.ovsschema"),
     ),
     Database(
         "ovn-sb",
         "OVN_Southbound",
         pathlib.Path("/run/ovn/ovnsb_db.sock"),
         "ovn-southbound.ovsdb",
+        pathlib.Path("/usr/share/ovn/ovn-sb.ovsschema"),
     ),
 )
 DATABASE_BY_KEY = {database.key: database for database in DATABASES}
@@ -176,8 +191,14 @@ def decode_json(raw: bytes | str, label: str) -> Any:
 
     try:
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-        return json.loads(text, object_pairs_hook=reject_duplicates)
-    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateJSONKey) as error:
+        return json.loads(
+            text,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {value!r}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateJSONKey, ValueError) as error:
         fail(f"{label} is invalid JSON: {error}")
 
 
@@ -263,6 +284,142 @@ def secure_file(path: pathlib.Path, label: str, exact_mode: int) -> os.stat_resu
     return metadata
 
 
+def stable_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def canonical_database_schema(document: Any, database: Database, label: str) -> bytes:
+    if not isinstance(document, dict) or document.get("name") != database.name:
+        fail(f"{label} does not contain the {database.name} schema")
+    if "cksum" in document and not isinstance(document["cksum"], str):
+        fail(f"{label} has an invalid optional schema checksum")
+    canonical = dict(document)
+    canonical.pop("cksum", None)
+    return json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def read_installed_schema(database: Database) -> tuple[tuple[int, ...], str]:
+    path = database.schema_path
+    inspect_directory_chain(path.parent, f"{database.name} schema directory")
+    try:
+        before = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect installed {database.name} schema: {error}")
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        fail(f"installed {database.name} schema must be a regular non-symlink file")
+    if before.st_nlink != 1:
+        fail(f"installed {database.name} schema must have exactly one hard link")
+    if (before.st_uid, before.st_gid) != (0, 0):
+        fail(f"installed {database.name} schema must be owned by root:root")
+    if stat.S_IMODE(before.st_mode) & 0o022:
+        fail(f"installed {database.name} schema must not be group/world writable")
+    if not 0 < before.st_size <= MAX_SCHEMA:
+        fail(f"installed {database.name} schema has an invalid size")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open installed {database.name} schema: {error}")
+    payload = bytearray()
+    try:
+        opened = os.fstat(descriptor)
+        if stable_file_identity(opened) != stable_file_identity(before):
+            fail(f"installed {database.name} schema changed while it was opened")
+        while len(payload) <= MAX_SCHEMA:
+            block = os.read(descriptor, min(1024 * 1024, MAX_SCHEMA + 1 - len(payload)))
+            if not block:
+                break
+            payload.extend(block)
+        final = os.fstat(descriptor)
+    except OSError as error:
+        fail(f"cannot read installed {database.name} schema: {error}")
+    finally:
+        os.close(descriptor)
+    if len(payload) > MAX_SCHEMA or len(payload) != before.st_size:
+        fail(f"installed {database.name} schema changed size or is too large")
+    try:
+        after = path.lstat()
+    except OSError as error:
+        fail(f"cannot re-inspect installed {database.name} schema: {error}")
+    expected = stable_file_identity(before)
+    if stable_file_identity(final) != expected or stable_file_identity(after) != expected:
+        fail(f"installed {database.name} schema changed while it was read")
+    document = decode_json(bytes(payload), f"installed {database.name} schema")
+    canonical_database_schema(document, database, f"installed {database.name} schema")
+    return expected, hashlib.sha256(payload).hexdigest()
+
+
+def read_standalone_schema_record(
+    path: pathlib.Path, database: Database, label: str
+) -> bytes:
+    before = secure_file(path, label, 0o600)
+    expected = stable_file_identity(before)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open {label}: {error}")
+    try:
+        opened = os.fstat(descriptor)
+        if stable_file_identity(opened) != expected:
+            fail(f"{label} changed while it was opened")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            header = source.readline(MAX_OVSDB_RECORD_HEADER + 1)
+            if len(header) > MAX_OVSDB_RECORD_HEADER:
+                fail(f"{label} first-record header is too long")
+            match = re.fullmatch(
+                rb"OVSDB JSON ([1-9][0-9]*) ([0-9a-f]{40})\n", header
+            )
+            if match is None:
+                fail(f"{label} has an invalid OVSDB JSON first-record header")
+            length = int(match.group(1))
+            if length > MAX_SCHEMA:
+                fail(f"{label} first schema record is too large")
+            record = bytearray()
+            while len(record) < length:
+                block = source.read(length - len(record))
+                if not block:
+                    break
+                record.extend(block)
+            if len(record) != length:
+                fail(f"{label} first schema record is truncated")
+        final = os.fstat(descriptor)
+    except OSError as error:
+        fail(f"cannot read {label}: {error}")
+    finally:
+        os.close(descriptor)
+    try:
+        after = path.lstat()
+    except OSError as error:
+        fail(f"cannot re-inspect {label}: {error}")
+    if stable_file_identity(final) != expected or stable_file_identity(after) != expected:
+        fail(f"{label} changed while its schema record was read")
+    payload = bytes(record)
+    if not payload.endswith(b"\n"):
+        fail(f"{label} first schema record does not end with LF")
+    actual_hash = hashlib.sha1(payload, usedforsecurity=False).hexdigest()
+    if actual_hash != match.group(2).decode("ascii"):
+        fail(f"{label} first schema record SHA-1 mismatch")
+    document = decode_json(payload[:-1], f"{label} first schema record")
+    return canonical_database_schema(document, database, f"{label} first schema record")
+
+
 def require_central_marker() -> None:
     try:
         metadata = CENTRAL_MARKER.lstat()
@@ -298,6 +455,7 @@ def command(
     *,
     timeout: int,
     quiet_stdout: bool = False,
+    strip_stdout: bool = True,
 ) -> str:
     try:
         result = subprocess.run(
@@ -326,7 +484,8 @@ def command(
     if len(output) > MAX_TEXT_OUTPUT:
         fail(f"command returned excessive output: {arguments[0]}")
     try:
-        return output.decode("utf-8", "strict").strip()
+        decoded = output.decode("utf-8", "strict")
+        return decoded.strip() if strip_stdout else decoded
     except UnicodeDecodeError:
         fail(f"command returned non-UTF-8 output: {arguments[0]}")
 
@@ -477,6 +636,41 @@ def require_socket(database: Database) -> None:
         fail(f"{database.name} endpoint is not a real Unix socket")
 
 
+def validate_schema_metadata(database: Database, version: str, checksum: str) -> None:
+    if (
+        len(version) > 256
+        or len(checksum) > 256
+        or "\n" in version
+        or "\r" in version
+        or "\n" in checksum
+        or "\r" in checksum
+    ):
+        fail(f"{database.name} returned invalid schema metadata")
+    if database.key != "pvn-control" and not checksum:
+        fail(f"{database.name} requires a nonempty schema checksum")
+
+
+def require_live_schema_current(database: Database) -> tuple[tuple[int, ...], str]:
+    installed_before = read_installed_schema(database)
+    conversion = command(
+        [
+            OVSDB_CLIENT,
+            "--timeout=10",
+            "needs-conversion",
+            database.remote,
+            str(database.schema_path),
+        ],
+        timeout=15,
+        strip_stdout=False,
+    )
+    installed_after = read_installed_schema(database)
+    if installed_after != installed_before:
+        fail(f"installed {database.name} schema changed during live validation")
+    if conversion != "no\n":
+        fail(f"live {database.name} schema is not exactly the installed package schema")
+    return installed_before
+
+
 def live_schema(database: Database) -> tuple[str, str]:
     require_socket(database)
     listed = command(
@@ -484,6 +678,7 @@ def live_schema(database: Database) -> tuple[str, str]:
     ).splitlines()
     if database.name not in {line.strip() for line in listed if line.strip()}:
         fail(f"{database.name} is not served by {database.socket_path}")
+    installed_before = require_live_schema_current(database)
     version = command(
         [
             OVSDB_CLIENT,
@@ -504,8 +699,10 @@ def live_schema(database: Database) -> tuple[str, str]:
         ],
         timeout=15,
     )
-    if len(version) > 256 or len(checksum) > 256 or "\n" in version or "\n" in checksum:
-        fail(f"{database.name} returned invalid schema metadata")
+    installed_after = require_live_schema_current(database)
+    if installed_after != installed_before:
+        fail(f"installed {database.name} schema changed across live metadata reads")
+    validate_schema_metadata(database, version, checksum)
     return version, checksum
 
 
@@ -553,12 +750,24 @@ def backup_database(database: Database, destination: pathlib.Path) -> tuple[int,
 def hash_file(path: pathlib.Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
+    try:
+        before = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect {path.name}: {error}")
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        fail(f"{path.name} must be a regular non-symlink file")
+    if before.st_nlink != 1:
+        fail(f"{path.name} must have exactly one hard link")
+    expected = stable_file_identity(before)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
         fail(f"cannot open {path.name}: {error}")
     try:
+        opened = os.fstat(descriptor)
+        if stable_file_identity(opened) != expected:
+            fail(f"{path.name} changed while it was opened")
         with os.fdopen(descriptor, "rb", closefd=False) as source:
             while True:
                 block = source.read(1024 * 1024)
@@ -566,11 +775,29 @@ def hash_file(path: pathlib.Path) -> tuple[str, int]:
                     break
                 size += len(block)
                 digest.update(block)
+        final = os.fstat(descriptor)
     except OSError as error:
         fail(f"cannot read {path.name}: {error}")
     finally:
         os.close(descriptor)
+    try:
+        after = path.lstat()
+    except OSError as error:
+        fail(f"cannot re-inspect {path.name}: {error}")
+    if stable_file_identity(final) != expected or stable_file_identity(after) != expected:
+        fail(f"{path.name} changed while it was hashed")
     return digest.hexdigest(), size
+
+
+def require_file_identity(
+    path: pathlib.Path, expected: tuple[int, ...], label: str
+) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect {label}: {error}")
+    if stable_file_identity(metadata) != expected:
+        fail(f"{label} changed during verification")
 
 
 def write_manifest(path: pathlib.Path, manifest: dict[str, Any]) -> None:
@@ -786,7 +1013,11 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             fail(f"backup manifest SHA-256 is invalid for {key}")
         positive_integer(entry.get("bytes"), f"{key} bytes")
         parse_short_string(entry.get("schema_version"), f"{key} schema version")
-        parse_short_string(entry.get("schema_checksum"), f"{key} schema checksum")
+        schema_checksum = parse_short_string(
+            entry.get("schema_checksum"), f"{key} schema checksum"
+        )
+        if key != "pvn-control" and not schema_checksum:
+            fail(f"backup manifest schema checksum is empty for {key}")
         cluster_id = entry.get("cluster_id")
         if not isinstance(cluster_id, str) or not UUID.fullmatch(cluster_id):
             fail(f"backup manifest cluster ID is invalid for {key}")
@@ -832,34 +1063,145 @@ def offline_database_metadata(path: pathlib.Path, database: Database) -> tuple[s
     version = command([OVSDB_TOOL, "db-version", str(path)], timeout=30)
     checksum = command([OVSDB_TOOL, "db-cksum", str(path)], timeout=30)
     command([OVSDB_TOOL, "show-log", str(path)], timeout=120, quiet_stdout=True)
+    validate_schema_metadata(database, version, checksum)
     return version, checksum
 
 
-def verify_snapshot(
-    backup_set: pathlib.Path, entry: dict[str, Any], temporary_root: pathlib.Path
+def normalized_installed_pvn_schema(
+    database: Database, temporary_root: pathlib.Path
+) -> bytes:
+    if database.key != "pvn-control":
+        fail("offline installed-schema normalization is only valid for PVN_Control")
+    installed_before = read_installed_schema(database)
+    normalized = temporary_root / ".installed-pvn-control.ovsdb"
+    if os.path.lexists(normalized):
+        fail("temporary installed-schema database unexpectedly already exists")
+    previous_umask = os.umask(0o077)
+    try:
+        command(
+            [OVSDB_TOOL, "create", str(normalized), str(database.schema_path)],
+            timeout=120,
+            quiet_stdout=True,
+        )
+    finally:
+        os.umask(previous_umask)
+    installed_after = read_installed_schema(database)
+    if installed_after != installed_before:
+        fail(f"installed {database.name} schema changed during normalization")
+    offline_database_metadata(normalized, database)
+    return read_standalone_schema_record(
+        normalized, database, "normalized installed PVN_Control schema database"
+    )
+
+
+def require_current_pvn_snapshot_schema(
+    path: pathlib.Path, database: Database, temporary_parent: pathlib.Path
 ) -> None:
+    if database.key != "pvn-control":
+        return
+    temporary_root: pathlib.Path | None = None
+    try:
+        temporary_root = pathlib.Path(
+            tempfile.mkdtemp(prefix=".pvn-schema-anchor-", dir=temporary_parent)
+        )
+        os.chmod(temporary_root, 0o700)
+        offline_database_metadata(path, database)
+        snapshot_schema = read_standalone_schema_record(
+            path, database, "PVN_Control recovery snapshot"
+        )
+        installed_schema = normalized_installed_pvn_schema(
+            database, temporary_root
+        )
+        if snapshot_schema != installed_schema:
+            fail("PVN_Control snapshot schema differs from the installed package schema")
+    finally:
+        if temporary_root is not None and os.path.lexists(temporary_root):
+            shutil.rmtree(temporary_root)
+
+
+def verify_snapshot(
+    backup_set: pathlib.Path,
+    entry: dict[str, Any],
+    temporary_root: pathlib.Path,
+    require_current_pvn_schema: bool,
+) -> SnapshotEvidence:
     database = DATABASE_BY_KEY[entry["key"]]
     path = backup_set / database.filename
     metadata = secure_file(path, f"{database.name} snapshot", 0o600)
+    snapshot_identity = stable_file_identity(metadata)
     if metadata.st_size != entry["bytes"]:
         fail(f"snapshot byte count mismatch for {database.name}")
     digest, size = hash_file(path)
     if size != entry["bytes"] or digest != entry["sha256"]:
         fail(f"snapshot SHA-256 mismatch for {database.name}")
+    require_file_identity(
+        path, snapshot_identity, f"{database.name} snapshot"
+    )
     version, checksum = offline_database_metadata(path, database)
+    require_file_identity(
+        path, snapshot_identity, f"{database.name} snapshot"
+    )
     if version != entry["schema_version"] or checksum != entry["schema_checksum"]:
         fail(f"snapshot schema metadata mismatch for {database.name}")
+    snapshot_pvn_schema: bytes | None = None
+    expected_pvn_schema: bytes | None = None
+    if database.key == "pvn-control":
+        snapshot_pvn_schema = read_standalone_schema_record(
+            path, database, f"{database.name} snapshot"
+        )
+        require_file_identity(
+            path, snapshot_identity, f"{database.name} snapshot"
+        )
+        if require_current_pvn_schema:
+            expected_pvn_schema = normalized_installed_pvn_schema(
+                database, temporary_root
+            )
+            if snapshot_pvn_schema != expected_pvn_schema:
+                fail(
+                    "PVN_Control snapshot schema differs from the installed package schema"
+                )
     compact = temporary_root / database.filename
+    require_file_identity(
+        path, snapshot_identity, f"{database.name} snapshot"
+    )
     command([OVSDB_TOOL, "compact", str(path), str(compact)], timeout=120, quiet_stdout=True)
+    require_file_identity(
+        path, snapshot_identity, f"{database.name} snapshot"
+    )
     compact_version, compact_checksum = offline_database_metadata(compact, database)
     if compact_version != version or compact_checksum != checksum:
         fail(f"compacted verification copy changed schema metadata for {database.name}")
+    if snapshot_pvn_schema is not None:
+        compact_schema = read_standalone_schema_record(
+            compact, database, "compacted PVN_Control verification copy"
+        )
+        if expected_pvn_schema is not None and compact_schema != expected_pvn_schema:
+            fail(
+                "compacted PVN_Control schema differs from the installed package schema"
+            )
+    final_digest, final_size = hash_file(path)
+    require_file_identity(
+        path, snapshot_identity, f"{database.name} snapshot"
+    )
+    if final_size != size or final_digest != digest:
+        fail(f"{database.name} snapshot changed during verification")
+    return SnapshotEvidence(database, path, snapshot_identity, digest, size)
 
 
-def verify_backup_set(backup_set: pathlib.Path) -> dict[str, Any]:
+def verify_backup_set(
+    backup_set: pathlib.Path, *, require_current_pvn_schema: bool = False
+) -> dict[str, Any]:
     metadata = inspect_directory_chain(backup_set, "backup set")
     if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, 0, 0o700):
         fail("backup set must be root:root mode 0700")
+    backup_set_identity = stable_file_identity(metadata)
+    manifest_path = backup_set / "manifest.json"
+    manifest_identity = stable_file_identity(
+        secure_file(manifest_path, "backup manifest", 0o600)
+    )
+    manifest_digest, manifest_size = hash_file(manifest_path)
+    if not 0 < manifest_size <= MAX_MANIFEST:
+        fail("backup manifest size is invalid")
     manifest = read_manifest(backup_set)
     entries = validate_manifest(manifest)
     expected_names = {"manifest.json", *(entry["file"] for entry in entries)}
@@ -870,13 +1212,56 @@ def verify_backup_set(backup_set: pathlib.Path) -> dict[str, Any]:
     if actual_names != expected_names:
         fail("backup set contains unknown or missing files")
     temporary_path: pathlib.Path | None = None
+    snapshot_evidence: list[SnapshotEvidence] = []
     try:
         temporary_path = pathlib.Path(
             tempfile.mkdtemp(prefix=".pvn-db-verify-", dir=backup_set.parent)
         )
         os.chmod(temporary_path, 0o700)
         for entry in entries:
-            verify_snapshot(backup_set, entry, temporary_path)
+            snapshot_evidence.append(
+                verify_snapshot(
+                    backup_set,
+                    entry,
+                    temporary_path,
+                    require_current_pvn_schema,
+                )
+            )
+        if require_current_pvn_schema:
+            for evidence in snapshot_evidence:
+                require_current_pvn_snapshot_schema(
+                    evidence.path, evidence.database, temporary_path
+                )
+        for evidence in snapshot_evidence:
+            require_file_identity(
+                evidence.path, evidence.identity, f"{evidence.path.name} snapshot"
+            )
+            final_digest, final_size = hash_file(evidence.path)
+            require_file_identity(
+                evidence.path, evidence.identity, f"{evidence.path.name} snapshot"
+            )
+            if (final_digest, final_size) != (evidence.digest, evidence.size):
+                fail(f"{evidence.path.name} snapshot changed during set verification")
+        require_file_identity(backup_set, backup_set_identity, "backup set")
+        require_file_identity(
+            manifest_path, manifest_identity, "backup manifest"
+        )
+        final_manifest_digest, final_manifest_size = hash_file(manifest_path)
+        require_file_identity(
+            manifest_path, manifest_identity, "backup manifest"
+        )
+        if (final_manifest_digest, final_manifest_size) != (
+            manifest_digest,
+            manifest_size,
+        ):
+            fail("backup manifest changed during verification")
+        try:
+            final_names = {entry.name for entry in backup_set.iterdir()}
+        except OSError as error:
+            fail(f"cannot re-enumerate backup set: {error}")
+        if final_names != expected_names:
+            fail("backup set file membership changed during verification")
+        require_file_identity(backup_set, backup_set_identity, "backup set")
     finally:
         if temporary_path is not None and os.path.lexists(temporary_path):
             shutil.rmtree(temporary_path)
@@ -931,7 +1316,9 @@ def pre_restore_check(
     voter_status_specs: list[str],
     status_max_age: int,
 ) -> dict[str, Any]:
-    verification = verify_backup_set(backup_set)
+    verification = verify_backup_set(
+        backup_set, require_current_pvn_schema=True
+    )
     manifest = read_manifest(backup_set)
     entries = validate_manifest(manifest)
     if manifest.get("format") != FORMAT or manifest.get("purpose") != "recovery-window":
@@ -943,6 +1330,21 @@ def pre_restore_check(
         fail("--expected-sha256 must be one lowercase SHA-256 digest")
     if entry["sha256"] != expected_sha256:
         fail("expected SHA-256 does not match the recovery-window manifest")
+    database = DATABASE_BY_KEY[database_key]
+    snapshot_path = backup_set / database.filename
+    snapshot_identity = stable_file_identity(
+        secure_file(snapshot_path, f"{database.name} recovery snapshot", 0o600)
+    )
+    snapshot_digest, snapshot_size = hash_file(snapshot_path)
+    if snapshot_digest != expected_sha256 or snapshot_size != entry["bytes"]:
+        fail("recovery snapshot differs from the recovery-window manifest")
+    manifest_path = backup_set / "manifest.json"
+    manifest_identity = stable_file_identity(
+        secure_file(manifest_path, "recovery backup manifest", 0o600)
+    )
+    manifest_digest, manifest_size = hash_file(manifest_path)
+    if not 0 < manifest_size <= MAX_MANIFEST:
+        fail("recovery backup manifest size is invalid")
 
     now = datetime.datetime.now(datetime.timezone.utc)
     window_start = timestamp_datetime(captured_after, "--captured-after")
@@ -1019,7 +1421,6 @@ def pre_restore_check(
 
     require_central_marker()
     require_recovery_service_state()
-    database = DATABASE_BY_KEY[database_key]
     require_socket(database)
     version, checksum = live_schema(database)
     if version != entry["schema_version"] or checksum != entry["schema_checksum"]:
@@ -1028,6 +1429,43 @@ def pre_restore_check(
     require_local_leaders(local_status, (database,))
     if local_status[database.name] != leader_identity:
         fail("local live Raft identity differs from the fresh voter status gate")
+    final_version, final_checksum = live_schema(database)
+    if (final_version, final_checksum) != (
+        entry["schema_version"],
+        entry["schema_checksum"],
+    ):
+        fail("selected live database schema changed during the pre-restore gate")
+    require_current_pvn_snapshot_schema(
+        snapshot_path, database, backup_set.parent
+    )
+    require_file_identity(
+        snapshot_path,
+        snapshot_identity,
+        f"{database.name} recovery snapshot",
+    )
+    final_snapshot_digest, final_snapshot_size = hash_file(snapshot_path)
+    require_file_identity(
+        snapshot_path,
+        snapshot_identity,
+        f"{database.name} recovery snapshot",
+    )
+    if (final_snapshot_digest, final_snapshot_size) != (
+        snapshot_digest,
+        snapshot_size,
+    ):
+        fail("recovery snapshot changed during the pre-restore gate")
+    require_file_identity(
+        manifest_path, manifest_identity, "recovery backup manifest"
+    )
+    final_manifest_digest, final_manifest_size = hash_file(manifest_path)
+    require_file_identity(
+        manifest_path, manifest_identity, "recovery backup manifest"
+    )
+    if (final_manifest_digest, final_manifest_size) != (
+        manifest_digest,
+        manifest_size,
+    ):
+        fail("recovery backup manifest changed during the pre-restore gate")
     return {
         **verification,
         "database_key": database.key,
@@ -1228,10 +1666,17 @@ def reserve_restore_submission(
         fail("fresh pre-restore gate differs from the verified backup identity")
 
     snapshot_path = backup_set / database.filename
+    snapshot_identity = stable_file_identity(
+        secure_file(snapshot_path, f"{database.name} recovery snapshot", 0o600)
+    )
     snapshot_digest, snapshot_size = hash_file(snapshot_path)
     if snapshot_digest != expected_sha256 or snapshot_size != entry["bytes"]:
         fail("recovery snapshot changed after the fresh pre-restore gate")
-    manifest_digest, manifest_size = hash_file(backup_set / "manifest.json")
+    manifest_path = backup_set / "manifest.json"
+    manifest_identity = stable_file_identity(
+        secure_file(manifest_path, "recovery backup manifest", 0o600)
+    )
+    manifest_digest, manifest_size = hash_file(manifest_path)
     if manifest_size <= 0 or manifest_size > MAX_MANIFEST:
         fail("backup manifest size changed after the fresh pre-restore gate")
 
@@ -1271,6 +1716,44 @@ def reserve_restore_submission(
         or live_identity.member_count != entry["member_count"]
     ):
         fail("local Raft identity changed after the fresh pre-restore gate")
+
+    final_live_version, final_live_checksum = live_schema(database)
+    if (final_live_version, final_live_checksum) != (
+        entry["schema_version"],
+        entry["schema_checksum"],
+    ):
+        fail("selected live database schema changed before restore reservation")
+    require_current_pvn_snapshot_schema(
+        snapshot_path, database, backup_set.parent
+    )
+    require_file_identity(
+        snapshot_path,
+        snapshot_identity,
+        f"{database.name} recovery snapshot",
+    )
+    final_snapshot_digest, final_snapshot_size = hash_file(snapshot_path)
+    require_file_identity(
+        snapshot_path,
+        snapshot_identity,
+        f"{database.name} recovery snapshot",
+    )
+    if (final_snapshot_digest, final_snapshot_size) != (
+        snapshot_digest,
+        snapshot_size,
+    ):
+        fail("recovery snapshot changed before restore reservation")
+    require_file_identity(
+        manifest_path, manifest_identity, "recovery backup manifest"
+    )
+    final_manifest_digest, final_manifest_size = hash_file(manifest_path)
+    require_file_identity(
+        manifest_path, manifest_identity, "recovery backup manifest"
+    )
+    if (final_manifest_digest, final_manifest_size) != (
+        manifest_digest,
+        manifest_size,
+    ):
+        fail("backup manifest changed before restore reservation")
 
     # One reservation is allowed for one selected database Raft leader epoch.
     # Deliberately omit backup paths, capture names, and snapshot digests from
@@ -1377,6 +1860,9 @@ def create_backup(
             started = utc_now()
             version, checksum = live_schema(database)
             size, digest = backup_database(database, partial / database.filename)
+            final_version, final_checksum = live_schema(database)
+            if (final_version, final_checksum) != (version, checksum):
+                fail(f"{database.name} schema metadata changed during backup")
             completed = utc_now()
             health = before[database.name]
             entry = {
@@ -1423,7 +1909,7 @@ def create_backup(
         }
         write_manifest(partial / "manifest.json", manifest)
         fsync_directory(partial)
-        verify_backup_set(partial)
+        verify_backup_set(partial, require_current_pvn_schema=True)
         if os.path.lexists(final):
             fail("generated backup set name unexpectedly already exists")
         os.rename(partial, final)
