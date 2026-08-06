@@ -253,6 +253,7 @@ func (s *Server) health(writer http.ResponseWriter, request *http.Request) {
 		"version": buildinfo.Version, "capacity": capacity,
 		"database": components["database"], "ovn_northbound": components["ovn_northbound"],
 		"ovn_southbound": components["ovn_southbound"], "reconciler": components["reconciler"],
+		"default_security_policy": components["default_security_policy"],
 	}})
 }
 
@@ -272,6 +273,7 @@ func (s *Server) componentHealth(parent context.Context) map[string]string {
 		{name: "ovn_northbound", probe: s.northboundProbe},
 		{name: "ovn_southbound", probe: s.southboundProbe},
 		{name: "reconciler", probe: s.reconcilerProbe},
+		{name: "default_security_policy", probe: s.defaultSecurity},
 	}
 	statuses := make([]string, len(probes))
 	var wait sync.WaitGroup

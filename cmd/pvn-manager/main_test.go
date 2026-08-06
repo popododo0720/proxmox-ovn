@@ -137,6 +137,49 @@ func (reconciler *controlledPeriodicReconciler) ReconcilePeriodic(ctx context.Co
 	}
 }
 
+type testDefaultSecurityRepairer struct {
+	calls int
+	err   error
+}
+
+func (repairer *testDefaultSecurityRepairer) EnsureDefaultSecurityPolicies(context.Context) error {
+	repairer.calls++
+	return repairer.err
+}
+
+type testPeriodicReconciler struct {
+	calls int
+	err   error
+}
+
+func (reconciler *testPeriodicReconciler) ReconcilePeriodic(context.Context, time.Duration) error {
+	reconciler.calls++
+	return reconciler.err
+}
+
+func TestDefaultSecurityStartupFailureIsNonFatal(t *testing.T) {
+	repairer := &testDefaultSecurityRepairer{err: errors.New("legacy name collision")}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	repairDefaultSecurityOnStartup(context.Background(), repairer, logger)
+	if repairer.calls != 1 {
+		t.Fatalf("startup repair calls=%d", repairer.calls)
+	}
+}
+
+func TestPeriodicReconcileContinuesWhenDefaultSecurityRepairFails(t *testing.T) {
+	policyErr := errors.New("default policy blocked")
+	reconcileErr := errors.New("render failed")
+	repairer := &testDefaultSecurityRepairer{err: policyErr}
+	controller := &testPeriodicReconciler{err: reconcileErr}
+	err := (managerPeriodicReconciler{controller: controller, defaultSecurity: repairer}).ReconcilePeriodic(context.Background(), time.Minute)
+	if repairer.calls != 1 || controller.calls != 1 {
+		t.Fatalf("repair calls=%d reconcile calls=%d", repairer.calls, controller.calls)
+	}
+	if !errors.Is(err, policyErr) || !errors.Is(err, reconcileErr) {
+		t.Fatalf("joined error=%v", err)
+	}
+}
+
 func TestReconcileLoopRunsImmediatelyThenWaitsAfterCompletion(t *testing.T) {
 	const interval = time.Minute
 	ctx, cancel := context.WithCancel(context.Background())

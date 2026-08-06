@@ -42,8 +42,26 @@ func TestHealthReportsLiveOperationalComponents(t *testing.T) {
 		Northbound string `json:"ovn_northbound"`
 		Southbound string `json:"ovn_southbound"`
 		Reconciler string `json:"reconciler"`
+		Policy     string `json:"default_security_policy"`
 	}](t, response)
-	if data.Status != "ok" || data.Database != "ready" || data.Northbound != "ready" || data.Southbound != "ready" || data.Reconciler != "ready" {
+	if data.Status != "ok" || data.Database != "ready" || data.Northbound != "ready" || data.Southbound != "ready" || data.Reconciler != "ready" || data.Policy != "ready" {
+		t.Fatalf("health data=%+v", data)
+	}
+}
+
+func TestHealthDegradesForMissingDefaultSecurityPolicy(t *testing.T) {
+	store := controlstore.NewMemory()
+	if _, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project"); err != nil {
+		t.Fatal(err)
+	}
+	ready := HealthProbeFunc(func(context.Context) error { return nil })
+	server, err := New(Options{Store: store, NorthboundProbe: ready, SouthboundProbe: ready, ReconcilerProbe: ready})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(t, server, http.MethodGet, "/api/v1/health", nil, nil)
+	data := decodeData[map[string]any](t, response)
+	if data["status"] != "degraded" || data["default_security_policy"] != "degraded" {
 		t.Fatalf("health data=%+v", data)
 	}
 }

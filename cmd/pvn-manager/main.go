@@ -191,6 +191,7 @@ func run(arguments []string) error {
 	if err != nil {
 		return err
 	}
+	repairDefaultSecurityOnStartup(startupContext, handler, logger)
 	application, err := api.NewApplicationHandler(handler, api.WebOptions{Root: defaults.webRoot, FrameAncestors: defaults.frameAncestors})
 	if err != nil {
 		return err
@@ -245,7 +246,7 @@ func run(arguments []string) error {
 			serverErrors <- runtimeServer.Serve(runtimeListener)
 		}()
 	}
-	go reconcilePeriodically(reconcileContext, controller, defaults.reconcileEvery, reconcilerHealth, logger)
+	go reconcilePeriodically(reconcileContext, managerPeriodicReconciler{controller: controller, defaultSecurity: handler}, defaults.reconcileEvery, reconcilerHealth, logger)
 
 	signalContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -404,6 +405,35 @@ func (health *reconcilerHealth) Probe(ctx context.Context) error {
 
 type periodicReconciler interface {
 	ReconcilePeriodic(context.Context, time.Duration) error
+}
+
+type defaultSecurityRepairer interface {
+	EnsureDefaultSecurityPolicies(context.Context) error
+}
+
+type managerPeriodicReconciler struct {
+	controller      periodicReconciler
+	defaultSecurity defaultSecurityRepairer
+}
+
+func (reconciler managerPeriodicReconciler) ReconcilePeriodic(ctx context.Context, freshness time.Duration) error {
+	var policyErr, reconcileErr error
+	if reconciler.defaultSecurity != nil {
+		policyErr = reconciler.defaultSecurity.EnsureDefaultSecurityPolicies(ctx)
+	}
+	if reconciler.controller != nil {
+		reconcileErr = reconciler.controller.ReconcilePeriodic(ctx, freshness)
+	}
+	return errors.Join(policyErr, reconcileErr)
+}
+
+func repairDefaultSecurityOnStartup(ctx context.Context, repairer defaultSecurityRepairer, logger *slog.Logger) {
+	if repairer == nil {
+		return
+	}
+	if err := repairer.EnsureDefaultSecurityPolicies(ctx); err != nil {
+		logger.Warn("default security policy startup repair incomplete; serving in degraded mode", "error", err)
+	}
 }
 
 func reconcileFreshness(interval time.Duration) time.Duration {

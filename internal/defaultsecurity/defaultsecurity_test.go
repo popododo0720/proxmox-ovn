@@ -209,6 +209,13 @@ func TestEnsureReconcilesRestrictiveGroupBeforeRules(t *testing.T) {
 	if group.State != model.ResourceReady || group.AppliedRevision != group.Revision {
 		t.Fatalf("group was not required ready: %+v", group.Metadata)
 	}
+	callCount := len(reconciler.calls)
+	if _, err := New(store, reconciler).Ensure(context.Background(), project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(reconciler.calls) != callCount {
+		t.Fatalf("ready policy was reconciled again: before=%d after=%d", callCount, len(reconciler.calls))
+	}
 }
 
 func TestEnsureRequiresSuccessfulRealization(t *testing.T) {
@@ -244,6 +251,50 @@ func TestEnsureAllDoesNotBackfillExistingEmptyPorts(t *testing.T) {
 	}
 }
 
+func TestProbeRequiresCompleteRealizedPolicy(t *testing.T) {
+	store := controlstore.NewMemory()
+	project := mustCreate(t, store, &model.Project{Name: "tenant", PoolID: "pool-tenant"}).(*model.Project)
+	manager := New(store, nil)
+	if err := manager.Probe(context.Background()); err == nil {
+		t.Fatal("Probe reported a missing policy ready")
+	}
+	reconciler := &recordingReconciler{store: store}
+	manager = New(store, reconciler)
+	if _, err := manager.Ensure(context.Background(), project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Probe(context.Background()); err != nil {
+		t.Fatalf("Probe rejected realized policy: %v", err)
+	}
+}
+
+func TestProbeUsesSingleSnapshotForMultipleProjects(t *testing.T) {
+	store := controlstore.NewMemory()
+	reconciler := &recordingReconciler{store: store}
+	manager := New(store, reconciler)
+	for index := 0; index < 3; index++ {
+		project := mustCreate(t, store, &model.Project{Name: fmt.Sprintf("tenant-%d", index), PoolID: fmt.Sprintf("pool-%d", index)}).(*model.Project)
+		if _, err := manager.Ensure(context.Background(), project.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observed := &snapshotOnlyStore{Store: store}
+	if err := New(observed, nil).Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if observed.snapshots != 1 || observed.gets != 0 || observed.lists != 0 {
+		t.Fatalf("snapshots=%d gets=%d lists=%d", observed.snapshots, observed.gets, observed.lists)
+	}
+	observed.snapshots, observed.gets, observed.lists = 0, 0, 0
+	reconcileCalls := len(reconciler.calls)
+	if err := New(observed, reconciler).EnsureAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if observed.snapshots != 1 || observed.gets != 0 || observed.lists != 0 || len(reconciler.calls) != reconcileCalls {
+		t.Fatalf("EnsureAll snapshots=%d gets=%d lists=%d reconciles=%d", observed.snapshots, observed.gets, observed.lists, len(reconciler.calls)-reconcileCalls)
+	}
+}
+
 func TestReservedResources(t *testing.T) {
 	projectID := "project-a"
 	if !IsReserved(desiredGroup(projectID)) || !IsReserved(desiredEgressRule(projectID)) || !IsReserved(desiredIngressRule(projectID)) {
@@ -263,6 +314,28 @@ func (function ReconcilerFunc) Reconcile(ctx context.Context, kind model.Kind, i
 type recordingReconciler struct {
 	store controlstore.Store
 	calls []string
+}
+
+type snapshotOnlyStore struct {
+	controlstore.Store
+	snapshots int
+	gets      int
+	lists     int
+}
+
+func (store *snapshotOnlyStore) Snapshot(ctx context.Context, kinds []model.Kind, options controlstore.ListOptions) (controlstore.ResourceSnapshot, error) {
+	store.snapshots++
+	return store.Store.Snapshot(ctx, kinds, options)
+}
+
+func (store *snapshotOnlyStore) Get(context.Context, model.Kind, string) (model.Resource, error) {
+	store.gets++
+	return nil, errors.New("Probe must not use Get")
+}
+
+func (store *snapshotOnlyStore) List(context.Context, model.Kind, controlstore.ListOptions) ([]model.Resource, error) {
+	store.lists++
+	return nil, errors.New("Probe must not use List")
 }
 
 func (r *recordingReconciler) Reconcile(ctx context.Context, kind model.Kind, id string) error {

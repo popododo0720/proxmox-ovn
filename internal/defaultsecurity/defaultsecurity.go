@@ -232,13 +232,16 @@ func (m *Manager) EnsureAll(ctx context.Context) error {
 	if m == nil || m.store == nil {
 		return errors.New("default security policy store is not configured")
 	}
-	projects, err := m.store.List(ctx, model.KindProject, controlstore.ListOptions{})
+	index, err := m.loadPolicyIndex(ctx)
 	if err != nil {
 		return err
 	}
 	var failures []error
-	for _, resource := range projects {
+	for _, resource := range index.projects {
 		if resource.GetMetadata().State == model.ResourceDeleting {
+			continue
+		}
+		if index.issue(resource.GetMetadata().ID) == nil {
 			continue
 		}
 		if _, ensureErr := m.Ensure(ctx, resource.GetMetadata().ID); ensureErr != nil {
@@ -246,6 +249,94 @@ func (m *Manager) EnsureAll(ctx context.Context) error {
 		}
 	}
 	return errors.Join(failures...)
+}
+
+// Probe reports whether every active project has a complete, realized default
+// policy. It is read-only and suitable for the manager health endpoint.
+func (m *Manager) Probe(ctx context.Context) error {
+	if m == nil || m.store == nil {
+		return errors.New("default security policy store is not configured")
+	}
+	index, err := m.loadPolicyIndex(ctx)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, resource := range index.projects {
+		if resource.GetMetadata().State == model.ResourceDeleting {
+			continue
+		}
+		if issue := index.issue(resource.GetMetadata().ID); issue != nil {
+			failures = append(failures, issue)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+type policyIndex struct {
+	projects             []model.Resource
+	groupsByID           map[string]*model.SecurityGroup
+	rulesByID            map[string]*model.SecurityGroupRule
+	defaultNameCollision map[string]bool
+}
+
+func (m *Manager) loadPolicyIndex(ctx context.Context) (*policyIndex, error) {
+	snapshot, err := m.store.Snapshot(ctx, []model.Kind{model.KindProject, model.KindSecurityGroup, model.KindSecurityGroupRule}, controlstore.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	index := &policyIndex{
+		projects:             snapshot[model.KindProject],
+		groupsByID:           make(map[string]*model.SecurityGroup, len(snapshot[model.KindSecurityGroup])),
+		rulesByID:            make(map[string]*model.SecurityGroupRule, len(snapshot[model.KindSecurityGroupRule])),
+		defaultNameCollision: make(map[string]bool),
+	}
+	for _, resource := range snapshot[model.KindSecurityGroup] {
+		group := resource.(*model.SecurityGroup)
+		index.groupsByID[group.ID] = group
+		if group.Name == DefaultSecurityGroupName && group.ID != DefaultSecurityGroupID(group.ProjectID) {
+			index.defaultNameCollision[group.ProjectID] = true
+		}
+	}
+	for _, resource := range snapshot[model.KindSecurityGroupRule] {
+		rule := resource.(*model.SecurityGroupRule)
+		index.rulesByID[rule.ID] = rule
+	}
+	return index, nil
+}
+
+func (index *policyIndex) issue(projectID string) error {
+	if index.defaultNameCollision[projectID] {
+		return fmt.Errorf("default security policy is blocked: %s", BlockedNameCollision)
+	}
+	desiredGroup := desiredGroup(projectID)
+	group := index.groupsByID[desiredGroup.ID]
+	if group == nil {
+		return errors.New("default security policy is incomplete")
+	}
+	if verifyErr := sameGroup(group, desiredGroup); verifyErr != nil {
+		return fmt.Errorf("default security policy is blocked: %s", BlockedMalformedGroup)
+	}
+	ready := resourceReady(group)
+	for _, desired := range []*model.SecurityGroupRule{desiredEgressRule(projectID), desiredIngressRule(projectID)} {
+		rule := index.rulesByID[desired.ID]
+		if rule == nil {
+			return errors.New("default security policy is incomplete")
+		}
+		if verifyErr := sameRule(rule, desired); verifyErr != nil {
+			return fmt.Errorf("default security policy is blocked: %s", BlockedMalformedRule)
+		}
+		ready = ready && resourceReady(rule)
+	}
+	if !ready {
+		return errors.New("default security policy is not realized")
+	}
+	return nil
+}
+
+func resourceReady(resource model.Resource) bool {
+	meta := resource.GetMetadata()
+	return meta.State == model.ResourceReady && meta.AppliedRevision == meta.Revision
 }
 
 func desiredGroup(projectID string) *model.SecurityGroup {
@@ -330,10 +421,13 @@ func (m *Manager) ensureResource(ctx context.Context, desired model.Resource) (m
 }
 
 func (m *Manager) reconcileAndRequireReady(ctx context.Context, resource model.Resource) (model.Resource, error) {
+	meta := resource.GetMetadata()
+	if meta.State == model.ResourceReady && meta.AppliedRevision == meta.Revision {
+		return resource, nil
+	}
 	if m.reconciler == nil {
 		return resource, nil
 	}
-	meta := resource.GetMetadata()
 	if err := m.reconciler.Reconcile(ctx, resource.ResourceKind(), meta.ID); err != nil {
 		return nil, fmt.Errorf("realize default security policy %s: %w", resource.ResourceKind(), err)
 	}
