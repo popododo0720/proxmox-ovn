@@ -825,9 +825,7 @@ for name, node in state["nodes"].items():
     node["network"] = "desired"
     node["staged"] = False
 
-topology_digest = hashlib.sha256(json.dumps(
-    legacy, sort_keys=True, separators=(",", ":")
-).encode()).hexdigest()
+topology_digest = hashlib.sha256(state["ledger"].encode()).hexdigest()
 snapshot_nodes = []
 for row in legacy["nodes"]:
     snapshot_nodes.append({
@@ -1153,6 +1151,32 @@ if grep -q 'action=write-ledger' "$LOG"; then
 fi
 grep -q 'already the exact schema 2 candidate; no-op' "$WORK/active-ledger-rerun.out" ||
     fail "exact active schema 2 rerun did not report a no-op"
+
+python3 - "$STATE" <<'PY'
+import hashlib
+import json
+import sys
+path = sys.argv[1]
+state = json.load(open(path, encoding="utf-8"))
+control = json.loads(state["control_ledger"])
+control["snapshot"]["topology_sha256"] = hashlib.sha256(
+    state["ledger"].encode()
+).hexdigest()
+state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
+state["control_ledger_sha256"] = hashlib.sha256(
+    state["control_ledger"].encode()
+).hexdigest()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream, sort_keys=True)
+PY
+: > "$LOG"
+PVN_TEST_ACTIVE=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-candidate-pin-rerun.out"
+if grep -q 'action=write-ledger' "$LOG"; then
+    fail "control-plane candidate raw pin repeated the topology ledger CAS"
+fi
 
 seed_active_schema1
 : > "$LOG"

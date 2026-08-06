@@ -3053,7 +3053,8 @@ def validate_active_control_ledger(
     nodes: list[dict[str, Any]],
     reports: list[dict[str, Any]],
     expected_legacy: dict[str, Any],
-    candidate: dict[str, Any],
+    legacy_sha256: str,
+    candidate_sha256: str,
 ) -> None:
     states = {
         (report.get("control_ledger_sha256"), report.get("control_ledger_text"))
@@ -3124,9 +3125,7 @@ def validate_active_control_ledger(
         or snapshot.get("physnet") != expected_legacy["physnet"]
     ):
         fail("active control-plane snapshot differs from the topology identity")
-    legacy_digest = digest_text(canonical_json(expected_legacy))
-    candidate_digest = digest_text(canonical_json(candidate))
-    if snapshot.get("topology_sha256") not in {legacy_digest, candidate_digest}:
+    if snapshot.get("topology_sha256") not in {legacy_sha256, candidate_sha256}:
         fail("active control-plane snapshot does not pin the legacy/candidate topology")
     snapshot_nodes = snapshot.get("nodes")
     expected_rows = {row["name"]: row for row in expected_legacy["nodes"]}
@@ -3212,10 +3211,12 @@ def build_active_ledger_upgrade_plan(
     except json.JSONDecodeError as exc:
         fail(f"active shared topology ledger is invalid: {exc}")
     expected_legacy = topology_ledger_base(cluster_name, nodes, reports, spec)
+    legacy_text = json.dumps(expected_legacy, sort_keys=True, indent=2) + "\n"
+    legacy_sha256 = digest_text(legacy_text)
     schema = previous.get("schema") if isinstance(previous, dict) else None
     if schema == 1:
-        if previous != expected_legacy:
-            fail("schema 1 topology ledger is not the exact live legacy projection")
+        if previous != expected_legacy or previous_text != legacy_text:
+            fail("schema 1 topology ledger is not the exact canonical legacy file")
         candidate = copy.deepcopy(previous)
         candidate["schema"] = 2
         candidate["corosync"] = corosync
@@ -3237,7 +3238,8 @@ def build_active_ledger_upgrade_plan(
     ):
         fail("schema 2 topology ledger is not the exact canonical candidate")
     validate_active_control_ledger(
-        cluster_name, nodes, reports, expected_legacy, candidate
+        cluster_name, nodes, reports, expected_legacy,
+        legacy_sha256, candidate_sha256,
     )
     return {
         "upgrade_required": upgrade_required,
