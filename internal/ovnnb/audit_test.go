@@ -63,16 +63,22 @@ func (runner *managedAuditRunner) Run(_ context.Context, _ string, arguments ...
 			case "_uuid":
 				cells = append(cells, auditTestUUID(row.uuid))
 			case "name":
-				cells = append(cells, row.name)
+				if table == "ACL" {
+					cells = append(cells, auditTestOptionalString(row.name, row.namePresent || row.name != ""))
+				} else {
+					cells = append(cells, row.name)
+				}
 			case "type":
 				cells = append(cells, row.rowType)
 			case "external_ids":
 				cells = append(cells, auditTestMap(row.externalIDs))
 			case "options":
 				cells = append(cells, auditTestMap(row.options))
-			case "direction", "match", "action", "external_ip", "logical_ip":
+			case "direction", "match", "action", "external_ip", "logical_ip", "external_port_range":
 				cells = append(cells, row.attributes[heading])
-			case "priority", "tier":
+			case "severity", "meter", "logical_port", "external_mac":
+				cells = append(cells, auditTestOptionalString(row.attributes[heading], row.attrPresent[heading] || row.attributes[heading] != ""))
+			case "priority", "tier", "label":
 				text := row.attributes[heading]
 				if text == "" {
 					text = "0"
@@ -123,6 +129,13 @@ func auditTestUUIDSet(uuids []string) []any {
 	return []any{"set", members}
 }
 
+func auditTestOptionalString(value string, present bool) any {
+	if !present {
+		return []any{"set", []any{}}
+	}
+	return []any{"set", []any{value}}
+}
+
 func auditTestMap(values map[string]string) []any {
 	keys := sortedAuditMapKeys(values)
 	pairs := make([]any, 0, len(keys))
@@ -157,7 +170,7 @@ func seedManagedAuditPlan(t *testing.T, runner *managedAuditRunner, snapshot con
 		runner.put(&managedAuditRow{
 			table: expected.table, uuid: uuid, name: expected.name, rowType: expected.rowType,
 			externalIDs: externalIDs, options: auditTestCopyMap(expected.requiredOptions),
-			attributes: auditTestCopyMap(expected.requiredAttrs), references: make(map[string][]string),
+			attributes: auditTestCopyMap(expected.requiredAttrs), attrPresent: make(map[string]bool), references: make(map[string][]string),
 		})
 		actualByKey[key] = uuid
 	}
@@ -269,10 +282,31 @@ func TestAuditManagedGraphRejectsSecurityCriticalACLAndNATDrift(t *testing.T) {
 		{name: "ACL action", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["action"] = "allow" }, want: "action="},
 		{name: "ACL tier", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["tier"] = "1" }, want: "tier="},
 		{name: "ACL log", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["log"] = "true" }, want: "log="},
+		{name: "ACL severity", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["severity"] = "alert" }, want: "severity="},
+		{name: "ACL name", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.name = "changed" }, want: "has name"},
+		{name: "ACL explicit empty name", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.namePresent = true }, want: "name atom that must be absent"},
+		{name: "ACL meter", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["meter"] = "meter-a" }, want: "meter="},
+		{name: "ACL explicit empty meter", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attrPresent["meter"] = true }, want: "meter=\"\" but it must be absent"},
+		{name: "ACL label", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.attributes["label"] = "1" }, want: "label="},
 		{name: "ACL options", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.options["apply-after-lb"] = "true" }, want: "has options"},
+		{name: "ACL new sample", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.references["sample_new"] = []string{deterministicUUID("sample-new")} }, want: "sample_new references"},
+		{name: "ACL established sample", key: "acl/rule-audit", mutate: func(row *managedAuditRow) { row.references["sample_est"] = []string{deterministicUUID("sample-est")} }, want: "sample_est references"},
 		{name: "NAT type", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.rowType = "snat" }, want: "has type"},
 		{name: "NAT external IP", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["external_ip"] = "192.0.2.99" }, want: "external_ip="},
 		{name: "NAT logical IP", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["logical_ip"] = "10.42.0.99" }, want: "logical_ip="},
+		{name: "NAT logical port", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["logical_port"] = "port-a" }, want: "logical_port="},
+		{name: "NAT explicit empty logical port", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attrPresent["logical_port"] = true }, want: "logical_port=\"\" but it must be absent"},
+		{name: "NAT external MAC", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["external_mac"] = "02:00:00:00:00:99" }, want: "external_mac="},
+		{name: "NAT external port range", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["external_port_range"] = "80" }, want: "external_port_range="},
+		{name: "NAT priority", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["priority"] = "1" }, want: "priority="},
+		{name: "NAT match", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.attributes["match"] = "ip4" }, want: "match="},
+		{name: "NAT options", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) { row.options["add_route"] = "true" }, want: "has options"},
+		{name: "NAT allowed external IPs", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) {
+			row.references["allowed_ext_ips"] = []string{deterministicUUID("allowed-address-set")}
+		}, want: "allowed_ext_ips references"},
+		{name: "NAT exempted external IPs", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) {
+			row.references["exempted_ext_ips"] = []string{deterministicUUID("exempted-address-set")}
+		}, want: "exempted_ext_ips references"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

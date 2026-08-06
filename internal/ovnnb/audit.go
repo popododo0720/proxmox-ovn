@@ -37,7 +37,7 @@ var managedAuditTables = []managedAuditTable{
 	{name: "Port_Group", columns: []string{"_uuid", "name", "external_ids", "ports", "acls"}},
 	{name: "Load_Balancer", columns: []string{"_uuid", "external_ids"}},
 	{name: "Load_Balancer_Health_Check", columns: []string{"_uuid", "external_ids"}},
-	{name: "ACL", columns: []string{"_uuid", "direction", "priority", "match", "action", "tier", "log", "options", "external_ids"}},
+	{name: "ACL", columns: []string{"_uuid", "direction", "priority", "match", "action", "tier", "log", "severity", "name", "meter", "label", "options", "sample_new", "sample_est", "external_ids"}},
 	{name: "QoS", columns: []string{"_uuid", "external_ids"}},
 	{name: "Mirror", columns: []string{"_uuid", "external_ids"}},
 	{name: "Meter", columns: []string{"_uuid", "external_ids"}},
@@ -46,7 +46,7 @@ var managedAuditTables = []managedAuditTable{
 	{name: "Logical_Router_Port", columns: []string{"_uuid", "name", "external_ids"}},
 	{name: "Logical_Router_Static_Route", columns: []string{"_uuid", "external_ids"}},
 	{name: "Logical_Router_Policy", columns: []string{"_uuid", "external_ids"}},
-	{name: "NAT", columns: []string{"_uuid", "type", "external_ip", "logical_ip", "external_ids", "gateway_port"}},
+	{name: "NAT", columns: []string{"_uuid", "type", "external_ip", "logical_ip", "logical_port", "external_mac", "external_port_range", "priority", "match", "options", "allowed_ext_ips", "exempted_ext_ips", "external_ids", "gateway_port"}},
 	{name: "DHCP_Options", columns: []string{"_uuid", "external_ids"}},
 	{name: "DHCP_Relay", columns: []string{"_uuid", "external_ids"}},
 	{name: "Connection", columns: []string{"_uuid", "external_ids"}},
@@ -92,10 +92,12 @@ type managedAuditRow struct {
 	table       string
 	uuid        string
 	name        string
+	namePresent bool
 	rowType     string
 	externalIDs map[string]string
 	options     map[string]string
 	attributes  map[string]string
+	attrPresent map[string]bool
 	references  map[string][]string
 }
 
@@ -112,7 +114,10 @@ type managedExpectedRow struct {
 	requiredExternal map[string]string
 	requiredOptions  map[string]string
 	requiredAttrs    map[string]string
+	absentAttrs      []string
+	emptyReferences  []string
 	exactOptions     bool
+	exactName        bool
 }
 
 type managedReferenceExpectation struct {
@@ -271,7 +276,7 @@ func decodeManagedAuditTable(spec managedAuditTable, output []byte) (map[string]
 		}
 		row := &managedAuditRow{
 			table: spec.name, externalIDs: make(map[string]string), options: make(map[string]string),
-			attributes: make(map[string]string), references: make(map[string][]string),
+			attributes: make(map[string]string), attrPresent: make(map[string]bool), references: make(map[string][]string),
 		}
 		for cellIndex, heading := range table.Headings {
 			cell := cells[cellIndex]
@@ -280,18 +285,24 @@ func decodeManagedAuditTable(spec managedAuditTable, output []byte) (map[string]
 			case "_uuid":
 				row.uuid, err = decodeAuditUUID(cell)
 			case "name":
-				err = json.Unmarshal(cell, &row.name)
+				if spec.name == "ACL" {
+					row.name, row.namePresent, err = decodeAuditOptionalString(cell)
+				} else {
+					err = json.Unmarshal(cell, &row.name)
+				}
 			case "type":
 				err = json.Unmarshal(cell, &row.rowType)
 			case "external_ids":
 				row.externalIDs, err = decodeAuditStringMap(cell)
 			case "options":
 				row.options, err = decodeAuditStringMap(cell)
-			case "direction", "match", "action", "external_ip", "logical_ip":
+			case "direction", "match", "action", "external_ip", "logical_ip", "external_port_range":
 				var value string
 				err = json.Unmarshal(cell, &value)
 				row.attributes[heading] = value
-			case "priority", "tier":
+			case "severity", "meter", "logical_port", "external_mac":
+				row.attributes[heading], row.attrPresent[heading], err = decodeAuditOptionalString(cell)
+			case "priority", "tier", "label":
 				var value int
 				err = json.Unmarshal(cell, &value)
 				row.attributes[heading] = strconv.Itoa(value)
@@ -315,6 +326,29 @@ func decodeManagedAuditTable(spec managedAuditTable, output []byte) (map[string]
 		rows[row.uuid] = row
 	}
 	return rows, nil
+}
+
+func decodeAuditOptionalString(raw json.RawMessage) (string, bool, error) {
+	var atom string
+	if err := json.Unmarshal(raw, &atom); err == nil {
+		return atom, true, nil
+	}
+	var value []json.RawMessage
+	if err := json.Unmarshal(raw, &value); err != nil || len(value) != 2 {
+		return "", false, errors.New("expected optional OVSDB string")
+	}
+	var tag string
+	if err := json.Unmarshal(value[0], &tag); err != nil || tag != "set" {
+		return "", false, errors.New("expected optional OVSDB string set")
+	}
+	var items []string
+	if err := json.Unmarshal(value[1], &items); err != nil || len(items) > 1 {
+		return "", false, errors.New("expected at most one optional OVSDB string")
+	}
+	if len(items) == 1 {
+		return items[0], true, nil
+	}
+	return "", false, nil
 }
 
 func decodeAuditUUID(raw json.RawMessage) (string, error) {
@@ -480,8 +514,10 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 				requiredAttrs: map[string]string{
 					"direction": implicit.direction, "priority": strconv.Itoa(implicit.priority),
 					"match": implicit.match, "action": implicit.action, "tier": "0", "log": "false",
+					"label": "0",
 				},
-				exactOptions: true,
+				absentAttrs: []string{"severity", "meter"}, emptyReferences: []string{"sample_new", "sample_est"},
+				exactOptions: true, exactName: true,
 			}); err != nil {
 				return managedAuditPlan{}, err
 			}
@@ -516,8 +552,10 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 			requiredAttrs: map[string]string{
 				"direction": spec.direction, "priority": strconv.Itoa(spec.priority),
 				"match": spec.match, "action": spec.action, "tier": "0", "log": "false",
+				"label": "0",
 			},
-			exactOptions: true,
+			absentAttrs: []string{"severity", "meter"}, emptyReferences: []string{"sample_new", "sample_est"},
+			exactOptions: true, exactName: true,
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -608,7 +646,12 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 					"pvn-managed": "true", "pvn-kind": "router-snat", "pvn-router": router.ID, "pvn-router-interface": routerInterface.ID,
 					"pvn-revision": strconv.FormatInt(router.Revision, 10), "pvn-interface-revision": strconv.FormatInt(routerInterface.Revision, 10),
 				},
-				requiredAttrs: map[string]string{"external_ip": router.ExternalIPAddress, "logical_ip": prefix.Masked().String()},
+				requiredAttrs: map[string]string{
+					"external_ip": router.ExternalIPAddress, "logical_ip": prefix.Masked().String(),
+					"external_port_range": "", "priority": "0", "match": "",
+				},
+				absentAttrs:     []string{"logical_port", "external_mac"},
+				emptyReferences: []string{"allowed_ext_ips", "exempted_ext_ips"}, exactOptions: true,
 			}); err != nil {
 				return managedAuditPlan{}, err
 			}
@@ -671,7 +714,12 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 			key: key, label: "floating IP NAT " + floatingIP.ID, table: "NAT", preferredUUID: deterministicUUID("floating-ip-nat:" + floatingIP.ID), rowType: "dnat_and_snat",
 			identity:         auditIdentity(model.KindFloatingIP.String(), "pvn-id", floatingIP.ID),
 			requiredExternal: auditResourceExternal(floatingIP, map[string]string{"pvn-project": floatingIP.ProjectID}),
-			requiredAttrs:    map[string]string{"external_ip": floatingIP.Address, "logical_ip": floatingIP.FixedIPAddress},
+			requiredAttrs: map[string]string{
+				"external_ip": floatingIP.Address, "logical_ip": floatingIP.FixedIPAddress,
+				"external_port_range": "", "priority": "0", "match": "",
+			},
+			absentAttrs:     []string{"logical_port", "external_mac"},
+			emptyReferences: []string{"allowed_ext_ips", "exempted_ext_ips"}, exactOptions: true,
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -948,10 +996,15 @@ func auditManagedInventory(plan managedAuditPlan, inventory managedAuditInventor
 		}
 		claimed[rowToken] = expected.label
 		actualByKey[key] = actual.uuid
-		if expected.name != "" {
+		if expected.name != "" || expected.exactName {
 			if actual.name != expected.name {
 				failures = append(failures, fmt.Errorf("%s UUID %q has name %q instead of %q", expected.label, actual.uuid, actual.name, expected.name))
 			}
+			if expected.exactName && actual.namePresent {
+				failures = append(failures, fmt.Errorf("%s UUID %q has an optional name atom that must be absent", expected.label, actual.uuid))
+			}
+		}
+		if expected.name != "" {
 			named := auditRowsNamed(rows, expected.name)
 			if len(named) != 1 || named[0].uuid != actual.uuid {
 				failures = append(failures, fmt.Errorf("%s expected name %q conflicts with UUIDs %v", expected.label, expected.name, auditRowUUIDs(named)))
@@ -982,6 +1035,16 @@ func auditManagedInventory(plan managedAuditPlan, inventory managedAuditInventor
 		for attribute, value := range expected.requiredAttrs {
 			if actual.attributes[attribute] != value {
 				failures = append(failures, fmt.Errorf("%s UUID %q has %s=%q instead of %q", expected.label, actual.uuid, attribute, actual.attributes[attribute], value))
+			}
+		}
+		for _, attribute := range expected.absentAttrs {
+			if actual.attrPresent[attribute] {
+				failures = append(failures, fmt.Errorf("%s UUID %q has optional %s=%q but it must be absent", expected.label, actual.uuid, attribute, actual.attributes[attribute]))
+			}
+		}
+		for _, reference := range expected.emptyReferences {
+			if len(actual.references[reference]) != 0 {
+				failures = append(failures, fmt.Errorf("%s UUID %q has unexpected %s references %v", expected.label, actual.uuid, reference, actual.references[reference]))
 			}
 		}
 	}
