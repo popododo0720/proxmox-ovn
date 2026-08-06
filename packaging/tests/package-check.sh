@@ -32,6 +32,7 @@ deploy/tests/pvn-update-test.sh
 deploy/tests/pvn-cluster-lease-test.sh
 deploy/tests/pvn-ovn-db-listeners-test.sh
 deploy/tests/pvn-topology-test.sh
+python3 deploy/tests/pvn-topology-corosync-test.py
 deploy/tests/pvn-control-plane-test.sh
 python3 deploy/tests/pvn-db-backup-test.py
 

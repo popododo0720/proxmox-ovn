@@ -112,6 +112,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import sys
 
@@ -156,7 +157,7 @@ with open(os.environ["PVN_TEST_LOG"], "a", encoding="utf-8") as stream:
     ))
 
 cleanup_actions = {
-    "restore-corosync", "rollback-network", "discard-stage", "restore-ledger",
+    "rollback-network", "discard-stage", "restore-ledger",
 }
 members_path = Path(os.environ["PVN_TOPOLOGY_MEMBERS_FILE"])
 members = json.loads(members_path.read_text(encoding="utf-8"))
@@ -193,7 +194,8 @@ if (
     stop("simulated final journal phase failure")
 
 mutating = {
-    "prepare", "validate-corosync", "apply-corosync", "restore-corosync",
+    "prepare", "validate-corosync", "apply-corosync",
+    "reload-corosync", "restart-corosync",
     "record-phase", "stage-network", "apply-network", "rollback-network",
     "discard-stage", "write-ledger", "restore-ledger",
 }
@@ -212,8 +214,17 @@ state_path = Path(os.environ["PVN_TEST_STATE"])
 if state_path.exists():
     state = json.loads(state_path.read_text(encoding="utf-8"))
 else:
+    initial_corosync = Path(os.environ["PVN_TEST_COROSYNC"]).read_text(encoding="utf-8")
     state = {
-        "corosync_text": Path(os.environ["PVN_TEST_COROSYNC"]).read_text(encoding="utf-8"),
+        "corosync_text": initial_corosync,
+        "corosync_runtime": {
+            name: initial_corosync for name in ("prox1", "prox2", "prox3")
+        },
+        "corosync_write_count": 0,
+        "corosync_writes": [],
+        "corosync_validation_count": 0,
+        "block_probes": False,
+        "restart_order": [],
         "ledger": None,
         "ledger_sha256": None,
         "nodes": {},
@@ -223,6 +234,10 @@ node_state = state["nodes"].setdefault(node, {
     "network": "initial", "staged": False, "journal": False, "phase": None,
     "effective_underlay_mtu": None,
 })
+if action == "probe" and state.get("block_probes") and os.environ.get(
+    "PVN_TEST_CRASH_AFTER_COROSYNC_WRITE_NUMBER"
+):
+    stop("simulated process crash boundary blocks recovery probes")
 if (
     os.environ.get("PVN_TEST_FAIL_FINAL_PROBE_HOST") == node
     and action == "probe"
@@ -276,6 +291,123 @@ provider = {
     "prox3": "192.168.200.178/24",
 }
 
+node_ids = {"prox1": 2, "prox2": 1, "prox3": 3}
+
+
+def parse_corosync(text):
+    import re
+    version_match = re.findall(r"^\s*config_version:\s*(\d+)\s*$", text, re.M)
+    cluster_match = re.findall(r"^\s*cluster_name:\s*(\S+)\s*$", text, re.M)
+    if len(version_match) != 1 or len(cluster_match) != 1:
+        stop("fake received malformed Corosync config")
+    nodes = {}
+    for match in re.finditer(r"(?ms)^\s*node\s*\{.*?^\s*\}", text):
+        block = match.group(0)
+        names = re.findall(r"^\s*name:\s*(\S+)\s*$", block, re.M)
+        ids = re.findall(r"^\s*nodeid:\s*(\d+)\s*$", block, re.M)
+        rings = dict(re.findall(r"^\s*ring([0-7])_addr:\s*(\S+)\s*$", block, re.M))
+        if len(names) != 1 or len(ids) != 1 or not rings:
+            stop("fake received malformed Corosync node")
+        nodes[names[0]] = {"node_id": int(ids[0]), "rings": rings}
+    return {
+        "cluster_name": cluster_match[0],
+        "config_version": int(version_match[0]),
+        "nodes": nodes,
+    }
+
+
+def runtime_report(local_name):
+    configs = {
+        name: parse_corosync(text)
+        for name, text in state["corosync_runtime"].items()
+    }
+    local = configs[local_name]
+    links = {}
+    expected_ids = sorted(node_ids.values())
+    for raw_ring, local_address in local["nodes"][local_name]["rings"].items():
+        connected = []
+        states = {}
+        for peer, peer_id in node_ids.items():
+            peer_ring = configs[peer]["nodes"].get(peer, {}).get("rings", {}).get(raw_ring)
+            expected_peer = local["nodes"].get(peer, {}).get("rings", {}).get(raw_ring)
+            is_connected = peer_ring is not None and peer_ring == expected_peer
+            if is_connected:
+                connected.append(peer_id)
+                states[str(peer_id)] = "localhost" if peer == local_name else "connected"
+            else:
+                states[str(peer_id)] = "disconnected"
+        links[raw_ring] = {
+            "address": local_address,
+            "connected_node_ids": sorted(connected),
+            "node_states": states,
+        }
+    members = {}
+    for peer, peer_id in node_ids.items():
+        peer_config = configs[peer]
+        members[str(peer_id)] = {
+            "status": "joined",
+            "config_version": peer_config["config_version"],
+            "rings": peer_config["nodes"][peer]["rings"],
+        }
+    return {
+        "local_node_id": node_ids[local_name],
+        "links": links,
+        "config": {
+            "cluster_name": local["cluster_name"],
+            "config_version": local["config_version"],
+            "local_node_id": node_ids[local_name],
+            "nodes": local["nodes"],
+            "members": members,
+            "bind_addresses": local["nodes"][local_name]["rings"],
+        },
+    }
+
+
+def bridge_is_full(local_name, request):
+    runtime = runtime_report(local_name)
+    link = runtime["links"].get(str(request["bridge_ring"]))
+    return (
+        link is not None
+        and link["connected_node_ids"] == sorted(node_ids.values())
+        and link["address"] == request["bridge_addresses"][local_name]
+    )
+
+
+def boundary_target_is_full(local_name, target):
+    if not isinstance(target, dict):
+        return False
+    runtime = runtime_report(local_name)["config"]
+    if (
+        runtime["cluster_name"] != target.get("cluster_name")
+        or runtime["config_version"] != target.get("config_version")
+        or runtime["nodes"] != target.get("nodes")
+        or runtime["bind_addresses"] != target.get("bind_addresses", {}).get(local_name)
+    ):
+        return False
+    expected_ids = {str(row["node_id"]) for row in target["nodes"].values()}
+    if set(runtime["members"]) != expected_ids:
+        return False
+    for name, target_node in target["nodes"].items():
+        member = runtime["members"][str(target_node["node_id"])]
+        if (
+            member["status"] != "joined"
+            or member["config_version"] != target["config_version"]
+            or member["rings"] != target["bind_addresses"][name]
+        ):
+            return False
+    return True
+
+
+def replace_node_ring(text, node_name, ring, address):
+    import re
+    pattern = re.compile(r"(?ms)(^\s*node\s*\{.*?^\s*name:\s*%s\s*$.*?^\s*ring%s_addr:\s*)\S+" % (
+        re.escape(node_name), ring,
+    ))
+    candidate, count = pattern.subn(lambda match: match.group(1) + address, text, count=1)
+    if count != 1:
+        stop("fake could not corrupt the requested bridge ring")
+    return candidate
+
 
 def report():
     network = node_state["network"]
@@ -291,6 +423,18 @@ def report():
         "pending_interfaces_sha256": pending_sha,
         "corosync_sha256": sha(state["corosync_text"]),
         "corosync_text": state["corosync_text"],
+        "corosync_package_version": (
+            "3.1.10-pve99"
+            if (
+                os.environ.get("PVN_TEST_COROSYNC_VERSION_MISMATCH_HOST") == node
+                or (
+                    os.environ.get("PVN_TEST_COROSYNC_VERSION_DRIFT_AFTER_WRITE_HOST") == node
+                    and state.get("corosync_write_count", 0) > 0
+                )
+            )
+            else "3.1.10-pve2"
+        ),
+        "corosync_runtime": runtime_report(node),
         "management": {
             "interface": "vmbr0",
             "address": management[node] + "/24",
@@ -348,31 +492,128 @@ elif action == "validate-corosync":
         stop("fake corosync CAS mismatch")
     if sha(request["candidate"]) != request["candidate_sha256"]:
         stop("fake candidate hash mismatch")
+    state["corosync_validation_count"] += 1
+    validation_count = state["corosync_validation_count"]
+    if (
+        os.environ.get("PVN_TEST_DRIFT_AFTER_COROSYNC_VALIDATIONS") == "yes"
+        and validation_count == 12
+    ):
+        drifted = request["candidate"].replace("config_version: 4", "config_version: 99", 1)
+        state["corosync_text"] = drifted
+    if os.environ.get("PVN_TEST_RUNTIME_DRIFT_AFTER_VALIDATION_COUNT") == str(
+        validation_count
+    ):
+        drift_node = os.environ.get(
+            "PVN_TEST_RUNTIME_DRIFT_AFTER_VALIDATION_HOST", "prox3"
+        )
+        state["corosync_runtime"][drift_node] = replace_node_ring(
+            state["corosync_runtime"][drift_node], drift_node, 0,
+            "203.0.113.254",
+        )
+    if os.environ.get("PVN_TEST_RUNTIME_VERSION_DRIFT_AFTER_VALIDATION_COUNT") == str(
+        validation_count
+    ):
+        drift_node = os.environ.get(
+            "PVN_TEST_RUNTIME_DRIFT_AFTER_VALIDATION_HOST", "prox3"
+        )
+        state["corosync_runtime"][drift_node] = state["corosync_runtime"][
+            drift_node
+        ].replace("config_version: 3", "config_version: 2", 1)
+    save()
     emit(valid=True)
 elif action == "apply-corosync":
     if sha(state["corosync_text"]) != request["expected_sha256"]:
         stop("fake corosync changed")
+    if os.environ.get("PVN_TEST_REMOTE_BRIDGE_DRIFT_BEFORE_CAS") == "yes":
+        drift_node = os.environ.get("PVN_TEST_REMOTE_CAS_DRIFT_HOST", "prox3")
+        state["corosync_runtime"][drift_node] = replace_node_ring(
+            state["corosync_runtime"][drift_node], drift_node,
+            request["bridge_ring"], "203.0.113.254",
+        )
+        save()
+    if os.environ.get("PVN_TEST_REMOTE_VERSION_DRIFT_BEFORE_CAS") == "yes":
+        drift_node = os.environ.get("PVN_TEST_REMOTE_CAS_DRIFT_HOST", node)
+        state["corosync_runtime"][drift_node] = re.sub(
+            r"(?m)^(\s*config_version:\s*)\d+(\s*)$",
+            lambda match: match.group(1) + "1" + match.group(2),
+            state["corosync_runtime"][drift_node], count=1,
+        )
+        save()
+    if not bridge_is_full(node, request):
+        stop("fake remote CAS rejected a non-N/N safety ring")
+    boundary_mode = request.get("runtime_boundary_mode")
+    if boundary_mode not in {"exact", "stale-v0.2.13", "partial-rollback"}:
+        stop("fake remote CAS received an invalid runtime boundary mode")
+    if boundary_mode != "partial-rollback" and not boundary_target_is_full(
+        node, request.get("runtime_boundary_target")
+    ):
+        stop("fake remote CAS rejected runtime boundary drift")
+    next_write = state["corosync_write_count"] + 1
+    if os.environ.get("PVN_TEST_CRASH_BEFORE_COROSYNC_WRITE_NUMBER") == str(next_write):
+        stop("simulated crash before shared Corosync write")
     state["corosync_text"] = request["candidate"]
+    state["corosync_write_count"] = next_write
+    state["corosync_writes"].append(request["candidate"])
+    if os.environ.get("PVN_TEST_CRASH_AFTER_COROSYNC_WRITE_NUMBER") == str(next_write):
+        state["block_probes"] = True
     save()
+    if state.get("block_probes"):
+        stop("simulated crash after shared Corosync write")
     if os.environ.get("PVN_TEST_FAIL_COROSYNC_AFTER_WRITE") == "yes":
         stop("simulated SSH failure after shared Corosync write")
     emit(corosync_sha256=request["candidate_sha256"])
-elif action == "restore-corosync":
-    current = sha(state["corosync_text"])
-    if current == request["failed_candidate_sha256"]:
-        state["corosync_text"] = request["rollback_candidate"]
-        save()
-        emit(restored=True, corosync_sha256=request["rollback_sha256"])
-    elif current == request["original_sha256"]:
-        emit(restored=False, corosync_sha256=current)
-    else:
-        stop("fake rollback CAS mismatch")
+elif action == "reload-corosync":
+    if sha(state["corosync_text"]) != request["expected_sha256"]:
+        stop("fake reload saw an unexpected shared Corosync config")
+    if not bridge_is_full(node, request):
+        stop("fake reload safety ring is not fully connected")
+    if os.environ.get("PVN_TEST_FAIL_RELOAD_BEFORE_APPLY") == "yes":
+        stop("simulated reload failure before runtime change")
+    partial = {
+        value for value in os.environ.get("PVN_TEST_PARTIAL_RELOAD_HOSTS", "").split(",")
+        if value
+    }
+    for name in state["corosync_runtime"]:
+        if name not in partial:
+            state["corosync_runtime"][name] = state["corosync_text"]
+    save()
+    if os.environ.get("PVN_TEST_FAIL_RELOAD_AFTER_APPLY") == "yes":
+        stop("simulated lost response after cluster-wide runtime reload")
+    emit(reloaded=True, corosync_sha256=sha(state["corosync_text"]))
+elif action == "restart-corosync":
+    if sha(state["corosync_text"]) != request["expected_sha256"]:
+        stop("fake restart saw an unexpected shared Corosync config")
+    if not bridge_is_full(node, request):
+        stop("fake restart safety ring is not fully connected")
+    if os.environ.get("PVN_TEST_FAIL_RESTART_BEFORE_HOST") == node:
+        stop("simulated restart failure before runtime change")
+    state["corosync_runtime"][node] = state["corosync_text"]
+    state["restart_order"].append(node)
+    if os.environ.get("PVN_TEST_BREAK_BRIDGE_AFTER_RESTART_HOST") == node:
+        broken_node = os.environ.get("PVN_TEST_BREAK_BRIDGE_NODE", "prox3")
+        state["corosync_runtime"][broken_node] = replace_node_ring(
+            state["corosync_runtime"][broken_node], broken_node,
+            request["bridge_ring"], "203.0.113.254",
+        )
+    save()
+    if not bridge_is_full(node, request):
+        stop("fake restarted node did not rejoin the safety ring")
+    if os.environ.get("PVN_TEST_FAIL_RESTART_AFTER_HOST") == node:
+        stop("simulated lost response after guarded restart")
+    emit(restarted=True, corosync_sha256=sha(state["corosync_text"]))
 elif action == "verify-cluster":
     if sha(state["corosync_text"]) not in request["allowed_corosync_sha256"]:
         stop("fake cluster has unexpected corosync hash")
     emit(verified=True, corosync_sha256=sha(state["corosync_text"]))
 elif action == "record-phase":
     node_state["phase"] = request["phase"]
+    if (
+        request["phase"] == "corosync-migrated"
+        and os.environ.get("PVN_TEST_DRIFT_AFTER_MIGRATED_PHASE_HOST") == node
+    ):
+        state["corosync_runtime"][node] = Path(
+            os.environ["PVN_TEST_COROSYNC"]
+        ).read_text(encoding="utf-8")
     save()
     emit(phase=request["phase"])
 elif action == "stage-network":
@@ -453,6 +694,7 @@ export PVN_TOPOLOGY_IDENTITY_FILE=$PVE_IDENTITY
 export PVN_TOPOLOGY_LOCK_FILE=$LOCK
 export PVN_TOPOLOGY_LEASE_BIN=$REPO/deploy/scripts/pvn-cluster-lease
 export PVN_TOPOLOGY_SSH_BIN=$BIN/ssh
+export PVN_TOPOLOGY_TEST_FAST=1
 export PVN_TEST_STATE=$STATE
 export PVN_TEST_COROSYNC=$COROSYNC
 export PVN_TEST_LOG=$LOG
@@ -477,7 +719,7 @@ reset_state() {
 }
 
 assert_no_mutation() {
-    if grep -Eq 'action=(prepare|validate-corosync|apply-corosync|restore-corosync|record-phase|stage-network|apply-network|rollback-network|discard-stage|write-ledger|restore-ledger)' "$LOG"; then
+    if grep -Eq 'action=(prepare|validate-corosync|apply-corosync|reload-corosync|restart-corosync|record-phase|stage-network|apply-network|rollback-network|discard-stage|write-ledger|restore-ledger)' "$LOG"; then
         fail "read-only/invalid invocation attempted a mutating remote action"
     fi
 }
@@ -526,7 +768,7 @@ if grep -Fq 'str(request["geneve"]["max_mtu"])' "$TOPOLOGY" ||
 then
     fail "topology staging can raise a NIC to its hardware max_mtu"
 fi
-grep -q 'Corosync ring0: Geneve -> management' "$WORK/plan.out" || fail "Corosync migration was not planned"
+grep -q 'Corosync: dual -> final' "$WORK/plan.out" || fail "dual-ring Corosync migration was not planned"
 grep -q 'cannot live-test arbitrary inner MAC/IP' "$WORK/plan.out" || fail "provider readiness warning is missing"
 grep -q -- "--provider-port-ready $ACK --confirm lab-cluster" "$WORK/plan.out" ||
     fail "exact provider and cluster confirmation was not printed"
@@ -614,6 +856,32 @@ grep -q 'uses a provider NIC' "$WORK/provider-corosync.out" ||
     fail "provider/Corosync rejection reason is missing"
 cp "$WORK/corosync.geneve" "$COROSYNC"
 
+reset_state
+if PVN_TEST_COROSYNC_VERSION_MISMATCH_HOST=prox3 "$TOPOLOGY" \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/corosync-version-mismatch.out" 2>&1
+then
+    fail "mixed Corosync package versions unexpectedly passed planning"
+fi
+assert_no_mutation
+grep -q 'do not run one exact Corosync package version' \
+    "$WORK/corosync-version-mismatch.out" ||
+    fail "mixed Corosync package version rejection reason is missing"
+
+reset_state
+if PVN_TEST_COROSYNC_VERSION_DRIFT_AFTER_WRITE_HOST=prox3 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/corosync-version-drift.out" 2>&1
+then
+    fail "Corosync package version drift after CAS unexpectedly applied"
+fi
+[ "$(grep -c 'action=apply-corosync' "$LOG")" -eq 1 ] ||
+    fail "Corosync package drift did not stop at the first shared write boundary"
+if grep -Eq 'action=(reload-corosync|restart-corosync|stage-network|apply-network|write-ledger)' "$LOG"; then
+    fail "runtime/network mutation ran after Corosync package version drift"
+fi
+
 for mtu_role in geneve provider; do
     reset_state
     if PVN_TEST_UNRESTORABLE_MTU_HOST=prox2 PVN_TEST_UNRESTORABLE_MTU_ROLE=$mtu_role \
@@ -643,8 +911,9 @@ if grep -q 'lease=0' "$LOG"; then
     fail "cluster-global lease was not held for the entire apply"
 fi
 [ "$(grep -c 'action=prepare' "$LOG")" -eq 3 ] || fail "journals/backups were not prepared on all nodes"
-[ "$(grep -c 'action=validate-corosync' "$LOG")" -eq 6 ] || fail "forward/rollback Corosync candidates were not validated everywhere"
-[ "$(grep -c 'action=apply-corosync' "$LOG")" -eq 1 ] || fail "shared Corosync config was not applied exactly once"
+[ "$(grep -c 'action=validate-corosync' "$LOG")" -eq 12 ] || fail "all Corosync transition/rollback candidates were not validated everywhere"
+[ "$(grep -c 'action=apply-corosync' "$LOG")" -eq 2 ] || fail "dual and final shared Corosync configs were not each applied once"
+[ "$(grep -c 'action=reload-corosync' "$LOG")" -eq 2 ] || fail "dual and final Corosync runtimes were not reloaded"
 [ "$(grep -c 'action=stage-network' "$LOG")" -eq 3 ] || fail "all candidates were not staged before apply"
 [ "$(grep -c 'action=apply-network' "$LOG")" -eq 3 ] || fail "network was not applied one node at a time"
 [ "$(grep -c 'action=verify-network' "$LOG")" -eq 3 ] || fail "each applied node was not verified"
@@ -664,6 +933,7 @@ import json
 import sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
 ledger = json.loads(state["ledger"])
+assert ledger["schema"] == 2
 assert ledger["phase"] == "complete"
 assert ledger["guest_mtu"] == 1300
 assert ledger["effective_underlay_mtu"] == 1442
@@ -678,6 +948,9 @@ assert ledger["provider_readiness"] == {
 assert len(ledger["nodes"]) == 3
 assert all(row["control_ip"] == row["management_ip"] for row in ledger["nodes"])
 assert len(ledger["membership_hash"]) == 64
+assert len(ledger["corosync"]["sha256"]) == 64
+assert ledger["corosync"]["config_version"] == 5
+assert set(ledger["corosync"]["rings"]) == {"1"}
 PY
 
 : > "$LOG"
@@ -704,23 +977,263 @@ done
 : > "$LOG"
 "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
     --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/rerun.out"
-if grep -Eq 'action=(validate-corosync|apply-corosync|restore-corosync|stage-network|apply-network|rollback-network)' "$LOG"; then
+if grep -Eq 'action=(validate-corosync|apply-corosync|reload-corosync|restart-corosync|stage-network|apply-network|rollback-network)' "$LOG"; then
     fail "exact-state rerun repeated a Corosync/network mutation"
 fi
 [ "$(grep -c 'exact network state already present; no-op' "$WORK/rerun.out")" -eq 3 ] ||
     fail "exact-state rerun did not report all no-ops"
 
 reset_state
-if PVN_TEST_FAIL_COROSYNC_AFTER_WRITE=yes "$TOPOLOGY" apply \
+PVN_TEST_PARTIAL_RELOAD_HOSTS=prox1,prox2,prox3 "$TOPOLOGY" apply \
     --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
-    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/corosync-rollback.out" 2>&1
-then
-    fail "post-write Corosync failure unexpectedly succeeded"
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/partial-reload.out"
+python3 - "$STATE" "$LOG" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state["restart_order"] == ["prox1", "prox3", "prox2"] * 2
+lines = open(sys.argv[2], encoding="utf-8").read().splitlines()
+last_restart = max(i for i, line in enumerate(lines) if "action=restart-corosync" in line)
+first_network = min(i for i, line in enumerate(lines) if "action=stage-network" in line)
+assert last_restart < first_network
+assert state["ledger"] is not None
+PY
+
+reset_state
+PVN_TEST_PARTIAL_RELOAD_HOSTS=prox2 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/coordinator-reload.out"
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state["restart_order"] == ["prox2", "prox2"]
+PY
+if grep -Eq 'node=(prox1|prox3) action=restart-corosync' "$LOG"; then
+    fail "healthy non-coordinator restarted when only coordinator was stale"
 fi
-grep -q 'action=restore-corosync' "$LOG" || fail "post-write Corosync failure was not rolled back"
-[ ! -e "$GLOBAL_LOCK" ] || fail "failed Corosync migration left the cluster-global lock behind"
+
+reset_state
+PVN_TEST_PARTIAL_RELOAD_HOSTS=prox3 PVN_TEST_FAIL_RESTART_AFTER_HOST=prox3 \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/restart-response-loss.out"
+[ "$(grep -c 'node=prox3 action=restart-corosync' "$LOG")" -eq 2 ] ||
+    fail "lost restart responses repeated or skipped the proven node restart"
+grep -q 'action=write-ledger' "$LOG" ||
+    fail "restart response-loss recovery did not reach the exact final ledger"
+
+reset_state
+if PVN_TEST_PARTIAL_RELOAD_HOSTS=prox1,prox2,prox3 \
+    PVN_TEST_BREAK_BRIDGE_AFTER_RESTART_HOST=prox1 \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/bridge-loss.out" 2>&1
+then
+    fail "Corosync safety-ring loss unexpectedly reached network mutation"
+fi
+[ "$(grep -c 'action=restart-corosync' "$LOG")" -eq 1 ] ||
+    fail "another Corosync node restarted after the safety ring lost N/N"
 if grep -Eq 'action=(stage-network|apply-network|write-ledger)' "$LOG"; then
-    fail "network/ledger mutation ran after failed Corosync migration"
+    fail "network/ledger mutation ran after Corosync safety-ring loss"
+fi
+
+reset_state
+if PVN_TEST_CRASH_BEFORE_COROSYNC_WRITE_NUMBER=2 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/dual-crash.out" 2>&1
+then
+    fail "simulated crash before final Corosync write unexpectedly completed"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import re
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state["corosync_write_count"] == 1
+assert re.search(r"ring0_addr:\s+192\.168\.100\.", state["corosync_text"])
+assert re.search(r"ring1_addr:\s+192\.168\.0\.", state["corosync_text"])
+assert all(value["network"] == "initial" for value in state["nodes"].values())
+PY
+: > "$LOG"
+"$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/dual-resume.out"
+grep -q 'action=write-ledger' "$LOG" || fail "dual-boundary rerun did not resume to completion"
+
+reset_state
+if PVN_TEST_CRASH_AFTER_COROSYNC_WRITE_NUMBER=2 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/final-crash.out" 2>&1
+then
+    fail "simulated crash after final Corosync write unexpectedly completed"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import re
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state["corosync_write_count"] == 2
+assert not re.search(r"ring0_addr:\s+192\.168\.100\.", state["corosync_text"])
+assert re.search(r"ring1_addr:\s+192\.168\.0\.", state["corosync_text"])
+assert all(value["network"] == "initial" for value in state["nodes"].values())
+PY
+: > "$LOG"
+"$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/final-resume.out"
+grep -q 'action=write-ledger' "$LOG" || fail "final-boundary rerun did not resume to completion"
+
+reset_state
+python3 - "$COROSYNC" "$STATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+original = Path(sys.argv[1]).read_text(encoding="utf-8")
+persisted = original.replace("config_version: 3", "config_version: 4")
+for old, new in (
+    ("192.168.100.25", "192.168.0.80"),
+    ("192.168.100.54", "192.168.0.126"),
+    ("192.168.100.163", "192.168.0.78"),
+):
+    persisted = persisted.replace(old, new)
+state = {
+    "corosync_text": persisted,
+    "corosync_runtime": {name: original for name in ("prox1", "prox2", "prox3")},
+    "corosync_write_count": 0,
+    "corosync_writes": [],
+    "corosync_validation_count": 0,
+    "block_probes": False,
+    "restart_order": [],
+    "ledger": None,
+    "ledger_sha256": None,
+    "nodes": {},
+}
+Path(sys.argv[2]).write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+PY
+cp "$STATE" "$WORK/stale-state.initial"
+"$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/stale-final-recovery.out"
+python3 - "$STATE" <<'PY'
+import json
+import re
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state["corosync_write_count"] == 2
+dual = state["corosync_writes"][0]
+assert "config_version: 5" in dual
+assert re.search(r"ring0_addr:\s+192\.168\.100\.", dual)
+assert re.search(r"ring1_addr:\s+192\.168\.0\.", dual)
+assert "config_version: 6" in state["corosync_text"]
+assert not re.search(r"ring0_addr:\s+192\.168\.100\.", state["corosync_text"])
+assert state["ledger"] is not None
+PY
+
+reset_state
+cp "$WORK/stale-state.initial" "$STATE"
+if PVN_TEST_RUNTIME_VERSION_DRIFT_AFTER_VALIDATION_COUNT=9 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/stale-pre-cas-version-drift.out" 2>&1
+then
+    fail "stale v0.2.13 runtime version drift unexpectedly applied"
+fi
+if grep -q 'action=apply-corosync' "$LOG"; then
+    fail "stale recovery CAS ran after pinned runtime version drift"
+fi
+grep -q 'stale v0.2.13 Corosync recovery boundary changed' \
+    "$WORK/stale-pre-cas-version-drift.out" ||
+    fail "stale recovery pre-CAS version gate did not report drift"
+
+reset_state
+cp "$WORK/stale-state.initial" "$STATE"
+if PVN_TEST_REMOTE_VERSION_DRIFT_BEFORE_CAS=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/stale-remote-cas-version-drift.out" 2>&1
+then
+    fail "remote stale-version TOCTOU unexpectedly wrote the dual candidate"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state["corosync_write_count"] == 0
+assert state["ledger"] is None
+PY
+grep -q 'fake remote CAS rejected runtime boundary drift' \
+    "$WORK/stale-remote-cas-version-drift.out" ||
+    fail "remote stale-version CAS gate did not report the TOCTOU"
+
+reset_state
+if PVN_TEST_DRIFT_AFTER_COROSYNC_VALIDATIONS=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/corosync-cas-drift.out" 2>&1
+then
+    fail "unplanned shared Corosync drift was overwritten"
+fi
+if grep -q 'action=apply-corosync' "$LOG"; then
+    fail "pinned Corosync CAS wrote over external drift"
+fi
+if grep -Eq 'action=(stage-network|apply-network|write-ledger)' "$LOG"; then
+    fail "network/ledger mutation ran after external Corosync drift"
+fi
+
+reset_state
+if PVN_TEST_RUNTIME_DRIFT_AFTER_VALIDATION_COUNT=12 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/pre-cas-bridge-drift.out" 2>&1
+then
+    fail "safety-ring drift immediately before Corosync CAS unexpectedly applied"
+fi
+if grep -q 'action=apply-corosync' "$LOG"; then
+    fail "Corosync CAS ran after its pre-write safety ring lost N/N"
+fi
+grep -q 'not N/N immediately before config CAS' "$WORK/pre-cas-bridge-drift.out" ||
+    fail "pre-CAS safety-ring rejection reason is missing"
+
+reset_state
+if PVN_TEST_REMOTE_BRIDGE_DRIFT_BEFORE_CAS=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/remote-cas-bridge-drift.out" 2>&1
+then
+    fail "remote safety-ring TOCTOU unexpectedly wrote a Corosync candidate"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state["corosync_write_count"] == 0
+assert state["ledger"] is None
+PY
+grep -q 'fake remote CAS rejected a non-N/N safety ring' \
+    "$WORK/remote-cas-bridge-drift.out" ||
+    fail "remote bridge CAS gate did not report the TOCTOU"
+
+reset_state
+if PVN_TEST_DRIFT_AFTER_MIGRATED_PHASE_HOST=prox3 "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/runtime-toctou.out" 2>&1
+then
+    fail "runtime drift after final phase unexpectedly reached network mutation"
+fi
+grep -q 'persisted/runtime state is not exact before network mutation' "$WORK/runtime-toctou.out" ||
+    fail "pre-network exact Corosync gate did not report runtime drift"
+if grep -Eq 'action=(stage-network|apply-network|write-ledger)' "$LOG"; then
+    fail "network/ledger mutation ran after pre-network Corosync runtime drift"
+fi
+
+reset_state
+PVN_TEST_FAIL_COROSYNC_AFTER_WRITE=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/corosync-write-loss.out" 2>&1
+[ ! -e "$GLOBAL_LOCK" ] || fail "recovered Corosync response loss left the cluster-global lock behind"
+[ "$(grep -c 'action=apply-corosync' "$LOG")" -eq 2 ] ||
+    fail "lost shared-write responses repeated a committed Corosync CAS"
+grep -q 'action=write-ledger' "$LOG" ||
+    fail "exact-state recovery after Corosync write response loss did not complete"
+
+if [ "${PVN_TOPOLOGY_CLUSTERED_ONLY:-0}" = 1 ]; then
+    echo "pvn-topology clustered Corosync tests passed"
+    exit 0
 fi
 
 reset_state

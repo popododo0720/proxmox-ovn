@@ -13,7 +13,6 @@ import fcntl
 import hashlib
 import ipaddress
 import json
-import fcntl
 import os
 from pathlib import Path
 import re
@@ -40,6 +39,10 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 PROVIDER_ACK = "OPENSTACK_PROVIDER_PORTS_ALLOW_ARBITRARY_MAC_IP"
 REMOTE_REQUEST_LIMIT = 8 * 1024 * 1024
+TEST_FAST = os.environ.get("PVN_TOPOLOGY_TEST_FAST") == "1"
+COROSYNC_SETTLE_ATTEMPTS = 1 if TEST_FAST else 5
+COROSYNC_FINAL_ATTEMPTS = 1 if TEST_FAST else 30
+COROSYNC_POLL_SECONDS = 0 if TEST_FAST else 2
 
 
 class TopologyError(RuntimeError):
@@ -839,6 +842,176 @@ def route_signature(routes):
     return values
 
 
+def corosync_runtime_links(expected_node_id):
+    output = run(["corosync-cfgtool", "-s"]).stdout
+    local_ids = re.findall(r"^Local node ID\s+(\d+),", output, re.M)
+    if len(local_ids) != 1 or int(local_ids[0]) != expected_node_id:
+        abort("Corosync runtime reports the wrong local node ID")
+    links = {}
+    for match in re.finditer(
+        r"(?ms)^LINK ID\s+(\d+)\s+.*?(?=^LINK ID\s+\d+\s+|\Z)", output
+    ):
+        ring = int(match.group(1))
+        if ring in links or ring < 0 or ring > 7:
+            abort("Corosync runtime exposes an invalid or duplicate link")
+        block = match.group(0)
+        addresses = re.findall(r"^\s*addr\s*=\s*(\S+)\s*$", block, re.M)
+        if len(addresses) != 1:
+            abort("Corosync runtime link has no unique local address")
+        try:
+            local_address = str(ipaddress.ip_address(addresses[0]))
+        except ValueError:
+            abort("Corosync runtime link has an invalid local address")
+        states = {}
+        for raw_id, raw_state in re.findall(
+            r"^\s*nodeid:\s*(\d+):\s*(\S+)\s*$", block, re.M
+        ):
+            node_id = int(raw_id)
+            if node_id in states:
+                abort("Corosync runtime link repeats a node status")
+            states[node_id] = raw_state.lower()
+        if states.get(expected_node_id) != "localhost":
+            abort("Corosync runtime link does not identify the local node")
+        connected = sorted(
+            node_id for node_id, state in states.items()
+            if state in ("connected", "localhost")
+        )
+        links[ring] = {
+            "address": local_address,
+            "connected_node_ids": connected,
+            "node_states": {str(key): value for key, value in sorted(states.items())},
+        }
+    if not links:
+        abort("Corosync runtime exposes no KNET links")
+    return {"local_node_id": expected_node_id, "links": links}
+
+
+def corosync_runtime_config(expected_node_id, expected_cluster_name, expected_members):
+    output = run(["corosync-cmapctl"]).stdout
+    values = {}
+    for line in output.splitlines():
+        match = re.match(r"^([A-Za-z0-9_.]+)\s+\([^)]+\)\s*=\s*(.*)$", line.strip())
+        if not match:
+            continue
+        key, value = match.groups()
+        if key in values:
+            abort("Corosync cmap repeats %s" % key)
+        value = value.strip()
+        if value.startswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                abort("Corosync cmap has an invalid quoted value")
+        values[key] = value
+
+    cluster_name = values.get("totem.cluster_name")
+    if cluster_name != expected_cluster_name:
+        abort("Corosync runtime reports the wrong cluster name")
+    try:
+        version = int(values["totem.config_version"])
+        local_position = int(values["nodelist.local_node_pos"])
+    except (KeyError, TypeError, ValueError):
+        abort("Corosync cmap is missing a valid config version or local position")
+    if version < 0 or local_position < 0:
+        abort("Corosync cmap has an invalid config version or local position")
+
+    positions = {}
+    node_pattern = re.compile(r"^nodelist\.node\.(\d+)\.(name|nodeid|ring([0-7])_addr)$")
+    for key, value in values.items():
+        match = node_pattern.match(key)
+        if not match:
+            continue
+        position = int(match.group(1))
+        row = positions.setdefault(position, {"rings": {}})
+        field = match.group(2)
+        if field == "name":
+            row["name"] = value
+        elif field == "nodeid":
+            try:
+                row["node_id"] = int(value)
+            except (TypeError, ValueError):
+                abort("Corosync cmap has an invalid node ID")
+        else:
+            row["rings"][match.group(3)] = value
+    if not positions or local_position not in positions:
+        abort("Corosync cmap has no complete local nodelist")
+
+    nodes = {}
+    for position, row in positions.items():
+        name = row.get("name")
+        node_id = row.get("node_id")
+        if (
+            not isinstance(name, str)
+            or not SAFE_NAME.fullmatch(name)
+            or type(node_id) is not int
+            or node_id <= 0
+            or not row["rings"]
+            or name in nodes
+        ):
+            abort("Corosync cmap has a malformed or duplicate nodelist node")
+        nodes[name] = {"node_id": node_id, "rings": row["rings"]}
+    expected_nodes = {
+        row["name"]: row["node_id"] for row in expected_members
+    }
+    if {name: row["node_id"] for name, row in nodes.items()} != expected_nodes:
+        abort("Corosync runtime nodelist differs from PVE membership")
+    if positions[local_position].get("node_id") != expected_node_id:
+        abort("Corosync cmap reports the wrong local node ID")
+
+    members = {}
+    member_pattern = re.compile(
+        r"^runtime\.members\.(\d+)\.(config_version|ip|status)$"
+    )
+    address_pattern = re.compile(r"r\(([0-7])\)\s+ip\(([^)]+)\)")
+    for key, value in values.items():
+        match = member_pattern.match(key)
+        if not match:
+            continue
+        node_id = int(match.group(1))
+        row = members.setdefault(str(node_id), {"rings": {}})
+        field = match.group(2)
+        if field == "config_version":
+            try:
+                row["config_version"] = int(value)
+            except (TypeError, ValueError):
+                abort("Corosync cmap has an invalid member config version")
+        elif field == "status":
+            row["status"] = value
+        else:
+            matches = address_pattern.findall(value)
+            if not matches or address_pattern.sub("", value).strip():
+                abort("Corosync cmap has malformed member link addresses")
+            row["rings"] = {ring: address.strip() for ring, address in matches}
+    expected_ids = {str(value) for value in expected_nodes.values()}
+    if set(members) != expected_ids:
+        abort("Corosync joined runtime members differ from PVE membership")
+    for row in members.values():
+        if (
+            row.get("status") != "joined"
+            or type(row.get("config_version")) is not int
+            or not row["rings"]
+        ):
+            abort("Corosync runtime member is not fully joined")
+
+    binds = {}
+    bind_pattern = re.compile(r"^totem\.interface\.([0-7])\.bindnetaddr$")
+    for key, value in values.items():
+        match = bind_pattern.match(key)
+        if match:
+            binds[match.group(1)] = value
+    local_rings = positions[local_position]["rings"]
+    if set(binds) != set(local_rings):
+        abort("Corosync live bind links differ from its runtime nodelist")
+    return {
+        "cluster_name": cluster_name,
+        "config_version": version,
+        "local_node_id": expected_node_id,
+        "nodes": nodes,
+        "members": members,
+        "bind_addresses": binds,
+    }
+
+
 def ovs_bridge_exists(name):
     return run(["ovs-vsctl", "--timeout=10", "br-exists", name], check=False).returncode == 0
 
@@ -857,6 +1030,16 @@ def check_pve_packages():
         status = run(["dpkg-query", "-W", "-f=${db:Status-Status}", package]).stdout.strip()
         if status != "installed":
             abort("%s has incomplete package state: %s" % (package, status or "unknown"))
+
+
+def installed_package_version(package):
+    result = run([
+        "dpkg-query", "-W", "-f=${db:Status-Abbrev} ${Version}", package,
+    ]).stdout.strip()
+    match = re.fullmatch(r"ii\s+([A-Za-z0-9.+:~_-]{1,200})", result)
+    if not match:
+        abort("%s has incomplete or unsafe package/version state" % package)
+    return match.group(1)
 
 
 def validate_journal_for_request(journal, request):
@@ -924,8 +1107,9 @@ def resolve_effective_underlay_mtu(request, journal, ledger_text):
 
 def build_probe(request):
     check_activation_absent()
-    require_commands(("ip", "pvecm", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "corosync", "corosync-cfgtool", "perl"))
+    require_commands(("ip", "pvecm", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "corosync", "corosync-cfgtool", "corosync-cmapctl", "perl"))
     check_pve_packages()
+    corosync_package_version = installed_package_version("corosync")
     cluster_status(request["node_count"], request["cluster_name"])
 
     node = request["node"]
@@ -940,6 +1124,14 @@ def build_probe(request):
     addresses = addresses_by_interface(address_list)
     routes = route_rows()
     api = network_rows(node)
+    member_rows = request["membership_snapshot"]["nodes"]
+    local_ids = [row["node_id"] for row in member_rows if row["name"] == node]
+    if len(local_ids) != 1:
+        abort("membership snapshot has no unique local node ID")
+    corosync_runtime = corosync_runtime_links(local_ids[0])
+    corosync_runtime["config"] = corosync_runtime_config(
+        local_ids[0], request["cluster_name"], member_rows
+    )
 
     management_matches = []
     for ifname, values in addresses.items():
@@ -1072,6 +1264,8 @@ def build_probe(request):
         "pending_interfaces_sha256": pending_sha,
         "corosync_sha256": corosync_sha,
         "corosync_text": corosync_text,
+        "corosync_package_version": corosync_package_version,
+        "corosync_runtime": corosync_runtime,
         "management": {
             "interface": management_if,
             "address": "%s/%d" % (management_addr["address"], management_addr["prefixlen"]),
@@ -1179,6 +1373,21 @@ def validate_corosync(request):
 
 
 def apply_corosync(request):
+    if installed_package_version("corosync") != request.get("corosync_package_version"):
+        abort("Corosync package version changed before shared config write")
+    local_id, members = corosync_request_identity(request)
+    runtime = corosync_runtime_links(local_id)
+    runtime["config"] = corosync_runtime_config(
+        local_id, request["cluster_name"], members
+    )
+    require_full_bridge(request, runtime)
+    boundary_mode = request.get("runtime_boundary_mode")
+    if boundary_mode not in ("exact", "stale-v0.2.13", "partial-rollback"):
+        abort("Corosync config write has no valid runtime boundary mode")
+    if boundary_mode != "partial-rollback" and not runtime_target_fully_loaded(
+        request, runtime, request.get("runtime_boundary_target")
+    ):
+        abort("Corosync runtime boundary changed immediately before config CAS")
     candidate = request["candidate"]
     if sha_text(candidate) != request["candidate_sha256"]:
         abort("corosync candidate hash mismatch")
@@ -1189,29 +1398,141 @@ def apply_corosync(request):
     })
     if result.get("corosync_sha256") != request["candidate_sha256"]:
         abort("Corosync CAS helper installed an unexpected candidate")
-    run(["corosync-cfgtool", "-R"])
     emit(corosync_sha256=sha_file(COROSYNC))
 
 
-def restore_corosync(request):
-    current = sha_file(COROSYNC)
-    if current == request["original_sha256"]:
-        emit(restored=False, corosync_sha256=current)
-        return
-    if current != request["failed_candidate_sha256"]:
-        abort("refusing Corosync rollback after unrelated config drift")
-    candidate = request["rollback_candidate"]
-    if sha_text(candidate) != request["rollback_sha256"]:
-        abort("Corosync rollback candidate hash mismatch")
-    result = pve_cas("apply-corosync", {
-        "expected_current_sha256": request["failed_candidate_sha256"],
-        "content": candidate,
-        "content_sha256": request["rollback_sha256"],
-    })
-    if result.get("corosync_sha256") != request["rollback_sha256"]:
-        abort("Corosync CAS helper installed an unexpected rollback")
+def corosync_request_identity(request):
+    members = request.get("membership_snapshot", {}).get("nodes")
+    if not isinstance(members, list) or not members:
+        abort("Corosync runtime request has no pinned membership")
+    node = request.get("node")
+    local = [row for row in members if isinstance(row, dict) and row.get("name") == node]
+    if len(local) != 1 or type(local[0].get("node_id")) is not int:
+        abort("Corosync runtime request has no unique local node ID")
+    if run(["hostname", "-s"]).stdout.strip() != node:
+        abort("SSH host is not the expected PVE node %s" % node)
+    cluster_status(len(members), request.get("cluster_name"))
+    return local[0]["node_id"], members
+
+
+def require_full_bridge(request, runtime):
+    ring = request.get("bridge_ring")
+    addresses = request.get("bridge_addresses")
+    members = request["membership_snapshot"]["nodes"]
+    if type(ring) is not int or ring < 0 or ring > 7 or not isinstance(addresses, dict):
+        abort("Corosync bridge-ring request is invalid")
+    link = runtime["links"].get(ring)
+    if link is None:
+        link = runtime["links"].get(str(ring))
+    expected_ids = sorted(row["node_id"] for row in members)
+    local_address = addresses.get(request["node"])
+    if (
+        not isinstance(link, dict)
+        or link.get("connected_node_ids") != expected_ids
+        or link.get("address") != local_address
+    ):
+        abort("Corosync safety bridge is not fully connected on this node")
+
+
+def runtime_target_loaded(request, runtime):
+    return runtime_target_loaded_from(
+        request, runtime, request.get("runtime_target")
+    )
+
+
+def runtime_target_loaded_from(request, runtime, target):
+    if not isinstance(target, dict):
+        return False
+    config = runtime.get("config", {})
+    if (
+        config.get("cluster_name") != target.get("cluster_name")
+        or config.get("config_version") != target.get("config_version")
+        or config.get("local_node_id") != runtime.get("local_node_id")
+        or config.get("nodes") != target.get("nodes")
+    ):
+        return False
+    local = target["nodes"].get(request["node"], {})
+    rings = local.get("rings", {})
+    binds = target.get("bind_addresses", {}).get(request["node"], {})
+    if set(rings) != set(binds) or config.get("bind_addresses") != binds:
+        return False
+    links = runtime.get("links", {})
+    if {str(value) for value in links} != set(rings):
+        return False
+    for raw_ring, address in binds.items():
+        link = links.get(int(raw_ring))
+        if link is None:
+            link = links.get(raw_ring)
+        if not isinstance(link, dict) or link.get("address") != address:
+            return False
+    return True
+
+
+def runtime_target_fully_loaded(request, runtime, target):
+    if not runtime_target_loaded_from(request, runtime, target):
+        return False
+    members = runtime.get("config", {}).get("members", {})
+    nodes = target.get("nodes", {})
+    binds = target.get("bind_addresses", {})
+    expected_ids = {str(row.get("node_id")) for row in nodes.values()}
+    if set(members) != expected_ids or set(binds) != set(nodes):
+        return False
+    for name, node in nodes.items():
+        row = members.get(str(node.get("node_id")), {})
+        if (
+            row.get("status") != "joined"
+            or row.get("config_version") != target.get("config_version")
+            or row.get("rings") != binds.get(name)
+        ):
+            return False
+    return True
+
+
+def reload_corosync(request):
+    local_id, members = corosync_request_identity(request)
+    if installed_package_version("corosync") != request.get("corosync_package_version"):
+        abort("Corosync package version changed before runtime reload")
+    if sha_file(COROSYNC) != request.get("expected_sha256"):
+        abort("corosync.conf changed before runtime reload")
+    runtime = corosync_runtime_links(local_id)
+    runtime["config"] = corosync_runtime_config(
+        local_id, request["cluster_name"], members
+    )
+    require_full_bridge(request, runtime)
     run(["corosync-cfgtool", "-R"])
-    emit(restored=True, corosync_sha256=sha_file(COROSYNC))
+    emit(reloaded=True, corosync_sha256=sha_file(COROSYNC))
+
+
+def restart_corosync(request):
+    local_id, members = corosync_request_identity(request)
+    if installed_package_version("corosync") != request.get("corosync_package_version"):
+        abort("Corosync package version changed before guarded restart")
+    if sha_file(COROSYNC) != request.get("expected_sha256"):
+        abort("corosync.conf changed before guarded restart")
+    runtime = corosync_runtime_links(local_id)
+    runtime["config"] = corosync_runtime_config(
+        local_id, request["cluster_name"], members
+    )
+    require_full_bridge(request, runtime)
+    run(["systemctl", "restart", "corosync.service"], timeout=90)
+    deadline = time.monotonic() + 90
+    last_error = "Corosync did not rejoin"
+    while time.monotonic() < deadline:
+        try:
+            cluster_status(len(members), request.get("cluster_name"))
+            runtime = corosync_runtime_links(local_id)
+            runtime["config"] = corosync_runtime_config(
+                local_id, request["cluster_name"], members
+            )
+            require_full_bridge(request, runtime)
+            if not runtime_target_loaded(request, runtime):
+                abort("restarted Corosync has not loaded the persisted target")
+            emit(restarted=True, corosync_sha256=sha_file(COROSYNC))
+            return
+        except RemoteFailure as exc:
+            last_error = str(exc)
+            time.sleep(2)
+    abort(last_error)
 
 
 def config_ring_addresses(text, ring):
@@ -1435,7 +1756,10 @@ def record_phase(request):
     journal = load_journal(optional=False)
     validate_journal_for_request(journal, request)
     phase = request.get("phase")
-    if phase not in ("corosync-migrated", "complete"):
+    if phase not in (
+        "corosync-dual-runtime", "corosync-final-runtime",
+        "corosync-migrated", "complete",
+    ):
         abort("invalid journal phase")
     journal["phase"] = phase
     save_journal(journal)
@@ -1517,7 +1841,7 @@ def main():
     if not isinstance(request, dict):
         abort("request must be an object")
     cleanup_actions = {
-        "restore-corosync", "rollback-network", "discard-stage", "restore-ledger",
+        "rollback-network", "discard-stage", "restore-ledger",
     }
     if action not in cleanup_actions:
         verify_membership_snapshot(request.get("membership_snapshot"))
@@ -1526,7 +1850,8 @@ def main():
         "prepare": lambda: prepare(request),
         "validate-corosync": lambda: validate_corosync(request),
         "apply-corosync": lambda: apply_corosync(request),
-        "restore-corosync": lambda: restore_corosync(request),
+        "reload-corosync": lambda: reload_corosync(request),
+        "restart-corosync": lambda: restart_corosync(request),
         "verify-cluster": lambda: verify_cluster(request),
         "stage-network": lambda: stage_network(request),
         "apply-network": lambda: apply_network(request),
@@ -1631,10 +1956,89 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
     for key in ("interfaces_sha256", "corosync_sha256"):
         if not isinstance(report.get(key), str) or not SHA256.fullmatch(report[key]):
             fail(f"invalid {key} from {node['name']}")
+    package_version = report.get("corosync_package_version")
+    if (
+        not isinstance(package_version, str)
+        or not re.fullmatch(r"[A-Za-z0-9.+:~_-]{1,200}", package_version)
+    ):
+        fail(f"invalid Corosync package version from {node['name']}")
     if not isinstance(report.get("corosync_text"), str) or len(report["corosync_text"]) > 4 * 1024 * 1024:
         fail(f"invalid corosync.conf from {node['name']}")
     if digest_text(report["corosync_text"]) != report["corosync_sha256"]:
         fail(f"corosync.conf hash mismatch from {node['name']}")
+    runtime = report.get("corosync_runtime")
+    if not isinstance(runtime, dict) or runtime.get("local_node_id") != node["id"]:
+        fail(f"invalid Corosync runtime identity from {node['name']}")
+    links = runtime.get("links")
+    if not isinstance(links, dict) or not links:
+        fail(f"missing Corosync runtime links from {node['name']}")
+    for raw_ring, link in links.items():
+        if type(raw_ring) is int:
+            ring = raw_ring
+        elif isinstance(raw_ring, str) and re.fullmatch(r"[0-7]", raw_ring):
+            ring = int(raw_ring)
+        else:
+            fail(f"invalid Corosync runtime link from {node['name']}")
+        if ring < 0 or ring > 7 or not isinstance(link, dict):
+            fail(f"invalid Corosync runtime link from {node['name']}")
+        try:
+            address = ipaddress.ip_address(link.get("address"))
+        except ValueError:
+            fail(f"invalid Corosync runtime address from {node['name']}")
+        if not isinstance(address, ipaddress.IPv4Address):
+            fail(f"non-IPv4 Corosync runtime address from {node['name']}")
+        connected = link.get("connected_node_ids")
+        if (
+            not isinstance(connected, list)
+            or any(type(value) is not int or value <= 0 for value in connected)
+            or connected != sorted(set(connected))
+            or node["id"] not in connected
+        ):
+            fail(f"invalid Corosync runtime membership from {node['name']}")
+    runtime_config = runtime.get("config")
+    if (
+        not isinstance(runtime_config, dict)
+        or runtime_config.get("cluster_name") != spec["cluster_name"]
+        or runtime_config.get("local_node_id") != node["id"]
+        or type(runtime_config.get("config_version")) is not int
+        or runtime_config["config_version"] < 0
+    ):
+        fail(f"invalid Corosync cmap identity from {node['name']}")
+    cmap_nodes = runtime_config.get("nodes")
+    cmap_members = runtime_config.get("members")
+    cmap_binds = runtime_config.get("bind_addresses")
+    if not all(isinstance(value, dict) and value for value in (cmap_nodes, cmap_members, cmap_binds)):
+        fail(f"incomplete Corosync cmap from {node['name']}")
+    for name, row in cmap_nodes.items():
+        if (
+            not isinstance(name, str)
+            or not SAFE_NAME.fullmatch(name)
+            or not isinstance(row, dict)
+            or type(row.get("node_id")) is not int
+            or row["node_id"] <= 0
+            or not isinstance(row.get("rings"), dict)
+            or not row["rings"]
+        ):
+            fail(f"invalid Corosync cmap nodelist from {node['name']}")
+    for raw_id, row in cmap_members.items():
+        if (
+            not isinstance(raw_id, str)
+            or not raw_id.isdigit()
+            or not isinstance(row, dict)
+            or row.get("status") != "joined"
+            or type(row.get("config_version")) is not int
+            or not isinstance(row.get("rings"), dict)
+            or not row["rings"]
+        ):
+            fail(f"invalid Corosync cmap member from {node['name']}")
+    if any(
+        not isinstance(raw_ring, str)
+        or not re.fullmatch(r"[0-7]", raw_ring)
+        or not isinstance(value, str)
+        or not value
+        for raw_ring, value in cmap_binds.items()
+    ):
+        fail(f"invalid Corosync cmap bind addresses from {node['name']}")
     if report.get("network_state") not in ("initial", "desired") or report.get("activation_safe") is not True:
         fail(f"unsafe topology state reported by {node['name']}")
     ledger_sha = report.get("ledger_sha256")
@@ -1699,11 +2103,40 @@ def parse_corosync(text: str, expected_nodes: set[str], cluster_name: str) -> tu
             fail("corosync.conf has malformed or duplicate node blocks")
         name = names[0]
         found_nodes.add(name)
-        for ring, address in re.findall(r"^\s*ring(\d+)_addr:\s*(\S+)\s*$", block, re.M):
-            rings.setdefault(int(ring), {})[name] = address
+        node_rings: set[int] = set()
+        for raw_ring, address in re.findall(r"^\s*ring(\d+)_addr:\s*(\S+)\s*$", block, re.M):
+            ring = int(raw_ring)
+            if ring < 0 or ring > 7 or ring in node_rings:
+                fail(f"corosync.conf node {name} has an invalid or duplicate KNET ring")
+            node_rings.add(ring)
+            rings.setdefault(ring, {})[name] = address
+        if not node_rings:
+            fail(f"corosync.conf node {name} has no KNET ring address")
     if found_nodes != expected_nodes:
         fail("corosync.conf members do not exactly match /etc/pve/.members")
+    for ring, addresses in rings.items():
+        if set(addresses) != expected_nodes:
+            fail(f"corosync.conf ring{ring} is not configured on every node")
     return int(versions[0]), rings
+
+
+def parse_corosync_node_ids(text: str, expected_nodes: set[str]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    seen_ids: set[int] = set()
+    for match in NODE_BLOCK.finditer(text):
+        block = match.group(0)
+        names = re.findall(r"^\s*name:\s*(\S+)\s*$", block, re.M)
+        values = re.findall(r"^\s*nodeid:\s*(\d+)\s*$", block, re.M)
+        if len(names) != 1 or len(values) != 1:
+            fail("corosync.conf node blocks must have one name and nodeid")
+        node_id = int(values[0])
+        if node_id <= 0 or node_id in seen_ids or names[0] in result:
+            fail("corosync.conf has an invalid or duplicate nodeid")
+        result[names[0]] = node_id
+        seen_ids.add(node_id)
+    if set(result) != expected_nodes:
+        fail("corosync.conf node IDs do not exactly match PVE membership")
+    return result
 
 
 def address_matches(value: str, node: dict[str, Any], expected: str) -> bool:
@@ -1713,6 +2146,21 @@ def address_matches(value: str, node: dict[str, Any], expected: str) -> bool:
         return str(ipaddress.ip_address(value)) == expected
     except ValueError:
         fail(f"Corosync ring address {value!r} is neither an IP nor its PVE node name")
+
+
+def addresses_equivalent(left: str, right: str, node: dict[str, Any]) -> bool:
+    def normalize(value: str) -> str:
+        if value == node["name"]:
+            return node["ip"]
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError:
+            fail(
+                f"Corosync address {value!r} is neither an IP nor the expected "
+                f"PVE node name {node['name']}"
+            )
+
+    return normalize(left) == normalize(right)
 
 
 def set_config_version(text: str, version: int) -> str:
@@ -1744,9 +2192,350 @@ def replace_ring(text: str, ring: int, addresses: dict[str, str], version: int) 
     return set_config_version(candidate, version)
 
 
+def config_block_span(text: str, name: str) -> tuple[int, int]:
+    matches = list(re.finditer(r"(?m)^\s*%s\s*\{" % re.escape(name), text))
+    if len(matches) != 1:
+        fail(f"corosync.conf must contain exactly one {name} block")
+    opening = text.find("{", matches[0].start(), matches[0].end())
+    depth = 0
+    for index in range(opening, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return matches[0].start(), index + 1
+    fail(f"corosync.conf has an unterminated {name} block")
+
+
+def add_ring(
+    text: str, ring: int, addresses: dict[str, str], version: int
+) -> str:
+    if ring < 0 or ring > 7:
+        fail("Corosync KNET link number must be 0..7")
+    cluster_names = re.findall(r"(?m)^\s*cluster_name:\s*(\S+)\s*$", text)
+    if len(cluster_names) != 1:
+        fail("corosync.conf has no unique cluster_name")
+    _current_version, rings = parse_corosync(text, set(addresses), cluster_names[0])
+    if ring in rings:
+        fail(f"Corosync ring{ring} is already configured")
+
+    seen = set()
+
+    def add_node_address(match: re.Match[str]) -> str:
+        block = match.group(0)
+        names = re.findall(r"(?m)^\s*name:\s*(\S+)\s*$", block)
+        if len(names) != 1 or names[0] not in addresses:
+            return block
+        name = names[0]
+        ring_lines = list(re.finditer(r"(?m)^(\s*)ring\d+_addr:\s*\S+\s*$", block))
+        if not ring_lines:
+            fail(f"Corosync node {name} has no existing ring address")
+        insertion = ring_lines[-1].end()
+        indent = ring_lines[-1].group(1)
+        seen.add(name)
+        return (
+            block[:insertion]
+            + f"\n{indent}ring{ring}_addr: {addresses[name]}"
+            + block[insertion:]
+        )
+
+    candidate = NODE_BLOCK.sub(add_node_address, text)
+    if seen != set(addresses):
+        fail("not every Corosync node received the temporary management ring")
+    totem_start, totem_end = config_block_span(candidate, "totem")
+    totem = candidate[totem_start:totem_end]
+    interface_links = []
+    for block in re.findall(r"(?ms)^\s*interface\s*\{.*?^\s*\}\s*$", totem):
+        values = re.findall(r"(?m)^\s*linknumber:\s*(\d+)\s*$", block)
+        if len(values) != 1:
+            fail("Corosync interface block has no unique linknumber")
+        interface_links.append(int(values[0]))
+    if ring in interface_links:
+        fail(f"Corosync interface linknumber {ring} already exists")
+    closing_line = totem.rfind("}")
+    closing_start = totem.rfind("\n", 0, closing_line) + 1
+    closing_indent = re.match(r"\s*", totem[closing_start:closing_line]).group(0)
+    child_indent = closing_indent + "    "
+    interface = (
+        f"{child_indent}interface {{\n"
+        f"{child_indent}    linknumber: {ring}\n"
+        f"{child_indent}}}\n"
+    )
+    totem = totem[:closing_start] + interface + totem[closing_start:]
+    candidate = candidate[:totem_start] + totem + candidate[totem_end:]
+    return set_config_version(candidate, version)
+
+
+def remove_ring(text: str, ring: int, version: int) -> str:
+    removed_nodes = set()
+
+    def remove_node_address(match: re.Match[str]) -> str:
+        block = match.group(0)
+        names = re.findall(r"(?m)^\s*name:\s*(\S+)\s*$", block)
+        if len(names) != 1:
+            return block
+        pattern = re.compile(r"(?m)^\s*ring%d_addr:\s*\S+\s*\n?" % ring)
+        matches = list(pattern.finditer(block))
+        if len(matches) != 1:
+            fail(f"Corosync node {names[0]} does not have exactly one ring{ring}_addr")
+        removed_nodes.add(names[0])
+        return pattern.sub("", block, count=1)
+
+    candidate = NODE_BLOCK.sub(remove_node_address, text)
+    if not removed_nodes:
+        fail(f"Corosync ring{ring} is absent")
+    totem_start, totem_end = config_block_span(candidate, "totem")
+    totem = candidate[totem_start:totem_end]
+    interface_matches = []
+    for match in re.finditer(r"(?ms)^\s*interface\s*\{.*?^\s*\}\s*\n?", totem):
+        values = re.findall(r"(?m)^\s*linknumber:\s*(\d+)\s*$", match.group(0))
+        if len(values) != 1:
+            fail("Corosync interface block has no unique linknumber")
+        if int(values[0]) == ring:
+            interface_matches.append(match)
+    if len(interface_matches) != 1:
+        fail(f"Corosync ring{ring} has no unique interface block")
+    match = interface_matches[0]
+    totem = totem[:match.start()] + totem[match.end():]
+    candidate = candidate[:totem_start] + totem + candidate[totem_end:]
+    return set_config_version(candidate, version)
+
+
+def runtime_link(report: dict[str, Any], ring: int) -> dict[str, Any] | None:
+    links = report["corosync_runtime"]["links"]
+    return links.get(ring) or links.get(str(ring))
+
+
+def runtime_config_is_loaded(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    node: dict[str, Any],
+    report: dict[str, Any],
+    text: str,
+) -> bool:
+    expected_names = {item["name"] for item in nodes}
+    version, rings = parse_corosync(text, expected_names, cluster_name)
+    node_ids = parse_corosync_node_ids(text, expected_names)
+    runtime = report["corosync_runtime"]
+    config = runtime["config"]
+    if (
+        config.get("cluster_name") != cluster_name
+        or config.get("config_version") != version
+        or config.get("local_node_id") != node["id"]
+        or set(config.get("nodes", {})) != expected_names
+        or node_ids != {item["name"]: item["id"] for item in nodes}
+    ):
+        return False
+    expected_ring_ids = {str(ring) for ring in rings}
+    for item in nodes:
+        row = config["nodes"].get(item["name"], {})
+        if row.get("node_id") != item["id"] or set(row.get("rings", {})) != expected_ring_ids:
+            return False
+        for ring, addresses in rings.items():
+            if not addresses_equivalent(
+                row["rings"][str(ring)], addresses[item["name"]], item
+            ):
+                return False
+    local_binds = config.get("bind_addresses", {})
+    if set(local_binds) != expected_ring_ids:
+        return False
+    links = runtime.get("links", {})
+    if {int(value) for value in links} != set(rings):
+        return False
+    for ring, addresses in rings.items():
+        if not addresses_equivalent(
+            local_binds[str(ring)], addresses[node["name"]], node
+        ):
+            return False
+        link = runtime_link(report, ring)
+        if not link or not addresses_equivalent(
+            link.get("address", ""), addresses[node["name"]], node
+        ):
+            return False
+    return True
+
+
+def runtime_ring_is_full(
+    nodes: list[dict[str, Any]], reports: list[dict[str, Any]], ring: int,
+    addresses: dict[str, str],
+) -> bool:
+    expected_ids = sorted(node["id"] for node in nodes)
+    for node, report in zip(nodes, reports):
+        link = runtime_link(report, ring)
+        if not link or link.get("connected_node_ids") != expected_ids:
+            return False
+        if not address_matches(link.get("address", ""), node, addresses[node["name"]]):
+            return False
+    return True
+
+
+def runtime_matches_config(
+    cluster_name: str, nodes: list[dict[str, Any]], reports: list[dict[str, Any]],
+    text: str,
+) -> bool:
+    version, rings = parse_corosync(text, {node["name"] for node in nodes}, cluster_name)
+    expected_ids = sorted(node["id"] for node in nodes)
+    for node, report in zip(nodes, reports):
+        if not runtime_config_is_loaded(cluster_name, nodes, node, report, text):
+            return False
+        members = report["corosync_runtime"]["config"].get("members", {})
+        if set(members) != {str(value) for value in expected_ids}:
+            return False
+        for member in nodes:
+            row = members[str(member["id"])]
+            if (
+                row.get("status") != "joined"
+                or row.get("config_version") != version
+                or {int(value) for value in row.get("rings", {})} != set(rings)
+            ):
+                return False
+            for ring, addresses in rings.items():
+                if not addresses_equivalent(
+                    row["rings"][str(ring)], addresses[member["name"]], member
+                ):
+                    return False
+    return all(
+        runtime_ring_is_full(nodes, reports, ring, addresses)
+        for ring, addresses in rings.items()
+    )
+
+
+def runtime_topology_matches_config(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+    text: str,
+) -> bool:
+    _version, rings = parse_corosync(
+        text, {node["name"] for node in nodes}, cluster_name
+    )
+    node_ids = parse_corosync_node_ids(text, {node["name"] for node in nodes})
+    expected_ring_ids = {str(ring) for ring in rings}
+    expected_ids = {node["name"]: node["id"] for node in nodes}
+    if node_ids != expected_ids:
+        return False
+    for node, report in zip(nodes, reports):
+        runtime = report["corosync_runtime"]
+        config = runtime["config"]
+        if (
+            config.get("cluster_name") != cluster_name
+            or config.get("local_node_id") != node["id"]
+            or set(config.get("nodes", {})) != set(expected_ids)
+            or {int(value) for value in runtime.get("links", {})} != set(rings)
+        ):
+            return False
+        for item in nodes:
+            row = config["nodes"].get(item["name"], {})
+            if row.get("node_id") != item["id"] or set(row.get("rings", {})) != expected_ring_ids:
+                return False
+            for ring, addresses in rings.items():
+                if not addresses_equivalent(
+                    row["rings"][str(ring)], addresses[item["name"]], item
+                ):
+                    return False
+        binds = config.get("bind_addresses", {})
+        if set(binds) != expected_ring_ids:
+            return False
+        for ring, addresses in rings.items():
+            if not addresses_equivalent(
+                binds[str(ring)], addresses[node["name"]], node
+            ):
+                return False
+        members = config.get("members", {})
+        if set(members) != {str(item["id"]) for item in nodes}:
+            return False
+        for member in nodes:
+            row = members[str(member["id"])]
+            if row.get("status") != "joined" or set(row.get("rings", {})) != expected_ring_ids:
+                return False
+            for ring, addresses in rings.items():
+                if not addresses_equivalent(
+                    row["rings"][str(ring)], addresses[member["name"]], member
+                ):
+                    return False
+    return all(
+        runtime_ring_is_full(nodes, reports, ring, addresses)
+        for ring, addresses in rings.items()
+    )
+
+
+def corosync_runtime_versions(reports: list[dict[str, Any]]) -> set[int]:
+    versions = {
+        report["corosync_runtime"]["config"]["config_version"]
+        for report in reports
+    }
+    versions.update(
+        member["config_version"]
+        for report in reports
+        for member in report["corosync_runtime"]["config"]["members"].values()
+    )
+    return versions
+
+
+def corosync_runtime_target(
+    cluster_name: str, nodes: list[dict[str, Any]], text: str
+) -> dict[str, Any]:
+    names = {node["name"] for node in nodes}
+    version, rings = parse_corosync(text, names, cluster_name)
+    node_ids = parse_corosync_node_ids(text, names)
+    target_nodes = {
+        node["name"]: {
+            "node_id": node_ids[node["name"]],
+            "rings": {
+                str(ring): addresses[node["name"]]
+                for ring, addresses in sorted(rings.items())
+            },
+        }
+        for node in nodes
+    }
+    bind_addresses = {}
+    for node in nodes:
+        bind_addresses[node["name"]] = {}
+        for ring, addresses in sorted(rings.items()):
+            value = addresses[node["name"]]
+            bind_addresses[node["name"]][str(ring)] = (
+                node["ip"] if value == node["name"] else value
+            )
+    return {
+        "cluster_name": cluster_name,
+        "config_version": version,
+        "nodes": target_nodes,
+        "bind_addresses": bind_addresses,
+    }
+
+
+def corosync_restart_order(
+    nodes: list[dict[str, Any]], coordinator: dict[str, Any]
+) -> list[dict[str, Any]]:
+    ordered = sorted(nodes, key=lambda item: (item["id"], item["name"]))
+    return [node for node in ordered if node["name"] != coordinator["name"]] + [
+        coordinator
+    ]
+
+
+def validate_corosync_node_count(count: int) -> None:
+    if type(count) is not int or count < 3 or count % 2 == 0:
+        fail("clustered PVN Corosync migration requires an odd PVE node count of at least 3")
+
+
+def unused_corosync_ring(rings: dict[int, Any]) -> int:
+    candidate = next((ring for ring in range(8) if ring not in rings), None)
+    if candidate is None:
+        fail("all eight Corosync KNET links are used; no safe transition ring remains")
+    return candidate
+
+
 def build_plan(
     cluster_name: str, nodes: list[dict[str, Any]], reports: list[dict[str, Any]], spec: dict[str, Any]
 ) -> dict[str, Any]:
+    validate_corosync_node_count(len(nodes))
+    corosync_package_versions = {
+        report["corosync_package_version"] for report in reports
+    }
+    if len(corosync_package_versions) != 1:
+        fail("PVE nodes do not run one exact Corosync package version")
+    corosync_package_version = next(iter(corosync_package_versions))
     first_text = reports[0]["corosync_text"]
     first_sha = reports[0]["corosync_sha256"]
     for report in reports[1:]:
@@ -1763,7 +2552,8 @@ def build_plan(
         node["name"]: report["provider"]["address"].split("/", 1)[0]
         for node, report in zip(nodes, reports)
     }
-    matching_rings = []
+    geneve_rings = []
+    management_rings = []
     for ring, addresses in rings.items():
         provider_matches = []
         for node in nodes:
@@ -1783,25 +2573,168 @@ def build_plan(
         if any(matches):
             if not all(matches):
                 fail(f"Corosync ring{ring} only partially uses the Geneve NICs")
-            matching_rings.append(ring)
-    if len(matching_rings) > 1:
+            geneve_rings.append(ring)
+        management_matches = []
+        for node in nodes:
+            value = addresses.get(node["name"])
+            management_matches.append(
+                value is not None
+                and address_matches(value, node, management_by_node[node["name"]])
+            )
+        if any(management_matches):
+            if not all(management_matches):
+                fail(f"Corosync ring{ring} only partially uses the management NICs")
+            management_rings.append(ring)
+    if len(geneve_rings) > 1:
         fail("multiple Corosync rings use Geneve; refusing to collapse redundant links")
+    if len(management_rings) > 1:
+        fail("multiple Corosync rings use management; refusing an ambiguous migration")
 
     corosync = None
-    if matching_rings:
-        ring = matching_rings[0]
-        candidate = replace_ring(first_text, ring, management_by_node, version + 1)
-        rollback = replace_ring(first_text, ring, geneve_by_node, version + 2)
+    stages: list[dict[str, Any]] = []
+    if geneve_rings and not management_rings:
+        geneve_ring = geneve_rings[0]
+        unused = unused_corosync_ring(rings)
+        dual = add_ring(first_text, unused, management_by_node, version + 1)
+        final = remove_ring(dual, geneve_ring, version + 2)
+        dual_rollback = remove_ring(dual, unused, version + 2)
+        stages = [
+            {
+                "name": "dual",
+                "candidate": dual,
+                "bridge_ring": geneve_ring,
+                "bridge_addresses": geneve_by_node,
+                "rollback": dual_rollback,
+                "rollback_bridge_ring": geneve_ring,
+                "rollback_bridge_addresses": geneve_by_node,
+            },
+            {
+                "name": "final",
+                "candidate": final,
+                "bridge_ring": unused,
+                "bridge_addresses": management_by_node,
+                "rollback": set_config_version(dual, version + 3),
+                "rollback_bridge_ring": unused,
+                "rollback_bridge_addresses": management_by_node,
+            },
+        ]
+    elif geneve_rings and management_rings:
+        geneve_ring = geneve_rings[0]
+        management_ring = management_rings[0]
+        if not runtime_ring_is_full(
+            nodes, reports, geneve_ring, geneve_by_node
+        ):
+            fail("saved dual-ring Corosync state has no fully connected Geneve safety ring")
+        final = remove_ring(first_text, geneve_ring, version + 1)
+        stages = [
+            {
+                "name": "dual",
+                "candidate": first_text,
+                "bridge_ring": geneve_ring,
+                "bridge_addresses": geneve_by_node,
+                "rollback": None,
+            },
+            {
+                "name": "final",
+                "candidate": final,
+                "bridge_ring": management_ring,
+                "bridge_addresses": management_by_node,
+                "rollback": set_config_version(first_text, version + 2),
+                "rollback_bridge_ring": management_ring,
+                "rollback_bridge_addresses": management_by_node,
+            },
+        ]
+    elif management_rings:
+        management_ring = management_rings[0]
+        if runtime_matches_config(cluster_name, nodes, reports, first_text):
+            stages = []
+        elif runtime_ring_is_full(
+            nodes, reports, management_ring, management_by_node
+        ):
+            # A crash after the final shared write can leave some daemons on
+            # the dual config.  The already-full management ring is the safe
+            # bridge while those nodes are restarted one at a time.
+            stages = [
+                {
+                    "name": "final",
+                    "candidate": first_text,
+                    "bridge_ring": management_ring,
+                    "bridge_addresses": management_by_node,
+                    "rollback": None,
+                }
+            ]
+        elif runtime_ring_is_full(
+            nodes, reports, management_ring, geneve_by_node
+        ):
+            # v0.2.13 could persist a direct address replacement while every
+            # daemon still ran the old Geneve ring.  Reconstruct that old
+            # topology only in memory, add management on a new KNET link,
+            # and persist the resulting dual candidate in one write.
+            recovery_base = replace_ring(
+                first_text, management_ring, geneve_by_node, version + 1
+            )
+            if not runtime_topology_matches_config(
+                cluster_name, nodes, reports, recovery_base
+            ):
+                fail("persisted-final/runtime-stale Corosync state is not uniform")
+            runtime_versions = corosync_runtime_versions(reports)
+            if (
+                version == 0
+                or runtime_versions != {version - 1}
+            ):
+                fail("stale Corosync runtime config versions are not one older safe boundary")
+            recovery_rings = parse_corosync(
+                recovery_base, {node["name"] for node in nodes}, cluster_name
+            )[1]
+            unused = unused_corosync_ring(recovery_rings)
+            # Persist only the dual candidate: ringY remains the already-live
+            # Geneve safety ring while unused ringX adds management.  Never
+            # publish/reload an intermediate single-ring address replacement.
+            dual = add_ring(recovery_base, unused, management_by_node, version + 1)
+            final = remove_ring(dual, management_ring, version + 2)
+            stages = [
+                {
+                    "name": "dual",
+                    "candidate": dual,
+                    "bridge_ring": management_ring,
+                    "bridge_addresses": geneve_by_node,
+                    "stale_runtime_topology": recovery_base,
+                    "stale_runtime_version": version - 1,
+                    "rollback": None,
+                },
+                {
+                    "name": "final",
+                    "candidate": final,
+                    "bridge_ring": unused,
+                    "bridge_addresses": management_by_node,
+                    "rollback": set_config_version(dual, version + 3),
+                    "rollback_bridge_ring": unused,
+                    "rollback_bridge_addresses": management_by_node,
+                },
+            ]
+        else:
+            fail(
+                "persisted Corosync management config and runtime have no common "
+                "fully connected safety ring"
+            )
+    elif not runtime_matches_config(cluster_name, nodes, reports, first_text):
+        fail("persisted and runtime Corosync state differ outside a PVN migration")
+
+    if stages:
+        from_sha256 = first_sha
+        from_text = first_text
+        for stage in stages:
+            stage["from_sha256"] = from_sha256
+            stage["from"] = from_text
+            stage["candidate_sha256"] = digest_text(stage["candidate"])
+            if stage.get("rollback") is not None:
+                stage["rollback_sha256"] = digest_text(stage["rollback"])
+            from_sha256 = stage["candidate_sha256"]
+            from_text = stage["candidate"]
         corosync = {
-            "ring": ring,
             "original": first_text,
             "original_sha256": first_sha,
-            "candidate": candidate,
-            "candidate_sha256": digest_text(candidate),
-            "rollback": rollback,
-            "rollback_sha256": digest_text(rollback),
-            "target_addresses": management_by_node,
-            "original_addresses": geneve_by_node,
+            "stages": stages,
         }
 
     # A device's max_mtu is only a driver/hardware ceiling.  It says nothing
@@ -1831,6 +2764,7 @@ def build_plan(
         fail(f"effective underlay MTU {effective} cannot support a safe overlay guest MTU")
     return {
         "corosync": corosync,
+        "corosync_package_version": corosync_package_version,
         "effective_underlay_mtu": effective,
         "guest_mtu_ceiling": ceiling,
         "default_guest_mtu": default_guest,
@@ -1869,7 +2803,12 @@ def print_plan(
             f"state={report['network_state']}"
         )
     if plan["corosync"]:
-        print(f"  Corosync ring{plan['corosync']['ring']}: Geneve -> management (config_version +1)")
+        stages = plan["corosync"]["stages"]
+        names = " -> ".join(stage["name"] for stage in stages)
+        print(
+            "  Corosync: " + names
+            + " (add management ring, verify all runtimes, remove Geneve ring)"
+        )
     else:
         print("  Corosync: already independent of the Geneve NICs")
     print(
@@ -1975,6 +2914,244 @@ def wait_cluster_verification(
     fail(last_error)
 
 
+def require_shared_corosync_hash(
+    reports: list[dict[str, Any]], expected_sha256: str
+) -> None:
+    hashes = {report["corosync_sha256"] for report in reports}
+    if hashes != {expected_sha256}:
+        fail("nodes do not expose the expected shared corosync.conf")
+
+
+def require_corosync_package_version(
+    reports: list[dict[str, Any]], expected_version: str
+) -> None:
+    versions = {report["corosync_package_version"] for report in reports}
+    if versions != {expected_version}:
+        fail("Corosync package versions differ from the pinned cluster version")
+
+
+def persist_corosync_text(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    spec: dict[str, Any],
+    transaction: str,
+    membership_guard: dict[str, Any],
+    base: dict[str, dict[str, Any]],
+    corosync_package_version: str,
+    from_sha256: str,
+    from_text: str,
+    candidate: str,
+    candidate_sha256: str,
+    bridge_ring: int,
+    bridge_addresses: dict[str, str],
+    stale_runtime_topology: str | None = None,
+    stale_runtime_version: int | None = None,
+    allow_partial_from: bool = False,
+) -> list[dict[str, Any]]:
+    reports = probe_all(cluster_name, nodes, spec, transaction, membership_guard)
+    require_corosync_package_version(reports, corosync_package_version)
+    current_hashes = {report["corosync_sha256"] for report in reports}
+    if current_hashes == {candidate_sha256}:
+        return reports
+    if current_hashes != {from_sha256}:
+        fail("shared corosync.conf drifted from the pinned stage boundary")
+    if not runtime_ring_is_full(
+        nodes, reports, bridge_ring, bridge_addresses
+    ):
+        fail("Corosync safety ring is not N/N immediately before config CAS")
+    if stale_runtime_topology is not None:
+        if (
+            stale_runtime_version is None
+            or not runtime_topology_matches_config(
+                cluster_name, nodes, reports, stale_runtime_topology
+            )
+            or corosync_runtime_versions(reports) != {stale_runtime_version}
+        ):
+            fail("stale v0.2.13 Corosync recovery boundary changed before config CAS")
+    elif not allow_partial_from and not runtime_matches_config(
+        cluster_name, nodes, reports, from_text
+    ):
+        fail("Corosync from-boundary runtime drifted before config CAS")
+    coordinator = nodes[0]
+    if stale_runtime_topology is not None:
+        boundary_mode = "stale-v0.2.13"
+        boundary_target = corosync_runtime_target(
+            cluster_name, nodes, stale_runtime_topology
+        )
+        boundary_target["config_version"] = stale_runtime_version
+    elif allow_partial_from:
+        boundary_mode = "partial-rollback"
+        boundary_target = None
+    else:
+        boundary_mode = "exact"
+        boundary_target = corosync_runtime_target(
+            cluster_name, nodes, from_text
+        )
+    request = dict(base[coordinator["name"]])
+    request.update({
+        "expected_sha256": from_sha256,
+        "candidate": candidate,
+        "candidate_sha256": candidate_sha256,
+        "corosync_package_version": corosync_package_version,
+        "bridge_ring": bridge_ring,
+        "bridge_addresses": bridge_addresses,
+        "runtime_boundary_mode": boundary_mode,
+        "runtime_boundary_target": boundary_target,
+    })
+    write_error = None
+    try:
+        assert_membership_unchanged(
+            membership_guard, "before shared Corosync config write"
+        )
+        ssh_request(coordinator, "apply-corosync", request)
+    except TopologyError as exc:
+        write_error = exc
+    reports = probe_all(cluster_name, nodes, spec, transaction, membership_guard)
+    require_corosync_package_version(reports, corosync_package_version)
+    if {report["corosync_sha256"] for report in reports} == {candidate_sha256}:
+        return reports
+    if write_error is not None:
+        raise write_error
+    fail("shared Corosync candidate did not persist on every node")
+
+
+def converge_corosync_runtime(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    spec: dict[str, Any],
+    transaction: str,
+    membership_guard: dict[str, Any],
+    base: dict[str, dict[str, Any]],
+    corosync_package_version: str,
+    candidate: str,
+    candidate_sha256: str,
+    bridge_ring: int,
+    bridge_addresses: dict[str, str],
+    initial_reports: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    coordinator = nodes[0]
+    target = corosync_runtime_target(cluster_name, nodes, candidate)
+    reports = initial_reports
+    if reports is None:
+        reports = probe_all(
+            cluster_name, nodes, spec, transaction, membership_guard
+        )
+    require_corosync_package_version(reports, corosync_package_version)
+    require_shared_corosync_hash(reports, candidate_sha256)
+    if runtime_matches_config(cluster_name, nodes, reports, candidate):
+        return reports
+    if not runtime_ring_is_full(
+        nodes, reports, bridge_ring, bridge_addresses
+    ):
+        fail("Corosync safety ring is not fully connected before runtime convergence")
+
+    reload_request = dict(base[coordinator["name"]])
+    reload_request.update({
+        "expected_sha256": candidate_sha256,
+        "bridge_ring": bridge_ring,
+        "bridge_addresses": bridge_addresses,
+        "corosync_package_version": corosync_package_version,
+    })
+    try:
+        ssh_request(coordinator, "reload-corosync", reload_request, timeout=45)
+    except TopologyError:
+        # A cluster-wide reload response can be lost.  The exact runtime
+        # sweep below decides whether it applied and which nodes still need
+        # a guarded restart.
+        pass
+
+    for _attempt in range(COROSYNC_SETTLE_ATTEMPTS):
+        reports = probe_all(cluster_name, nodes, spec, transaction, membership_guard)
+        require_corosync_package_version(reports, corosync_package_version)
+        require_shared_corosync_hash(reports, candidate_sha256)
+        if runtime_matches_config(cluster_name, nodes, reports, candidate):
+            return reports
+        if not runtime_ring_is_full(
+            nodes, reports, bridge_ring, bridge_addresses
+        ):
+            fail("Corosync safety ring lost full connectivity after runtime reload")
+        if not TEST_FAST:
+            time.sleep(1)
+
+    ordered = corosync_restart_order(nodes, coordinator)
+    loaded = {
+        node["name"]: runtime_config_is_loaded(
+            cluster_name, nodes, node, report, candidate
+        )
+        for node, report in zip(nodes, reports)
+    }
+    restart_candidates = [
+        node for node in ordered if not loaded[node["name"]]
+    ]
+    restarted: set[str] = set()
+    for node in restart_candidates:
+        if node["name"] in restarted:
+            continue
+        reports = probe_all(cluster_name, nodes, spec, transaction, membership_guard)
+        require_corosync_package_version(reports, corosync_package_version)
+        require_shared_corosync_hash(reports, candidate_sha256)
+        if runtime_matches_config(cluster_name, nodes, reports, candidate):
+            return reports
+        if not runtime_ring_is_full(
+            nodes, reports, bridge_ring, bridge_addresses
+        ):
+            fail(
+                f"Corosync safety ring is not N/N before restarting {node['name']}"
+            )
+        request = dict(base[node["name"]])
+        request.update({
+            "expected_sha256": candidate_sha256,
+            "bridge_ring": bridge_ring,
+            "bridge_addresses": bridge_addresses,
+            "runtime_target": target,
+            "corosync_package_version": corosync_package_version,
+        })
+        print(
+            f"[{node['name']}] restart Corosync over fully connected "
+            f"safety ring{bridge_ring}"
+        )
+        restart_error = None
+        try:
+            ssh_request(node, "restart-corosync", request, timeout=120)
+        except TopologyError as exc:
+            restart_error = exc
+        restarted.add(node["name"])
+        reports = probe_all(cluster_name, nodes, spec, transaction, membership_guard)
+        require_corosync_package_version(reports, corosync_package_version)
+        require_shared_corosync_hash(reports, candidate_sha256)
+        local_report = next(
+            report for report in reports if report["node"] == node["name"]
+        )
+        if not (
+            runtime_config_is_loaded(
+                cluster_name, nodes, node, local_report, candidate
+            )
+            and runtime_ring_is_full(
+                nodes, reports, bridge_ring, bridge_addresses
+            )
+        ):
+            if restart_error is not None:
+                raise restart_error
+            fail(f"{node['name']} did not safely rejoin on the persisted Corosync target")
+
+    last_reports = reports
+    for _attempt in range(COROSYNC_FINAL_ATTEMPTS):
+        last_reports = probe_all(
+            cluster_name, nodes, spec, transaction, membership_guard
+        )
+        require_corosync_package_version(last_reports, corosync_package_version)
+        require_shared_corosync_hash(last_reports, candidate_sha256)
+        if runtime_matches_config(cluster_name, nodes, last_reports, candidate):
+            return last_reports
+        if not runtime_ring_is_full(
+            nodes, last_reports, bridge_ring, bridge_addresses
+        ):
+            fail("Corosync safety ring lost full connectivity during final convergence")
+        if COROSYNC_POLL_SECONDS:
+            time.sleep(COROSYNC_POLL_SECONDS)
+    fail("Corosync runtime did not exactly converge to the persisted configuration")
+
+
 def apply_topology(
     cluster_name: str,
     nodes: list[dict[str, Any]],
@@ -2002,98 +3179,167 @@ def apply_topology(
 
     migration = plan["corosync"]
     if migration:
-        validate_request = {
-            "expected_sha256": migration["original_sha256"],
-            "candidate": migration["candidate"],
-            "candidate_sha256": migration["candidate_sha256"],
-        }
-        rollback_validation = {
-            "expected_sha256": migration["original_sha256"],
-            "candidate": migration["rollback"],
-            "candidate_sha256": migration["rollback_sha256"],
-        }
+        validation_candidates: dict[str, str] = {}
+        for stage in migration["stages"]:
+            validation_candidates[stage["candidate_sha256"]] = stage["candidate"]
+            if stage.get("rollback") is not None:
+                validation_candidates[stage["rollback_sha256"]] = stage["rollback"]
         for node in nodes:
-            request = dict(base[node["name"]])
-            request.update(validate_request)
-            ssh_request(node, "validate-corosync", request)
-            request = dict(base[node["name"]])
-            request.update(rollback_validation)
-            ssh_request(node, "validate-corosync", request)
-        coordinator = nodes[0]
-        request = dict(base[coordinator["name"]])
-        request.update(validate_request)
-        print(f"[{coordinator['name']}] migrate Corosync ring{migration['ring']} to management")
-        try:
-            assert_membership_unchanged(membership_guard, "before Corosync migration")
-            ssh_request(coordinator, "apply-corosync", request)
-            verify = {
-                "allowed_corosync_sha256": [migration["candidate_sha256"]],
-                "ring": migration["ring"],
-                "expected_ring_addresses": migration["target_addresses"],
-            }
-            for node in nodes:
-                verify.setdefault("management_peers", [])
-            # Each helper receives only its remote management peers below.
-            deadline = time.monotonic() + 60
-            last_error = "Corosync verification did not run"
-            while time.monotonic() < deadline:
-                try:
-                    for node in nodes:
-                        node_verify = dict(verify)
-                        node_verify["management_peers"] = [peer["ip"] for peer in nodes if peer != node]
-                        verify_request = dict(base[node["name"]])
-                        verify_request.update(node_verify)
-                        ssh_request(node, "verify-cluster", verify_request, timeout=30)
-                    break
-                except TopologyError as exc:
-                    last_error = str(exc)
-                    time.sleep(2)
-            else:
-                fail(last_error)
-        except TopologyError as migration_error:
-            restore = dict(base[coordinator["name"]])
-            restore.update({
-                "original_sha256": migration["original_sha256"],
-                "failed_candidate_sha256": migration["candidate_sha256"],
-                "rollback_candidate": migration["rollback"],
-                "rollback_sha256": migration["rollback_sha256"],
-            })
+            for candidate_sha256, candidate in validation_candidates.items():
+                request = dict(base[node["name"]])
+                request.update({
+                    "expected_sha256": migration["original_sha256"],
+                    "candidate": candidate,
+                    "candidate_sha256": candidate_sha256,
+                })
+                ssh_request(node, "validate-corosync", request)
+
+        for stage in migration["stages"]:
+            print(
+                f"[cluster] Corosync {stage['name']} stage over "
+                f"safety ring{stage['bridge_ring']}"
+            )
             try:
-                ssh_request(coordinator, "restore-corosync", restore)
-                restored_verify = {
-                    "allowed_corosync_sha256": [
-                        migration["original_sha256"], migration["rollback_sha256"],
-                    ],
-                    "ring": migration["ring"],
-                    "expected_ring_addresses": migration["original_addresses"],
-                }
-                deadline = time.monotonic() + 60
-                last_restore_error = "restored Corosync verification did not run"
-                while time.monotonic() < deadline:
-                    try:
-                        for node in nodes:
-                            node_verify = dict(restored_verify)
-                            node_verify["management_peers"] = [
-                                peer["ip"] for peer in nodes if peer != node
-                            ]
-                            verify_request = dict(base[node["name"]])
-                            verify_request.update(node_verify)
-                            ssh_request(node, "verify-cluster", verify_request, timeout=30)
-                        break
-                    except TopologyError as exc:
-                        last_restore_error = str(exc)
-                        time.sleep(2)
-                else:
-                    fail(last_restore_error)
-            except TopologyError as rollback_error:
-                fail(f"{migration_error}; Corosync rollback also failed: {rollback_error}")
-            fail(f"{migration_error}; Corosync was restored and verified before network changes")
+                stage_reports = persist_corosync_text(
+                    cluster_name, nodes, spec, transaction, membership_guard,
+                    base, plan["corosync_package_version"],
+                    stage["from_sha256"], stage["from"],
+                    stage["candidate"], stage["candidate_sha256"],
+                    stage["bridge_ring"], stage["bridge_addresses"],
+                    stage.get("stale_runtime_topology"),
+                    stage.get("stale_runtime_version"),
+                )
+                converge_corosync_runtime(
+                    cluster_name, nodes, spec, transaction, membership_guard,
+                    base, plan["corosync_package_version"],
+                    stage["candidate"], stage["candidate_sha256"],
+                    stage["bridge_ring"], stage["bridge_addresses"],
+                    initial_reports=stage_reports,
+                )
+            except TopologyError as migration_error:
+                rollback = stage.get("rollback")
+                if rollback is None:
+                    fail(
+                        f"{migration_error}; Corosync remains on a resumable "
+                        f"{stage['name']} boundary and no network changes were made"
+                    )
+                try:
+                    current_reports = probe_all(
+                        cluster_name, nodes, spec, transaction, membership_guard
+                    )
+                    current_hashes = {
+                        report["corosync_sha256"] for report in current_reports
+                    }
+                    if current_hashes == {stage["candidate_sha256"]}:
+                        rollback_reports = persist_corosync_text(
+                            cluster_name, nodes, spec, transaction,
+                            membership_guard, base,
+                            plan["corosync_package_version"],
+                            stage["candidate_sha256"], stage["candidate"],
+                            rollback, stage["rollback_sha256"],
+                            stage["rollback_bridge_ring"],
+                            stage["rollback_bridge_addresses"],
+                            allow_partial_from=True,
+                        )
+                        converge_corosync_runtime(
+                            cluster_name, nodes, spec, transaction,
+                            membership_guard, base,
+                            plan["corosync_package_version"], rollback,
+                            stage["rollback_sha256"],
+                            stage["rollback_bridge_ring"],
+                            stage["rollback_bridge_addresses"],
+                            initial_reports=rollback_reports,
+                        )
+                    elif current_hashes == {stage["from_sha256"]}:
+                        if not runtime_matches_config(
+                            cluster_name, nodes, current_reports, stage["from"]
+                        ):
+                            fail(
+                                "pinned pre-stage Corosync config is present but "
+                                "its runtime is not exact"
+                            )
+                    else:
+                        fail(
+                            "shared Corosync state drifted outside the pinned "
+                            "pre-stage/candidate rollback boundaries"
+                        )
+                except TopologyError as rollback_error:
+                    fail(
+                        f"{migration_error}; Corosync safety rollback also failed: "
+                        f"{rollback_error}"
+                    )
+                fail(
+                    f"{migration_error}; Corosync was restored to a fully connected "
+                    "safety boundary before network changes"
+                )
+
+            if stage["name"] in ("dual", "final"):
+                phase = (
+                    "corosync-dual-runtime"
+                    if stage["name"] == "dual"
+                    else "corosync-final-runtime"
+                )
+                for node in nodes:
+                    request = dict(base[node["name"]])
+                    request["phase"] = phase
+                    ssh_request(node, "record-phase", request)
         for node in nodes:
             request = dict(base[node["name"]])
             request["phase"] = "corosync-migrated"
             ssh_request(node, "record-phase", request)
 
     reports = probe_all(cluster_name, nodes, spec, transaction, membership_guard)
+    require_corosync_package_version(
+        reports, plan["corosync_package_version"]
+    )
+    final_corosync_text = reports[0]["corosync_text"]
+    final_corosync_sha256 = reports[0]["corosync_sha256"]
+    if any(
+        report["corosync_text"] != final_corosync_text
+        or report["corosync_sha256"] != final_corosync_sha256
+        for report in reports[1:]
+    ):
+        fail("shared Corosync config drifted before network mutation")
+    if not runtime_matches_config(
+        cluster_name, nodes, reports, final_corosync_text
+    ):
+        fail("Corosync persisted/runtime state is not exact before network mutation")
+    final_corosync_version, final_corosync_rings = parse_corosync(
+        final_corosync_text, {node["name"] for node in nodes}, cluster_name
+    )
+    final_geneve_addresses = {
+        node["name"]: report["geneve"]["address"].split("/", 1)[0]
+        for node, report in zip(nodes, reports)
+    }
+    final_management_addresses = {node["name"]: node["ip"] for node in nodes}
+    management_ring_count = 0
+    for ring, addresses in final_corosync_rings.items():
+        if all(
+            address_matches(
+                addresses[node["name"]], node,
+                final_geneve_addresses[node["name"]],
+            )
+            for node in nodes
+        ):
+            fail(f"Corosync ring{ring} still uses Geneve before network mutation")
+        if all(
+            address_matches(
+                addresses[node["name"]], node,
+                final_management_addresses[node["name"]],
+            )
+            for node in nodes
+        ):
+            management_ring_count += 1
+    if migration is not None and management_ring_count != 1:
+        fail("Corosync migration did not leave exactly one management ring")
+    final_corosync_ledger = {
+        "sha256": final_corosync_sha256,
+        "config_version": final_corosync_version,
+        "rings": {
+            str(ring): dict(sorted(addresses.items()))
+            for ring, addresses in sorted(final_corosync_rings.items())
+        },
+    }
     requests: dict[str, dict[str, Any]] = {}
     for node, report in zip(nodes, reports):
         request = dict(base[node["name"]])
@@ -2169,9 +3415,20 @@ def apply_topology(
         final_reports = probe_all(
             cluster_name, nodes, spec, transaction, membership_guard
         )
+        require_corosync_package_version(
+            final_reports, plan["corosync_package_version"]
+        )
         incomplete = [report["node"] for report in final_reports if report["network_state"] != "desired"]
         if incomplete:
             fail("final exact-state sweep failed on: " + ", ".join(incomplete))
+        if any(
+            report["corosync_sha256"] != final_corosync_sha256
+            or report["corosync_text"] != final_corosync_text
+            for report in final_reports
+        ) or not runtime_matches_config(
+            cluster_name, nodes, final_reports, final_corosync_text
+        ):
+            fail("Corosync drifted before topology ledger publication")
 
         existing_ledger_states = {
             (report.get("ledger_sha256"), report.get("ledger_text"))
@@ -2188,7 +3445,7 @@ def apply_topology(
             ],
         }
         ledger = {
-            "schema": 1,
+            "schema": 2,
             "phase": "complete",
             "cluster_name": cluster_name,
             "membership_snapshot": ledger_membership_snapshot,
@@ -2209,6 +3466,7 @@ def apply_topology(
             "effective_underlay_mtu": plan["effective_underlay_mtu"],
             "provider_bridge": "br-provider",
             "physnet": "provider",
+            "corosync": final_corosync_ledger,
             "provider_readiness": {
                 "operator_ack": True,
                 "ack_phrase": PROVIDER_ACK,
