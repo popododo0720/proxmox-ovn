@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { BaseResource } from '../api/types';
+import { redactResourceIDs } from '../diagnostics/display';
 import { useResourceCatalog } from './ResourceCatalog';
 
 export interface ResourceMatch {
@@ -45,7 +46,7 @@ function readPath(value: unknown, path: string): unknown {
 function firstText(resource: BaseResource, keys: string[]): string {
   for (const key of keys) {
     const value = readPath(resource, key);
-    if (value !== null && value !== undefined && value !== '') return String(value);
+    if (value !== null && value !== undefined && value !== '') return redactResourceIDs(String(value));
   }
   return '';
 }
@@ -164,7 +165,7 @@ export function ResourceSelect({
       {multiple && options.length > 0 && <small>Use Ctrl/Cmd to select more than one.</small>}
       {error && (
         <span className="reference-error" role="alert">
-          {error}
+          {redactResourceIDs(error)}
           <button type="button" onClick={() => void retry().catch(() => undefined)}>Retry</button>
         </span>
       )}

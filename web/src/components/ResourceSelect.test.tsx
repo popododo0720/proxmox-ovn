@@ -6,9 +6,10 @@ import { ResourceSelect } from './ResourceSelect';
 
 describe('ResourceSelect', () => {
   it('shows human-readable project-scoped choices while submitting the exact ID', async () => {
+    const networkID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
     const list = vi.fn().mockResolvedValue({
       items: [
-        { id: 'network-aaaaaaaa', name: 'application', project_id: 'project-a' },
+        { id: networkID, name: 'application', project_id: 'project-a' },
         { id: 'network-bbbbbbbb', name: 'database', project_id: 'project-b' },
       ],
     });
@@ -30,16 +31,18 @@ describe('ResourceSelect', () => {
 
     const option = await screen.findByRole('option', { name: 'application' });
     expect(screen.queryByRole('option', { name: /database/ })).not.toBeInTheDocument();
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'network-aaaaaaaa' } });
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: networkID } });
 
-    expect(option).toHaveValue('network-aaaaaaaa');
-    expect(onChange).toHaveBeenCalledWith('network-aaaaaaaa');
+    expect(option).toHaveValue(networkID);
+    expect(screen.getByRole('combobox')).not.toHaveTextContent(networkID);
+    expect(onChange).toHaveBeenCalledWith(networkID);
     expect(list).toHaveBeenCalledWith('/networks');
   });
 
   it('reports load failures and retries the same source', async () => {
+    const operationID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
     const list = vi.fn()
-      .mockRejectedValueOnce(new Error('manager unavailable'))
+      .mockRejectedValueOnce(new Error(`manager unavailable: ${operationID}`))
       .mockResolvedValueOnce({ items: [{ id: 'project-1', name: 'tenant-a' }] });
 
     render(
@@ -53,7 +56,9 @@ describe('ResourceSelect', () => {
       </ApiProvider>,
     );
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('manager unavailable');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('manager unavailable: [resource]');
+    expect(alert).not.toHaveTextContent(operationID);
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
     await screen.findByRole('option', { name: 'tenant-a' });

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useApi } from '../api/context';
 import type { HealthStatus, NodeStatus, Operation, Project } from '../api/types';
+import { redactResourceIDs, uiErrorMessage } from '../diagnostics/display';
 import { ErrorState } from '../components/ErrorState';
 import { LoadingState } from '../components/LoadingState';
 import { ReferenceLabel } from '../components/ReferenceLabel';
@@ -29,7 +30,7 @@ export function OverviewPage() {
         if (current) setData({ health, projects: projects.items, nodes: nodes.items, operations: operations.items });
       })
       .catch((reason: unknown) => {
-        if (current) setError(reason instanceof Error ? reason.message : 'The PVN overview is unavailable');
+        if (current) setError(uiErrorMessage(reason, 'The PVN overview is unavailable'));
       });
     return () => { current = false; };
   }, [api, reloadKey]);
@@ -73,7 +74,12 @@ export function OverviewPage() {
               <HealthRow label="Reconciler" value={data.health.reconciler} />
               <HealthRow label="Default security policy" value={data.health.default_security_policy} />
               <HealthRow label="All online PVE nodes" value={data.health.capacity?.ready ? 'ready' : 'degraded'} />
-              {data.health.capacity?.reason && <p className="muted">{data.health.capacity.reason}</p>}
+              {data.health.capacity?.reason && (
+                <p className="muted">{redactResourceIDs(data.health.capacity.reason, data.nodes.map((node) => ({
+                  id: node.id,
+                  name: node.name || node.management_address,
+                })))}</p>
+              )}
             </section>
             <section className="panel-card">
               <div className="panel-heading">

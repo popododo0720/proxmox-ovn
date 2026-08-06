@@ -1,6 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { useApi } from '../api/context';
 import type { BaseResource } from '../api/types';
+import { redactResourceIDs, uiErrorMessage } from '../diagnostics/display';
 import { CreateDialog, type FormField } from './CreateDialog';
 import { EmptyState } from './EmptyState';
 import { ErrorState } from './ErrorState';
@@ -47,15 +48,15 @@ export function formatValue(value: unknown): ReactNode {
   if (typeof value === 'boolean') return value ? 'Yes' : 'No';
   if (Array.isArray(value)) {
     if (!value.length) return <span className="muted">—</span>;
-    if (value.every((item) => typeof item !== 'object')) return value.join(', ');
+    if (value.every((item) => typeof item !== 'object')) return redactResourceIDs(value.join(', '));
     return value.map((item) => {
       if (item && typeof item === 'object' && 'ip_address' in item) return String(item.ip_address);
       if (item && typeof item === 'object' && 'address' in item) return String(item.address);
-      return JSON.stringify(item);
+      return redactResourceIDs(JSON.stringify(item));
     }).join(', ');
   }
-  if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
+  if (typeof value === 'object') return redactResourceIDs(JSON.stringify(value));
+  return redactResourceIDs(String(value));
 }
 
 function resourceLabel(resource: BaseResource): string {
@@ -115,7 +116,7 @@ export function ResourcePage<T extends BaseResource>({
       else await api.remove(endpoint, item.id, item.revision);
       catalog.invalidate();
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : 'Delete failed');
+      setActionError(uiErrorMessage(reason, 'Delete failed', [{ id: item.id, name: label }]));
     } finally {
       setDeleting(null);
     }
@@ -135,7 +136,7 @@ export function ResourcePage<T extends BaseResource>({
             onClick={() => {
               setActionError('');
               void catalog.retry().catch((reason: unknown) => {
-                setActionError(reason instanceof Error ? reason.message : 'Refresh failed');
+                setActionError(uiErrorMessage(reason, 'Refresh failed'));
               });
             }}
             disabled={catalog.loading}

@@ -9,6 +9,7 @@ import {
 } from 'react';
 import type { ApiClient } from '../api/client';
 import type { BaseResource } from '../api/types';
+import { uiErrorMessage } from '../diagnostics/display';
 
 interface CatalogEntry {
   items?: BaseResource[];
@@ -27,7 +28,7 @@ interface ResourceCatalogValue {
 const ResourceCatalogContext = createContext<ResourceCatalogValue | null>(null);
 
 function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : 'Resource names are unavailable';
+  return uiErrorMessage(reason, 'Resource names are unavailable');
 }
 
 export function ResourceCatalogProvider({ client, children }: PropsWithChildren<{ client: ApiClient }>) {

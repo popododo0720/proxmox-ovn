@@ -1,3 +1,5 @@
+import { redactResourceIDs } from '../diagnostics/display';
+
 export function ErrorState({
   title = 'Could not load data',
   message,
@@ -12,7 +14,7 @@ export function ErrorState({
       <span className="state-icon" aria-hidden="true">!</span>
       <div>
         <strong>{title}</strong>
-        <p>{message}</p>
+        <p>{redactResourceIDs(message)}</p>
         {onRetry && <button className="button button-secondary" onClick={onRetry}>Try again</button>}
       </div>
     </div>

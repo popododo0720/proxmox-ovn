@@ -71,4 +71,31 @@ describe('OverviewPage operational health', () => {
     expect(list).toHaveBeenCalledTimes(1);
     expect(list).toHaveBeenCalledWith('/networks');
   });
+
+  it('maps capacity node IDs to names and redacts unknown UUIDs', async () => {
+    const nodeID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const reporterID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
+    const client = {
+      health: vi.fn().mockResolvedValue({
+        status: 'degraded', cluster: 'lab', version: 'test',
+        database: 'ready', ovn_northbound: 'ready',
+        ovn_southbound: 'ready', reconciler: 'ready',
+        default_security_policy: 'ready',
+        capacity: { ready: false, reason: `node ${nodeID} was not reported by ${reporterID}` },
+      }),
+      projects: vi.fn().mockResolvedValue({ items: [] }),
+      nodes: vi.fn().mockResolvedValue({ items: [{ id: nodeID, name: 'prox3', enabled: true }] }),
+      operations: vi.fn().mockResolvedValue({ items: [] }),
+    } as unknown as ApiClient;
+
+    render(
+      <ApiProvider client={client}>
+        <OverviewPage />
+      </ApiProvider>,
+    );
+
+    const reason = await screen.findByText('node prox3 was not reported by [resource]');
+    expect(reason).not.toHaveTextContent(nodeID);
+    expect(reason).not.toHaveTextContent(reporterID);
+  });
 });

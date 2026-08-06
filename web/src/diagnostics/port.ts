@@ -1,4 +1,5 @@
 import type { NodeStatus, Port } from '../api/types';
+import { redactResourceIDs } from './display';
 
 export type ChassisDiagnostic = 'matched' | 'mismatch' | 'missing' | 'not requested' | 'unavailable';
 export type RuntimeDiagnostic = 'matched' | 'mismatch' | 'not-found' | 'ambiguous' | 'not-bindable' | 'error';
@@ -21,8 +22,6 @@ export interface PortDiagnostic {
   tone: DiagnosticTone;
   warnings: string[];
 }
-
-const uuidPattern = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -62,16 +61,16 @@ export function observeVM(
 }
 
 export function portDisplayName(port: Port): string {
-  return port.name || port.mac_address || 'Unnamed port';
+  return redactResourceIDs(port.name || port.mac_address || 'Unnamed port');
 }
 
 export function nodeDisplayName(node: NodeStatus | undefined): string {
-  return node?.name || node?.management_address || 'Unavailable node';
+  return redactResourceIDs(node?.name || node?.management_address || 'Unavailable node');
 }
 
 export function vmDisplayName(port: Port, observation?: VMObservation): string {
   if (!port.vmid) return 'Not attached';
-  return observation?.name ? `${observation.name} (VM ${port.vmid})` : `VM ${port.vmid}`;
+  return observation?.name ? `${redactResourceIDs(observation.name)} (VM ${port.vmid})` : `VM ${port.vmid}`;
 }
 
 export function chassisDiagnostic(port: Port, node: NodeStatus | undefined): ChassisDiagnostic {
@@ -87,7 +86,7 @@ function safeReason(message: string, port: Port, node: NodeStatus | undefined): 
     .filter((value): value is string => Boolean(value && value.length > 3))
     .sort((left, right) => right.length - left.length);
   for (const value of sensitive) result = result.split(value).join('[resource ID]');
-  return result.replace(uuidPattern, '[resource ID]').slice(0, 300);
+  return redactResourceIDs(result).slice(0, 300);
 }
 
 function errorReason(port: Port, node: NodeStatus | undefined, fallback: string): string {

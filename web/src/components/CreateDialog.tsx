@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'react';
+import { uiErrorMessage } from '../diagnostics/display';
 import { ResourceSelect, type ResourceReference } from './ResourceSelect';
 
 export interface FormField {
@@ -88,7 +89,11 @@ export function CreateDialog({
       setFormValues(initialValues);
       onClose();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : `The resource could not be ${mode === 'edit' ? 'updated' : 'created'}`);
+      const fallback = `The resource could not be ${mode === 'edit' ? 'updated' : 'created'}`;
+      setError(uiErrorMessage(reason, fallback, [{
+        id: values.id,
+        name: values.name || values.address || values.cidr,
+      }]));
     } finally {
       setSubmitting(false);
     }

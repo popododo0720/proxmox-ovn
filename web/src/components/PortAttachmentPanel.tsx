@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { ApiError } from '../api/client';
 import { useApi } from '../api/context';
 import type { NodeStatus, Port } from '../api/types';
+import { redactResourceIDs, uiErrorMessage } from '../diagnostics/display';
 import { observeVM, type RuntimeDiagnostic } from '../diagnostics/port';
 import { pveBridge } from '../pve/bridge';
 import {
@@ -154,7 +155,10 @@ export function PortAttachmentPanel({
         if (available) setNIC(available);
       }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not read the VM configuration');
+      setError(uiErrorMessage(reason, 'Could not read the VM configuration', [
+        { id: selectedPort.id, name: selectedPort.name || selectedPort.mac_address },
+        { id: selectedNode?.id, name: selectedNode?.name || selectedNode?.management_address },
+      ]));
     } finally {
       setReading(false);
     }
@@ -171,14 +175,17 @@ export function PortAttachmentPanel({
         ? await attachVMPort(api, bridge, selectedPort, selection, { onStep: setBusyStep })
         : await detachVMPort(api, bridge, selectedPort, selection, { onStep: setBusyStep });
       setMessage(action === 'attach'
-        ? `${result.name || result.mac_address || 'Port'} is bound and the VM NIC is enabled.`
-        : `${result.name || result.mac_address || 'Port'} is unbound and the VM NIC was removed.`);
+        ? `${redactResourceIDs(result.name || result.mac_address || 'Port')} is bound and the VM NIC is enabled.`
+        : `${redactResourceIDs(result.name || result.mac_address || 'Port')} is unbound and the VM NIC was removed.`);
       clearInspection();
       portCatalog.invalidate();
       onChanged?.();
     } catch (reason) {
       portCatalog.invalidate();
-      setError(reason instanceof Error ? reason.message : `Could not ${action} the VM port`);
+      setError(uiErrorMessage(reason, `Could not ${action} the VM port`, [
+        { id: selectedPort.id, name: selectedPort.name || selectedPort.mac_address },
+        { id: selectedNode?.id, name: selectedNode?.name || selectedNode?.management_address },
+      ]));
       onChanged?.();
     } finally {
       setBusyStep(null);
@@ -253,7 +260,7 @@ export function PortAttachmentPanel({
       {busyStep && <div className="workflow-progress" role="status"><span className="spinner" /><strong>{stepLabels[busyStep]}</strong><span>The VM NIC remains fail-closed during this step.</span></div>}
       {vmConfig && <div className="nic-list">
         <div className="nic-list-heading"><strong>{nics.length} configured NICs</strong><span>VM status: {vmStatus}</span></div>
-        {nics.length ? nics.map(([key, value]) => <div className="nic-row" key={key}><code>{key}</code><span>{String(value)}</span></div>) : <p className="muted">This VM has no configured NICs.</p>}
+        {nics.length ? nics.map(([key, value]) => <div className="nic-row" key={key}><code>{key}</code><span>{redactResourceIDs(String(value))}</span></div>) : <p className="muted">This VM has no configured NICs.</p>}
       </div>}
     </section>
   );

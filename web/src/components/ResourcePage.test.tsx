@@ -5,6 +5,51 @@ import { ApiProvider } from '../api/context';
 import { ResourcePage } from './ResourcePage';
 
 describe('ResourcePage resource identity', () => {
+  it('shows no raw UUID in the table but preserves and copies it in Details', async () => {
+    const resourceID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const projectID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const list = vi.fn(async (endpoint: string) => endpoint === '/projects'
+      ? { items: [{ id: projectID, name: 'Tenant A' }] }
+      : { items: [{ id: resourceID, name: 'application', project_id: projectID }] });
+
+    try {
+      render(
+        <ApiProvider client={{ list } as unknown as ApiClient}>
+          <ResourcePage
+            title="Networks"
+            description="Tenant networks"
+            endpoint="/networks"
+            columns={[
+              { key: 'name', label: 'Network' },
+              { key: 'project_id', label: 'Project', reference: { endpoint: '/projects' } },
+            ]}
+          />
+        </ApiProvider>,
+      );
+
+      const table = await screen.findByRole('table');
+      expect(await within(table).findByText('Tenant A')).toBeInTheDocument();
+      expect(table).not.toHaveTextContent(resourceID);
+      expect(table).not.toHaveTextContent(projectID);
+
+      fireEvent.click(within(table).getByRole('button', { name: 'Details' }));
+      const dialog = screen.getByRole('dialog');
+      expect(dialog).toHaveTextContent(resourceID);
+      expect(dialog).toHaveTextContent(projectID);
+      fireEvent.click(within(dialog).getByRole('button', { name: `Copy resource ID ${projectID}` }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith(projectID));
+    } finally {
+      if (originalClipboard) Object.defineProperty(navigator, 'clipboard', originalClipboard);
+      else Reflect.deleteProperty(navigator, 'clipboard');
+    }
+  });
+
   it('shows cached human references in the table and keeps full IDs in Details', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     const originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
@@ -101,6 +146,32 @@ describe('ResourcePage resource identity', () => {
 
     fireEvent.click(within(row!).getByRole('button', { name: 'Details' }));
     expect(within(screen.getByRole('dialog')).getByText('project-forbidden')).toBeInTheDocument();
+  });
+
+  it('maps a failed action ID to the resource name and hides unrelated UUIDs', async () => {
+    const resourceID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
+    const operationID = 'acbd18db-4cc2-4854-978d-8472f72f8d1b';
+    const list = vi.fn().mockResolvedValue({ items: [{ id: resourceID, name: 'application', revision: 2 }] });
+    const remove = vi.fn().mockRejectedValue(new Error(`delete ${resourceID} failed in ${operationID}`));
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    render(
+      <ApiProvider client={{ list, remove } as unknown as ApiClient}>
+        <ResourcePage
+          title="Networks"
+          description="Tenant networks"
+          endpoint="/networks"
+          columns={[{ key: 'name', label: 'Network' }]}
+          allowDelete
+        />
+      </ApiProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('delete application failed in [resource]');
+    expect(alert).not.toHaveTextContent(resourceID);
+    expect(alert).not.toHaveTextContent(operationID);
   });
 
   it('edits a safe field with the complete resource and optimistic revision', async () => {
