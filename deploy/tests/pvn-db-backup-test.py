@@ -73,6 +73,11 @@ try:
         "OVN_Northbound": 8,
         "OVN_Southbound": 7,
     }
+    roles = {
+        "PVN_Control": ("follower", "f055"),
+        "OVN_Northbound": ("leader", "self"),
+        "OVN_Southbound": ("leader", "self"),
+    }
     versions = {
         "PVN_Control": "1.0.0",
         "OVN_Northbound": "7.11.0",
@@ -92,9 +97,9 @@ try:
                 "healthy": True,
                 "cluster_id": cluster_ids[name],
                 "server_id": server_ids[name],
-                "role": "leader",
+                "role": roles[name][0],
                 "term": terms[name],
-                "leader": "self",
+                "leader": roles[name][1],
                 "member_count": 3,
                 "connected_members": 3,
                 "quorum_size": 2,
@@ -278,11 +283,12 @@ else:
     manifest = json.loads((backup_set / "manifest.json").read_text())
     check(manifest["consistency"] == "independent-per-database", "consistency claim drifted")
     check(manifest["format"] == "pvn-db-backup/v2", "manifest format was not upgraded")
+    check(manifest["purpose"] == "general-backup", "general backup purpose was omitted")
     check(len(manifest["databases"]) == 3, "all create did not capture three databases")
     for entry in manifest["databases"]:
         check(
-            entry["role"] == "leader" and entry["leader"] == "self",
-            "source was not recorded as leader",
+            (entry["role"], entry["leader"]) == roles[entry["database"]],
+            "source role and leader identity were not recorded",
         )
         check(entry["term"] == terms[entry["database"]], "Raft term was not recorded")
         check(
@@ -301,6 +307,7 @@ else:
     legacy_manifest_path = legacy / "manifest.json"
     legacy_manifest = json.loads(legacy_manifest_path.read_text())
     legacy_manifest["format"] = "pvn-db-backup/v1"
+    legacy_manifest.pop("purpose")
     for entry in legacy_manifest["databases"]:
         for field in ("server_id", "role", "term", "leader"):
             entry.pop(field)
@@ -324,6 +331,7 @@ else:
             str(output_root),
             "--database",
             "ovn-nb",
+            "--recovery-window",
         ),
         "selected-database create",
     )
@@ -333,6 +341,10 @@ else:
     check(
         [entry["key"] for entry in selected_manifest["databases"]] == ["ovn-nb"],
         "selected create captured the wrong database set",
+    )
+    check(
+        selected_manifest["purpose"] == "recovery-window",
+        "selected recovery backup was not marked for recovery",
     )
     check(
         selected["database_identities"] == [
@@ -356,18 +368,58 @@ else:
         "create report omitted the selected database identity",
     )
 
-    follower = copy.deepcopy(base_status)
-    follower["databases"][1].update(role="follower", leader="abcd")
-    reset_status(follower)
+    reset_status()
+    general_follower_output = temporary / "general-follower-backups"
+    general_follower = require_success(
+        invoke(
+            "create",
+            "--output",
+            str(general_follower_output),
+            "--database",
+            "pvn-control",
+        ),
+        "general follower create",
+    )
+    general_follower_manifest = json.loads(
+        (pathlib.Path(general_follower["backup_set"]) / "manifest.json").read_text()
+    )
+    check(
+        general_follower_manifest["databases"][0]["role"] == "follower",
+        "general follower identity was not preserved",
+    )
+
+    reset_status()
     follower_output = temporary / "follower-backups"
     result = invoke(
-        "create", "--output", str(follower_output), "--database", "ovn-nb"
+        "create",
+        "--output",
+        str(follower_output),
+        "--database",
+        "pvn-control",
+        "--recovery-window",
     )
     check(
         result.returncode != 0 and "current local Raft leader" in result.stderr,
         "selected follower created a backup",
     )
     check(not follower_output.exists(), "follower create changed the output filesystem")
+
+    reset_status()
+    missing_selection_output = temporary / "missing-selection-backups"
+    result = invoke(
+        "create",
+        "--output",
+        str(missing_selection_output),
+        "--recovery-window",
+    )
+    check(
+        result.returncode != 0 and "exactly one explicit" in result.stderr,
+        "recovery window accepted an implicit all-database selection",
+    )
+    check(
+        not missing_selection_output.exists(),
+        "invalid recovery selection changed the output filesystem",
+    )
 
     tampered = clone_backup(backup_set, "tampered")
     with (tampered / "pvn-control.ovsdb").open("ab") as output:
@@ -453,6 +505,7 @@ else:
         str(cluster_drift_output),
         "--database",
         "ovn-nb",
+        "--recovery-window",
     )
     check(
         result.returncode != 0 and "changed during backup" in result.stderr,
@@ -473,6 +526,7 @@ else:
         str(term_drift_output),
         "--database",
         "ovn-nb",
+        "--recovery-window",
     )
     check(
         result.returncode != 0 and "changed during backup" in result.stderr,
@@ -490,6 +544,7 @@ else:
         str(leadership_drift_output),
         "--database",
         "ovn-nb",
+        "--recovery-window",
     )
     check(
         result.returncode != 0 and "current local Raft leader" in result.stderr,
@@ -512,6 +567,7 @@ else:
         str(server_drift_output),
         "--database",
         "ovn-nb",
+        "--recovery-window",
     )
     check(
         result.returncode != 0 and "changed during backup" in result.stderr,

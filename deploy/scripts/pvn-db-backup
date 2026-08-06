@@ -86,6 +86,9 @@ class RaftIdentity:
             "member_count": self.member_count,
         }
 
+    def stable_backup_identity(self) -> tuple[str, int, int]:
+        return (self.cluster_id, self.member_count, self.quorum_size)
+
 
 DATABASES = (
     Database(
@@ -543,14 +546,19 @@ def read_manifest(backup_set: pathlib.Path) -> dict[str, Any]:
 
 def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     top_keys = {"format", "consistency", "created_at", "source", "databases"}
+    manifest_format = manifest.get("format")
+    if manifest_format == FORMAT:
+        top_keys.add("purpose")
     if set(manifest) != top_keys:
         fail("backup manifest has unknown or missing top-level fields")
-    manifest_format = manifest.get("format")
     if (
         manifest_format not in {FORMAT, LEGACY_FORMAT}
         or manifest.get("consistency") != CONSISTENCY
     ):
         fail("backup manifest format or consistency model is unsupported")
+    purpose = manifest.get("purpose") if manifest_format == FORMAT else "general-backup"
+    if purpose not in {"general-backup", "recovery-window"}:
+        fail("backup manifest purpose is unsupported")
     parse_timestamp(manifest.get("created_at"), "manifest created_at")
     source = manifest.get("source")
     if not isinstance(source, dict) or set(source) != {"hostname"}:
@@ -609,8 +617,14 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             server_id = entry.get("server_id")
             if not isinstance(server_id, str) or not UUID.fullmatch(server_id):
                 fail(f"backup manifest server ID is invalid for {key}")
-            if entry.get("role") != "leader" or entry.get("leader") != "self":
-                fail(f"backup manifest source was not the local leader for {key}")
+            role = entry.get("role")
+            leader = entry.get("leader")
+            if role not in {"leader", "follower"}:
+                fail(f"backup manifest role is invalid for {key}")
+            if not isinstance(leader, str) or not leader or len(leader) > 256:
+                fail(f"backup manifest leader identity is invalid for {key}")
+            if (role == "leader") != (leader == "self"):
+                fail(f"backup manifest role and leader identity disagree for {key}")
             positive_integer(entry.get("term"), f"{key} term")
         if entry.get("source_service_model") != "clustered":
             fail(f"backup source service model is unsupported for {key}")
@@ -619,6 +633,11 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     expected_order = [database.key for database in DATABASES if database.key in seen]
     if [entry["key"] for entry in entries] != expected_order:
         fail("backup manifest database entries are not in canonical order")
+    if purpose == "recovery-window":
+        if len(entries) != 1:
+            fail("recovery-window manifest must contain exactly one database")
+        if entries[0].get("role") != "leader" or entries[0].get("leader") != "self":
+            fail("recovery-window manifest source was not the local leader")
     return entries
 
 
@@ -717,11 +736,16 @@ def select_databases(values: list[str] | None) -> tuple[Database, ...]:
     return tuple(database for database in DATABASES if database.key in selected)
 
 
-def create_backup(output_root: pathlib.Path, selected: tuple[Database, ...]) -> dict[str, Any]:
+def create_backup(
+    output_root: pathlib.Path,
+    selected: tuple[Database, ...],
+    recovery_window: bool,
+) -> dict[str, Any]:
     require_central_marker()
     command([SYSTEMCTL, "is-active", "--quiet", "pvn-central.target"], timeout=20)
     before = central_status()
-    require_local_leaders(before, selected)
+    if recovery_window:
+        require_local_leaders(before, selected)
     ensure_output_root(output_root)
     stamp = utc_now().replace("-", "").replace(":", "")
     base = f"pvn-db-backup-{stamp}-{safe_hostname()}-{secrets.token_hex(4)}"
@@ -756,16 +780,25 @@ def create_backup(output_root: pathlib.Path, selected: tuple[Database, ...]) -> 
             entry.update(health.manifest_fields())
             entries.append(entry)
         after = central_status()
-        require_local_leaders(after, selected)
+        if recovery_window:
+            require_local_leaders(after, selected)
         for database in selected:
-            if after[database.name] != before[database.name]:
+            changed = (
+                after[database.name] != before[database.name]
+                if recovery_window
+                else after[database.name].stable_backup_identity()
+                != before[database.name].stable_backup_identity()
+            )
+            if changed:
                 fail(
                     f"{database.name} Raft identity, term, leadership, or membership changed during backup"
                 )
         hostname = safe_hostname()
+        purpose = "recovery-window" if recovery_window else "general-backup"
         manifest = {
             "format": FORMAT,
             "consistency": CONSISTENCY,
+            "purpose": purpose,
             "created_at": utc_now(),
             "source": {"hostname": hostname},
             "databases": entries,
@@ -782,6 +815,7 @@ def create_backup(output_root: pathlib.Path, selected: tuple[Database, ...]) -> 
             "backup_set": str(final),
             "format": FORMAT,
             "consistency": CONSISTENCY,
+            "purpose": purpose,
             "source": {"hostname": hostname},
             "databases": [database.name for database in selected],
             "database_identities": [
@@ -829,6 +863,11 @@ def parser() -> argparse.ArgumentParser:
         choices=["all", *(database.key for database in DATABASES)],
         help="database to capture; repeat for multiple databases (default: all)",
     )
+    create.add_argument(
+        "--recovery-window",
+        action="store_true",
+        help="require one explicit database and stable local Raft leadership",
+    )
     verify = subcommands.add_parser("verify", help="verify a backup set offline")
     verify.add_argument("backup_set", type=pathlib.Path)
     return result
@@ -841,9 +880,17 @@ def main() -> int:
         fail("must run as root")
     if arguments.action == "create":
         selected = select_databases(arguments.database)
+        if arguments.recovery_window and (
+            not arguments.database or len(selected) != 1
+        ):
+            fail("--recovery-window requires exactly one explicit --database")
         lock_descriptor = acquire_lock()
         try:
-            report = create_backup(clean_absolute(arguments.output, "backup output root"), selected)
+            report = create_backup(
+                clean_absolute(arguments.output, "backup output root"),
+                selected,
+                arguments.recovery_window,
+            )
         finally:
             os.close(lock_descriptor)
     else:
