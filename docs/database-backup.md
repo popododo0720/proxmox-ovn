@@ -509,11 +509,34 @@ pause or state change after reservation requires aborting this epoch and
 beginning a genuinely new recovery window; it does not authorize receipt
 deletion.
 
-### 6. Force desired-state reconciliation while writers remain frozen
+### 6. Start northd, then force desired-state reconciliation
 
-Keep all database services active and keep northd, every manager, agent, and
-controller inactive. From the same leader, run the dedicated recovery writer
-once:
+After the one restore submission has completed and all three databases are
+healthy, keep every normal PVN writer and transport component frozen. Start
+the complete central target on every voter through its normal dependency
+graph:
+
+```sh
+systemctl start pvn-central.target
+```
+
+Do not start `ovn-northd.service` directly and never use
+`--ignore-dependencies`. The central target starts the TLS listeners and
+northd, but it does not start a manager, agent, host configuration service, or
+controller. Wait until `pvnctl central status` and the strict northd check
+succeed on every voter:
+
+```sh
+/usr/lib/pvn/pvn-ovn-northd status
+```
+
+The three strict northd reports must show connected NB/SB IDLs, one active
+role and the remaining standby roles, and one synchronized configuration
+value. Re-prove that `pvn-node.target`, `pvn-node-ready.service`,
+`pvn-manager.service`, `pvn-agent.service`, `pvn-ovn-host-config.service`, and
+`ovn-controller.service` remain inactive on every node.
+
+From the same recovery leader, run the dedicated recovery writer once:
 
 ```sh
 pvnctl recovery reconcile-ovn --apply --confirm "$pvn_cluster_id"
@@ -525,9 +548,11 @@ records the resulting operation state in `PVN_Control`. It returns
 applied, and has exactly one successful reconcile operation completed by this
 pass. It is required after `PVN_Control` or Northbound reconstruction; running
 it for a Southbound-only reconstruction also verifies PVN-owned Northbound
-state before northd repopulates Southbound. It deliberately writes both PVN
-Control and Northbound, which is why normal managers must remain frozen. On
-failure, keep the freeze and investigate instead of starting a second restore.
+state after northd has repopulated Southbound. Every mutation retains the
+strict Northbound-to-Southbound synchronization fence, which cannot complete
+while northd is inactive. The command deliberately writes both PVN Control
+and Northbound, which is why normal managers must remain frozen. On failure,
+keep the node freeze and investigate instead of starting a second restore.
 
 Success also includes a read-only managed-graph audit after reconciliation.
 The audit snapshots current PVN Control desired state, inventories every
@@ -538,25 +563,17 @@ child-to-parent UUID sets. Unknown managed table use, orphaned or malformed
 identity, duplicates, and missing/extra/conflicting parents fail closed. The
 PVN Control snapshot digest must also be unchanged from the beginning to the
 end of the audit. Reconciliation may create or update the current desired
-graph, but the audit itself never creates, updates, deletes, or prunes. In
-Current releases report an orphan and leave it intact because no cluster ownership
+graph, but the audit itself never creates, updates, deletes, or prunes. Current
+releases report an orphan and leave it intact because no cluster ownership
 marker authorizes global cleanup; it is never silently deleted. If either
 reconciliation or audit fails, the command returns nonzero without a success
 JSON result, and the writer freeze must remain in place.
 
-### 7. Restart through the targets and validate
+### 7. Restart the transport targets and validate
 
-After the restore and forced reconciliation both succeed, run this on every
-central voter:
-
-```sh
-systemctl start pvn-central.target
-```
-
-Do not start northd with dependency overrides. Wait until
-`pvnctl central status` succeeds on every voter. Then start the complete node
-target on every PVE node so its readiness gate and all required components
-return as one lifecycle:
+After the restore, central-target startup, and forced reconciliation all
+succeed, start the complete node target on every PVE node so its readiness
+gate and all required components return as one lifecycle:
 
 ```sh
 systemctl start pvn-node.target
