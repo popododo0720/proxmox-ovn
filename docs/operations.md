@@ -142,6 +142,14 @@ that PVN remains disabled and inactive, and removes the staged file. A failure
 stops before the next node; nodes already completed remain installed but
 inactive, so investigate the failure and then rerun the same command.
 
+Package configuration runs
+`pvnctl doctor --check corosync-runtime-config` before `daemon-reload` or any
+PVN service action. This configuration-independent check applies equally to an
+active node, an inactive topology-only node, and a standalone node. A clustered
+node fails closed if `corosync-cmapctl` is unavailable or its live membership,
+addresses, or version differ from `/etc/pve/corosync.conf`; a standalone node
+without that file passes.
+
 This completes package distribution only. It does **not** create `br-int` or a
 provider bridge, attach an uplink, edit `/etc/network/interfaces`, select
 Geneve/control addresses, install PKI or configuration, initialize PVN/OVN
@@ -314,8 +322,9 @@ also proves its startup PVN Control and OVN NB probes passed. Keep the packaged
 `PVN_HEALTH_LISTEN` and `PVN_AGENT_HEALTH_URL` values unchanged. This is a
 bounded local startup check, not continuous health monitoring.
 
-`pvnctl doctor` always reads node-local identity from `/etc/pvn/node.env`, even
-when invoked directly by an operator, the control-plane, or the updater. The
+The full `pvnctl doctor` invocation always reads node-local identity from
+`/etc/pvn/node.env`, even when invoked directly by an operator, the
+control-plane, or the updater. The
 shared `/etc/pve/pvn/config.json` intentionally leaves `networking.encap_ip`
 empty. Use `--node-env /absolute/test/path` only for an isolated test fixture;
 the file is parsed as a strict, non-shell `KEY=VALUE` allowlist and fails closed
@@ -330,6 +339,10 @@ address must agree. A config written to pmxcfs but not loaded by the Corosync
 runtime therefore makes the doctor, node-readiness gate, and rolling-update
 health check fail before the node is treated as safe to reboot. A standalone
 node with no `corosync.conf` skips only this cluster-specific check.
+`pvnctl doctor --check corosync-runtime-config` runs exactly that persisted/live
+comparison without loading PVN configuration; package safety gates use this
+form before PVN may be configured or activated. Any other check name, repeated
+`--check`, malformed output, command failure, or failed check is rejected.
 
 At boot, `pvn-guest-gate.service` leaves normal PVE behavior unchanged when
 the local marker is absent. When the marker exists, a failed readiness check
@@ -405,11 +418,16 @@ and after every node it requires PVE quorum, consistent package state, the PVE
 UI hook, node readiness/`pvnctl doctor` for active transport nodes, and healthy
 mode-specific database status for active central nodes: exact local schema
 identity over all three Unix sockets in standalone mode, or local Raft status
-in clustered mode. Existing `/etc/pvn`, shared PVN configuration, and database
-paths are preserved; an unexpected configuration change fails the rollout. A
-failed node stops the sequence. Nodes already completed remain upgraded, and a
-later run safely verifies/skips them while continuing the one remaining older
-version.
+in clustered mode. Independently of activation markers, package `postinst`
+runs the dedicated persisted/live Corosync doctor before its first possible
+service restart. The updater repeats that exact check after installation and
+on every already-updated node before staging or applying the next node. Thus a
+stale inactive topology-only node also stops a 1-, 3-, 5-, or larger supported
+odd-node rollout before another package mutation. Existing `/etc/pvn`, shared
+PVN configuration, and database paths are preserved; an unexpected
+configuration change fails the rollout. A failed node stops the sequence.
+Nodes already completed remain upgraded, and a later run safely verifies/skips
+them while continuing the one remaining older version.
 
 Proxmox also exposes a volatile membership-view generation as the top-level
 `version` in `/etc/pve/.members`. It can advance while the durable cluster is

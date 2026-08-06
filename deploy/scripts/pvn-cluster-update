@@ -642,6 +642,11 @@ active_central_health() {
     esac
 }
 
+corosync_doctor_gate() {
+    /usr/sbin/pvnctl doctor --check corosync-runtime-config >/dev/null ||
+        remote_fail "pvnctl persisted/live Corosync safety check failed"
+}
+
 collect_state() {
     for pvn_command in python3 pvecm dpkg dpkg-query systemctl sha256sum apt-get awk perl ovsdb-tool ovsdb-client; do
         require_command "$pvn_command"
@@ -745,6 +750,12 @@ case "$pvn_action" in
         [ "$#" -eq 0 ] || remote_fail "invalid probe arguments"
         emit_probe
         ;;
+    corosync-gate)
+        [ "$#" -eq 0 ] || remote_fail "invalid corosync-gate arguments"
+        collect_state
+        corosync_doctor_gate
+        printf 'PVN_COROSYNC_GATE version=%s\n' "$pvn_version"
+        ;;
     prepare)
         [ "$#" -eq 0 ] || remote_fail "invalid prepare arguments"
         umask 077
@@ -798,6 +809,10 @@ case "$pvn_action" in
         fi
         DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade --no-remove -- "$pvn_deb"
         collect_state
+        # postinst runs the same check before restarting an active node stack;
+        # repeat it here before the updater can mutate another node. This also
+        # covers topology-only nodes with no activation marker.
+        corosync_doctor_gate
         [ "$pvn_version" = "$pvn_target" ] || remote_fail "installed version differs from target"
         [ "$pvn_node_state" = "$pvn_expected_node" ] || remote_fail "node activation state changed during update"
         [ "$pvn_central_state" = "$pvn_expected_central" ] || remote_fail "central activation state changed during update"
@@ -975,6 +990,22 @@ def validate_rollout_versions(probes: dict[str, Probe], target: str) -> None:
         fail("cluster has more than one pre-update package version; normalize it before rolling update")
 
 
+def gate_updated_nodes(
+    transport: Transport,
+    snapshot: Snapshot,
+    probes: dict[str, Probe],
+    target: str,
+) -> None:
+    """Fail closed on persisted/live Corosync drift before another mutation."""
+    for node in snapshot.nodes:
+        if probes[node.name].version != target:
+            continue
+        result = transport.run(node, "corosync-gate")
+        expected = f"PVN_COROSYNC_GATE version={target}"
+        if result.stdout.strip() != expected:
+            fail(f"{node.name} returned no Corosync safety-gate record")
+
+
 def inspect_deb(path: pathlib.Path) -> tuple[str, str, str]:
     try:
         resolved = path.resolve(strict=True)
@@ -1088,6 +1119,7 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
         revalidate(snapshot)
         probes = probe_all(transport, snapshot, announce=True)
         validate_rollout_versions(probes, target)
+        gate_updated_nodes(transport, snapshot, probes, target)
         if architecture != "all" and any(probe.architecture != architecture for probe in probes.values()):
             fail(f"DEB architecture {architecture} differs from one or more PVE nodes")
         staged = stage_pending(transport, snapshot, probes, target, digest)
@@ -1097,6 +1129,7 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
             revalidate(snapshot)
             probes = probe_all(transport, snapshot, announce=False)
             validate_rollout_versions(probes, target)
+            gate_updated_nodes(transport, snapshot, probes, target)
             current = probes[node.name]
             if current.version == target:
                 print(f"[{node.name}] already at pvn-node {target}; health verified")
@@ -1126,6 +1159,7 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
             final_gate = probe_all(transport, snapshot, announce=False)
             if final_gate[node.name].version != target:
                 fail(f"post-update health gate found the wrong version on {node.name}")
+            gate_updated_nodes(transport, snapshot, final_gate, target)
             transport.run(node, "cleanup", path)
             staged.pop(node.name, None)
             print(f"[{node.name}] updated; full-cluster health gate passed")
@@ -1135,6 +1169,7 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
         final = probe_all(transport, snapshot, announce=True)
         if any(probe.version != target for probe in final.values()):
             fail("final sweep found a mixed pvn-node version")
+        gate_updated_nodes(transport, snapshot, final, target)
         active_pending = [
             probe.node.name for probe in final.values()
             if probe.central_state == "active" and probe.central_pending != "none"
@@ -1197,6 +1232,7 @@ def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, 
     transport = Transport(snapshot, deb)
     probes = probe_all(transport, snapshot, announce=True)
     validate_rollout_versions(probes, target)
+    gate_updated_nodes(transport, snapshot, probes, target)
     if architecture != "all" and any(probe.architecture != architecture for probe in probes.values()):
         fail(f"DEB architecture {architecture} differs from one or more PVE nodes")
     pending = [probe.node.name for probe in probes.values() if probe.version != target]

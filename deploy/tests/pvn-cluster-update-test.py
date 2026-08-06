@@ -261,6 +261,7 @@ central_states = {"pve-a": "active", "pve-b": "inactive"}
 central_modes = {"pve-a": "raft", "pve-b": "inactive"}
 central_pending = {"pve-a": "none", "pve-b": "none"}
 fail_apply = ""
+corosync_gate_fail: set[str] = set()
 
 
 class FakeLease:
@@ -299,6 +300,12 @@ class FakeTransport:
         if action == "prepare":
             token = node.name.replace("-", "")
             return subprocess.CompletedProcess([], 0, f"/var/tmp/pvn-node-update.{token}.deb\n", "")
+        if action == "corosync-gate":
+            if node.name in corosync_gate_fail:
+                raise module.UpdateError(f"injected Corosync doctor failure on {node.name}")
+            return subprocess.CompletedProcess(
+                [], 0, f"PVN_COROSYNC_GATE version={versions[node.name]}\n", ""
+            )
         if action in {"verify", "cleanup"}:
             return subprocess.CompletedProcess([], 0, "", "")
         if action == "apply":
@@ -352,6 +359,10 @@ try:
     for expected in ("cleanup:pve-a", "cleanup:pve-b"):
         check(events.count(expected) == 1, "successful update left a staged DEB behind")
     check(events.count("membership-revalidate") >= 4, "membership was not repeatedly revalidated")
+    check(
+        events.index("corosync-gate:pve-a") < events.index("apply:pve-b"),
+        "updated node was not Corosync-gated before the next node mutation",
+    )
 
     plan_output = io.StringIO()
     with contextlib.redirect_stdout(plan_output):
@@ -387,7 +398,152 @@ finally:
     module.compare_versions = original_compare
 
 
+def exercise_inactive_odd_rollout(
+    count: int,
+    *,
+    initially_updated: int = 0,
+    failing_gate: str = "",
+):
+    scenario_nodes = tuple(
+        module.Node(index, f"pve-{index}", f"192.0.2.{index + 9}", index == 1)
+        for index in range(1, count + 1)
+    )
+    scenario_fingerprint = module.membership_fingerprint(
+        "cluster", f"odd-{count}", 11, scenario_nodes
+    )
+    scenario_snapshot = module.Snapshot(
+        "cluster", f"odd-{count}", 11, "pve-1", scenario_nodes, scenario_fingerprint
+    )
+    scenario_versions = {
+        node.name: "0.2.1" if index < initially_updated else "0.1.0"
+        for index, node in enumerate(scenario_nodes)
+    }
+    scenario_events: list[str] = []
+
+    class ScenarioLease:
+        def __init__(self, used_snapshot):
+            self.snapshot = used_snapshot
+
+        def acquire(self):
+            scenario_events.append("lease-acquire")
+
+        def release(self):
+            scenario_events.append("lease-release")
+
+    class ScenarioTransport:
+        def __init__(self, used_snapshot, deb):
+            self.snapshot = used_snapshot
+            self.deb = deb
+
+        def run(self, node, action, *arguments, check=True):
+            scenario_events.append(f"{action}:{node.name}")
+            if action == "probe":
+                return subprocess.CompletedProcess(
+                    [],
+                    0,
+                    probe_line(
+                        self.snapshot,
+                        node,
+                        scenario_versions[node.name],
+                        node_state="inactive",
+                        central="inactive",
+                    ),
+                    "",
+                )
+            if action == "prepare":
+                return subprocess.CompletedProcess(
+                    [], 0, f"/var/tmp/pvn-node-update.pve{node.node_id}.deb\n", ""
+                )
+            if action == "corosync-gate":
+                if node.name == failing_gate:
+                    raise module.UpdateError(f"stale Corosync runtime on {node.name}")
+                return subprocess.CompletedProcess(
+                    [], 0, f"PVN_COROSYNC_GATE version={scenario_versions[node.name]}\n", ""
+                )
+            if action in {"verify", "cleanup"}:
+                return subprocess.CompletedProcess([], 0, "", "")
+            if action == "apply":
+                scenario_versions[node.name] = arguments[2]
+                return subprocess.CompletedProcess(
+                    [], 0, f"PVN_UPDATED version={arguments[2]} central-restart=none\n", ""
+                )
+            raise AssertionError(f"unexpected scenario action {action}")
+
+        def copy(self, node, destination):
+            scenario_events.append(f"copy:{node.name}")
+
+    saved_transport = module.Transport
+    saved_lease = module.UpdateLease
+    saved_revalidate = module.revalidate
+    saved_compare = module.compare_versions
+    module.Transport = ScenarioTransport
+    module.UpdateLease = ScenarioLease
+    module.revalidate = lambda ignored: scenario_events.append("membership-revalidate")
+    module.compare_versions = (
+        lambda left, operator, right: operator == "lt" and left == "0.1.0" and right == "0.2.1"
+    )
+    error = None
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            deb = pathlib.Path(temporary) / "pvn-node.deb"
+            deb.write_bytes(b"test")
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.update_cluster(scenario_snapshot, deb, "0.2.1", "amd64", "a" * 64)
+    except module.UpdateError as caught:
+        error = caught
+    finally:
+        module.Transport = saved_transport
+        module.UpdateLease = saved_lease
+        module.revalidate = saved_revalidate
+        module.compare_versions = saved_compare
+    return scenario_nodes, scenario_versions, scenario_events, error
+
+
+# Every supported odd cluster size can roll while PVN is topology-only and
+# inactive. Each completed node is gated before the following package mutation.
+for odd_count in (1, 3, 5):
+    odd_nodes, odd_versions, odd_events, odd_error = exercise_inactive_odd_rollout(odd_count)
+    check(odd_error is None, f"inactive {odd_count}-node rollout failed: {odd_error}")
+    check(
+        set(odd_versions.values()) == {"0.2.1"},
+        f"inactive {odd_count}-node rollout did not finish",
+    )
+    for index in range(len(odd_nodes) - 1):
+        current = odd_nodes[index].name
+        following = odd_nodes[index + 1].name
+        current_apply = odd_events.index(f"apply:{current}")
+        following_apply = odd_events.index(f"apply:{following}")
+        check(
+            any(
+                event == f"corosync-gate:{current}"
+                for event in odd_events[current_apply + 1 : following_apply]
+            ),
+            f"{odd_count}-node rollout mutated {following} before gating {current}",
+        )
+
+
+# A stale runtime discovered immediately after the first package install stops
+# before the second node's package is touched.
+stale_nodes, _, stale_events, stale_error = exercise_inactive_odd_rollout(
+    3, failing_gate="pve-1"
+)
+check(stale_error is not None, "stale Corosync runtime did not fail the rollout")
+check("apply:pve-1" in stale_events, "stale-runtime scenario never installed the new checker")
+check("apply:pve-2" not in stale_events, "stale runtime did not stop the next node mutation")
+
+
+# On a resumed rollout an already-updated node's doctor failure is checked
+# before staging or applying the remaining nodes.
+_, _, resume_events, resume_error = exercise_inactive_odd_rollout(
+    3, initially_updated=1, failing_gate="pve-1"
+)
+check(resume_error is not None, "resumed rollout ignored a failed Corosync doctor")
+check(not any(event.startswith("prepare:") for event in resume_events), "doctor gate ran after staging")
+check(not any(event.startswith("apply:") for event in resume_events), "doctor gate ran after mutation")
+
+
 source = SCRIPT.read_text(encoding="utf-8")
+postinst_source = (REPO / "packaging/debian/pvn-node.postinst").read_text(encoding="utf-8")
 for required in (
     "apt-get install -y --only-upgrade --no-remove",
     "/usr/sbin/pvnctl central status",
@@ -401,7 +557,18 @@ for required in (
     "central-restart-pending",
     "RESTART REQUIRED: active central processes were preserved",
     '"domain": "mutation"',
+    "pvnctl doctor --check corosync-runtime-config",
+    'transport.run(node, "corosync-gate")',
 ):
     check(required in source, f"missing fail-closed updater behavior: {required}")
+
+postinst_gate = postinst_source.index("\nverify_corosync_runtime\n")
+daemon_reload = postinst_source.index("\nsystemctl daemon-reload")
+node_restart = postinst_source.index("\n    if ! systemctl restart")
+check(postinst_gate < daemon_reload < node_restart, "postinst Corosync gate runs after service mutation")
+check(
+    "/usr/sbin/pvnctl doctor --check corosync-runtime-config" in postinst_source,
+    "postinst does not use the exact configuration-independent doctor check",
+)
 
 print("pvn-cluster-update tests passed")

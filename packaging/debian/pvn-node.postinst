@@ -14,6 +14,13 @@ install_ui() {
     /usr/lib/pvn/pvn-ui-verify
 }
 
+verify_corosync_runtime() {
+    if ! /usr/sbin/pvnctl doctor --check corosync-runtime-config >/dev/null; then
+        echo "persisted and live Corosync state differ; refusing PVN service restart" >&2
+        return 1
+    fi
+}
+
 mark_central_restart_pending() {
     state_dir=/var/lib/pvn-node
     marker=$state_dir/central-restart-pending
@@ -65,6 +72,11 @@ install -d -m 0750 -o root -g pvn /etc/pvn /etc/pvn/central /etc/pvn/pki
 if [ ! -e /etc/pvn/ovn-host.env ]; then
     install -m 0640 -o root -g pvn /usr/share/doc/pvn-node/examples/ovn-host.env /etc/pvn/ovn-host.env
 fi
+
+# The newly unpacked pvnctl can perform this check without PVN configuration or
+# activation. Run it before daemon-reload or any service mutation so a stale
+# live Corosync ring cannot be hidden until the next host reboot.
+verify_corosync_runtime
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 
