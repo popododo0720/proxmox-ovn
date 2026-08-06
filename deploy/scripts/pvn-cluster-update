@@ -136,6 +136,16 @@ class Probe:
     central_pending: str
 
 
+@dataclasses.dataclass(frozen=True)
+class EmbeddedCorosyncSnapshot:
+    """Canonical all-node Corosync state proven without the installed pvnctl."""
+
+    canonical: str
+    package_version: str
+    config_sha256: str | None
+    config_version: int | None
+
+
 def membership_fingerprint(mode: str, deployment: str, version: int, nodes: Iterable[Node]) -> str:
     records = [
         {"id": node.node_id, "ip": node.address, "name": node.name, "online": 1}
@@ -642,6 +652,513 @@ active_central_health() {
     esac
 }
 
+embedded_corosync_snapshot() {
+    python3 - <<'PVN_EMBEDDED_COROSYNC'
+import hashlib
+import ipaddress
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+
+MAX_FILE = 4 * 1024 * 1024
+MAX_OUTPUT = 4 * 1024 * 1024
+SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
+SAFE_VERSION = re.compile(r"[A-Za-z0-9.+:~_-]+")
+MEMBERS_PATH = pathlib.Path(
+    os.environ.get("PVN_PVE_MEMBERS_FILE", "/etc/pve/.members")
+)
+COROSYNC_PATH = pathlib.Path(
+    os.environ.get("PVN_PVE_COROSYNC_CONF", "/etc/pve/corosync.conf")
+)
+PVECM = os.environ.get("PVN_PVECM_BIN", "pvecm")
+CFGTOOL = os.environ.get("PVN_COROSYNC_CFGTOOL_BIN", "corosync-cfgtool")
+CMAPCTL = os.environ.get("PVN_COROSYNC_CMAPCTL_BIN", "corosync-cmapctl")
+SYSTEMCTL = os.environ.get("PVN_SYSTEMCTL_BIN", "systemctl")
+DPKG_QUERY = os.environ.get("PVN_DPKG_QUERY_BIN", "dpkg-query")
+
+
+def stop(message):
+    print(
+        "PVN embedded Corosync preflight failed: " + str(message),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+def run(arguments, *, check=True, timeout=20):
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            arguments,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        stop("cannot execute %s: %s" % (arguments[0], error))
+    if len(result.stdout) > MAX_OUTPUT or len(result.stderr) > MAX_OUTPUT:
+        stop("%s returned unbounded output" % arguments[0])
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().replace("\n", "; ")
+        stop("%s failed: %s" % (arguments[0], detail[-800:] or result.returncode))
+    return result
+
+
+def secure_read(path, label, *, optional=False):
+    try:
+        path_metadata = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return None
+        stop("%s is missing" % label)
+    except OSError as error:
+        stop("cannot inspect %s: %s" % (label, error))
+    if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(path_metadata.st_mode):
+        stop("%s must be a regular non-symlink file" % label)
+    if path_metadata.st_uid != 0 or stat.S_IMODE(path_metadata.st_mode) & 0o022:
+        stop("%s has unsafe ownership or permissions" % label)
+    if path_metadata.st_size < 0 or path_metadata.st_size > MAX_FILE:
+        stop("%s exceeds the bounded size" % label)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        stop("cannot securely open %s: %s" % (label, error))
+    try:
+        before = os.fstat(descriptor)
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, MAX_FILE + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_FILE:
+                stop("%s exceeds the bounded size" % label)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_uid,
+        stat.S_IMODE(value.st_mode),
+    )
+    if identity(before) != identity(after) or before.st_dev != path_metadata.st_dev or \
+            before.st_ino != path_metadata.st_ino:
+        stop("%s changed while it was read" % label)
+    return b"".join(chunks)
+
+
+def safe_name(value, label):
+    if not isinstance(value, str) or not SAFE_NAME.fullmatch(value) or value in {".", ".."}:
+        stop("%s is unsafe" % label)
+    return value
+
+
+def canonical_ipv4(value, label):
+    try:
+        address = ipaddress.ip_address(value)
+    except (TypeError, ValueError):
+        stop("%s is not an IPv4 address" % label)
+    if not isinstance(address, ipaddress.IPv4Address) or address.is_unspecified or address.is_multicast:
+        stop("%s is not a usable IPv4 address" % label)
+    result = str(address)
+    if result != value:
+        stop("%s is not canonical" % label)
+    return result
+
+
+def package_version():
+    status = run([DPKG_QUERY, "-W", "-f=${db:Status-Status}", "corosync"]).stdout.strip()
+    if status != "installed":
+        stop("corosync package is not completely installed")
+    version = run([DPKG_QUERY, "-W", "-f=${Version}", "corosync"]).stdout.strip()
+    if not SAFE_VERSION.fullmatch(version):
+        stop("corosync package version is unsafe")
+    return version
+
+
+members_raw = secure_read(MEMBERS_PATH, "/etc/pve/.members")
+try:
+    members_document = json.loads(members_raw.decode("utf-8"))
+except (UnicodeError, json.JSONDecodeError) as error:
+    stop("cannot parse /etc/pve/.members: %s" % error)
+if not isinstance(members_document, dict):
+    stop("/etc/pve/.members root must be an object")
+local_name = safe_name(members_document.get("nodename"), "local nodename")
+view_version = members_document.get("version")
+if type(view_version) is not int or view_version < 0:
+    stop("membership view version is invalid")
+cluster = members_document.get("cluster")
+nodelist = members_document.get("nodelist")
+nodes = []
+
+if isinstance(cluster, dict) and cluster.get("name"):
+    mode = "cluster"
+    deployment = safe_name(cluster.get("name"), "cluster name")
+    membership_config_version = cluster.get("version")
+    node_count = cluster.get("nodes")
+    if type(membership_config_version) is not int or membership_config_version < 0:
+        stop("cluster config version is invalid")
+    if type(node_count) is not int or node_count < 1 or cluster.get("quorate") != 1:
+        stop("cluster is not fully quorate")
+    if not isinstance(nodelist, dict) or len(nodelist) != node_count or local_name not in nodelist:
+        stop("cluster nodelist is incomplete")
+    seen_ids = set()
+    for raw_name, member in nodelist.items():
+        name = safe_name(raw_name, "PVE node name")
+        if not isinstance(member, dict):
+            stop("node %s membership is malformed" % name)
+        node_id = member.get("id")
+        if type(node_id) is not int or node_id <= 0 or node_id in seen_ids:
+            stop("node %s has an invalid or duplicate ID" % name)
+        if member.get("online") != 1:
+            stop("node %s is not online" % name)
+        seen_ids.add(node_id)
+        address = canonical_ipv4(member.get("ip"), "node %s management IP" % name)
+        nodes.append({"id": node_id, "ip": address, "name": name, "online": 1})
+    nodes.sort(key=lambda value: (value["id"], value["name"]))
+    status = run([PVECM, "status"]).stdout
+
+    def status_field(pattern, label):
+        matches = re.findall(pattern, status, re.MULTILINE)
+        if len(matches) != 1:
+            stop("pvecm status has an invalid %s" % label)
+        return matches[0]
+
+    if status_field(r"^Name:\s+(\S+)\s*$", "name") != deployment or \
+            int(status_field(r"^Nodes:\s+(\d+)\s*$", "node count")) != node_count or \
+            status_field(r"^Quorate:\s+(Yes|No)\s*$", "quorum") != "Yes":
+        stop("pvecm status differs from /etc/pve/.members")
+    live_nodes = {}
+    local_markers = []
+    for line in run([PVECM, "nodes"]).stdout.splitlines():
+        match = re.fullmatch(
+            r"\s*(\d+)\s+\d+\s+([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?)(\s+\(local\))?\s*",
+            line,
+        )
+        if not match:
+            continue
+        name = match.group(2)
+        if name in live_nodes:
+            stop("pvecm nodes repeats %s" % name)
+        live_nodes[name] = int(match.group(1))
+        if match.group(3):
+            local_markers.append(name)
+    if live_nodes != {node["name"]: node["id"] for node in nodes} or local_markers != [local_name]:
+        stop("pvecm live membership differs from /etc/pve/.members")
+else:
+    if cluster is not None:
+        stop("standalone membership contains malformed cluster state")
+    mode = "standalone"
+    deployment = "standalone-" + local_name
+    membership_config_version = 0
+    if nodelist is None:
+        local_id = 0
+        local_address = "local"
+    else:
+        if not isinstance(nodelist, dict) or set(nodelist) != {local_name}:
+            stop("standalone membership contains a foreign node")
+        member = nodelist[local_name]
+        if not isinstance(member, dict) or member.get("online", 1) != 1:
+            stop("standalone local membership is malformed")
+        local_id = member.get("id", 0)
+        local_address = member.get("ip", "local")
+        if local_address != "local":
+            local_address = canonical_ipv4(local_address, "standalone management IP")
+    if type(local_id) is not int or local_id != 0:
+        stop("standalone node ID must be 0")
+    nodes = [{"id": 0, "ip": local_address, "name": local_name, "online": 1}]
+    if run([PVECM, "status"], check=False).returncode == 0:
+        stop("pvecm status succeeded in standalone mode")
+
+local_rows = [node for node in nodes if node["name"] == local_name]
+if len(local_rows) != 1:
+    stop("membership has no unique local node")
+local_node_id = local_rows[0]["id"]
+membership_payload = {
+    "cluster": deployment,
+    "config_version": membership_config_version,
+    "mode": mode,
+    "node_count": len(nodes),
+    "nodes": nodes,
+}
+membership_fingerprint = hashlib.sha256(
+    json.dumps(membership_payload, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+corosync_package = package_version()
+
+if mode == "standalone":
+    if secure_read(COROSYNC_PATH, "/etc/pve/corosync.conf", optional=True) is not None:
+        stop("standalone node unexpectedly has corosync.conf")
+    if run([SYSTEMCTL, "is-active", "--quiet", "corosync.service"], check=False).returncode == 0:
+        stop("standalone node unexpectedly has an active Corosync service")
+    if run([CFGTOOL, "-s"], check=False).returncode == 0:
+        stop("standalone node unexpectedly exposes Corosync link runtime")
+    if run([CMAPCTL], check=False).returncode == 0:
+        stop("standalone node unexpectedly exposes Corosync cmap runtime")
+    corosync_summary = None
+else:
+    config_raw = secure_read(COROSYNC_PATH, "/etc/pve/corosync.conf")
+    try:
+        config_text = config_raw.decode("utf-8").replace("\r\n", "\n")
+    except UnicodeError as error:
+        stop("corosync.conf is not valid UTF-8: %s" % error)
+    cluster_names = re.findall(r"^\s*cluster_name:\s*(\S+)\s*$", config_text, re.MULTILINE)
+    versions = re.findall(r"^\s*config_version:\s*(\d+)\s*$", config_text, re.MULTILINE)
+    if cluster_names != [deployment] or len(versions) != 1:
+        stop("corosync.conf cluster identity/config_version is invalid")
+    config_version = int(versions[0])
+    if config_version != membership_config_version:
+        stop("corosync.conf config_version differs from PVE membership")
+    node_starts = re.findall(r"^\s*node\s*\{", config_text, re.MULTILINE)
+    node_blocks = re.findall(r"(?ms)^\s*node\s*\{.*?^\s*\}\s*$", config_text)
+    if not node_blocks or len(node_blocks) != len(node_starts):
+        stop("corosync.conf node blocks are malformed")
+    configured = {}
+    configured_ids = set()
+    expected_by_name = {node["name"]: node for node in nodes}
+    for block in node_blocks:
+        names = re.findall(r"^\s*name:\s*(\S+)\s*$", block, re.MULTILINE)
+        ids = re.findall(r"^\s*nodeid:\s*(\d+)\s*$", block, re.MULTILINE)
+        if len(names) != 1 or len(ids) != 1:
+            stop("each corosync.conf node needs one name and nodeid")
+        name = safe_name(names[0], "corosync node name")
+        node_id = int(ids[0])
+        if name in configured or node_id <= 0 or node_id in configured_ids:
+            stop("corosync.conf repeats a node name or ID")
+        if name not in expected_by_name or expected_by_name[name]["id"] != node_id:
+            stop("corosync.conf node identity differs from PVE membership")
+        rings = {}
+        for raw_ring, raw_address in re.findall(
+            r"^\s*ring(\d+)_addr:\s*(\S+)\s*$", block, re.MULTILINE
+        ):
+            ring = int(raw_ring)
+            if ring < 0 or ring > 7 or str(ring) in rings:
+                stop("corosync.conf contains an invalid or duplicate KNET ring")
+            if raw_address != name:
+                canonical_ipv4(raw_address, "corosync ring address for %s" % name)
+            rings[str(ring)] = raw_address
+        if not rings:
+            stop("corosync.conf node %s has no KNET ring" % name)
+        configured[name] = {"name": name, "node_id": node_id, "rings": rings}
+        configured_ids.add(node_id)
+    if set(configured) != set(expected_by_name):
+        stop("corosync.conf nodes differ from PVE membership")
+    expected_rings = set(next(iter(configured.values()))["rings"])
+    if not expected_rings or any(set(row["rings"]) != expected_rings for row in configured.values()):
+        stop("corosync.conf KNET rings do not cover every node")
+
+    def normalized_address(value, node_name):
+        if value == node_name:
+            return expected_by_name[node_name]["ip"]
+        try:
+            address = ipaddress.ip_address(value)
+        except (TypeError, ValueError):
+            stop("runtime ring address %r is neither an IP nor node name" % value)
+        if not isinstance(address, ipaddress.IPv4Address):
+            stop("runtime ring address is not IPv4")
+        return str(address)
+
+    def same_address(actual, expected, node_name):
+        return normalized_address(actual, node_name) == normalized_address(expected, node_name)
+
+    cmap_output = run([CMAPCTL]).stdout
+    cfgtool_output = run([CFGTOOL, "-s"]).stdout
+    values = {}
+    for line in cmap_output.splitlines():
+        match = re.match(r"^([A-Za-z0-9_.]+)\s+\([^)]+\)\s*=\s*(.*)$", line.strip())
+        if not match:
+            continue
+        key, value = match.groups()
+        if key in values:
+            stop("Corosync cmap repeats %s" % key)
+        value = value.strip()
+        if value.startswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                stop("Corosync cmap contains invalid quoted data")
+        values[key] = value
+    if values.get("totem.cluster_name") != deployment:
+        stop("Corosync cmap cluster name differs from PVE membership")
+    try:
+        runtime_version = int(values["totem.config_version"])
+        local_position = int(values["nodelist.local_node_pos"])
+    except (KeyError, TypeError, ValueError):
+        stop("Corosync cmap lacks config version or local position")
+    if runtime_version != config_version or local_position < 0:
+        stop("Corosync cmap config version differs from persisted config")
+    positions = {}
+    node_pattern = re.compile(r"^nodelist\.node\.(\d+)\.(name|nodeid|ring([0-7])_addr)$")
+    for key, value in values.items():
+        match = node_pattern.match(key)
+        if not match:
+            continue
+        position = int(match.group(1))
+        row = positions.setdefault(position, {"rings": {}})
+        field = match.group(2)
+        if field in row and field != "rings":
+            stop("Corosync cmap repeats a nodelist field")
+        if field == "name":
+            row["name"] = value
+        elif field == "nodeid":
+            try:
+                row["node_id"] = int(value)
+            except (TypeError, ValueError):
+                stop("Corosync cmap has an invalid node ID")
+        else:
+            ring = match.group(3)
+            if ring in row["rings"]:
+                stop("Corosync cmap repeats a nodelist ring")
+            row["rings"][ring] = value
+    if local_position not in positions or len(positions) != len(configured):
+        stop("Corosync cmap nodelist is incomplete")
+    runtime_nodes = {}
+    for row in positions.values():
+        name = row.get("name")
+        node_id = row.get("node_id")
+        if name in runtime_nodes or name not in configured or configured[name]["node_id"] != node_id:
+            stop("Corosync cmap nodelist identity differs from persisted config")
+        if set(row["rings"]) != expected_rings:
+            stop("Corosync cmap nodelist rings differ from persisted config")
+        for ring in expected_rings:
+            if not same_address(row["rings"][ring], configured[name]["rings"][ring], name):
+                stop("Corosync cmap nodelist address differs from persisted config")
+        runtime_nodes[name] = row
+    if set(runtime_nodes) != set(configured) or positions[local_position].get("node_id") != local_node_id:
+        stop("Corosync cmap local/full nodelist identity is wrong")
+    members = {}
+    member_pattern = re.compile(r"^runtime\.members\.(\d+)\.(config_version|ip|status)$")
+    address_pattern = re.compile(r"r\(([0-7])\)\s+ip\(([^)]+)\)")
+    for key, value in values.items():
+        match = member_pattern.match(key)
+        if not match:
+            continue
+        node_id = int(match.group(1))
+        row = members.setdefault(node_id, {"rings": {}})
+        field = match.group(2)
+        if field == "config_version":
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                stop("Corosync runtime member has invalid config_version")
+            if "config_version" in row:
+                stop("Corosync runtime member repeats config_version")
+            row["config_version"] = parsed
+        elif field == "status":
+            if "status" in row:
+                stop("Corosync runtime member repeats status")
+            row["status"] = value
+        else:
+            if row["rings"]:
+                stop("Corosync runtime member repeats link addresses")
+            matches = address_pattern.findall(value)
+            if not matches or address_pattern.sub("", value).strip():
+                stop("Corosync runtime member link addresses are malformed")
+            row["rings"] = {ring: address.strip() for ring, address in matches}
+            if len(row["rings"]) != len(matches):
+                stop("Corosync runtime member repeats a ring")
+    expected_by_id = {node["id"]: node for node in nodes}
+    if set(members) != set(expected_by_id):
+        stop("Corosync joined runtime members differ from PVE membership")
+    for node_id, node in expected_by_id.items():
+        row = members[node_id]
+        name = node["name"]
+        if row.get("status") != "joined" or row.get("config_version") != config_version or \
+                set(row["rings"]) != expected_rings:
+            stop("Corosync runtime member %s is not exact/joined" % name)
+        for ring in expected_rings:
+            if not same_address(row["rings"][ring], configured[name]["rings"][ring], name):
+                stop("Corosync runtime member address differs from persisted config")
+    binds = {}
+    for key, value in values.items():
+        match = re.match(r"^totem\.interface\.([0-7])\.bindnetaddr$", key)
+        if match:
+            ring = match.group(1)
+            if ring in binds:
+                stop("Corosync cmap repeats a bind address")
+            binds[ring] = value
+    if set(binds) != expected_rings:
+        stop("Corosync live bind rings differ from persisted config")
+    for ring in expected_rings:
+        if not same_address(binds[ring], configured[local_name]["rings"][ring], local_name):
+            stop("Corosync live bind address differs from persisted config")
+
+    local_ids = re.findall(r"^Local node ID\s+(\d+),", cfgtool_output, re.MULTILINE)
+    if len(local_ids) != 1 or int(local_ids[0]) != local_node_id:
+        stop("corosync-cfgtool reports the wrong local node ID")
+    links = {}
+    for match in re.finditer(
+        r"(?ms)^LINK ID\s+(\d+)\s+.*?(?=^LINK ID\s+\d+\s+|\Z)",
+        cfgtool_output,
+    ):
+        ring = int(match.group(1))
+        if ring < 0 or ring > 7 or str(ring) in links:
+            stop("corosync-cfgtool repeats an invalid link")
+        block = match.group(0)
+        addresses = re.findall(r"^\s*addr\s*=\s*(\S+)\s*$", block, re.MULTILINE)
+        if len(addresses) != 1:
+            stop("corosync-cfgtool link has no unique address")
+        states = {}
+        for raw_id, raw_state in re.findall(
+            r"^\s*nodeid:\s*(\d+):\s*(\S+)\s*$", block, re.MULTILINE
+        ):
+            node_id = int(raw_id)
+            if node_id in states:
+                stop("corosync-cfgtool link repeats a node state")
+            states[node_id] = raw_state.lower()
+        if set(states) != set(expected_by_id) or states.get(local_node_id) != "localhost" or any(
+            state != ("localhost" if node_id == local_node_id else "connected")
+            for node_id, state in states.items()
+        ):
+            stop("corosync-cfgtool link is not fully connected N/N")
+        if not same_address(addresses[0], configured[local_name]["rings"][str(ring)], local_name):
+            stop("corosync-cfgtool link address differs from persisted config")
+        links[str(ring)] = addresses[0]
+    if set(links) != expected_rings:
+        stop("corosync-cfgtool link set differs from persisted config")
+    if secure_read(COROSYNC_PATH, "/etc/pve/corosync.conf") != config_raw:
+        stop("corosync.conf changed during runtime verification")
+    corosync_summary = {
+        "sha256": hashlib.sha256(config_raw).hexdigest(),
+        "config_version": config_version,
+        "nodes": [configured[name] for name in sorted(configured)],
+    }
+
+if secure_read(MEMBERS_PATH, "/etc/pve/.members") != members_raw:
+    stop("PVE membership changed during embedded Corosync verification")
+if package_version() != corosync_package:
+    stop("Corosync package version changed during embedded verification")
+payload = {
+    "schema": 1,
+    "mode": mode,
+    "deployment": deployment,
+    "membership_config_version": membership_config_version,
+    "membership_fingerprint": membership_fingerprint,
+    "local_name": local_name,
+    "local_node_id": local_node_id,
+    "corosync_package_version": corosync_package,
+    "corosync": corosync_summary,
+}
+print("PVN_EMBEDDED_COROSYNC " + json.dumps(payload, sort_keys=True, separators=(",", ":")))
+PVN_EMBEDDED_COROSYNC
+}
+
 corosync_doctor_gate() {
     /usr/sbin/pvnctl doctor --check corosync-runtime-config >/dev/null ||
         remote_fail "pvnctl persisted/live Corosync safety check failed"
@@ -746,6 +1263,10 @@ emit_probe() {
 pvn_action=${1:-}
 shift || true
 case "$pvn_action" in
+    embedded-corosync)
+        [ "$#" -eq 0 ] || remote_fail "invalid embedded-corosync arguments"
+        embedded_corosync_snapshot
+        ;;
     probe)
         [ "$#" -eq 0 ] || remote_fail "invalid probe arguments"
         emit_probe
@@ -1006,6 +1527,142 @@ def gate_updated_nodes(
             fail(f"{node.name} returned no Corosync safety-gate record")
 
 
+def parse_embedded_corosync_snapshot(
+    node: Node, raw: str, snapshot: Snapshot
+) -> EmbeddedCorosyncSnapshot:
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    prefix = "PVN_EMBEDDED_COROSYNC "
+    if len(lines) != 1 or not lines[0].startswith(prefix):
+        fail(f"{node.name} returned no embedded Corosync preflight record")
+    try:
+        payload = json.loads(lines[0][len(prefix):])
+    except json.JSONDecodeError as error:
+        fail(f"{node.name} returned invalid embedded Corosync JSON: {error}")
+    required = {
+        "schema", "mode", "deployment", "membership_config_version",
+        "membership_fingerprint", "local_name", "local_node_id",
+        "corosync_package_version", "corosync",
+    }
+    if not isinstance(payload, dict) or set(payload) != required or payload.get("schema") != 1:
+        fail(f"{node.name} returned an unsupported embedded Corosync snapshot")
+    if payload.get("mode") != snapshot.mode or payload.get("deployment") != snapshot.deployment:
+        fail(f"{node.name} embedded Corosync deployment differs from PVE membership")
+    if payload.get("membership_config_version") != snapshot.config_version or \
+            payload.get("membership_fingerprint") != snapshot.fingerprint:
+        fail(f"{node.name} embedded Corosync membership snapshot differs")
+    if payload.get("local_name") != node.name or payload.get("local_node_id") != node.node_id:
+        fail(f"{node.name} embedded Corosync transport reached the wrong node")
+    package_version = payload.get("corosync_package_version")
+    if not isinstance(package_version, str) or not SAFE_VERSION.fullmatch(package_version):
+        fail(f"{node.name} returned an invalid Corosync package version")
+
+    config_sha: str | None = None
+    config_version: int | None = None
+    corosync = payload.get("corosync")
+    if snapshot.mode == "standalone":
+        if corosync is not None:
+            fail(f"{node.name} standalone snapshot unexpectedly contains Corosync state")
+    else:
+        if not isinstance(corosync, dict) or set(corosync) != {
+            "sha256", "config_version", "nodes",
+        }:
+            fail(f"{node.name} returned malformed persisted Corosync state")
+        config_sha = corosync.get("sha256")
+        config_version = corosync.get("config_version")
+        records = corosync.get("nodes")
+        if not isinstance(config_sha, str) or not SAFE_SHA.fullmatch(config_sha) or \
+                type(config_version) is not int or config_version != snapshot.config_version or \
+                not isinstance(records, list) or len(records) != len(snapshot.nodes):
+            fail(f"{node.name} returned an invalid Corosync config identity")
+        expected_by_name = {item.name: item for item in snapshot.nodes}
+        seen_names: set[str] = set()
+        seen_ids: set[int] = set()
+        expected_ring_keys: set[str] | None = None
+        for record in records:
+            if not isinstance(record, dict) or set(record) != {"name", "node_id", "rings"}:
+                fail(f"{node.name} returned a malformed Corosync node record")
+            name = record.get("name")
+            node_id = record.get("node_id")
+            rings = record.get("rings")
+            expected_node = expected_by_name.get(name)
+            if expected_node is None or node_id != expected_node.node_id or \
+                    name in seen_names or node_id in seen_ids:
+                fail(f"{node.name} Corosync node identity differs from PVE membership")
+            if not isinstance(rings, dict) or not 1 <= len(rings) <= 8:
+                fail(f"{node.name} Corosync node has an invalid KNET ring set")
+            ring_keys = set(rings)
+            if expected_ring_keys is None:
+                expected_ring_keys = ring_keys
+            elif ring_keys != expected_ring_keys:
+                fail(f"{node.name} Corosync KNET rings do not cover every member")
+            for ring, address in rings.items():
+                if not isinstance(ring, str) or not re.fullmatch(r"[0-7]", ring) or \
+                        not isinstance(address, str):
+                    fail(f"{node.name} Corosync node has an invalid ring record")
+                if address != name:
+                    try:
+                        parsed = ipaddress.ip_address(address)
+                    except ValueError:
+                        fail(f"{node.name} Corosync ring address is unsafe")
+                    if not isinstance(parsed, ipaddress.IPv4Address) or str(parsed) != address or \
+                            parsed.is_unspecified or parsed.is_multicast:
+                        fail(f"{node.name} Corosync ring address is not canonical IPv4")
+            seen_names.add(name)
+            seen_ids.add(node_id)
+        if seen_names != set(expected_by_name):
+            fail(f"{node.name} Corosync config omits a PVE member")
+
+    common = {
+        key: value for key, value in payload.items()
+        if key not in {"local_name", "local_node_id"}
+    }
+    return EmbeddedCorosyncSnapshot(
+        canonical=json.dumps(common, sort_keys=True, separators=(",", ":")),
+        package_version=package_version,
+        config_sha256=config_sha,
+        config_version=config_version,
+    )
+
+
+def gate_embedded_corosync(
+    transport: Transport,
+    snapshot: Snapshot,
+    *,
+    expected: EmbeddedCorosyncSnapshot | None = None,
+    announce: bool = False,
+) -> EmbeddedCorosyncSnapshot:
+    """Prove all-node persisted/runtime state before any remote package mutation."""
+    cluster_snapshot: EmbeddedCorosyncSnapshot | None = None
+    for node in snapshot.nodes:
+        if announce:
+            print(f"[{node.name}] embedded pre-update Corosync persisted/runtime check")
+        result = transport.run(node, "embedded-corosync")
+        current = parse_embedded_corosync_snapshot(node, result.stdout, snapshot)
+        if cluster_snapshot is None:
+            cluster_snapshot = current
+        elif current.package_version != cluster_snapshot.package_version:
+            fail("PVE nodes do not run one exact Corosync package version")
+        elif current.config_sha256 != cluster_snapshot.config_sha256 or \
+                current.config_version != cluster_snapshot.config_version or \
+                current.canonical != cluster_snapshot.canonical:
+            fail("PVE nodes do not expose one exact persisted/runtime Corosync state")
+    if cluster_snapshot is None:
+        fail("embedded Corosync preflight found no PVE nodes")
+    if expected is not None and cluster_snapshot != expected:
+        fail("Corosync persisted/runtime/package state changed after preflight")
+    if announce:
+        if snapshot.mode == "standalone":
+            print("[cluster] embedded Corosync preflight: standalone runtime is absent")
+        else:
+            print(
+                "[cluster] embedded Corosync preflight: "
+                f"config_version={cluster_snapshot.config_version} "
+                f"sha256={cluster_snapshot.config_sha256} "
+                f"package={cluster_snapshot.package_version}"
+            )
+    return cluster_snapshot
+
+
 def inspect_deb(path: pathlib.Path) -> tuple[str, str, str]:
     try:
         resolved = path.resolve(strict=True)
@@ -1119,14 +1776,29 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
         revalidate(snapshot)
         probes = probe_all(transport, snapshot, announce=True)
         validate_rollout_versions(probes, target)
+        embedded_corosync = gate_embedded_corosync(
+            transport, snapshot, announce=True
+        )
+        # A second all-node sweep closes the gap between the first read-only
+        # proof and remote DEB staging.  Later sweeps pin this same snapshot
+        # immediately before and after each dpkg transaction.
+        gate_embedded_corosync(
+            transport, snapshot, expected=embedded_corosync
+        )
         gate_updated_nodes(transport, snapshot, probes, target)
         if architecture != "all" and any(probe.architecture != architecture for probe in probes.values()):
             fail(f"DEB architecture {architecture} differs from one or more PVE nodes")
         staged = stage_pending(transport, snapshot, probes, target, digest)
         revalidate(snapshot)
+        gate_embedded_corosync(
+            transport, snapshot, expected=embedded_corosync
+        )
 
         for node in snapshot.nodes:
             revalidate(snapshot)
+            gate_embedded_corosync(
+                transport, snapshot, expected=embedded_corosync
+            )
             probes = probe_all(transport, snapshot, announce=False)
             validate_rollout_versions(probes, target)
             gate_updated_nodes(transport, snapshot, probes, target)
@@ -1159,6 +1831,9 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
             final_gate = probe_all(transport, snapshot, announce=False)
             if final_gate[node.name].version != target:
                 fail(f"post-update health gate found the wrong version on {node.name}")
+            gate_embedded_corosync(
+                transport, snapshot, expected=embedded_corosync
+            )
             gate_updated_nodes(transport, snapshot, final_gate, target)
             transport.run(node, "cleanup", path)
             staged.pop(node.name, None)
@@ -1169,6 +1844,9 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
         final = probe_all(transport, snapshot, announce=True)
         if any(probe.version != target for probe in final.values()):
             fail("final sweep found a mixed pvn-node version")
+        gate_embedded_corosync(
+            transport, snapshot, expected=embedded_corosync
+        )
         gate_updated_nodes(transport, snapshot, final, target)
         active_pending = [
             probe.node.name for probe in final.values()
@@ -1195,15 +1873,23 @@ def update_cluster(snapshot: Snapshot, deb: pathlib.Path, target: str, architect
                 "RESTART REQUIRED: active central processes were preserved and a durable "
                 "restart marker remains on: " + " ".join(active_pending)
             )
+            print(
+                "NEXT REQUIRED ORDER: keep every restart marker intact; first run the "
+                "pvn-topology active schema migration, then run pvn-control-plane plan "
+                "and its confirmed apply for the combined package/schema repin; only "
+                "after both succeed may central voters be restarted."
+            )
         if standalone_pending:
             print(
-                "Restart the standalone central target during a maintenance window, then verify all "
+                "After the required schema/package repin, restart the standalone central target "
+                "during a maintenance window, then verify all "
                 "three exact local database schemas before clearing its marker: "
                 + " ".join(standalone_pending)
             )
         if raft_pending:
             print(
-                "After full Raft convergence, restart these voters separately, one healthy voter at a time: "
+                "After the required schema/package repin and full Raft convergence, restart these "
+                "voters separately, one healthy voter at a time: "
                 + " ".join(raft_pending)
             )
         if inactive_pending:
@@ -1232,6 +1918,7 @@ def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, 
     transport = Transport(snapshot, deb)
     probes = probe_all(transport, snapshot, announce=True)
     validate_rollout_versions(probes, target)
+    gate_embedded_corosync(transport, snapshot, announce=True)
     gate_updated_nodes(transport, snapshot, probes, target)
     if architecture != "all" and any(probe.architecture != architecture for probe in probes.values()):
         fail(f"DEB architecture {architecture} differs from one or more PVE nodes")
@@ -1250,6 +1937,11 @@ def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, 
             "Plan: active central processes will not be restarted automatically; a durable "
             "restart-required marker will remain on: " + " ".join(central_will_require_restart)
         )
+        print(
+            "Plan: required order is pvn-topology active schema migration, then the "
+            "pvn-control-plane combined package/schema repin, and only then a guarded "
+            "central restart with marker consumption."
+        )
         standalone_restart = [
             probe.node.name for probe in probes.values()
             if probe.node.name in central_will_require_restart and probe.central_mode == "standalone"
@@ -1260,12 +1952,14 @@ def plan(snapshot: Snapshot, deb: pathlib.Path, target: str, architecture: str, 
         ]
         if standalone_restart:
             print(
-                "Plan: restart the standalone central target in a maintenance window and verify its "
+                "Plan: after both repins, restart the standalone central target in a maintenance "
+                "window and verify its "
                 "three local database schemas: " + " ".join(standalone_restart)
             )
         if raft_restart:
             print(
-                "Plan: restart clustered voters only after full Raft convergence, one healthy voter at a time: "
+                "Plan: after both repins, restart clustered voters only after full Raft "
+                "convergence, one healthy voter at a time: "
                 + " ".join(raft_restart)
             )
     print(f"Re-run with apply --confirm {snapshot.deployment}; no changes made.")
