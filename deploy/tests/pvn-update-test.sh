@@ -4,6 +4,8 @@ set -eu
 TEST_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
 REPO=$(CDPATH= cd -P "$TEST_DIR/../.." && pwd)
 BOOTSTRAP=$REPO/deploy/scripts/pvn-update.sh
+# Pin the fixture to the bootstrap DEFAULT_VERSION so its default asset URL is tested.
+RELEASE_VERSION=0.2.14
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' 0 HUP INT TERM
 
@@ -52,12 +54,12 @@ cat > "$ASSETS/pvn-cluster-lease" <<'EOF'
 exit 0
 EOF
 chmod 0755 "$ASSETS/pvn-cluster-lease"
-printf 'PVN DEB\n' > "$ASSETS/pvn-node_0.2.13_amd64.deb"
+printf 'PVN DEB\n' > "$ASSETS/pvn-node_${RELEASE_VERSION}_amd64.deb"
 
 make_manifest() {
     (
         cd "$ASSETS"
-        sha256sum pvn-node_0.2.13_amd64.deb pvn-cluster-update \
+        sha256sum "pvn-node_${RELEASE_VERSION}_amd64.deb" pvn-cluster-update \
             pvn-cluster-lease > SHA256SUMS
     )
 }
@@ -79,7 +81,7 @@ reset_logs() {
 }
 
 run_bootstrap() {
-    PVN_RELEASE_BASE_URL=https://releases.example.invalid/v0.2.13 \
+    PVN_RELEASE_BASE_URL=https://releases.example.invalid/v$RELEASE_VERSION \
         "$BOOTSTRAP" "$@"
 }
 
@@ -88,7 +90,7 @@ sh -n "$BOOTSTRAP"
 reset_logs
 run_bootstrap plan > "$WORK/plan.out"
 [ "$(wc -l < "$CURL_LOG")" -eq 4 ] || fail "plan did not fetch exactly four assets"
-grep -q '/pvn-node_0.2.13_amd64.deb ' "$CURL_LOG" || fail "versioned DEB was not downloaded"
+grep -q "/pvn-node_${RELEASE_VERSION}_amd64.deb " "$CURL_LOG" || fail "versioned DEB was not downloaded"
 grep -q '/pvn-cluster-update ' "$CURL_LOG" || fail "cluster updater was not downloaded"
 grep -q '/pvn-cluster-lease ' "$CURL_LOG" || fail "lease helper was not downloaded"
 grep -q '/SHA256SUMS ' "$CURL_LOG" || fail "checksum manifest was not downloaded"
@@ -109,21 +111,21 @@ fi
 [ ! -s "$CURL_LOG" ] || fail "invalid apply downloaded release artifacts"
 
 reset_logs
-if PVN_RELEASE_BASE_URL=http://releases.example.invalid/v0.2.13 \
+if PVN_RELEASE_BASE_URL=http://releases.example.invalid/v$RELEASE_VERSION \
     "$BOOTSTRAP" plan > "$WORK/http.out" 2>&1
 then
     fail "non-HTTPS release URL succeeded"
 fi
 [ ! -s "$CURL_LOG" ] || fail "non-HTTPS URL reached curl"
 
-cp "$ASSETS/pvn-node_0.2.13_amd64.deb" "$WORK/good.deb"
-printf 'tampered\n' > "$ASSETS/pvn-node_0.2.13_amd64.deb"
+cp "$ASSETS/pvn-node_${RELEASE_VERSION}_amd64.deb" "$WORK/good.deb"
+printf 'tampered\n' > "$ASSETS/pvn-node_${RELEASE_VERSION}_amd64.deb"
 reset_logs
 if run_bootstrap plan > "$WORK/checksum.out" 2>&1; then
     fail "tampered DEB passed checksum verification"
 fi
 [ ! -s "$UPDATE_LOG" ] || fail "updater ran after checksum failure"
-cp "$WORK/good.deb" "$ASSETS/pvn-node_0.2.13_amd64.deb"
+cp "$WORK/good.deb" "$ASSETS/pvn-node_${RELEASE_VERSION}_amd64.deb"
 make_manifest
 
 reset_logs
