@@ -96,6 +96,8 @@ export interface Port extends BaseResource {
   network_id?: string;
   mac_address?: string;
   fixed_ips?: Array<{ subnet_id?: string; address?: string }>;
+  security_group_ids?: string[];
+  admin_state_up?: boolean;
   node_id?: string;
   vmid?: number;
   nic?: string;
@@ -103,6 +105,15 @@ export interface Port extends BaseResource {
   lsp_name?: string;
   generation?: number;
   requested_chassis?: string;
+}
+
+export interface RuntimePortResolution {
+  port_id: string;
+  lsp_name: string;
+  mac_address: string;
+  generation: number;
+  requested_chassis: string;
+  status: string;
 }
 
 export interface PortAttachInput {

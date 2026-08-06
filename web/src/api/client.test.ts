@@ -109,6 +109,28 @@ describe('ApiClient', () => {
     expect(new Headers(deprovision.headers).get('Idempotency-Key')).toBe('deprovision-key');
   });
 
+  it('resolves one runtime VM NIC with encoded lookup parameters', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: {
+      port_id: 'port-1',
+      lsp_name: 'pvn-port-1',
+      mac_address: '02:00:00:00:00:01',
+      generation: 3,
+      requested_chassis: 'chassis-a',
+      status: 'bound',
+    } }));
+    const client = new ApiClient('/api/v1', fetcher as unknown as typeof fetch);
+
+    await expect(client.resolveRuntimePort('pve-a', 100, 'net0')).resolves.toMatchObject({
+      port_id: 'port-1',
+      status: 'bound',
+    });
+
+    const url = fetcher.mock.calls[0][0] as URL;
+    expect(url.pathname).toBe('/api/v1/runtime/ports/resolve');
+    expect(Object.fromEntries(url.searchParams)).toEqual({ node: 'pve-a', vmid: '100', nic: 'net0' });
+    expect((fetcher.mock.calls[0][1] as RequestInit).method).toBe('GET');
+  });
+
   it('surfaces structured API errors', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({
       error: { code: 'revision_conflict', message: 'resource changed', details: { current: 3 } },

@@ -17,6 +17,7 @@ import type {
   ResourceID,
   Router,
   RouterInterface,
+  RuntimePortResolution,
   SecurityGroup,
   SecurityGroupRule,
   SessionInfo,
@@ -203,6 +204,10 @@ export class ApiClient {
   nodes = () => this.list<NodeStatus>('/nodes');
   operations = (limit = 100) => this.list<Operation>('/operations', { limit });
   health = () => this.request<HealthStatus>('/health');
+
+  resolveRuntimePort(node: string, vmid: number, nic: string): Promise<RuntimePortResolution> {
+    return this.request<RuntimePortResolution>('/runtime/ports/resolve', { query: { node, vmid, nic } });
+  }
 
   attachPort(id: ResourceID, input: PortAttachInput, revision: number, idempotencyKey: string = crypto.randomUUID()): Promise<Port> {
     return this.request<Port>(`/ports/${encodeURIComponent(id)}/attach`, {
