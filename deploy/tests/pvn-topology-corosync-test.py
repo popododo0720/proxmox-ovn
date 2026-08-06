@@ -49,6 +49,61 @@ remote["verify_membership_snapshot"]({
     ],
 })
 
+active_state = {
+    "markers": {
+        "/etc/pvn/node-enabled": True,
+        "/etc/pvn/central/enabled": True,
+    },
+    "units": {unit: True for unit in remote["ACTIVATION_UNITS"]},
+}
+inactive_state = {
+    "markers": {key: False for key in active_state["markers"]},
+    "units": {key: False for key in active_state["units"]},
+}
+assert remote["activation_mode"](active_state) == "active"
+assert remote["activation_mode"](inactive_state) == "inactive"
+mixed_state = json.loads(json.dumps(active_state))
+mixed_state["units"]["pvn-manager.service"] = False
+assert remote["activation_mode"](mixed_state) == "mixed"
+
+old_ledger_sha = "1" * 64
+upgrade_report = {
+    key: None for key in remote["LEDGER_UPGRADE_PROOF_KEYS"]
+}
+upgrade_report.update({
+    "node": "prox2",
+    "interfaces_sha256": "2" * 64,
+    "pending_interfaces_sha256": None,
+    "network_state": "desired",
+    "journal": {
+        "schema": 1,
+        "phase": "complete",
+        "desired_interfaces_sha256": "2" * 64,
+    },
+    "journal_phase": "complete",
+    "activation": active_state,
+    "ledger_sha256": old_ledger_sha,
+})
+remote["build_probe"] = lambda _request: upgrade_report
+upgrade_request = {
+    "ledger_upgrade_only": True,
+    "upgrade_proof_sha256": remote["ledger_upgrade_proof_sha256"](
+        upgrade_report
+    ),
+}
+assert remote["require_active_ledger_upgrade"](
+    upgrade_request, old_ledger_sha
+) == upgrade_report
+changed_report = dict(upgrade_report)
+changed_report["interfaces_sha256"] = "3" * 64
+remote["build_probe"] = lambda _request: changed_report
+try:
+    remote["require_active_ledger_upgrade"](upgrade_request, old_ledger_sha)
+except remote["RemoteFailure"]:
+    pass
+else:
+    raise AssertionError("production active-ledger helper accepted proof drift")
+
 
 def expect_failure(call, message):
     try:

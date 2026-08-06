@@ -9,6 +9,7 @@ starts a PVN central or node target.
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import hashlib
 import ipaddress
@@ -43,6 +44,21 @@ TEST_FAST = os.environ.get("PVN_TOPOLOGY_TEST_FAST") == "1"
 COROSYNC_SETTLE_ATTEMPTS = 1 if TEST_FAST else 5
 COROSYNC_FINAL_ATTEMPTS = 1 if TEST_FAST else 30
 COROSYNC_POLL_SECONDS = 0 if TEST_FAST else 2
+ACTIVATION_MARKERS = ("/etc/pvn/node-enabled", "/etc/pvn/central/enabled")
+ACTIVATION_UNITS = (
+    "pvn-node.target", "pvn-central.target", "pvn-node-ready.service",
+    "pvn-manager.service", "pvn-agent.service", "pvn-control-db.service",
+    "pvn-ovn-db-listeners.service", "pvn-ovn-host-config.service",
+    "ovn-controller.service", "ovn-northd.service",
+    "ovn-ovsdb-server-nb.service", "ovn-ovsdb-server-sb.service",
+)
+LEDGER_UPGRADE_PROOF_KEYS = (
+    "node", "interfaces_sha256", "pending_interfaces_sha256",
+    "corosync_sha256", "corosync_text", "corosync_package_version",
+    "corosync_runtime", "management", "geneve", "provider",
+    "network_state", "journal", "journal_phase", "activation",
+    "control_ledger_text", "control_ledger_sha256",
+)
 
 
 class TopologyError(RuntimeError):
@@ -223,7 +239,15 @@ STATE_DIR = Path("/var/lib/pvn/topology")
 STATE_FILE = STATE_DIR / "state.json"
 LEDGER_DIR = Path("/etc/pve/priv/pvn")
 LEDGER_FILE = LEDGER_DIR / "topology.json"
+CONTROL_LEDGER_FILE = LEDGER_DIR / "control-plane.json"
 MARKERS = (Path("/etc/pvn/node-enabled"), Path("/etc/pvn/central/enabled"))
+ACTIVATION_UNITS = (
+    "pvn-node.target", "pvn-central.target", "pvn-node-ready.service",
+    "pvn-manager.service", "pvn-agent.service", "pvn-control-db.service",
+    "pvn-ovn-db-listeners.service", "pvn-ovn-host-config.service",
+    "ovn-controller.service", "ovn-northd.service",
+    "ovn-ovsdb-server-nb.service", "ovn-ovsdb-server-sb.service",
+)
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 REMOTE_REQUEST_LIMIT = 8 * 1024 * 1024
@@ -664,20 +688,45 @@ def save_journal(value):
     atomic_write(STATE_FILE, json.dumps(value, sort_keys=True, indent=2) + "\n", 0o600)
 
 
-def check_activation_absent():
-    for marker in MARKERS:
-        if marker.exists() or marker.is_symlink():
-            abort("PVN activation marker exists: %s" % marker)
-    for unit in (
-        "pvn-node.target", "pvn-central.target", "pvn-node-ready.service",
-        "pvn-manager.service", "pvn-agent.service", "pvn-control-db.service",
-        "pvn-ovn-db-listeners.service", "pvn-ovn-host-config.service",
-        "ovn-controller.service", "ovn-northd.service",
-        "ovn-ovsdb-server-nb.service", "ovn-ovsdb-server-sb.service",
-    ):
+def activation_state():
+    markers = {
+        str(marker): bool(marker.exists() or marker.is_symlink())
+        for marker in MARKERS
+    }
+    units = {}
+    for unit in ACTIVATION_UNITS:
         result = run(["systemctl", "is-active", unit], check=False)
-        if result.returncode == 0 or result.stdout.strip() == "active":
-            abort("PVN activation target is active: %s" % unit)
+        units[unit] = result.returncode == 0 and result.stdout.strip() == "active"
+    return {"markers": markers, "units": units}
+
+
+def activation_mode(value):
+    if not isinstance(value, dict):
+        return "mixed"
+    markers = value.get("markers")
+    units = value.get("units")
+    if (
+        not isinstance(markers, dict)
+        or set(markers) != {str(marker) for marker in MARKERS}
+        or any(type(item) is not bool for item in markers.values())
+        or not isinstance(units, dict)
+        or set(units) != set(ACTIVATION_UNITS)
+        or any(type(item) is not bool for item in units.values())
+    ):
+        return "mixed"
+    values = list(markers.values()) + list(units.values())
+    if all(values):
+        return "active"
+    if not any(values):
+        return "inactive"
+    return "mixed"
+
+
+def check_activation_absent():
+    state = activation_state()
+    mode = activation_mode(state)
+    if mode != "inactive":
+        abort("PVN activation state is not uniformly inactive: %s" % mode)
 
 
 def require_commands(names):
@@ -1080,6 +1129,19 @@ def read_ledger():
     return text, sha_text(text)
 
 
+def read_control_ledger():
+    if not (CONTROL_LEDGER_FILE.exists() or CONTROL_LEDGER_FILE.is_symlink()):
+        return None, None
+    text = read_regular(CONTROL_LEDGER_FILE, 1024 * 1024)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        abort("invalid shared control-plane ledger: %s" % exc)
+    if not isinstance(value, dict):
+        abort("shared control-plane ledger must be an object")
+    return text, sha_text(text)
+
+
 def resolve_effective_underlay_mtu(request, journal, ledger_text):
     recorded = []
     requested = request.get("effective_underlay_mtu")
@@ -1108,7 +1170,7 @@ def resolve_effective_underlay_mtu(request, journal, ledger_text):
 
 
 def build_probe(request):
-    check_activation_absent()
+    activation = activation_state()
     require_commands(("ip", "pvecm", "pvesh", "ifquery", "ifreload", "ovs-vsctl", "corosync", "corosync-cfgtool", "corosync-cmapctl", "perl"))
     check_pve_packages()
     corosync_package_version = installed_package_version("corosync")
@@ -1152,6 +1214,7 @@ def build_probe(request):
     journal = load_journal(optional=True)
     validate_journal_for_request(journal, request)
     ledger_text, ledger_sha = read_ledger()
+    control_ledger_text, control_ledger_sha = read_control_ledger()
     effective_underlay_mtu = resolve_effective_underlay_mtu(
         request, journal, ledger_text
     )
@@ -1276,10 +1339,14 @@ def build_probe(request):
         "geneve": geneve,
         "provider": provider,
         "network_state": "desired" if desired else "initial",
+        "journal": journal,
         "journal_phase": journal.get("phase") if journal else None,
         "ledger_text": ledger_text,
         "ledger_sha256": ledger_sha,
-        "activation_safe": True,
+        "control_ledger_text": control_ledger_text,
+        "control_ledger_sha256": control_ledger_sha,
+        "activation": activation,
+        "activation_safe": activation_mode(activation) == "inactive",
     }
 
 
@@ -1305,6 +1372,7 @@ def exclusive_backup(path, content):
 
 
 def prepare(request):
+    check_activation_absent()
     report = build_probe(request)
     effective_underlay_mtu = request.get("effective_underlay_mtu")
     if (
@@ -1350,6 +1418,7 @@ def prepare(request):
 
 
 def validate_corosync(request):
+    check_activation_absent()
     current = sha_file(COROSYNC)
     if current != request["expected_sha256"]:
         abort("corosync.conf failed compare-and-swap validation")
@@ -1375,6 +1444,7 @@ def validate_corosync(request):
 
 
 def apply_corosync(request):
+    check_activation_absent()
     if installed_package_version("corosync") != request.get("corosync_package_version"):
         abort("Corosync package version changed before shared config write")
     local_id, members = corosync_request_identity(request)
@@ -1491,6 +1561,7 @@ def runtime_target_fully_loaded(request, runtime, target):
 
 
 def reload_corosync(request):
+    check_activation_absent()
     local_id, members = corosync_request_identity(request)
     if installed_package_version("corosync") != request.get("corosync_package_version"):
         abort("Corosync package version changed before runtime reload")
@@ -1506,6 +1577,7 @@ def reload_corosync(request):
 
 
 def restart_corosync(request):
+    check_activation_absent()
     local_id, members = corosync_request_identity(request)
     if installed_package_version("corosync") != request.get("corosync_package_version"):
         abort("Corosync package version changed before guarded restart")
@@ -1745,6 +1817,7 @@ def rollback_network(request):
 
 
 def discard_stage(request):
+    check_activation_absent()
     journal = load_journal(optional=False)
     validate_journal_for_request(journal, request)
     if not (PENDING.exists() or PENDING.is_symlink()):
@@ -1755,6 +1828,7 @@ def discard_stage(request):
 
 
 def record_phase(request):
+    check_activation_absent()
     journal = load_journal(optional=False)
     validate_journal_for_request(journal, request)
     phase = request.get("phase")
@@ -1768,13 +1842,52 @@ def record_phase(request):
     emit(phase=phase)
 
 
+LEDGER_UPGRADE_PROOF_KEYS = (
+    "node", "interfaces_sha256", "pending_interfaces_sha256",
+    "corosync_sha256", "corosync_text", "corosync_package_version",
+    "corosync_runtime", "management", "geneve", "provider",
+    "network_state", "journal", "journal_phase", "activation",
+    "control_ledger_text", "control_ledger_sha256",
+)
+
+
+def ledger_upgrade_proof_sha256(report):
+    proof = {key: report.get(key) for key in LEDGER_UPGRADE_PROOF_KEYS}
+    return sha_text(json.dumps(proof, sort_keys=True, separators=(",", ":")))
+
+
+def require_active_ledger_upgrade(request, expected_ledger_sha256):
+    if request.get("ledger_upgrade_only") is not True:
+        abort("active ledger mutation lacks its explicit upgrade-only fence")
+    report = build_probe(request)
+    if activation_mode(report.get("activation")) != "active":
+        abort("ledger-only upgrade requires one exact active PVN state")
+    journal = report.get("journal")
+    if (
+        not isinstance(journal, dict)
+        or journal.get("phase") != "complete"
+        or report.get("network_state") != "desired"
+        or report.get("pending_interfaces_sha256") is not None
+        or report.get("interfaces_sha256") != journal.get("desired_interfaces_sha256")
+    ):
+        abort("ledger-only upgrade local topology proof is no longer complete")
+    if report.get("ledger_sha256") != expected_ledger_sha256:
+        abort("ledger-only upgrade observed a different shared ledger boundary")
+    if ledger_upgrade_proof_sha256(report) != request.get("upgrade_proof_sha256"):
+        abort("ledger-only upgrade local proof changed before ledger CAS")
+    return report
+
+
 def write_ledger(request):
-    check_activation_absent()
     content = request.get("ledger")
     expected_hash = request.get("expected_ledger_sha256")
     desired_hash = request.get("ledger_sha256")
     if not isinstance(content, str) or sha_text(content) != desired_hash:
         abort("shared topology ledger hash mismatch")
+    if request.get("ledger_upgrade_only") is True:
+        require_active_ledger_upgrade(request, expected_hash)
+    else:
+        check_activation_absent()
     _current_text, current_hash = read_ledger()
     if current_hash != expected_hash:
         abort("shared topology ledger failed compare-and-swap")
@@ -1793,7 +1906,10 @@ def write_ledger(request):
 
 
 def verify_ledger(request):
-    check_activation_absent()
+    if request.get("ledger_upgrade_only") is True:
+        require_active_ledger_upgrade(request, request.get("ledger_sha256"))
+    else:
+        check_activation_absent()
     _text, current_hash = read_ledger()
     if current_hash != request.get("ledger_sha256"):
         abort("shared topology ledger is absent or inconsistent")
@@ -1952,6 +2068,28 @@ def common_request(
     return request
 
 
+def activation_report_mode(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "mixed"
+    markers = value.get("markers")
+    units = value.get("units")
+    if (
+        not isinstance(markers, dict)
+        or set(markers) != set(ACTIVATION_MARKERS)
+        or any(type(item) is not bool for item in markers.values())
+        or not isinstance(units, dict)
+        or set(units) != set(ACTIVATION_UNITS)
+        or any(type(item) is not bool for item in units.values())
+    ):
+        return "mixed"
+    states = list(markers.values()) + list(units.values())
+    if all(states):
+        return "active"
+    if not any(states):
+        return "inactive"
+    return "mixed"
+
+
 def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(report, dict) or report.get("node") != node["name"]:
         fail(f"malformed topology report from {node['name']}")
@@ -2041,8 +2179,21 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
         for raw_ring, value in cmap_binds.items()
     ):
         fail(f"invalid Corosync cmap bind addresses from {node['name']}")
-    if report.get("network_state") not in ("initial", "desired") or report.get("activation_safe") is not True:
+    if report.get("network_state") not in ("initial", "desired"):
         fail(f"unsafe topology state reported by {node['name']}")
+    activation_mode = activation_report_mode(report.get("activation"))
+    if activation_mode == "mixed":
+        fail(f"mixed or malformed PVN activation state on {node['name']}")
+    if report.get("activation_safe") is not (activation_mode == "inactive"):
+        fail(f"inconsistent PVN activation report from {node['name']}")
+    journal = report.get("journal")
+    if journal is not None:
+        if (
+            not isinstance(journal, dict)
+            or journal.get("schema") != 1
+            or len(canonical_json(journal)) > 1024 * 1024
+        ):
+            fail(f"invalid topology journal from {node['name']}")
     ledger_sha = report.get("ledger_sha256")
     if ledger_sha is not None and (not isinstance(ledger_sha, str) or not SHA256.fullmatch(ledger_sha)):
         fail(f"invalid topology ledger hash from {node['name']}")
@@ -2056,6 +2207,19 @@ def validate_report(report: Any, node: dict[str, Any], spec: dict[str, Any]) -> 
         or digest_text(ledger_text) != ledger_sha
     ):
         fail(f"invalid topology ledger content from {node['name']}")
+    control_ledger_sha = report.get("control_ledger_sha256")
+    control_ledger_text = report.get("control_ledger_text")
+    if control_ledger_sha is None:
+        if control_ledger_text is not None:
+            fail(f"unexpected control-plane ledger content from {node['name']}")
+    elif (
+        not isinstance(control_ledger_sha, str)
+        or not SHA256.fullmatch(control_ledger_sha)
+        or not isinstance(control_ledger_text, str)
+        or len(control_ledger_text) > 1024 * 1024
+        or digest_text(control_ledger_text) != control_ledger_sha
+    ):
+        fail(f"invalid control-plane ledger content from {node['name']}")
     for role, cidr in (("geneve", spec["geneve_cidr"]), ("provider", spec["provider_cidr"])):
         value = report.get(role)
         if not isinstance(value, dict) or not isinstance(value.get("interface"), str):
@@ -2773,6 +2937,322 @@ def build_plan(
     }
 
 
+def topology_ledger_base(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+    spec: dict[str, Any],
+) -> dict[str, Any]:
+    membership = {
+        "cluster_name": cluster_name,
+        "nodes": [
+            {
+                "name": node["name"],
+                "node_id": node["id"],
+                "management_ip": node["ip"],
+            }
+            for node in nodes
+        ],
+    }
+    return {
+        "schema": 1,
+        "phase": "complete",
+        "cluster_name": cluster_name,
+        "membership_snapshot": membership,
+        "membership_hash": digest_text(canonical_json(membership)),
+        "nodes": [
+            {
+                "name": node["name"],
+                "node_id": node["id"],
+                "management_ip": node["ip"],
+                "control_ip": node["ip"],
+                "geneve_ip": report["geneve"]["address"].split("/", 1)[0],
+                "geneve_interface": report["geneve"]["interface"],
+                "provider_interface": report["provider"]["interface"],
+            }
+            for node, report in zip(nodes, reports)
+        ],
+        "guest_mtu": spec["guest_mtu"],
+        "effective_underlay_mtu": spec["effective_underlay_mtu"],
+        "provider_bridge": "br-provider",
+        "physnet": "provider",
+        "provider_readiness": {
+            "operator_ack": True,
+            "ack_phrase": PROVIDER_ACK,
+            "live_arbitrary_mac_l2_verified": False,
+            "basis": "operator-ack-only",
+        },
+    }
+
+
+def topology_corosync_pin(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+) -> dict[str, Any]:
+    text = reports[0]["corosync_text"]
+    sha256 = reports[0]["corosync_sha256"]
+    if any(
+        report["corosync_text"] != text
+        or report["corosync_sha256"] != sha256
+        for report in reports[1:]
+    ):
+        fail("active nodes do not expose one identical shared corosync.conf")
+    if not runtime_matches_config(cluster_name, nodes, reports, text):
+        fail("active Corosync persisted/runtime state is not exact")
+    version, rings = parse_corosync(
+        text, {node["name"] for node in nodes}, cluster_name
+    )
+    management = {node["name"]: node["ip"] for node in nodes}
+    geneve = {
+        node["name"]: report["geneve"]["address"].split("/", 1)[0]
+        for node, report in zip(nodes, reports)
+    }
+    provider = {
+        node["name"]: report["provider"]["address"].split("/", 1)[0]
+        for node, report in zip(nodes, reports)
+    }
+    management_rings = 0
+    for ring, addresses in rings.items():
+        for label, expected in (("Geneve", geneve), ("provider", provider)):
+            matches = [
+                address_matches(addresses[node["name"]], node, expected[node["name"]])
+                for node in nodes
+            ]
+            if any(matches):
+                fail(f"active Corosync ring{ring} still uses a {label} NIC")
+        matches = [
+            address_matches(
+                addresses[node["name"]], node, management[node["name"]]
+            )
+            for node in nodes
+        ]
+        if any(matches) and not all(matches):
+            fail(f"active Corosync ring{ring} only partially uses management")
+        if all(matches):
+            management_rings += 1
+    if management_rings != 1:
+        fail("active Corosync must have exactly one management ring")
+    return {
+        "sha256": sha256,
+        "config_version": version,
+        "rings": {
+            str(ring): dict(sorted(addresses.items()))
+            for ring, addresses in sorted(rings.items())
+        },
+    }
+
+
+def report_ledger_upgrade_proof_sha256(report: dict[str, Any]) -> str:
+    proof = {key: report.get(key) for key in LEDGER_UPGRADE_PROOF_KEYS}
+    return digest_text(canonical_json(proof))
+
+
+def validate_active_control_ledger(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+    expected_legacy: dict[str, Any],
+    candidate: dict[str, Any],
+) -> None:
+    states = {
+        (report.get("control_ledger_sha256"), report.get("control_ledger_text"))
+        for report in reports
+    }
+    if len(states) != 1:
+        fail("active nodes do not expose one identical control-plane ledger")
+    _sha256, text = next(iter(states))
+    if text is None:
+        fail("active PVN has no shared control-plane ledger")
+    try:
+        ledger = json.loads(text)
+    except json.JSONDecodeError as exc:
+        fail(f"active control-plane ledger is invalid: {exc}")
+    required = {
+        "version", "cluster_uuid", "snapshot", "phase", "central_complete",
+        "nodes_complete", "cert_fingerprints", "control_db_cluster_id",
+        "db_cluster_ids",
+    }
+    count = len(nodes)
+    if (
+        not isinstance(ledger, dict)
+        or set(ledger) != required
+        or ledger.get("version") != 1
+        or ledger.get("phase") != "complete"
+        or ledger.get("central_complete") != count
+        or ledger.get("nodes_complete") != count
+    ):
+        fail("active control-plane ledger is not at its exact complete N/N boundary")
+    fingerprints = ledger.get("cert_fingerprints")
+    node_fingerprints = fingerprints.get("nodes") if isinstance(fingerprints, dict) else None
+    if (
+        not isinstance(fingerprints, dict)
+        or set(fingerprints) != {"ca_certificate_sha256", "nodes"}
+        or not isinstance(fingerprints.get("ca_certificate_sha256"), str)
+        or not SHA256.fullmatch(fingerprints["ca_certificate_sha256"])
+        or not isinstance(node_fingerprints, dict)
+        or set(node_fingerprints) != {node["name"] for node in nodes}
+    ):
+        fail("active control-plane certificate pins are incomplete")
+    for pins in node_fingerprints.values():
+        if (
+            not isinstance(pins, dict)
+            or set(pins) != {"certificate_sha256", "public_key_sha256"}
+            or any(not isinstance(value, str) or not SHA256.fullmatch(value) for value in pins.values())
+        ):
+            fail("active control-plane certificate pins are malformed")
+    control_id = ledger.get("control_db_cluster_id")
+    db_ids = ledger.get("db_cluster_ids")
+    expected_dbs = {"PVN_Control", "OVN_Northbound", "OVN_Southbound"}
+    if (
+        not isinstance(control_id, str)
+        or not control_id
+        or not isinstance(db_ids, dict)
+        or set(db_ids) != expected_dbs
+        or db_ids.get("PVN_Control") != control_id
+        or any(not isinstance(value, str) or not value for value in db_ids.values())
+    ):
+        fail("active control-plane database identities are incomplete")
+    snapshot = ledger.get("snapshot")
+    if not isinstance(snapshot, dict):
+        fail("active control-plane snapshot is missing")
+    if (
+        snapshot.get("mode") != "raft"
+        or snapshot.get("confirmation") != cluster_name
+        or snapshot.get("cluster_name") != cluster_name
+        or snapshot.get("guest_mtu") != expected_legacy["guest_mtu"]
+        or snapshot.get("physnet") != expected_legacy["physnet"]
+    ):
+        fail("active control-plane snapshot differs from the topology identity")
+    legacy_digest = digest_text(canonical_json(expected_legacy))
+    candidate_digest = digest_text(canonical_json(candidate))
+    if snapshot.get("topology_sha256") not in {legacy_digest, candidate_digest}:
+        fail("active control-plane snapshot does not pin the legacy/candidate topology")
+    snapshot_nodes = snapshot.get("nodes")
+    expected_rows = {row["name"]: row for row in expected_legacy["nodes"]}
+    if (
+        not isinstance(snapshot_nodes, list)
+        or len(snapshot_nodes) != count
+        or any(not isinstance(row, dict) for row in snapshot_nodes)
+        or {row.get("name") for row in snapshot_nodes} != set(expected_rows)
+    ):
+        fail("active control-plane snapshot node set is not N/N")
+    package_versions = set()
+    for row in snapshot_nodes:
+        expected = expected_rows[row["name"]]
+        if (
+            row.get("node_id") != expected["node_id"]
+            or row.get("control_ip") != expected["control_ip"]
+            or row.get("geneve_ip") != expected["geneve_ip"]
+            or row.get("geneve_interface") != expected["geneve_interface"]
+            or row.get("provider_interface") != expected["provider_interface"]
+            or row.get("provider_bridge") != expected_legacy["provider_bridge"]
+            or type(row.get("geneve_mtu")) is not int
+            or row["geneve_mtu"] < expected_legacy["guest_mtu"] + 100
+            or not isinstance(row.get("package_version"), str)
+            or not re.fullmatch(r"[A-Za-z0-9.+:~_-]{1,200}", row["package_version"])
+        ):
+            fail(f"active control-plane snapshot node {row.get('name')} drifted")
+        package_versions.add(row["package_version"])
+    if len(package_versions) != 1:
+        fail("active control-plane snapshot package versions are not uniform")
+
+
+def build_active_ledger_upgrade_plan(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    reports: list[dict[str, Any]],
+    spec: dict[str, Any],
+    transaction: str,
+    topology_plan: dict[str, Any],
+) -> dict[str, Any]:
+    if any(activation_report_mode(report.get("activation")) != "active" for report in reports):
+        fail("ledger-only upgrade requires exact active PVN state on every node")
+    if topology_plan.get("corosync") is not None:
+        fail("active PVN requires Corosync migration; deactivate it before topology repair")
+    expected_package = topology_plan["corosync_package_version"]
+    if {report["corosync_package_version"] for report in reports} != {expected_package}:
+        fail("active Corosync package versions are not one exact value")
+    corosync = topology_corosync_pin(cluster_name, nodes, reports)
+    for node, report in zip(nodes, reports):
+        journal = report.get("journal")
+        if not isinstance(journal, dict):
+            fail(f"active node {node['name']} has no topology journal")
+        if (
+            journal.get("schema") != 1
+            or journal.get("phase") != "complete"
+            or journal.get("transaction") != transaction
+            or journal.get("spec") != spec
+            or journal.get("node") != node["name"]
+            or journal.get("effective_underlay_mtu") != spec["effective_underlay_mtu"]
+            or journal.get("management") != report["management"]
+            or journal.get("geneve") != report["geneve"]
+            or journal.get("provider") != report["provider"]
+            or journal.get("before_corosync_sha256") != report["corosync_sha256"]
+            or journal.get("desired_interfaces_sha256") != report["interfaces_sha256"]
+            or report.get("pending_interfaces_sha256") is not None
+            or report.get("network_state") != "desired"
+        ):
+            fail(f"active node {node['name']} is not at its exact completed topology boundary")
+        before = journal.get("before_interfaces_sha256")
+        if not isinstance(before, str) or not SHA256.fullmatch(before):
+            fail(f"active node {node['name']} has an invalid topology journal hash")
+
+    ledger_states = {
+        (report.get("ledger_sha256"), report.get("ledger_text"))
+        for report in reports
+    }
+    if len(ledger_states) != 1:
+        fail("active nodes do not expose one identical shared topology ledger")
+    previous_sha256, previous_text = next(iter(ledger_states))
+    if previous_sha256 is None or previous_text is None:
+        fail("active PVN has no shared topology ledger")
+    try:
+        previous = json.loads(previous_text)
+    except json.JSONDecodeError as exc:
+        fail(f"active shared topology ledger is invalid: {exc}")
+    expected_legacy = topology_ledger_base(cluster_name, nodes, reports, spec)
+    schema = previous.get("schema") if isinstance(previous, dict) else None
+    if schema == 1:
+        if previous != expected_legacy:
+            fail("schema 1 topology ledger is not the exact live legacy projection")
+        candidate = copy.deepcopy(previous)
+        candidate["schema"] = 2
+        candidate["corosync"] = corosync
+        upgrade_required = True
+    elif schema == 2:
+        projection = copy.deepcopy(previous)
+        pinned = projection.pop("corosync", None)
+        projection["schema"] = 1
+        if projection != expected_legacy or pinned != corosync:
+            fail("schema 2 topology ledger does not exactly pin the live topology")
+        candidate = previous
+        upgrade_required = False
+    else:
+        fail("active topology ledger must be schema 1 or schema 2")
+    candidate_text = json.dumps(candidate, sort_keys=True, indent=2) + "\n"
+    candidate_sha256 = digest_text(candidate_text)
+    if not upgrade_required and (
+        previous_text != candidate_text or previous_sha256 != candidate_sha256
+    ):
+        fail("schema 2 topology ledger is not the exact canonical candidate")
+    validate_active_control_ledger(
+        cluster_name, nodes, reports, expected_legacy, candidate
+    )
+    return {
+        "upgrade_required": upgrade_required,
+        "previous_text": previous_text,
+        "previous_sha256": previous_sha256,
+        "candidate_text": candidate_text,
+        "candidate_sha256": candidate_sha256,
+        "corosync": corosync,
+        "proofs": {
+            report["node"]: report_ledger_upgrade_proof_sha256(report)
+            for report in reports
+        },
+    }
+
+
 def probe_all(
     cluster_name: str,
     nodes: list[dict[str, Any]],
@@ -2816,6 +3296,87 @@ def print_plan(
     print(
         f"  effective-underlay-mtu={plan['effective_underlay_mtu']} "
         f"guest-mtu={guest_mtu} ceiling={plan['guest_mtu_ceiling']}"
+    )
+
+
+def apply_active_ledger_upgrade(
+    cluster_name: str,
+    nodes: list[dict[str, Any]],
+    spec: dict[str, Any],
+    transaction: str,
+    membership_guard: dict[str, Any],
+    initial_upgrade: dict[str, Any],
+) -> None:
+    assert_membership_unchanged(
+        membership_guard, "before active ledger-only verification"
+    )
+    reports = probe_all(
+        cluster_name, nodes, spec, transaction, membership_guard
+    )
+    topology_plan = build_plan(cluster_name, nodes, reports, spec)
+    upgrade = build_active_ledger_upgrade_plan(
+        cluster_name, nodes, reports, spec, transaction, topology_plan
+    )
+    if (
+        upgrade["candidate_sha256"] != initial_upgrade["candidate_sha256"]
+        or upgrade["previous_sha256"] != initial_upgrade["previous_sha256"]
+    ):
+        fail("active topology or ledger changed between its two exact sweeps")
+    if not upgrade["upgrade_required"]:
+        print("Active PVN topology ledger is already the exact schema 2 candidate; no-op.")
+        return
+
+    coordinator = nodes[0]
+    request = common_request(
+        coordinator, cluster_name, nodes, spec, transaction, membership_guard
+    )
+    request.update({
+        "ledger_upgrade_only": True,
+        "ledger": upgrade["candidate_text"],
+        "ledger_sha256": upgrade["candidate_sha256"],
+        "expected_ledger_sha256": upgrade["previous_sha256"],
+        "upgrade_proof_sha256": upgrade["proofs"][coordinator["name"]],
+    })
+    print(
+        f"[{coordinator['name']}] CAS-publish schema 2 topology ledger only; "
+        "network, Corosync, journals, services, and markers remain untouched"
+    )
+    assert_membership_unchanged(
+        membership_guard, "before active topology ledger CAS"
+    )
+    write_error: TopologyError | None = None
+    try:
+        ssh_request(coordinator, "write-ledger", request)
+    except TopologyError as exc:
+        write_error = exc
+
+    try:
+        post_reports = probe_all(
+            cluster_name, nodes, spec, transaction, membership_guard
+        )
+        post_topology = build_plan(cluster_name, nodes, post_reports, spec)
+        post = build_active_ledger_upgrade_plan(
+            cluster_name, nodes, post_reports, spec, transaction, post_topology
+        )
+    except TopologyError as post_error:
+        fail(
+            f"active ledger CAS outcome requires a resumable exact-state recheck: "
+            f"{post_error}; no network, Corosync, journal, service, or marker rollback was attempted"
+        )
+    if (
+        not post["upgrade_required"]
+        and post["candidate_sha256"] == upgrade["candidate_sha256"]
+        and post["previous_sha256"] == upgrade["candidate_sha256"]
+    ):
+        print(
+            f"PVN active topology ledger upgraded and verified on all {len(nodes)} nodes."
+        )
+        return
+    if write_error is not None and post["previous_sha256"] == upgrade["previous_sha256"]:
+        raise write_error
+    fail(
+        "active ledger CAS did not reach the exact candidate; the observed ledger was "
+        "preserved and no other state was mutated"
     )
 
 
@@ -3439,43 +4000,11 @@ def apply_topology(
         if len(existing_ledger_states) != 1:
             fail("nodes do not expose one identical shared topology ledger state")
         previous_ledger_sha, previous_ledger_text = next(iter(existing_ledger_states))
-        ledger_membership_snapshot = {
-            "cluster_name": cluster_name,
-            "nodes": [
-                {"name": node["name"], "node_id": node["id"], "management_ip": node["ip"]}
-                for node in nodes
-            ],
-        }
-        ledger = {
-            "schema": 2,
-            "phase": "complete",
-            "cluster_name": cluster_name,
-            "membership_snapshot": ledger_membership_snapshot,
-            "membership_hash": digest_text(canonical_json(ledger_membership_snapshot)),
-            "nodes": [
-                {
-                    "name": node["name"],
-                    "node_id": node["id"],
-                    "management_ip": node["ip"],
-                    "control_ip": node["ip"],
-                    "geneve_ip": report["geneve"]["address"].split("/", 1)[0],
-                    "geneve_interface": report["geneve"]["interface"],
-                    "provider_interface": report["provider"]["interface"],
-                }
-                for node, report in zip(nodes, final_reports)
-            ],
-            "guest_mtu": spec["guest_mtu"],
-            "effective_underlay_mtu": plan["effective_underlay_mtu"],
-            "provider_bridge": "br-provider",
-            "physnet": "provider",
-            "corosync": final_corosync_ledger,
-            "provider_readiness": {
-                "operator_ack": True,
-                "ack_phrase": PROVIDER_ACK,
-                "live_arbitrary_mac_l2_verified": False,
-                "basis": "operator-ack-only",
-            },
-        }
+        ledger = topology_ledger_base(
+            cluster_name, nodes, final_reports, spec
+        )
+        ledger["schema"] = 2
+        ledger["corosync"] = final_corosync_ledger
         ledger_text = json.dumps(ledger, sort_keys=True, indent=2) + "\n"
         ledger_sha = digest_text(ledger_text)
         coordinator = nodes[0]
@@ -3573,6 +4102,12 @@ def main() -> int:
         reports = probe_all(
             cluster_name, nodes, spec, transaction, membership_snapshot
         )
+        activation_modes = {
+            activation_report_mode(report.get("activation")) for report in reports
+        }
+        if len(activation_modes) != 1:
+            fail("PVN activation is not uniform across every PVE node")
+        activation_mode = next(iter(activation_modes))
         plan = build_plan(cluster_name, nodes, reports, spec)
         spec["effective_underlay_mtu"] = plan["effective_underlay_mtu"]
         guest_mtu = args.guest_mtu if args.guest_mtu is not None else plan["default_guest_mtu"]
@@ -3583,12 +4118,34 @@ def main() -> int:
             )
         spec["guest_mtu"] = guest_mtu
         print_plan(cluster_name, nodes, reports, plan, guest_mtu)
+        active_upgrade = None
+        if activation_mode == "active":
+            active_upgrade = build_active_ledger_upgrade_plan(
+                cluster_name, nodes, reports, spec, transaction, plan
+            )
+            state = "required" if active_upgrade["upgrade_required"] else "already complete"
+            print(
+                "  Active PVN: schema 1 -> schema 2 ledger-only upgrade " + state
+            )
+            print(
+                "  Mutations allowed: one shared topology-ledger CAS only; "
+                "network, Corosync, journals, services, and markers stay untouched"
+            )
+        elif activation_mode != "inactive":
+            fail("PVN activation state is neither uniformly inactive nor active")
         if args.operation == "plan":
             print("Read-only plan complete; no journal, backup, pending config, or network change was created.")
-            print("WARNING: this plan cannot live-test arbitrary inner MAC/IP forwarding on the outer OpenStack port.")
-            print(
-                f"Apply only after independent provider-port verification: {PROGRAM} apply ... "
-                f"--provider-port-ready {PROVIDER_ACK} --confirm {cluster_name}"
+            if activation_mode == "inactive":
+                print("WARNING: this plan cannot live-test arbitrary inner MAC/IP forwarding on the outer OpenStack port.")
+                print(
+                    f"Apply only after independent provider-port verification: {PROGRAM} apply ... "
+                    f"--provider-port-ready {PROVIDER_ACK} --confirm {cluster_name}"
+                )
+            return 0
+        if activation_mode == "active":
+            apply_active_ledger_upgrade(
+                cluster_name, nodes, spec, transaction,
+                membership_snapshot, active_upgrade,
             )
             return 0
         # Re-probe with the final transaction/spec so existing journals are
@@ -3597,6 +4154,11 @@ def main() -> int:
         reports = probe_all(
             cluster_name, nodes, spec, transaction, membership_snapshot
         )
+        if any(
+            activation_report_mode(report.get("activation")) != "inactive"
+            for report in reports
+        ):
+            fail("normal topology apply requires every PVN node to remain inactive")
         plan = build_plan(cluster_name, nodes, reports, spec)
         apply_topology(
             cluster_name, nodes, spec, transaction, reports, plan, membership_snapshot

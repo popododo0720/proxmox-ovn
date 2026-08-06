@@ -228,11 +228,13 @@ else:
         "restart_order": [],
         "ledger": None,
         "ledger_sha256": None,
+        "control_ledger": None,
+        "control_ledger_sha256": None,
         "nodes": {},
     }
 
 node_state = state["nodes"].setdefault(node, {
-    "network": "initial", "staged": False, "journal": False, "phase": None,
+    "network": "initial", "staged": False, "journal": None, "phase": None,
     "effective_underlay_mtu": None,
 })
 if action == "probe" and state.get("block_probes") and os.environ.get(
@@ -418,6 +420,37 @@ def report():
     bad_mtu_role = os.environ.get("PVN_TEST_UNRESTORABLE_MTU_ROLE")
     geneve_configured_mtu = 1450 if node == bad_mtu_host and bad_mtu_role == "geneve" else 1442
     provider_configured_mtu = 1450 if node == bad_mtu_host and bad_mtu_role == "provider" else 1442
+    journal = node_state.get("journal")
+    if isinstance(journal, dict):
+        journal = dict(journal)
+        journal["phase"] = node_state["phase"]
+        if node_state["network"] == "desired":
+            journal["desired_interfaces_sha256"] = interfaces_sha
+        if os.environ.get("PVN_TEST_ACTIVE_JOURNAL_DRIFT_HOST") == node:
+            journal["phase"] = "network-applied-unverified"
+    active_hosts = {
+        value for value in os.environ.get("PVN_TEST_ACTIVE_HOSTS", "").split(",")
+        if value
+    }
+    active = os.environ.get("PVN_TEST_ACTIVE") == "yes" or node in active_hosts
+    marker_state = active
+    unit_state = active
+    if os.environ.get("PVN_TEST_MIXED_ACTIVATION_HOST") == node:
+        marker_state = True
+        unit_state = False
+    if (
+        os.environ.get("PVN_TEST_ACTIVE_POST_DRIFT_HOST") == node
+        and state.get("ledger")
+        and json.loads(state["ledger"]).get("schema") == 2
+    ):
+        unit_state = False
+    activation_units = (
+        "pvn-node.target", "pvn-central.target", "pvn-node-ready.service",
+        "pvn-manager.service", "pvn-agent.service", "pvn-control-db.service",
+        "pvn-ovn-db-listeners.service", "pvn-ovn-host-config.service",
+        "ovn-controller.service", "ovn-northd.service",
+        "ovn-ovsdb-server-nb.service", "ovn-ovsdb-server-sb.service",
+    )
     return {
         "node": node,
         "interfaces_sha256": interfaces_sha,
@@ -450,10 +483,20 @@ def report():
             "mtu": 1442, "max_mtu": 65535, "configured_mtu": provider_configured_mtu,
         },
         "network_state": network,
+        "journal": journal,
         "journal_phase": node_state["phase"],
         "ledger_text": state["ledger"],
         "ledger_sha256": state["ledger_sha256"],
-        "activation_safe": True,
+        "control_ledger_text": state.get("control_ledger"),
+        "control_ledger_sha256": state.get("control_ledger_sha256"),
+        "activation": {
+            "markers": {
+                "/etc/pvn/node-enabled": marker_state,
+                "/etc/pvn/central/enabled": marker_state,
+            },
+            "units": {unit: unit_state for unit in activation_units},
+        },
+        "activation_safe": not marker_state and not unit_state,
     }
 
 
@@ -483,7 +526,20 @@ if action == "probe":
         drift_membership()
     emit(report=response)
 elif action == "prepare":
-    node_state["journal"] = True
+    node_state["journal"] = {
+        "schema": 1,
+        "transaction": request["transaction"],
+        "spec": request["spec"],
+        "node": node,
+        "management": report()["management"],
+        "geneve": report()["geneve"],
+        "provider": report()["provider"],
+        "effective_underlay_mtu": request.get("effective_underlay_mtu"),
+        "before_interfaces_sha256": sha("interfaces-%s-%s" % (node, node_state["network"])),
+        "before_corosync_sha256": sha(state["corosync_text"]),
+        "desired_interfaces_sha256": None,
+        "phase": node_state["phase"] or "prepared",
+    }
     node_state["phase"] = node_state["phase"] or "prepared"
     node_state["effective_underlay_mtu"] = request.get("effective_underlay_mtu")
     save()
@@ -657,6 +713,17 @@ elif action == "discard-stage":
     save()
     emit(noop=not was_staged)
 elif action == "write-ledger":
+    if os.environ.get("PVN_TEST_ACTIVE") == "yes":
+        if request.get("ledger_upgrade_only") is not True:
+            stop("active ledger write lacks its upgrade-only fence")
+        if not isinstance(request.get("upgrade_proof_sha256"), str):
+            stop("active ledger write lacks its exact local proof")
+    if os.environ.get("PVN_TEST_FAIL_LEDGER_UPGRADE_BEFORE_WRITE") == "yes":
+        stop("simulated active ledger failure before CAS")
+    if os.environ.get("PVN_TEST_LEDGER_UPGRADE_EXTERNAL_DRIFT") == "yes":
+        state["ledger"] = json.dumps({"schema": 77}, sort_keys=True)
+        state["ledger_sha256"] = sha(state["ledger"])
+        save()
     if state["ledger_sha256"] != request["expected_ledger_sha256"]:
         stop("fake ledger CAS mismatch")
     if sha(request["ledger"]) != request["ledger_sha256"]:
@@ -664,6 +731,8 @@ elif action == "write-ledger":
     state["ledger"] = request["ledger"]
     state["ledger_sha256"] = request["ledger_sha256"]
     save()
+    if os.environ.get("PVN_TEST_FAIL_LEDGER_UPGRADE_AFTER_WRITE") == "yes":
+        stop("simulated lost active ledger CAS response")
     emit(noop=False, ledger_sha256=state["ledger_sha256"])
 elif action == "verify-ledger":
     if state["ledger_sha256"] != request["ledger_sha256"]:
@@ -723,6 +792,95 @@ assert_no_mutation() {
     if grep -Eq 'action=(prepare|validate-corosync|apply-corosync|reload-corosync|restart-corosync|record-phase|stage-network|apply-network|rollback-network|discard-stage|write-ledger|restore-ledger)' "$LOG"; then
         fail "read-only/invalid invocation attempted a mutating remote action"
     fi
+}
+
+seed_active_schema1() {
+    python3 - "$STATE" <<'PY'
+import copy
+import hashlib
+import json
+import sys
+
+path = sys.argv[1]
+state = json.load(open(path, encoding="utf-8"))
+topology = json.loads(state["ledger"])
+if topology.get("schema") == 2:
+    state["_test_good_topology"] = copy.deepcopy(topology)
+elif topology.get("schema") not in {1, 2}:
+    topology = copy.deepcopy(state["_test_good_topology"])
+legacy = copy.deepcopy(topology)
+legacy["schema"] = 1
+legacy.pop("corosync", None)
+state["ledger"] = json.dumps(legacy, sort_keys=True, indent=2) + "\n"
+state["ledger_sha256"] = hashlib.sha256(state["ledger"].encode()).hexdigest()
+corosync_sha = hashlib.sha256(state["corosync_text"].encode()).hexdigest()
+for name, node in state["nodes"].items():
+    journal = node["journal"]
+    journal["before_corosync_sha256"] = corosync_sha
+    journal["desired_interfaces_sha256"] = hashlib.sha256(
+        ("interfaces-%s-desired" % name).encode()
+    ).hexdigest()
+    journal["phase"] = "complete"
+    node["phase"] = "complete"
+    node["network"] = "desired"
+    node["staged"] = False
+
+topology_digest = hashlib.sha256(json.dumps(
+    legacy, sort_keys=True, separators=(",", ":")
+).encode()).hexdigest()
+snapshot_nodes = []
+for row in legacy["nodes"]:
+    snapshot_nodes.append({
+        "name": row["name"],
+        "node_id": row["node_id"],
+        "control_ip": row["control_ip"],
+        "geneve_ip": row["geneve_ip"],
+        "geneve_interface": row["geneve_interface"],
+        "provider_interface": row["provider_interface"],
+        "provider_bridge": legacy["provider_bridge"],
+        "package_version": "0.2.13-1",
+        "geneve_mtu": 1442,
+    })
+names = [row["name"] for row in snapshot_nodes]
+pin = "a" * 64
+control = {
+    "version": 1,
+    "cluster_uuid": "11111111-1111-4111-8111-111111111111",
+    "snapshot": {
+        "mode": "raft",
+        "confirmation": legacy["cluster_name"],
+        "cluster_name": legacy["cluster_name"],
+        "members_version": 9,
+        "cluster_version": 3,
+        "topology_sha256": topology_digest,
+        "guest_mtu": legacy["guest_mtu"],
+        "physnet": legacy["physnet"],
+        "nodes": snapshot_nodes,
+    },
+    "phase": "complete",
+    "central_complete": len(names),
+    "nodes_complete": len(names),
+    "cert_fingerprints": {
+        "ca_certificate_sha256": pin,
+        "nodes": {
+            name: {"certificate_sha256": pin, "public_key_sha256": pin}
+            for name in names
+        },
+    },
+    "control_db_cluster_id": "control-cid",
+    "db_cluster_ids": {
+        "PVN_Control": "control-cid",
+        "OVN_Northbound": "nb-cid",
+        "OVN_Southbound": "sb-cid",
+    },
+}
+state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
+state["control_ledger_sha256"] = hashlib.sha256(
+    state["control_ledger"].encode()
+).hexdigest()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream, sort_keys=True)
+PY
 }
 
 PYTHONDONTWRITEBYTECODE=1 python3 -c \
@@ -953,6 +1111,166 @@ assert len(ledger["corosync"]["sha256"]) == 64
 assert ledger["corosync"]["config_version"] == 5
 assert set(ledger["corosync"]["rings"]) == {"1"}
 PY
+
+seed_active_schema1
+: > "$LOG"
+PVN_TEST_ACTIVE=yes "$TOPOLOGY" plan \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-plan.out"
+[ "$(grep -c 'action=probe' "$LOG")" -eq 3 ] ||
+    fail "active ledger plan did not perform one read-only N/N sweep"
+assert_no_mutation
+grep -q 'schema 1 -> schema 2 ledger-only upgrade required' \
+    "$WORK/active-ledger-plan.out" ||
+    fail "active ledger plan did not make its sole mutation explicit"
+
+: > "$LOG"
+PVN_TEST_ACTIVE=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-apply.out"
+[ "$(grep -c 'action=write-ledger' "$LOG")" -eq 1 ] ||
+    fail "active ledger upgrade did not perform exactly one CAS"
+if grep -Eq 'action=(prepare|validate-corosync|apply-corosync|reload-corosync|restart-corosync|record-phase|stage-network|apply-network|verify-network|rollback-network|discard-stage|restore-ledger)' "$LOG"; then
+    fail "active ledger-only upgrade mutated non-ledger state"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert json.loads(state["ledger"])["schema"] == 2
+assert all(node["phase"] == "complete" for node in state["nodes"].values())
+assert all(node["network"] == "desired" for node in state["nodes"].values())
+PY
+
+: > "$LOG"
+PVN_TEST_ACTIVE=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-rerun.out"
+if grep -q 'action=write-ledger' "$LOG"; then
+    fail "exact active schema 2 rerun repeated the ledger CAS"
+fi
+grep -q 'already the exact schema 2 candidate; no-op' "$WORK/active-ledger-rerun.out" ||
+    fail "exact active schema 2 rerun did not report a no-op"
+
+seed_active_schema1
+: > "$LOG"
+PVN_TEST_ACTIVE=yes PVN_TEST_FAIL_LEDGER_UPGRADE_AFTER_WRITE=yes \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-lost-response.out"
+[ "$(grep -c 'action=write-ledger' "$LOG")" -eq 1 ] ||
+    fail "lost active ledger response repeated its committed CAS"
+python3 - "$STATE" <<'PY'
+import json
+import sys
+assert json.loads(json.load(open(sys.argv[1], encoding="utf-8"))["ledger"])["schema"] == 2
+PY
+
+seed_active_schema1
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes PVN_TEST_FAIL_LEDGER_UPGRADE_BEFORE_WRITE=yes \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-before-cas.out" 2>&1
+then
+    fail "active ledger failure before CAS unexpectedly succeeded"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import sys
+assert json.loads(json.load(open(sys.argv[1], encoding="utf-8"))["ledger"])["schema"] == 1
+PY
+
+seed_active_schema1
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes PVN_TEST_ACTIVE_POST_DRIFT_HOST=prox3 \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-post-drift.out" 2>&1
+then
+    fail "post-CAS active-state drift unexpectedly verified"
+fi
+if grep -q 'action=restore-ledger' "$LOG"; then
+    fail "post-CAS failure rolled the owned schema 2 boundary back"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import sys
+assert json.loads(json.load(open(sys.argv[1], encoding="utf-8"))["ledger"])["schema"] == 2
+PY
+grep -q 'resumable exact-state recheck' "$WORK/active-ledger-post-drift.out" ||
+    fail "post-CAS drift did not report the preserved resumable boundary"
+
+seed_active_schema1
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes PVN_TEST_LEDGER_UPGRADE_EXTERNAL_DRIFT=yes \
+    "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-external-drift.out" 2>&1
+then
+    fail "external active ledger CAS drift unexpectedly applied"
+fi
+python3 - "$STATE" <<'PY'
+import json
+import sys
+assert json.loads(json.load(open(sys.argv[1], encoding="utf-8"))["ledger"])["schema"] == 77
+PY
+if grep -q 'action=restore-ledger' "$LOG"; then
+    fail "external ledger drift was overwritten by rollback"
+fi
+
+seed_active_schema1
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes PVN_TEST_MIXED_ACTIVATION_HOST=prox2 \
+    "$TOPOLOGY" plan --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-mixed-marker.out" 2>&1
+then
+    fail "mixed active marker/target state unexpectedly planned"
+fi
+assert_no_mutation
+
+seed_active_schema1
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes PVN_TEST_ACTIVE_JOURNAL_DRIFT_HOST=prox2 \
+    "$TOPOLOGY" plan --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-journal-drift.out" 2>&1
+then
+    fail "incomplete active topology journal unexpectedly planned"
+fi
+assert_no_mutation
+
+seed_active_schema1
+python3 - "$STATE" <<'PY'
+import hashlib
+import json
+import sys
+path = sys.argv[1]
+state = json.load(open(path, encoding="utf-8"))
+control = json.loads(state["control_ledger"])
+control["central_complete"] -= 1
+state["control_ledger"] = json.dumps(control, sort_keys=True, separators=(",", ":"))
+state["control_ledger_sha256"] = hashlib.sha256(state["control_ledger"].encode()).hexdigest()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(state, stream, sort_keys=True)
+PY
+: > "$LOG"
+if PVN_TEST_ACTIVE=yes "$TOPOLOGY" plan \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    > "$WORK/active-ledger-control-incomplete.out" 2>&1
+then
+    fail "incomplete active control-plane ledger unexpectedly planned"
+fi
+assert_no_mutation
+
+# Leave the main fixture at the exact completed schema 2 boundary for the
+# existing idempotency and drift cases below.
+seed_active_schema1
+PVN_TEST_ACTIVE=yes "$TOPOLOGY" apply \
+    --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
+    --provider-port-ready "$ACK" --confirm lab-cluster \
+    > "$WORK/active-ledger-finalize.out"
 
 : > "$LOG"
 "$TOPOLOGY" --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
