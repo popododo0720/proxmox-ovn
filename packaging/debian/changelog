@@ -1,3 +1,20 @@
+proxmox-ovn (0.2.16) unstable; urgency=medium
+
+  * Terminalize canceled or expired reconciliation operations with bounded,
+    fenced bookkeeping while preserving genuine writer-lease recovery.
+  * Show human names for policy backfills, relationships, and operation targets
+    while retaining raw UUIDs in Details and diagnostics.
+  * Fence OVN reconciliation on Northbound-to-Southbound synchronization and
+    audit exact ACL, NAT, reference, and cross-project security semantics.
+  * Connect northd through the complete ordered TLS voter sets and provide a
+    marker-scoped standby-first rolling transition with strict final cfg proof.
+  * Freeze every northd, listener, and host-config writer gate during each
+    independent PVN Control, OVN NB, or OVN SB recovery window.
+  * Build releases from clean deterministic inputs and publish exact seven-file
+    draft assets without mutating an existing public release.
+
+ -- PVN Project <root@localhost>  Thu, 06 Aug 2026 11:59:19 +0000
+
 proxmox-ovn (0.2.15) unstable; urgency=medium
 
   * Derive the operator-facing clustered or standalone deployment name from a
