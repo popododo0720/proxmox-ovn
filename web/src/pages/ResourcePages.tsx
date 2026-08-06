@@ -23,6 +23,7 @@ import { ReferenceLabel } from '../components/ReferenceLabel';
 import { useResourceCatalog } from '../components/ResourceCatalog';
 import { ResourcePage, formatValue, type Column } from '../components/ResourcePage';
 import { StatusPill } from '../components/StatusPill';
+import { operationErrorSummary } from '../diagnostics/operation';
 import {
   currentProviderSegmentReference,
   externalNetworkReference,
@@ -458,7 +459,7 @@ export function OperationsPage() {
       { key: 'status', label: 'State' },
       { key: 'started_at', label: 'Started' },
       { key: 'completed_at', label: 'Completed' },
-      { key: 'error', label: 'Error', className: 'error-cell' },
+      { key: 'error', label: 'Error', className: 'error-cell', render: (item) => formatValue(operationErrorSummary(item)) },
     ]}
     emptyMessage="PVN operations will appear here when resources are reconciled."
   />;

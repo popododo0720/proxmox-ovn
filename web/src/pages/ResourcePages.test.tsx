@@ -27,10 +27,11 @@ describe('floatingIPDisplayStatus', () => {
 
 describe('resource reference UX', () => {
   it('resolves polymorphic operation targets and handles an unknown kind neutrally', async () => {
+    const rawError = 'failed to reconcile network-aaaaaaaa through 9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
     const list = vi.fn(async (endpoint: string) => {
       if (endpoint === '/operations') {
         return { items: [
-          { id: 'operation-known', action: 'update', target_kind: 'network', target_id: 'network-aaaaaaaa', status: 'ready' },
+          { id: 'operation-known', action: 'update', target_kind: 'network', target_id: 'network-aaaaaaaa', status: 'error', error: rawError },
           { id: 'operation-unknown', action: 'inspect', target_kind: 'future-kind', target_id: 'future-aaaaaaaa', status: 'ready' },
         ] };
       }
@@ -50,9 +51,16 @@ describe('resource reference UX', () => {
     expect(unknownRow).not.toBeNull();
     expect(await within(knownRow!).findByText('application')).toBeInTheDocument();
     expect(within(knownRow!).queryByText('network-aaaaaaaa')).not.toBeInTheDocument();
+    expect(within(knownRow!).getByText('failed to reconcile [resource] through [resource]')).toBeInTheDocument();
+    expect(knownRow).not.toHaveTextContent('9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a');
     expect(within(unknownRow!).getByText('Unavailable')).toBeInTheDocument();
     expect(within(unknownRow!).queryByText('future-aaaaaaaa')).not.toBeInTheDocument();
     expect(list.mock.calls.filter(([endpoint]) => endpoint === '/networks')).toHaveLength(1);
+
+    fireEvent.click(within(knownRow!).getByRole('button', { name: 'Details' }));
+    const knownDialog = screen.getByRole('dialog');
+    expect(knownDialog).toHaveTextContent(rawError);
+    fireEvent.click(within(knownDialog).getByText('Close', { selector: 'button' }));
 
     fireEvent.click(within(unknownRow!).getByRole('button', { name: 'Details' }));
     expect(within(screen.getByRole('dialog')).getByText('future-aaaaaaaa')).toBeInTheDocument();
