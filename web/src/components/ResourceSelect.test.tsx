@@ -4,6 +4,8 @@ import type { ApiClient } from '../api/client';
 import { ApiProvider } from '../api/context';
 import { ResourceSelect } from './ResourceSelect';
 
+const uuidPattern = /[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/i;
+
 describe('ResourceSelect', () => {
   it('shows human-readable project-scoped choices while submitting the exact ID', async () => {
     const networkID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
@@ -35,6 +37,7 @@ describe('ResourceSelect', () => {
 
     expect(option).toHaveValue(networkID);
     expect(screen.getByRole('combobox')).not.toHaveTextContent(networkID);
+    expect(screen.getByRole('combobox').textContent).not.toMatch(uuidPattern);
     expect(onChange).toHaveBeenCalledWith(networkID);
     expect(list).toHaveBeenCalledWith('/networks');
   });
@@ -59,6 +62,7 @@ describe('ResourceSelect', () => {
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('manager unavailable: [resource]');
     expect(alert).not.toHaveTextContent(operationID);
+    expect(alert.textContent).not.toMatch(uuidPattern);
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
     await screen.findByRole('option', { name: 'tenant-a' });

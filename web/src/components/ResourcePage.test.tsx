@@ -4,6 +4,8 @@ import type { ApiClient } from '../api/client';
 import { ApiProvider } from '../api/context';
 import { ResourcePage } from './ResourcePage';
 
+const uuidPattern = /[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/i;
+
 describe('ResourcePage resource identity', () => {
   it('shows no raw UUID in the table but preserves and copies it in Details', async () => {
     const resourceID = '9e21e0b5-a40f-4bf8-9fe1-cfcdadbc0f7a';
@@ -37,6 +39,7 @@ describe('ResourcePage resource identity', () => {
       expect(await within(table).findByText('Tenant A')).toBeInTheDocument();
       expect(table).not.toHaveTextContent(resourceID);
       expect(table).not.toHaveTextContent(projectID);
+      expect(table.textContent).not.toMatch(uuidPattern);
 
       fireEvent.click(within(table).getByRole('button', { name: 'Details' }));
       const dialog = screen.getByRole('dialog');
@@ -172,6 +175,7 @@ describe('ResourcePage resource identity', () => {
     expect(alert).toHaveTextContent('delete application failed in [resource]');
     expect(alert).not.toHaveTextContent(resourceID);
     expect(alert).not.toHaveTextContent(operationID);
+    expect(alert.textContent).not.toMatch(uuidPattern);
   });
 
   it('edits a safe field with the complete resource and optimistic revision', async () => {
