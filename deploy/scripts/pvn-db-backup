@@ -8,6 +8,7 @@ import dataclasses
 import datetime
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
@@ -19,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 
@@ -47,6 +49,10 @@ TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 SAFE_HOSTNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 MAX_MANIFEST = 1024 * 1024
 MAX_TEXT_OUTPUT = 1024 * 1024
+MAX_RECOVERY_WINDOW_AGE = 60 * 60
+MAX_STATUS_AGE = 10 * 60
+DEFAULT_STATUS_AGE = 120
+FUTURE_CLOCK_SKEW = 5
 
 
 class BackupError(RuntimeError):
@@ -69,6 +75,7 @@ class Database:
 class RaftIdentity:
     cluster_id: str
     server_id: str
+    address: str
     role: str
     term: int
     leader: str
@@ -80,6 +87,7 @@ class RaftIdentity:
         return {
             "cluster_id": self.cluster_id,
             "server_id": self.server_id,
+            "address": self.address,
             "role": self.role,
             "term": self.term,
             "leader": self.leader,
@@ -112,6 +120,23 @@ DATABASES = (
 )
 DATABASE_BY_KEY = {database.key: database for database in DATABASES}
 DATABASE_BY_NAME = {database.name: database for database in DATABASES}
+DATABASE_RAFT_PORTS = {
+    "PVN_Control": 6646,
+    "OVN_Northbound": 6643,
+    "OVN_Southbound": 6644,
+}
+DATABASE_UNITS = (
+    "pvn-control-db.service",
+    "ovn-ovsdb-server-nb.service",
+    "ovn-ovsdb-server-sb.service",
+)
+RECOVERY_INACTIVE_UNITS = (
+    "pvn-central.target",
+    "ovn-northd.service",
+    "pvn-manager.service",
+    "pvn-agent.service",
+    "ovn-controller.service",
+)
 
 
 def fail(message: str) -> None:
@@ -222,6 +247,23 @@ def require_central_marker() -> None:
         fail("central activation marker must not be group/world writable")
 
 
+def require_recovery_service_state() -> None:
+    for unit in DATABASE_UNITS:
+        state = command(
+            [SYSTEMCTL, "show", "--property=ActiveState", "--value", unit],
+            timeout=20,
+        )
+        if state != "active":
+            fail(f"recovery window requires {unit} active, got {state!r}")
+    for unit in RECOVERY_INACTIVE_UNITS:
+        state = command(
+            [SYSTEMCTL, "show", "--property=ActiveState", "--value", unit],
+            timeout=20,
+        )
+        if state != "inactive":
+            fail(f"recovery window requires {unit} inactive, got {state!r}")
+
+
 def command(
     arguments: list[str],
     *,
@@ -288,6 +330,30 @@ def positive_integer(value: Any, label: str) -> int:
     return value
 
 
+def validate_raft_address(value: Any, database_name: str, label: str) -> str:
+    if not isinstance(value, str) or not value.startswith("ssl:") or len(value) > 512:
+        fail(f"{label} is not a valid clustered SSL address")
+    endpoint = value[4:]
+    if endpoint.startswith("["):
+        closing = endpoint.find("]:")
+        if closing < 0:
+            fail(f"{label} is not a valid bracketed IPv6 SSL address")
+        host = endpoint[1:closing]
+        port_text = endpoint[closing + 2 :]
+    else:
+        host, separator, port_text = endpoint.rpartition(":")
+        if not separator or ":" in host:
+            fail(f"{label} is not a valid IPv4 SSL address")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        fail(f"{label} does not contain a valid IP address")
+    expected_port = DATABASE_RAFT_PORTS[database_name]
+    if port_text != str(expected_port):
+        fail(f"{label} must use the configured Raft port {expected_port}")
+    return value
+
+
 def parse_central_status(report: Any) -> dict[str, RaftIdentity]:
     if not isinstance(report, dict) or report.get("healthy") is not True:
         fail("all three local Raft databases must report healthy")
@@ -322,6 +388,9 @@ def parse_central_status(report: Any) -> dict[str, RaftIdentity]:
         server_id = row.get("server_id")
         if not isinstance(server_id, str) or not UUID.fullmatch(server_id):
             fail(f"{name} has no valid local Raft server ID")
+        address = validate_raft_address(
+            row.get("address"), name, f"{name} local Raft address"
+        )
         role = row.get("role")
         if role not in {"leader", "follower"}:
             fail(f"{name} has an invalid local Raft role")
@@ -342,6 +411,7 @@ def parse_central_status(report: Any) -> dict[str, RaftIdentity]:
         result[name] = RaftIdentity(
             cluster_id=cluster_id.lower(),
             server_id=server_id.lower(),
+            address=address,
             role=role,
             term=term,
             leader=leader,
@@ -508,6 +578,13 @@ def parse_timestamp(value: Any, label: str) -> str:
     return value
 
 
+def timestamp_datetime(value: Any, label: str) -> datetime.datetime:
+    parsed = parse_timestamp(value, label)
+    return datetime.datetime.strptime(parsed, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc
+    )
+
+
 def parse_short_string(value: Any, label: str) -> str:
     if not isinstance(value, str) or len(value) > 256 or "\n" in value or "\r" in value:
         fail(f"{label} is invalid")
@@ -544,6 +621,60 @@ def read_manifest(backup_set: pathlib.Path) -> dict[str, Any]:
     return manifest
 
 
+def read_secure_json_file(
+    path: pathlib.Path,
+    label: str,
+    *,
+    max_age: int | None = None,
+) -> tuple[Any, tuple[int, int], float]:
+    clean_absolute(path, label)
+    inspect_directory_chain(path.parent, f"{label} parent")
+    metadata = secure_file(path, label, 0o600)
+    if metadata.st_size <= 0 or metadata.st_size > MAX_TEXT_OUTPUT:
+        fail(f"{label} size is invalid")
+    if max_age is not None:
+        now = time.time()
+        age = now - metadata.st_mtime
+        if age < -FUTURE_CLOCK_SKEW:
+            fail(f"{label} modification time is in the future")
+        if age > max_age:
+            fail(f"{label} is older than {max_age} seconds")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open {label}: {error}")
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or opened.st_size != metadata.st_size
+            or opened.st_mtime_ns != metadata.st_mtime_ns
+        ):
+            fail(f"{label} changed while it was being opened")
+        raw = b""
+        while len(raw) <= MAX_TEXT_OUTPUT:
+            block = os.read(descriptor, 65536)
+            if not block:
+                break
+            raw += block
+        if len(raw) > MAX_TEXT_OUTPUT:
+            fail(f"{label} is too large")
+        final = os.fstat(descriptor)
+        if (
+            final.st_size != opened.st_size
+            or final.st_mtime_ns != opened.st_mtime_ns
+        ):
+            fail(f"{label} changed while it was being read")
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"{label} is invalid JSON: {error}")
+    return payload, (opened.st_dev, opened.st_ino), opened.st_mtime
+
+
 def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     top_keys = {"format", "consistency", "created_at", "source", "databases"}
     manifest_format = manifest.get("format")
@@ -559,7 +690,7 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     purpose = manifest.get("purpose") if manifest_format == FORMAT else "general-backup"
     if purpose not in {"general-backup", "recovery-window"}:
         fail("backup manifest purpose is unsupported")
-    parse_timestamp(manifest.get("created_at"), "manifest created_at")
+    created_at = parse_timestamp(manifest.get("created_at"), "manifest created_at")
     source = manifest.get("source")
     if not isinstance(source, dict) or set(source) != {"hostname"}:
         fail("backup manifest source is invalid")
@@ -585,7 +716,7 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         "snapshot_service_model",
     }
     if manifest_format == FORMAT:
-        entry_keys |= {"server_id", "role", "term", "leader"}
+        entry_keys |= {"server_id", "address", "role", "term", "leader"}
     seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != entry_keys:
@@ -601,6 +732,8 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         completed = parse_timestamp(entry.get("capture_completed_at"), f"{key} capture end")
         if completed < started:
             fail(f"backup manifest capture interval is reversed for {key}")
+        if created_at < completed:
+            fail(f"backup manifest predates completed capture for {key}")
         digest = entry.get("sha256")
         if not isinstance(digest, str) or not SHA256.fullmatch(digest):
             fail(f"backup manifest SHA-256 is invalid for {key}")
@@ -617,6 +750,9 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             server_id = entry.get("server_id")
             if not isinstance(server_id, str) or not UUID.fullmatch(server_id):
                 fail(f"backup manifest server ID is invalid for {key}")
+            validate_raft_address(
+                entry.get("address"), database.name, f"{key} manifest server address"
+            )
             role = entry.get("role")
             leader = entry.get("leader")
             if role not in {"leader", "follower"}:
@@ -701,8 +837,162 @@ def verify_backup_set(backup_set: pathlib.Path) -> dict[str, Any]:
         "backup_set": str(backup_set),
         "format": manifest["format"],
         "consistency": CONSISTENCY,
+        "purpose": manifest.get("purpose", "general-backup"),
         "databases": [entry["database"] for entry in entries],
         "verified": True,
+    }
+
+
+def load_voter_statuses(
+    specifications: list[str], max_age: int
+) -> tuple[dict[str, dict[str, RaftIdentity]], dict[str, float]]:
+    if type(max_age) is not int or not 1 <= max_age <= MAX_STATUS_AGE:
+        fail(f"status report maximum age must be between 1 and {MAX_STATUS_AGE} seconds")
+    result: dict[str, dict[str, RaftIdentity]] = {}
+    modification_times: dict[str, float] = {}
+    paths: set[pathlib.Path] = set()
+    inodes: set[tuple[int, int]] = set()
+    for specification in specifications:
+        node, separator, raw_path = specification.partition("=")
+        if (
+            not separator
+            or not SAFE_HOSTNAME.fullmatch(node)
+            or not raw_path
+            or node in result
+        ):
+            fail("--voter-status must use a unique NODE=/secure/absolute/path value")
+        path = clean_absolute(pathlib.Path(raw_path), f"{node} voter status path")
+        if path in paths:
+            fail("voter status path cannot be reused")
+        payload, inode, modification_time = read_secure_json_file(
+            path, f"{node} voter status", max_age=max_age
+        )
+        if inode in inodes:
+            fail("voter status file inode cannot be reused")
+        paths.add(path)
+        inodes.add(inode)
+        result[node] = parse_central_status(payload)
+        modification_times[node] = modification_time
+    return result, modification_times
+
+
+def pre_restore_check(
+    backup_set: pathlib.Path,
+    database_key: str,
+    captured_after: str,
+    expected_sha256: str,
+    voter_status_specs: list[str],
+    status_max_age: int,
+) -> dict[str, Any]:
+    verification = verify_backup_set(backup_set)
+    manifest = read_manifest(backup_set)
+    entries = validate_manifest(manifest)
+    if manifest.get("format") != FORMAT or manifest.get("purpose") != "recovery-window":
+        fail("pre-restore requires a current recovery-window backup set")
+    if len(entries) != 1 or entries[0].get("key") != database_key:
+        fail("pre-restore database does not exactly match the backup set")
+    entry = entries[0]
+    if not isinstance(expected_sha256, str) or not SHA256.fullmatch(expected_sha256):
+        fail("--expected-sha256 must be one lowercase SHA-256 digest")
+    if entry["sha256"] != expected_sha256:
+        fail("expected SHA-256 does not match the recovery-window manifest")
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    window_start = timestamp_datetime(captured_after, "--captured-after")
+    if window_start > now + datetime.timedelta(seconds=FUTURE_CLOCK_SKEW):
+        fail("--captured-after is in the future")
+    if now - window_start > datetime.timedelta(seconds=MAX_RECOVERY_WINDOW_AGE):
+        fail(
+            f"--captured-after is older than {MAX_RECOVERY_WINDOW_AGE} seconds"
+        )
+    capture_started = timestamp_datetime(
+        entry["capture_started_at"], "recovery capture start"
+    )
+    capture_completed = timestamp_datetime(
+        entry["capture_completed_at"], "recovery capture completion"
+    )
+    manifest_created = timestamp_datetime(manifest["created_at"], "manifest created_at")
+    if capture_started < window_start:
+        fail("recovery backup capture predates this maintenance window")
+    if manifest_created > now + datetime.timedelta(seconds=FUTURE_CLOCK_SKEW):
+        fail("recovery backup manifest creation time is in the future")
+    if capture_completed > manifest_created:
+        fail("recovery backup manifest predates its completed capture")
+
+    statuses, status_modification_times = load_voter_statuses(
+        voter_status_specs, status_max_age
+    )
+    for node, modification_time in status_modification_times.items():
+        if modification_time < capture_completed.timestamp():
+            fail(f"{node} voter status predates the completed recovery capture")
+    expected_members = entry["member_count"]
+    if len(statuses) != expected_members:
+        fail(
+            f"pre-restore requires exactly {expected_members} distinct voter status reports"
+        )
+    selected: dict[str, RaftIdentity] = {
+        node: status[entry["database"]] for node, status in statuses.items()
+    }
+    server_ids = {identity.server_id for identity in selected.values()}
+    addresses = {identity.address for identity in selected.values()}
+    if len(server_ids) != expected_members:
+        fail("selected database voter status reports reuse a Raft server ID")
+    if len(addresses) != expected_members:
+        fail("selected database voter status reports reuse a Raft address")
+    for node, identity in selected.items():
+        if identity.cluster_id != entry["cluster_id"]:
+            fail(f"{node} selected database cluster ID differs from the manifest")
+        if identity.term != entry["term"]:
+            fail(f"{node} selected database term differs from the manifest")
+        if identity.member_count != expected_members:
+            fail(f"{node} selected database member count differs from the manifest")
+    leaders = [
+        (node, identity)
+        for node, identity in selected.items()
+        if identity.role == "leader"
+    ]
+    if len(leaders) != 1:
+        fail("selected database must have exactly one leader across voter reports")
+    leader_node, leader_identity = leaders[0]
+    source_hostname = manifest["source"]["hostname"]
+    if leader_node != source_hostname:
+        fail("selected database leader does not match the manifest source hostname")
+    if (
+        leader_identity.server_id != entry["server_id"]
+        or leader_identity.address != entry["address"]
+        or leader_identity.leader != "self"
+    ):
+        fail("selected database leader identity differs from the manifest source")
+    if safe_hostname() != source_hostname:
+        fail("pre-restore must run on the recovery-window source host")
+
+    require_central_marker()
+    require_recovery_service_state()
+    database = DATABASE_BY_KEY[database_key]
+    require_socket(database)
+    version, checksum = live_schema(database)
+    if version != entry["schema_version"] or checksum != entry["schema_checksum"]:
+        fail("selected live database schema differs from the recovery snapshot")
+    local_status = central_status()
+    require_local_leaders(local_status, (database,))
+    if local_status[database.name] != leader_identity:
+        fail("local live Raft identity differs from the fresh voter status gate")
+    return {
+        **verification,
+        "database_key": database.key,
+        "database": database.name,
+        "source": source_hostname,
+        "cluster_id": entry["cluster_id"],
+        "server_id": entry["server_id"],
+        "address": entry["address"],
+        "term": entry["term"],
+        "member_count": expected_members,
+        "capture_started_at": entry["capture_started_at"],
+        "capture_completed_at": entry["capture_completed_at"],
+        "sha256": entry["sha256"],
+        "voters": sorted(statuses),
+        "live_identity_verified": True,
+        "restore_ready": True,
     }
 
 
@@ -742,7 +1032,10 @@ def create_backup(
     recovery_window: bool,
 ) -> dict[str, Any]:
     require_central_marker()
-    command([SYSTEMCTL, "is-active", "--quiet", "pvn-central.target"], timeout=20)
+    if recovery_window:
+        require_recovery_service_state()
+    else:
+        command([SYSTEMCTL, "is-active", "--quiet", "pvn-central.target"], timeout=20)
     before = central_status()
     if recovery_window:
         require_local_leaders(before, selected)
@@ -790,9 +1083,12 @@ def create_backup(
                 != before[database.name].stable_backup_identity()
             )
             if changed:
-                fail(
-                    f"{database.name} Raft identity, term, leadership, or membership changed during backup"
+                detail = (
+                    "Raft identity, term, leadership, or membership"
+                    if recovery_window
+                    else "Raft cluster identity or membership"
                 )
+                fail(f"{database.name} {detail} changed during backup")
         hostname = safe_hostname()
         purpose = "recovery-window" if recovery_window else "general-backup"
         manifest = {
@@ -826,6 +1122,7 @@ def create_backup(
                         "database",
                         "cluster_id",
                         "server_id",
+                        "address",
                         "role",
                         "term",
                         "leader",
@@ -870,6 +1167,40 @@ def parser() -> argparse.ArgumentParser:
     )
     verify = subcommands.add_parser("verify", help="verify a backup set offline")
     verify.add_argument("backup_set", type=pathlib.Path)
+    pre_restore = subcommands.add_parser(
+        "pre-restore",
+        help="verify one recovery-window set against fresh live voter identities",
+    )
+    pre_restore.add_argument("backup_set", type=pathlib.Path)
+    pre_restore.add_argument(
+        "--database",
+        required=True,
+        choices=[database.key for database in DATABASES],
+        help="exact recovery-window database key",
+    )
+    pre_restore.add_argument(
+        "--captured-after",
+        required=True,
+        help="UTC maintenance-window boundary in YYYY-MM-DDTHH:MM:SSZ form",
+    )
+    pre_restore.add_argument(
+        "--expected-sha256",
+        required=True,
+        help="exact snapshot SHA-256 recorded from create output",
+    )
+    pre_restore.add_argument(
+        "--voter-status",
+        action="append",
+        required=True,
+        metavar="NODE=/SECURE/ABSOLUTE/PATH",
+        help="fresh root-only pvnctl central status JSON; repeat for every voter",
+    )
+    pre_restore.add_argument(
+        "--status-max-age",
+        type=int,
+        default=DEFAULT_STATUS_AGE,
+        help=f"maximum voter status file age in seconds (default: {DEFAULT_STATUS_AGE})",
+    )
     return result
 
 
@@ -893,8 +1224,17 @@ def main() -> int:
             )
         finally:
             os.close(lock_descriptor)
-    else:
+    elif arguments.action == "verify":
         report = verify_backup_set(clean_absolute(arguments.backup_set, "backup set"))
+    else:
+        report = pre_restore_check(
+            clean_absolute(arguments.backup_set, "backup set"),
+            arguments.database,
+            arguments.captured_after,
+            arguments.expected_sha256,
+            arguments.voter_status,
+            arguments.status_max_age,
+        )
     print(json.dumps(report, sort_keys=True))
     return 0
 

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import socket
 import stat
@@ -47,6 +49,7 @@ try:
     sequence_path = state / "status-sequence.json"
     counter_path = state / "status-counter"
     fail_database = state / "fail-database"
+    unit_override = state / "unit-override"
 
     sockets = {
         "PVN_Control": socket_root / "pvn-control.sock",
@@ -78,6 +81,11 @@ try:
         "OVN_Northbound": ("leader", "self"),
         "OVN_Southbound": ("leader", "self"),
     }
+    addresses = {
+        "PVN_Control": "ssl:192.0.2.10:6646",
+        "OVN_Northbound": "ssl:192.0.2.10:6643",
+        "OVN_Southbound": "ssl:192.0.2.10:6644",
+    }
     versions = {
         "PVN_Control": "1.0.0",
         "OVN_Northbound": "7.11.0",
@@ -97,6 +105,7 @@ try:
                 "healthy": True,
                 "cluster_id": cluster_ids[name],
                 "server_id": server_ids[name],
+                "address": addresses[name],
                 "role": roles[name][0],
                 "term": terms[name],
                 "leader": roles[name][1],
@@ -111,7 +120,18 @@ try:
 
     (fake_bin / "systemctl").write_text(
         "#!/bin/sh\n"
-        "[ \"$1 $2 $3\" = 'is-active --quiet pvn-central.target' ] || exit 2\n",
+        "if [ \"$1 $2 $3\" = 'is-active --quiet pvn-central.target' ]; then exit 0; fi\n"
+        "[ \"$1 $2 $3\" = 'show --property=ActiveState --value' ] || exit 2\n"
+        f"override={str(unit_override)!r}\n"
+        "if [ -f \"$override\" ]; then\n"
+        "  read -r override_unit override_state < \"$override\"\n"
+        "  if [ \"$4\" = \"$override_unit\" ]; then echo \"$override_state\"; exit 0; fi\n"
+        "fi\n"
+        "case \"$4\" in\n"
+        "  pvn-control-db.service|ovn-ovsdb-server-nb.service|ovn-ovsdb-server-sb.service) echo active ;;\n"
+        "  pvn-central.target|ovn-northd.service|pvn-manager.service|pvn-agent.service|ovn-controller.service) echo inactive ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
         encoding="ascii",
     )
     (fake_bin / "pvnctl").write_text(
@@ -271,6 +291,12 @@ else:
         shutil.copytree(source_path, destination)
         return destination
 
+    def write_status_report(name: str, report: dict) -> pathlib.Path:
+        path = state / name
+        path.write_text(json.dumps(report), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
     output_root = temporary / "backups"
     reset_status()
     created = require_success(
@@ -309,7 +335,7 @@ else:
     legacy_manifest["format"] = "pvn-db-backup/v1"
     legacy_manifest.pop("purpose")
     for entry in legacy_manifest["databases"]:
-        for field in ("server_id", "role", "term", "leader"):
+        for field in ("server_id", "address", "role", "term", "leader"):
             entry.pop(field)
     legacy_manifest_path.write_text(
         json.dumps(legacy_manifest, sort_keys=True, indent=2) + "\n",
@@ -355,6 +381,7 @@ else:
                     "database",
                     "cluster_id",
                     "server_id",
+                    "address",
                     "role",
                     "term",
                     "leader",
@@ -366,6 +393,235 @@ else:
             }
         ],
         "create report omitted the selected database identity",
+    )
+
+    source_hostname = re.sub(
+        r"[^A-Za-z0-9._-]", "-", socket.gethostname()
+    ).strip("._-")[:63]
+    source_report = copy.deepcopy(base_status)
+    follower_b_report = copy.deepcopy(base_status)
+    follower_b_report["databases"][1].update(
+        server_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        address="ssl:192.0.2.11:6643",
+        role="follower",
+        leader="bbbb",
+    )
+    follower_c_report = copy.deepcopy(base_status)
+    follower_c_report["databases"][1].update(
+        server_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        address="ssl:192.0.2.12:6643",
+        role="follower",
+        leader="bbbb",
+    )
+    status_paths = {
+        source_hostname: write_status_report("source-status.json", source_report),
+        "voter-b": write_status_report("voter-b-status.json", follower_b_report),
+        "voter-c": write_status_report("voter-c-status.json", follower_c_report),
+    }
+    selected_entry = selected_manifest["databases"][0]
+
+    def pre_restore_arguments(
+        *,
+        expected_sha256: str | None = None,
+        captured_after: str | None = None,
+        specifications: list[str] | None = None,
+    ) -> list[str]:
+        values = [
+            "pre-restore",
+            selected["backup_set"],
+            "--database",
+            "ovn-nb",
+            "--captured-after",
+            captured_after or selected_entry["capture_started_at"],
+            "--expected-sha256",
+            expected_sha256 or selected_entry["sha256"],
+        ]
+        for specification in specifications or [
+            f"{node}={path}" for node, path in status_paths.items()
+        ]:
+            values.extend(("--voter-status", specification))
+        return values
+
+    reset_status()
+    pre_restore = require_success(
+        invoke(*pre_restore_arguments()), "pre-restore identity gate"
+    )
+    check(
+        pre_restore["restore_ready"] is True
+        and pre_restore["live_identity_verified"] is True,
+        "pre-restore did not report a verified live identity",
+    )
+    check(
+        pre_restore["voters"] == sorted(status_paths),
+        "pre-restore did not retain exact voter labels",
+    )
+
+    reset_status()
+    result = invoke(*pre_restore_arguments(expected_sha256="0" * 64))
+    check(
+        result.returncode != 0 and "expected SHA-256" in result.stderr,
+        "pre-restore accepted the wrong recorded digest",
+    )
+
+    reset_status()
+    duplicate_path_specs = [
+        f"{source_hostname}={status_paths[source_hostname]}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-c={status_paths['voter-b']}",
+    ]
+    result = invoke(
+        *pre_restore_arguments(specifications=duplicate_path_specs)
+    )
+    check(
+        result.returncode != 0 and "path cannot be reused" in result.stderr,
+        "pre-restore accepted one voter status path twice",
+    )
+
+    duplicate_label_specs = [
+        f"{source_hostname}={status_paths[source_hostname]}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-b={status_paths['voter-c']}",
+    ]
+    reset_status()
+    result = invoke(
+        *pre_restore_arguments(specifications=duplicate_label_specs)
+    )
+    check(
+        result.returncode != 0 and "unique NODE=" in result.stderr,
+        "pre-restore accepted a duplicate voter label",
+    )
+
+    duplicate_server_report = copy.deepcopy(follower_c_report)
+    duplicate_server_report["databases"][1]["server_id"] = (
+        follower_b_report["databases"][1]["server_id"]
+    )
+    duplicate_server_path = write_status_report(
+        "duplicate-server-status.json", duplicate_server_report
+    )
+    duplicate_server_specs = [
+        f"{source_hostname}={status_paths[source_hostname]}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-c={duplicate_server_path}",
+    ]
+    reset_status()
+    result = invoke(
+        *pre_restore_arguments(specifications=duplicate_server_specs)
+    )
+    check(
+        result.returncode != 0 and "reuse a Raft server ID" in result.stderr,
+        "pre-restore accepted duplicate selected-database server IDs",
+    )
+
+    duplicate_address_report = copy.deepcopy(follower_c_report)
+    duplicate_address_report["databases"][1]["address"] = (
+        follower_b_report["databases"][1]["address"]
+    )
+    duplicate_address_path = write_status_report(
+        "duplicate-address-status.json", duplicate_address_report
+    )
+    duplicate_address_specs = [
+        f"{source_hostname}={status_paths[source_hostname]}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-c={duplicate_address_path}",
+    ]
+    reset_status()
+    result = invoke(
+        *pre_restore_arguments(specifications=duplicate_address_specs)
+    )
+    check(
+        result.returncode != 0 and "reuse a Raft address" in result.stderr,
+        "pre-restore accepted duplicate selected-database addresses",
+    )
+
+    wrong_term_report = copy.deepcopy(follower_c_report)
+    wrong_term_report["databases"][1]["term"] += 1
+    wrong_term_path = write_status_report("wrong-term-status.json", wrong_term_report)
+    wrong_term_specs = [
+        f"{source_hostname}={status_paths[source_hostname]}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-c={wrong_term_path}",
+    ]
+    reset_status()
+    result = invoke(*pre_restore_arguments(specifications=wrong_term_specs))
+    check(
+        result.returncode != 0 and "term differs" in result.stderr,
+        "pre-restore accepted a mismatched selected-database term",
+    )
+
+    wrong_port_report = copy.deepcopy(follower_c_report)
+    wrong_port_report["databases"][1]["address"] = "ssl:192.0.2.12:9999"
+    wrong_port_path = write_status_report("wrong-port-status.json", wrong_port_report)
+    wrong_port_specs = [
+        f"{source_hostname}={status_paths[source_hostname]}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-c={wrong_port_path}",
+    ]
+    reset_status()
+    result = invoke(*pre_restore_arguments(specifications=wrong_port_specs))
+    check(
+        result.returncode != 0 and "Raft port 6643" in result.stderr,
+        "pre-restore accepted a selected-database address on the wrong port",
+    )
+
+    duplicate_leader_report = copy.deepcopy(follower_c_report)
+    duplicate_leader_report["databases"][1].update(role="leader", leader="self")
+    duplicate_leader_path = write_status_report(
+        "duplicate-leader-status.json", duplicate_leader_report
+    )
+    duplicate_leader_specs = [
+        f"{source_hostname}={status_paths[source_hostname]}",
+        f"voter-b={status_paths['voter-b']}",
+        f"voter-c={duplicate_leader_path}",
+    ]
+    reset_status()
+    result = invoke(
+        *pre_restore_arguments(specifications=duplicate_leader_specs)
+    )
+    check(
+        result.returncode != 0 and "exactly one leader" in result.stderr,
+        "pre-restore accepted multiple selected-database leaders",
+    )
+
+    reset_status()
+    old_boundary = "2000-01-01T00:00:00Z"
+    result = invoke(*pre_restore_arguments(captured_after=old_boundary))
+    check(
+        result.returncode != 0 and "older than" in result.stderr,
+        "pre-restore accepted an obsolete maintenance-window boundary",
+    )
+
+    capture_completed_epoch = datetime.datetime.strptime(
+        selected_entry["capture_completed_at"], "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=datetime.timezone.utc).timestamp()
+    source_status_path = status_paths[source_hostname]
+    os.utime(
+        source_status_path,
+        (capture_completed_epoch - 1, capture_completed_epoch - 1),
+    )
+    reset_status()
+    result = invoke(*pre_restore_arguments())
+    check(
+        result.returncode != 0 and "predates the completed" in result.stderr,
+        "pre-restore accepted a voter report captured before the backup",
+    )
+    os.utime(source_status_path, None)
+
+    reset_status()
+    result = invoke(
+        "pre-restore",
+        str(backup_set),
+        "--database",
+        "pvn-control",
+        "--captured-after",
+        selected_entry["capture_started_at"],
+        "--expected-sha256",
+        manifest["databases"][0]["sha256"],
+        "--voter-status",
+        f"{source_hostname}={status_paths[source_hostname]}",
+    )
+    check(
+        result.returncode != 0 and "recovery-window" in result.stderr,
+        "pre-restore accepted a general backup set",
     )
 
     reset_status()
@@ -420,6 +676,50 @@ else:
         not missing_selection_output.exists(),
         "invalid recovery selection changed the output filesystem",
     )
+
+    reset_status()
+    unit_override.write_text("ovn-northd.service active\n", encoding="ascii")
+    active_writer_output = temporary / "active-writer-backups"
+    result = invoke(
+        "create",
+        "--output",
+        str(active_writer_output),
+        "--database",
+        "ovn-nb",
+        "--recovery-window",
+    )
+    check(
+        result.returncode != 0
+        and "ovn-northd.service inactive" in result.stderr,
+        "recovery window accepted an active northd writer",
+    )
+    check(
+        not active_writer_output.exists(),
+        "active northd rejection changed the output filesystem",
+    )
+    unit_override.unlink()
+
+    reset_status()
+    unit_override.write_text("ovn-ovsdb-server-sb.service inactive\n", encoding="ascii")
+    inactive_database_output = temporary / "inactive-database-backups"
+    result = invoke(
+        "create",
+        "--output",
+        str(inactive_database_output),
+        "--database",
+        "ovn-nb",
+        "--recovery-window",
+    )
+    check(
+        result.returncode != 0
+        and "ovn-ovsdb-server-sb.service active" in result.stderr,
+        "recovery window accepted an inactive database service",
+    )
+    check(
+        not inactive_database_output.exists(),
+        "inactive database rejection changed the output filesystem",
+    )
+    unit_override.unlink()
 
     tampered = clone_backup(backup_set, "tampered")
     with (tampered / "pvn-control.ovsdb").open("ab") as output:
