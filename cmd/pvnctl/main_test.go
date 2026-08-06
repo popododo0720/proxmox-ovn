@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/popododo0720/proxmox-ovn/internal/diagnostic"
 	"github.com/popododo0720/proxmox-ovn/internal/nodestate"
 	"github.com/popododo0720/proxmox-ovn/internal/raftstatus"
 )
@@ -121,5 +122,79 @@ func TestNodeCanRemove(t *testing.T) {
 	}
 	if err := run([]string{"node", "can-remove", "--state", path, "--config", filepath.Join(t.TempDir(), "missing-config.json")}); err != nil {
 		t.Fatalf("unused package should be removable: %v", err)
+	}
+}
+
+func TestDoctorRejectsUnsupportedStandaloneCheck(t *testing.T) {
+	err := doctor([]string{"--check", "not-a-doctor-check"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported standalone doctor check") {
+		t.Fatalf("unsupported standalone check was accepted: %v", err)
+	}
+}
+
+func TestDoctorStandaloneCheckWritesCompatibleJSON(t *testing.T) {
+	var output bytes.Buffer
+	err := doctorWith(
+		[]string{"--check", diagnostic.CorosyncRuntimeCheckName},
+		&output,
+		func(context.Context, diagnostic.Runner) diagnostic.Check {
+			return diagnostic.Check{
+				Name:    diagnostic.CorosyncRuntimeCheckName,
+				Status:  diagnostic.Pass,
+				Message: "runtime matches",
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checks []diagnostic.Check
+	if err := json.Unmarshal(output.Bytes(), &checks); err != nil {
+		t.Fatalf("decode doctor JSON: %v", err)
+	}
+	if len(checks) != 1 || checks[0].Name != diagnostic.CorosyncRuntimeCheckName || checks[0].Status != diagnostic.Pass {
+		t.Fatalf("unexpected standalone doctor JSON: %+v", checks)
+	}
+}
+
+func TestDoctorStandaloneCheckReturnsFailureAfterJSON(t *testing.T) {
+	var output bytes.Buffer
+	err := doctorWith(
+		[]string{"--check", diagnostic.CorosyncRuntimeCheckName},
+		&output,
+		func(context.Context, diagnostic.Runner) diagnostic.Check {
+			return diagnostic.Check{
+				Name:    diagnostic.CorosyncRuntimeCheckName,
+				Status:  diagnostic.Fail,
+				Message: "stale runtime",
+			}
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "checks failed") {
+		t.Fatalf("failed standalone doctor check was accepted: %v", err)
+	}
+	var checks []diagnostic.Check
+	if jsonErr := json.Unmarshal(output.Bytes(), &checks); jsonErr != nil {
+		t.Fatalf("failed doctor did not write compatible JSON: %v", jsonErr)
+	}
+	if len(checks) != 1 || checks[0].Status != diagnostic.Fail {
+		t.Fatalf("unexpected failed standalone doctor JSON: %+v", checks)
+	}
+}
+
+func TestDoctorRejectsDuplicateStandaloneCheck(t *testing.T) {
+	err := doctor([]string{
+		"--check", "corosync-runtime-config",
+		"--check", "corosync-runtime-config",
+	})
+	if err == nil || !strings.Contains(err.Error(), "specified only once") {
+		t.Fatalf("duplicate standalone check was accepted: %v", err)
+	}
+}
+
+func TestDoctorRejectsPositionalArguments(t *testing.T) {
+	err := doctor([]string{"unexpected"})
+	if err == nil || !strings.Contains(err.Error(), "does not accept positional arguments") {
+		t.Fatalf("doctor positional argument was accepted: %v", err)
 	}
 }

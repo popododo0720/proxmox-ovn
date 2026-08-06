@@ -13,6 +13,10 @@ import (
 
 const defaultCorosyncConfigPath = "/etc/pve/corosync.conf"
 
+// CorosyncRuntimeCheckName is the stable doctor check name used by package
+// installation and rolling-update safety gates.
+const CorosyncRuntimeCheckName = "corosync-runtime-config"
+
 const maxCorosyncConfigSize = 1024 * 1024
 
 var (
@@ -69,7 +73,7 @@ type corosyncRuntimeSnapshot struct {
 }
 
 func corosyncRuntimeCheck(ctx context.Context, runner Runner, path string) Check {
-	const name = "corosync-runtime-config"
+	const name = CorosyncRuntimeCheckName
 
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
@@ -115,6 +119,14 @@ func corosyncRuntimeCheck(ctx context.Context, runner Runner, path string) Check
 		Status:  Pass,
 		Message: fmt.Sprintf("config_version %d; %d configured nodes and joined runtime members match", persisted.Version, len(persisted.Nodes)),
 	}
+}
+
+// CorosyncRuntimeCheck compares the persisted PVE Corosync configuration with
+// the currently joined runtime without requiring PVN to be configured or
+// active. Package orchestration uses it before any post-upgrade service
+// restart and between rolling node mutations.
+func CorosyncRuntimeCheck(ctx context.Context, runner Runner) Check {
+	return corosyncRuntimeCheck(ctx, runner, defaultCorosyncConfigPath)
 }
 
 func parseCorosyncConfig(text string) (corosyncConfigSnapshot, error) {

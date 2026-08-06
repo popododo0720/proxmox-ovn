@@ -121,18 +121,54 @@ func pkiIssueNode(args []string) error {
 }
 
 func doctor(args []string) error {
+	return doctorWith(args, os.Stdout, diagnostic.CorosyncRuntimeCheck)
+}
+
+func doctorWith(
+	args []string,
+	output io.Writer,
+	corosyncCheck func(context.Context, diagnostic.Runner) diagnostic.Check,
+) error {
 	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	path := flags.String("config", config.DefaultPath, "PVN config path")
 	nodeEnvPath := flags.String("node-env", config.DefaultNodeEnvPath, "node-local PVN environment path")
+	check := ""
+	checkSet := false
+	flags.Func("check", "run one configuration-independent safety check", func(value string) error {
+		if checkSet {
+			return errors.New("--check may be specified only once")
+		}
+		checkSet = true
+		check = value
+		return nil
+	})
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("doctor does not accept positional arguments")
+	}
+	if checkSet {
+		if check != diagnostic.CorosyncRuntimeCheckName {
+			return fmt.Errorf("unsupported standalone doctor check %q", check)
+		}
+		checks := []diagnostic.Check{
+			corosyncCheck(context.Background(), diagnostic.ExecRunner{}),
+		}
+		if err := writeJSON(output, checks); err != nil {
+			return err
+		}
+		if !diagnostic.Healthy(checks) {
+			return errors.New("one or more checks failed")
+		}
+		return nil
 	}
 	cfg, err := config.LoadNode(*path, *nodeEnvPath)
 	if err != nil {
 		return err
 	}
 	checks := diagnostic.Run(context.Background(), cfg, diagnostic.ExecRunner{})
-	if err := writeJSON(os.Stdout, checks); err != nil {
+	if err := writeJSON(output, checks); err != nil {
 		return err
 	}
 	if !diagnostic.Healthy(checks) {
