@@ -110,14 +110,40 @@ jobs:
             printf 'existing release has invalid tag or prerelease state\n' >&2
             exit 1
           fi
-          unexpected_uploaders=$(gh release view "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --json assets \
-            --jq '.assets[] | select(.uploader.login != "github-actions[bot]") | .name')
-          if [[ -n $unexpected_uploaders ]]; then
-            printf 'release contains assets from a noncanonical publisher:\n%s\n' \
-              "$unexpected_uploaders" >&2
-            exit 1
-          fi
+          verify_asset_uploaders() {
+            local asset_api_prefix asset_api_url asset_api_urls asset_id asset_record
+            local asset_name asset_uploader
+            asset_api_prefix="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/"
+            asset_api_urls=$(gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[] | (.apiUrl // "")')
+            if [[ -z $asset_api_urls ]]; then
+              return 0
+            fi
+            while IFS= read -r asset_api_url; do
+              if [[ $asset_api_url != "$asset_api_prefix"* ]]; then
+                printf 'release asset has an invalid API URL: %s\n' \
+                  "$asset_api_url" >&2
+                exit 1
+              fi
+              asset_id=${asset_api_url#"$asset_api_prefix"}
+              if [[ ! $asset_id =~ ^[0-9]+$ ]]; then
+                printf 'release asset has an invalid API ID: %s\n' \
+                  "$asset_id" >&2
+                exit 1
+              fi
+              asset_record=$(gh api \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+                --jq '[.name, (.uploader.login // "")] | @tsv')
+              IFS=$'\t' read -r asset_name asset_uploader <<< "$asset_record"
+              if [[ $asset_uploader != 'github-actions[bot]' ]]; then
+                printf 'release asset was not uploaded by the canonical publisher: %s (%s)\n' \
+                  "$asset_name" "${asset_uploader:-missing}" >&2
+                exit 1
+              fi
+            done <<< "$asset_api_urls"
+          }
+          verify_asset_uploaders
 
       - name: Run release source gates
         run: make fmt-check vet test test-race web-test ui-test package-check release-check-test
@@ -227,8 +253,41 @@ jobs:
               exit 1
             fi
           }
+          verify_asset_uploaders() {
+            local asset_api_prefix asset_api_url asset_api_urls asset_id asset_record
+            local asset_name asset_uploader
+            asset_api_prefix="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/"
+            asset_api_urls=$(gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[] | (.apiUrl // "")')
+            if [[ -z $asset_api_urls ]]; then
+              return 0
+            fi
+            while IFS= read -r asset_api_url; do
+              if [[ $asset_api_url != "$asset_api_prefix"* ]]; then
+                printf 'release asset has an invalid API URL: %s\n' \
+                  "$asset_api_url" >&2
+                exit 1
+              fi
+              asset_id=${asset_api_url#"$asset_api_prefix"}
+              if [[ ! $asset_id =~ ^[0-9]+$ ]]; then
+                printf 'release asset has an invalid API ID: %s\n' \
+                  "$asset_id" >&2
+                exit 1
+              fi
+              asset_record=$(gh api \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+                --jq '[.name, (.uploader.login // "")] | @tsv')
+              IFS=$'\t' read -r asset_name asset_uploader <<< "$asset_record"
+              if [[ $asset_uploader != 'github-actions[bot]' ]]; then
+                printf 'release asset was not uploaded by the canonical publisher: %s (%s)\n' \
+                  "$asset_name" "${asset_uploader:-missing}" >&2
+                exit 1
+              fi
+            done <<< "$asset_api_urls"
+          }
           verify_release_provenance() {
-            local release_author unexpected_uploaders
+            local release_author
             release_author=$(gh release view "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" --json author \
               --jq '.author.login')
@@ -237,14 +296,7 @@ jobs:
                 "$release_author" >&2
               exit 1
             fi
-            unexpected_uploaders=$(gh release view "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" --json assets \
-              --jq '.assets[] | select(.uploader.login != "github-actions[bot]") | .name')
-            if [[ -n $unexpected_uploaders ]]; then
-              printf 'release contains assets from a noncanonical publisher:\n%s\n' \
-                "$unexpected_uploaders" >&2
-              exit 1
-            fi
+            verify_asset_uploaders
           }
 
           verify_remote_tag

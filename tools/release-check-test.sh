@@ -82,5 +82,18 @@ grep -Fq 'gh release view "$GITHUB_REF_NAME"' "$release_workflow" || {
     printf 'release workflow does not resolve releases through draft-aware gh lookup\n' >&2
     exit 1
 }
+if grep -Fq \
+    '.assets[] | select(.uploader.login != "github-actions[bot]")' \
+    "$release_workflow"; then
+    printf 'release workflow trusts uploader data omitted by gh release view\n' >&2
+    exit 1
+fi
+rest_uploader_checks=$(grep -Fc \
+    '"repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"' \
+    "$release_workflow")
+if (( rest_uploader_checks != 2 )); then
+    printf 'release workflow does not verify claim and publish assets through REST\n' >&2
+    exit 1
+fi
 
 printf 'release-check tests passed\n'
