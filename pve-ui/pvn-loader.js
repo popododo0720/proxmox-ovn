@@ -234,7 +234,37 @@
                 }
                 payload[spec.name] = value;
             });
+            if (collection === 'subnets' && fields.some(function (spec) {
+                return spec.name === 'allocation_pool_start' || spec.name === 'allocation_pool_end';
+            })) {
+                var poolStart = text(values.allocation_pool_start).trim();
+                var poolEnd = text(values.allocation_pool_end).trim();
+                var originalPools = dataOf(resource).allocation_pools || [];
+                delete payload.allocation_pool_start;
+                delete payload.allocation_pool_end;
+                if (Boolean(poolStart) !== Boolean(poolEnd)) {
+                    throw new Error('Both DHCP/IPAM range endpoints are required.');
+                }
+                if (poolStart || poolEnd) {
+                    if (!isCreate && originalPools.length > 1 && originalPools[0].start === poolStart && originalPools[0].end === poolEnd) {
+                        payload.allocation_pools = originalPools;
+                    } else {
+                        payload.allocation_pools = [{ start: poolStart, end: poolEnd }];
+                    }
+                } else if (!isCreate) {
+                    payload.allocation_pools = [];
+                }
+            }
             return payload;
+        }
+
+        function formValues(resource, collection) {
+            var values = Ext.apply({}, dataOf(resource));
+            if (collection === 'subnets' && Array.isArray(values.allocation_pools) && values.allocation_pools.length > 0) {
+                values.allocation_pool_start = values.allocation_pools[0].start || '';
+                values.allocation_pool_end = values.allocation_pools[0].end || '';
+            }
+            return values;
         }
 
         PVN.Utils = {
@@ -245,6 +275,7 @@
             detailRows: detailRows,
             editableResource: editableResource,
             formPayload: formPayload,
+            formValues: formValues,
             html: html,
             humanName: humanName,
             idempotencyKey: idempotencyKey,
@@ -411,7 +442,7 @@
             },
         });
 
-        function fieldConfig(spec) {
+        function fieldConfig(spec, lockedFields) {
             var config = {
                 name: spec.name,
                 fieldLabel: spec.label,
@@ -421,6 +452,9 @@
                 minValue: spec.minValue,
                 maxValue: spec.maxValue,
             };
+            if ((lockedFields || []).indexOf(spec.name) !== -1) {
+                config.readOnly = true;
+            }
             if (spec.type === 'number') {
                 config.xtype = 'proxmoxintegerfield';
             } else if (spec.type === 'checkbox') {
@@ -436,6 +470,10 @@
                 config.where = spec.where;
                 config.match = spec.match;
                 config.multiSelect = Boolean(spec.multiple);
+                if (config.readOnly) {
+                    config.editable = false;
+                    config.hideTrigger = true;
+                }
             } else {
                 config.xtype = 'textfield';
             }
@@ -460,7 +498,9 @@
                 me.subject = me.subject || me.resourceLabel || 'PVN resource';
 
                 var panel = Ext.create('Proxmox.panel.InputPanel', {
-                    items: fields.map(fieldConfig),
+                    items: fields.map(function (spec) {
+                        return fieldConfig(spec, isCreate ? me.lockedCreateFields : []);
+                    }),
                     onGetValues: function (values) {
                         var payload = formPayload(values, fields, resource, isCreate, me.collection);
                         return writeParams(payload, isCreate ? undefined : resource.revision);
@@ -469,7 +509,9 @@
                 me.items = [panel];
                 me.callParent();
                 if (!isCreate) {
-                    me.setValues(resource);
+                    me.setValues(formValues(resource, me.collection));
+                } else if (me.createValues) {
+                    me.setValues(me.createValues);
                 }
             },
         });
@@ -978,14 +1020,24 @@
                 }
 
                 function reload() {
+                    if (me.requiredFilter) {
+                        var requiredProxy = me.store.getProxy ? me.store.getProxy() : me.store.proxy;
+                        var requiredParams = requiredProxy && requiredProxy.extraParams || {};
+                        if (!requiredParams[me.requiredFilter]) {
+                            if (me.store.removeAll) me.store.removeAll();
+                            return;
+                        }
+                    }
                     refreshStore(me.store);
                 }
+                me.reloadResourceGrid = reload;
 
                 function showFailure(response) {
                     Ext.Msg.alert('Error', html(apiError(response)));
                 }
 
                 function openEditor(record) {
+                    var createValues = typeof me.createValues === 'function' ? me.createValues() : me.createValues;
                     var win = Ext.create('PVN.window.ResourceEdit', {
                         collection: me.collection,
                         resource: record || null,
@@ -993,6 +1045,8 @@
                         createFields: me.createFields,
                         editFields: me.editFields,
                         createAction: me.createAction,
+                        createValues: createValues,
+                        lockedCreateFields: me.lockedCreateFields,
                     });
                     if (win.on) win.on('destroy', reload);
                     win.show();
@@ -1057,6 +1111,9 @@
                         if (editButton) editButton.setDisabled(readOnly);
                         if (deleteButton) deleteButton.setDisabled(readOnly);
                         detailsButton.setDisabled(!record);
+                        if (typeof me.onPVNSelectionChange === 'function') {
+                            me.onPVNSelectionChange(record || null);
+                        }
                     });
                 }
 
@@ -1103,6 +1160,35 @@
                 me.callParent();
             },
         });
+
+        function setRelatedGrid(grid, filterName, record, createValues, lockedFields) {
+            if (!grid) return;
+            var store = grid.getStore ? grid.getStore() : grid.store;
+            var proxy = store && (store.getProxy ? store.getProxy() : store.proxy);
+            if (!proxy) return;
+            proxy.extraParams = proxy.extraParams || {};
+            var data = dataOf(record);
+            if (!record || !data.id) {
+                delete proxy.extraParams[filterName];
+                grid.createValues = null;
+                grid.lockedCreateFields = [];
+                if (grid.setDisabled) grid.setDisabled(true);
+                if (store.removeAll) store.removeAll();
+                return;
+            }
+            proxy.extraParams[filterName] = data.id;
+            grid.createValues = Ext.apply({}, createValues || {});
+            grid.createValues[filterName] = data.id;
+            grid.lockedCreateFields = lockedFields || [filterName];
+            if (grid.setDisabled) grid.setDisabled(false);
+            if (grid.reloadResourceGrid) {
+                grid.reloadResourceGrid();
+            } else {
+                refreshStore(store);
+            }
+        }
+
+        PVN.Utils.setRelatedGrid = setRelatedGrid;
 
         Ext.define('PVN.panel.Overview', {
             extend: 'Ext.panel.Panel',
@@ -1271,6 +1357,13 @@
             return { text: 'State', dataIndex: 'state', width: 125, renderer: statusRenderer };
         }
 
+        function allocationPoolRenderer(pools) {
+            if (!Array.isArray(pools) || pools.length === 0) return 'Automatic';
+            return html(pools.map(function (pool) {
+                return (pool.start || '?') + ' - ' + (pool.end || '?');
+            }).join(', '));
+        }
+
         var networkCreateFields = [
             { name: 'name', label: 'Name', required: true, placeholder: 'application' },
             { name: 'mtu', label: 'Guest MTU', type: 'number', defaultValue: 1400, minValue: 576, maxValue: 9000 },
@@ -1291,6 +1384,8 @@
             { name: 'cidr', label: 'IPv4 CIDR', required: true, placeholder: '10.42.0.0/24' },
             { name: 'gateway_ip', label: 'Gateway IP', placeholder: '10.42.0.1' },
             { name: 'enable_dhcp', label: 'Enable OVN DHCP', type: 'checkbox', defaultValue: true },
+            { name: 'allocation_pool_start', label: 'DHCP/IPAM range start', placeholder: '10.42.0.10' },
+            { name: 'allocation_pool_end', label: 'DHCP/IPAM range end', placeholder: '10.42.0.200' },
         ];
         var routerCreateFields = [
             { name: 'name', label: 'Name', required: true, placeholder: 'edge' },
@@ -1354,7 +1449,10 @@
 
         PVN.Resources = {
             networks: { createFields: networkCreateFields, editFields: networkEditFields },
-            subnets: { createFields: subnetCreateFields, editFields: [subnetCreateFields[0], subnetCreateFields[3], subnetCreateFields[4]] },
+            subnets: {
+                createFields: subnetCreateFields,
+                editFields: [subnetCreateFields[0], subnetCreateFields[3], subnetCreateFields[4], subnetCreateFields[5], subnetCreateFields[6]],
+            },
             routers: { createFields: routerCreateFields, editFields: routerCreateFields },
             'router-interfaces': { createFields: routerInterfaceFields },
             ports: { createFields: portProvisionFields, createAction: 'provision', deleteAction: 'deprovision' },
@@ -1662,58 +1760,104 @@
             },
         });
 
-        Ext.define('PVN.panel.Networks', {
-            extend: 'Ext.tab.Panel', alias: 'widget.pvnNetworks', border: false,
-            items: [{
-                xtype: 'pvnResourceGrid', title: 'Networks', collection: 'networks',
-                resourceLabel: 'Network', createFields: networkCreateFields,
-                editFields: networkEditFields, allowDelete: true,
-                columns: [
-                    namedColumn('Network', 'Unnamed network'),
-                    { text: 'External', dataIndex: 'external', width: 90, renderer: booleanRenderer },
-                    { text: 'MTU', dataIndex: 'mtu', width: 90 },
-                    { text: 'Provider', dataIndex: 'provider_network_id', flex: 1, renderer: referenceRenderer('provider-networks', 'Unavailable provider') },
-                    stateColumn(),
-                ],
-            }, {
-                xtype: 'pvnResourceGrid', title: 'Subnets', collection: 'subnets',
-                resourceLabel: 'Subnet', createFields: subnetCreateFields,
-                editFields: PVN.Resources.subnets.editFields, allowDelete: true,
-                columns: [
-                    namedColumn('Subnet', 'Unnamed subnet', ['name', 'cidr']),
-                    { text: 'Network', dataIndex: 'network_id', flex: 1, renderer: referenceRenderer('networks', 'Unavailable network') },
-                    { text: 'CIDR', dataIndex: 'cidr', width: 150 },
-                    { text: 'Gateway', dataIndex: 'gateway_ip', width: 140 },
-                    { text: 'DHCP', dataIndex: 'enable_dhcp', width: 80, renderer: booleanRenderer },
-                    stateColumn(),
-                ],
-            }],
+        Ext.define('PVN.panel.LogicalNetworks', {
+            extend: 'Ext.panel.Panel', alias: 'widget.pvnLogicalNetworks', border: false,
+
+            initComponent: function () {
+                var me = this;
+                var portGrid = Ext.create('PVN.grid.Resource', {
+                    region: 'center', title: 'Ports on selected subnet', split: true,
+                    collection: 'ports', resourceLabel: 'Port', requiredFilter: 'subnet_id', disabled: true,
+                    createFields: portProvisionFields, createAction: 'provision', allowDelete: true, deleteAction: 'deprovision',
+                    columns: [
+                        namedColumn('Port', 'Unnamed port', ['name', 'mac_address']),
+                        { text: 'Fixed IPs', dataIndex: 'fixed_ips', flex: 1, renderer: listRenderer },
+                        { text: 'MAC address', dataIndex: 'mac_address', width: 155 },
+                        { text: 'VM', dataIndex: 'vmid', width: 110 },
+                        { text: 'Binding', dataIndex: 'binding_status', width: 110, renderer: statusRenderer },
+                        stateColumn(),
+                    ],
+                });
+                var subnetGrid = Ext.create('PVN.grid.Resource', {
+                    region: 'center', title: 'Subnets', split: true,
+                    collection: 'subnets', resourceLabel: 'Subnet', requiredFilter: 'network_id', disabled: true,
+                    createFields: subnetCreateFields, editFields: PVN.Resources.subnets.editFields, allowDelete: true,
+                    onPVNSelectionChange: function (record) {
+                        var subnet = dataOf(record);
+                        setRelatedGrid(portGrid, 'subnet_id', record, {
+                            network_id: subnet.network_id,
+                        }, ['network_id', 'subnet_id']);
+                    },
+                    columns: [
+                        namedColumn('Subnet', 'Unnamed subnet', ['name', 'cidr']),
+                        { text: 'CIDR', dataIndex: 'cidr', width: 140 },
+                        { text: 'Gateway', dataIndex: 'gateway_ip', width: 130 },
+                        { text: 'DHCP', dataIndex: 'enable_dhcp', width: 70, renderer: booleanRenderer },
+                        { text: 'DHCP/IPAM range', dataIndex: 'allocation_pools', flex: 1, minWidth: 190, renderer: allocationPoolRenderer },
+                        stateColumn(),
+                    ],
+                });
+                var networkGrid = Ext.create('PVN.grid.Resource', {
+                    region: 'north', height: '44%', title: 'Logical Networks', split: true,
+                    collection: 'networks', resourceLabel: 'Network', createFields: networkCreateFields,
+                    editFields: networkEditFields, allowDelete: true,
+                    onPVNSelectionChange: function (record) {
+                        setRelatedGrid(subnetGrid, 'network_id', record, null, ['network_id']);
+                        setRelatedGrid(portGrid, 'subnet_id', null);
+                    },
+                    columns: [
+                        namedColumn('Network', 'Unnamed network'),
+                        { text: 'External', dataIndex: 'external', width: 80, renderer: booleanRenderer },
+                        { text: 'MTU', dataIndex: 'mtu', width: 80 },
+                        { text: 'Provider', dataIndex: 'provider_network_id', flex: 1, renderer: referenceRenderer('provider-networks', 'Overlay') },
+                        stateColumn(),
+                    ],
+                });
+                Ext.apply(me, {
+                    layout: 'border',
+                    items: [{
+                        xtype: 'panel', region: 'west', width: '58%', minWidth: 560,
+                        split: true, border: false, layout: 'border', items: [networkGrid, subnetGrid],
+                    }, portGrid],
+                });
+                me.callParent();
+            },
         });
 
         Ext.define('PVN.panel.Routers', {
-            extend: 'Ext.tab.Panel', alias: 'widget.pvnRouters', border: false,
-            items: [{
-                xtype: 'pvnResourceGrid', title: 'Routers', collection: 'routers',
-                resourceLabel: 'Router', createFields: routerCreateFields,
-                editFields: routerCreateFields, allowDelete: true,
-                columns: [
-                    namedColumn('Router', 'Unnamed router'),
-                    { text: 'External network', dataIndex: 'external_network_id', flex: 1, renderer: referenceRenderer('networks', 'Unavailable network') },
-                    { text: 'Gateway IP', dataIndex: 'external_ip_address', width: 150 },
-                    { text: 'SNAT', dataIndex: 'enable_snat', width: 80, renderer: booleanRenderer },
-                    stateColumn(),
-                ],
-            }, {
-                xtype: 'pvnResourceGrid', title: 'Interfaces', collection: 'router-interfaces',
-                resourceLabel: 'Router interface', createFields: routerInterfaceFields,
-                allowDelete: true,
-                columns: [
-                    { text: 'Router', dataIndex: 'router_id', flex: 1, renderer: referenceRenderer('routers', 'Unavailable router') },
-                    { text: 'Subnet', dataIndex: 'subnet_id', flex: 1, renderer: referenceRenderer('subnets', 'Unavailable subnet', ['name', 'cidr']) },
-                    { text: 'Port', dataIndex: 'port_id', flex: 1, renderer: referenceRenderer('ports', 'Managed logical port', ['name', 'mac_address']) },
-                    stateColumn(),
-                ],
-            }],
+            extend: 'Ext.panel.Panel', alias: 'widget.pvnRouters', border: false,
+
+            initComponent: function () {
+                var me = this;
+                var interfaceGrid = Ext.create('PVN.grid.Resource', {
+                    region: 'center', title: 'Interfaces on selected router', split: true,
+                    collection: 'router-interfaces', resourceLabel: 'Router interface',
+                    requiredFilter: 'router_id', disabled: true,
+                    createFields: routerInterfaceFields, allowDelete: true,
+                    columns: [
+                        { text: 'Subnet', dataIndex: 'subnet_id', flex: 1, renderer: referenceRenderer('subnets', 'Unavailable subnet', ['name', 'cidr']) },
+                        { text: 'Port', dataIndex: 'port_id', flex: 1, renderer: referenceRenderer('ports', 'Managed logical port', ['name', 'mac_address']) },
+                        stateColumn(),
+                    ],
+                });
+                var routerGrid = Ext.create('PVN.grid.Resource', {
+                    region: 'west', width: '48%', minWidth: 520, split: true,
+                    title: 'Routers', collection: 'routers', resourceLabel: 'Router',
+                    createFields: routerCreateFields, editFields: routerCreateFields, allowDelete: true,
+                    onPVNSelectionChange: function (record) {
+                        setRelatedGrid(interfaceGrid, 'router_id', record, null, ['router_id']);
+                    },
+                    columns: [
+                        namedColumn('Router', 'Unnamed router'),
+                        { text: 'External network', dataIndex: 'external_network_id', flex: 1, renderer: referenceRenderer('networks', 'None') },
+                        { text: 'Gateway IP', dataIndex: 'external_ip_address', width: 140 },
+                        { text: 'SNAT', dataIndex: 'enable_snat', width: 70, renderer: booleanRenderer },
+                        stateColumn(),
+                    ],
+                });
+                Ext.apply(me, { layout: 'border', items: [routerGrid, interfaceGrid] });
+                me.callParent();
+            },
         });
 
         Ext.define('PVN.panel.Ports', {
@@ -1752,59 +1896,113 @@
         });
 
         Ext.define('PVN.panel.SecurityGroups', {
-            extend: 'Ext.tab.Panel', alias: 'widget.pvnSecurityGroups', border: false,
-            items: [{
-                xtype: 'pvnResourceGrid', title: 'Security Groups', collection: 'security-groups',
-                resourceLabel: 'Security group', createFields: securityGroupCreateFields,
-                editFields: securityGroupCreateFields, allowDelete: true,
-                columns: [
-                    namedColumn('Security group', 'Unnamed security group'),
-                    { text: 'Description', dataIndex: 'description', flex: 2, renderer: html },
-                    { text: 'Stateful', dataIndex: 'stateful', width: 90, renderer: booleanRenderer },
-                    { text: 'Managed', dataIndex: 'managed', width: 90, renderer: booleanRenderer },
-                    stateColumn(),
-                ],
-            }, {
-                xtype: 'pvnResourceGrid', title: 'Rules', collection: 'security-group-rules',
-                resourceLabel: 'Security group rule', createFields: securityRuleCreateFields,
-                editFields: PVN.Resources['security-group-rules'].editFields, allowDelete: true,
-                columns: [
-                    { text: 'Security group', dataIndex: 'security_group_id', flex: 1, renderer: referenceRenderer('security-groups', 'Unavailable security group') },
-                    { text: 'Direction', dataIndex: 'direction', width: 100 },
-                    { text: 'Protocol', dataIndex: 'protocol', width: 100 },
-                    { text: 'Ports', dataIndex: 'port_range_min', width: 110, renderer: function (value, _meta, record) { return value ? html(value + '-' + (record.get('port_range_max') || value)) : '-'; } },
-                    { text: 'Remote CIDR', dataIndex: 'remote_cidr', width: 150 },
-                    { text: 'Remote group', dataIndex: 'remote_group_id', flex: 1, renderer: referenceRenderer('security-groups', 'Unavailable security group') },
-                    { text: 'Action', dataIndex: 'action', width: 90 },
-                    stateColumn(),
-                ],
-            }],
+            extend: 'Ext.panel.Panel', alias: 'widget.pvnSecurityGroups', border: false,
+
+            initComponent: function () {
+                var me = this;
+                var ruleGrid = Ext.create('PVN.grid.Resource', {
+                    region: 'center', title: 'Rules in selected group', split: true,
+                    collection: 'security-group-rules', resourceLabel: 'Security group rule',
+                    requiredFilter: 'security_group_id', disabled: true,
+                    createFields: securityRuleCreateFields,
+                    editFields: PVN.Resources['security-group-rules'].editFields, allowDelete: true,
+                    columns: [
+                        { text: 'Direction', dataIndex: 'direction', width: 90 },
+                        { text: 'Protocol', dataIndex: 'protocol', width: 90 },
+                        { text: 'Ports', dataIndex: 'port_range_min', width: 110, renderer: function (value, _meta, record) { return value ? html(value + '-' + (record.get('port_range_max') || value)) : '-'; } },
+                        { text: 'Remote CIDR', dataIndex: 'remote_cidr', width: 145 },
+                        { text: 'Remote group', dataIndex: 'remote_group_id', flex: 1, renderer: referenceRenderer('security-groups', 'None') },
+                        { text: 'Action', dataIndex: 'action', width: 80 },
+                        stateColumn(),
+                    ],
+                });
+                var groupGrid = Ext.create('PVN.grid.Resource', {
+                    region: 'west', width: '45%', minWidth: 480, split: true,
+                    title: 'Security Groups', collection: 'security-groups',
+                    resourceLabel: 'Security group', createFields: securityGroupCreateFields,
+                    editFields: securityGroupCreateFields, allowDelete: true,
+                    onPVNSelectionChange: function (record) {
+                        setRelatedGrid(ruleGrid, 'security_group_id', record, null, ['security_group_id']);
+                    },
+                    columns: [
+                        namedColumn('Security group', 'Unnamed security group'),
+                        { text: 'Description', dataIndex: 'description', flex: 2, renderer: html },
+                        { text: 'Managed', dataIndex: 'managed', width: 80, renderer: booleanRenderer },
+                        stateColumn(),
+                    ],
+                });
+                Ext.apply(me, { layout: 'border', items: [groupGrid, ruleGrid] });
+                me.callParent();
+            },
         });
 
         Ext.define('PVN.panel.ProviderNetworks', {
-            extend: 'Ext.tab.Panel', alias: 'widget.pvnProviderNetworks', border: false,
+            extend: 'Ext.panel.Panel', alias: 'widget.pvnProviderNetworks', border: false,
+
+            initComponent: function () {
+                var me = this;
+                var segmentGrid = Ext.create('PVN.grid.Resource', {
+                    title: 'Segments', collection: 'provider-segments', resourceLabel: 'Provider segment',
+                    requiredFilter: 'provider_network_id', disabled: true,
+                    createFields: providerSegmentCreateFields,
+                    editFields: PVN.Resources['provider-segments'].editFields, allowDelete: true,
+                    columns: [
+                        namedColumn('Segment', 'Unnamed segment'),
+                        { text: 'Type', dataIndex: 'network_type', width: 80 },
+                        { text: 'Physical network', dataIndex: 'physical_network', flex: 1 },
+                        { text: 'VLAN', dataIndex: 'vlan_id', width: 70 },
+                        stateColumn(),
+                    ],
+                });
+                var externalNetworkGrid = Ext.create('PVN.grid.Resource', {
+                    title: 'External Networks', collection: 'networks', resourceLabel: 'External network',
+                    requiredFilter: 'provider_network_id', disabled: true,
+                    createFields: networkCreateFields, editFields: networkEditFields, allowDelete: true,
+                    columns: [
+                        namedColumn('External network', 'Unnamed network'),
+                        { text: 'MTU', dataIndex: 'mtu', width: 80 },
+                        { text: 'Description', dataIndex: 'description', flex: 1, renderer: html },
+                        stateColumn(),
+                    ],
+                });
+                var floatingGrid = Ext.create('PVN.grid.FloatingIPs', {
+                    title: 'Floating IPs', requiredFilter: 'provider_network_id', disabled: true,
+                });
+                var providerGrid = Ext.create('PVN.grid.Resource', {
+                    region: 'west', width: '42%', minWidth: 430, split: true,
+                    title: 'Provider Networks', collection: 'provider-networks',
+                    resourceLabel: 'Provider network', createFields: providerNetworkCreateFields,
+                    editFields: providerNetworkEditFields, allowDelete: true,
+                    onPVNSelectionChange: function (record) {
+                        setRelatedGrid(segmentGrid, 'provider_network_id', record, null, ['provider_network_id']);
+                        setRelatedGrid(externalNetworkGrid, 'provider_network_id', record, {
+                            external: true,
+                        }, ['external', 'provider_network_id']);
+                        setRelatedGrid(floatingGrid, 'provider_network_id', record, null, ['provider_network_id']);
+                    },
+                    columns: [
+                        namedColumn('Provider network', 'Unnamed provider network'),
+                        { text: 'Default segment', dataIndex: 'default_segment_id', flex: 1, renderer: referenceRenderer('provider-segments', 'None') },
+                        stateColumn(),
+                    ],
+                });
+                Ext.apply(me, {
+                    layout: 'border',
+                    items: [providerGrid, {
+                        xtype: 'tabpanel', region: 'center', border: false,
+                        items: [segmentGrid, externalNetworkGrid, floatingGrid],
+                    }],
+                });
+                me.callParent();
+            },
+        });
+
+        Ext.define('PVN.panel.Networks', {
+            extend: 'Ext.tab.Panel', alias: 'widget.pvnNetworks', border: false,
             items: [{
-                xtype: 'pvnResourceGrid', title: 'Provider Networks', collection: 'provider-networks',
-                resourceLabel: 'Provider network', createFields: providerNetworkCreateFields,
-                editFields: providerNetworkEditFields, allowDelete: true,
-                columns: [
-                    namedColumn('Provider network', 'Unnamed provider network'),
-                    { text: 'Default segment', dataIndex: 'default_segment_id', flex: 1, renderer: referenceRenderer('provider-segments', 'No default segment') },
-                    { text: 'Description', dataIndex: 'description', flex: 2, renderer: html },
-                    stateColumn(),
-                ],
+                xtype: 'pvnLogicalNetworks', title: 'Logical Networks', iconCls: 'fa fa-cloud',
             }, {
-                xtype: 'pvnResourceGrid', title: 'Segments', collection: 'provider-segments',
-                resourceLabel: 'Provider segment', createFields: providerSegmentCreateFields,
-                editFields: PVN.Resources['provider-segments'].editFields, allowDelete: true,
-                columns: [
-                    namedColumn('Segment', 'Unnamed segment'),
-                    { text: 'Provider', dataIndex: 'provider_network_id', flex: 1, renderer: referenceRenderer('provider-networks', 'Unavailable provider') },
-                    { text: 'Type', dataIndex: 'network_type', width: 90 },
-                    { text: 'Physical network', dataIndex: 'physical_network', width: 150 },
-                    { text: 'VLAN', dataIndex: 'vlan_id', width: 80 },
-                    stateColumn(),
-                ],
+                xtype: 'pvnProviderNetworks', title: 'Provider Networks', iconCls: 'fa fa-exchange',
             }],
         });
 
@@ -1851,14 +2049,8 @@
             xtype: 'pvnPorts', itemId: 'pvn-ports', title: 'Ports',
             iconCls: 'fa fa-plug', groups: ['pvn'],
         }, {
-            xtype: 'pvnFloatingIPs', itemId: 'pvn-floating-ips', title: 'Floating IPs',
-            iconCls: 'fa fa-globe', groups: ['pvn'],
-        }, {
             xtype: 'pvnSecurityGroups', itemId: 'pvn-security-groups', title: 'Security Groups',
             iconCls: 'fa fa-shield', groups: ['pvn'],
-        }, {
-            xtype: 'pvnProviderNetworks', itemId: 'pvn-provider-networks', title: 'Provider Networks',
-            iconCls: 'fa fa-exchange', groups: ['pvn'],
         }, {
             xtype: 'pvnNodes', itemId: 'pvn-nodes', title: 'Nodes',
             iconCls: 'fa fa-server', groups: ['pvn'],

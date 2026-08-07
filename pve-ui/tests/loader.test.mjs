@@ -107,14 +107,12 @@ const expectedPanels = [
   ['pvn-networks', 'pvnNetworks', 'Networks'],
   ['pvn-routers', 'pvnRouters', 'Routers'],
   ['pvn-ports', 'pvnPorts', 'Ports'],
-  ['pvn-floating-ips', 'pvnFloatingIPs', 'Floating IPs'],
   ['pvn-security-groups', 'pvnSecurityGroups', 'Security Groups'],
-  ['pvn-provider-networks', 'pvnProviderNetworks', 'Provider Networks'],
   ['pvn-nodes', 'pvnNodes', 'Nodes'],
   ['pvn-operations', 'pvnOperations', 'Operations'],
 ];
 
-test('installs one native PVN root with exactly eight grouped children', () => {
+test('installs one native PVN root with six grouped workspaces', () => {
   const { DatacenterConfig } = harness();
   const first = new DatacenterConfig();
   first.initComponent();
@@ -137,12 +135,96 @@ test('defines native ExtJS panels and resource grids for every menu entry', () =
   const { classes } = harness();
   for (const name of [
     'PVN.panel.Overview', 'PVN.panel.Networks', 'PVN.panel.Routers', 'PVN.panel.Ports',
-    'PVN.grid.FloatingIPs', 'PVN.panel.SecurityGroups', 'PVN.panel.ProviderNetworks',
+    'PVN.panel.LogicalNetworks', 'PVN.grid.FloatingIPs', 'PVN.panel.SecurityGroups', 'PVN.panel.ProviderNetworks',
     'PVN.grid.Nodes', 'PVN.grid.Operations',
   ]) {
     assert.ok(classes.has(name), `${name} was not defined`);
   }
   assert.equal(classes.has('PVN.panel.Projects'), false);
+});
+
+test('network workspace nests logical and provider master-detail views', () => {
+  const { classes } = harness();
+  const Networks = classes.get('PVN.panel.Networks');
+  assert.deepEqual(Array.from(Networks.definition.items, (item) => [item.xtype, item.title]), [
+    ['pvnLogicalNetworks', 'Logical Networks'],
+    ['pvnProviderNetworks', 'Provider Networks'],
+  ]);
+
+  const Logical = classes.get('PVN.panel.LogicalNetworks');
+  const logical = new Logical();
+  logical.initComponent();
+  assert.equal(logical.layout, 'border');
+  const [left, ports] = logical.items;
+  const [networks, subnets] = left.items;
+  assert.equal(networks.collection, 'networks');
+  assert.equal(subnets.collection, 'subnets');
+  assert.equal(subnets.requiredFilter, 'network_id');
+  assert.equal(ports.collection, 'ports');
+  assert.equal(ports.requiredFilter, 'subnet_id');
+  assert.equal(subnets.disabled, true);
+  assert.equal(ports.disabled, true);
+});
+
+test('router and security workspaces use selected-parent detail grids', () => {
+  const { classes } = harness();
+  const Routers = classes.get('PVN.panel.Routers');
+  const routers = new Routers();
+  routers.initComponent();
+  assert.equal(routers.layout, 'border');
+  assert.equal(routers.items[0].collection, 'routers');
+  assert.equal(routers.items[1].collection, 'router-interfaces');
+  assert.equal(routers.items[1].requiredFilter, 'router_id');
+
+  const SecurityGroups = classes.get('PVN.panel.SecurityGroups');
+  const security = new SecurityGroups();
+  security.initComponent();
+  assert.equal(security.layout, 'border');
+  assert.equal(security.items[0].collection, 'security-groups');
+  assert.equal(security.items[1].collection, 'security-group-rules');
+  assert.equal(security.items[1].requiredFilter, 'security_group_id');
+});
+
+test('provider details own segments, external networks and floating IPs', () => {
+  const { classes } = harness();
+  const Providers = classes.get('PVN.panel.ProviderNetworks');
+  const providers = new Providers();
+  providers.initComponent();
+  assert.equal(providers.layout, 'border');
+  assert.equal(providers.items[0].collection, 'provider-networks');
+  const details = providers.items[1].items;
+  assert.deepEqual(Array.from(details, (grid) => grid.collection), [
+    'provider-segments', 'networks', 'floating-ips',
+  ]);
+  details.forEach((grid) => assert.equal(grid.requiredFilter, 'provider_network_id'));
+});
+
+test('related grids update API filters and lock parent create values', () => {
+  const { window } = harness();
+  const store = {
+    proxy: { extraParams: {} },
+    removed: 0,
+    removeAll() { this.removed += 1; },
+  };
+  const disabled = [];
+  const grid = {
+    store,
+    reloads: 0,
+    setDisabled(value) { disabled.push(value); },
+    reloadResourceGrid() { this.reloads += 1; },
+  };
+  window.PVN.Utils.setRelatedGrid(
+    grid, 'subnet_id', { id: 'subnet-a', network_id: 'network-a' },
+    { network_id: 'network-a' }, ['network_id', 'subnet_id'],
+  );
+  assert.deepEqual(store.proxy.extraParams, { subnet_id: 'subnet-a' });
+  assert.deepEqual(JSON.parse(JSON.stringify(grid.createValues)), { network_id: 'network-a', subnet_id: 'subnet-a' });
+  assert.deepEqual(grid.lockedCreateFields, ['network_id', 'subnet_id']);
+  assert.equal(grid.reloads, 1);
+  window.PVN.Utils.setRelatedGrid(grid, 'subnet_id', null);
+  assert.deepEqual(store.proxy.extraParams, {});
+  assert.equal(store.removed, 1);
+  assert.deepEqual(disabled, [false, true]);
 });
 
 test('resource stores use only the same-origin PVN API2 path', () => {
@@ -254,6 +336,48 @@ test('form payloads omit empty create options and strip managed edit fields', ()
     protocol: 'tcp', binding_status: 'bound', node_id: 'node-a',
   }, false, 'networks');
   assert.deepEqual(JSON.parse(JSON.stringify(edited)), { name: 'renamed', description: '', external: true });
+});
+
+test('subnet forms round-trip one explicit DHCP and IPAM allocation range', () => {
+  const { window } = harness();
+  const fields = window.PVN.Resources.subnets.createFields;
+  const created = window.PVN.Utils.formPayload({
+    name: 'app-v4', network_id: 'network-a', cidr: '10.42.0.0/24',
+    gateway_ip: '10.42.0.1', enable_dhcp: true,
+    allocation_pool_start: '10.42.0.10', allocation_pool_end: '10.42.0.200',
+  }, fields, null, true, 'subnets');
+  assert.deepEqual(JSON.parse(JSON.stringify(created.allocation_pools)), [
+    { start: '10.42.0.10', end: '10.42.0.200' },
+  ]);
+  assert.equal('allocation_pool_start' in created, false);
+  assert.equal('allocation_pool_end' in created, false);
+
+  const values = window.PVN.Utils.formValues({
+    allocation_pools: [{ start: '10.42.0.20', end: '10.42.0.80' }],
+  }, 'subnets');
+  assert.equal(values.allocation_pool_start, '10.42.0.20');
+  assert.equal(values.allocation_pool_end, '10.42.0.80');
+
+  const preserved = window.PVN.Utils.formPayload({
+    name: 'app-v4', gateway_ip: '10.42.0.1', enable_dhcp: true,
+    allocation_pool_start: '10.42.0.20', allocation_pool_end: '10.42.0.80',
+  }, window.PVN.Resources.subnets.editFields, {
+    name: 'app-v4', network_id: 'network-a', cidr: '10.42.0.0/24',
+    allocation_pools: [
+      { start: '10.42.0.20', end: '10.42.0.80' },
+      { start: '10.42.0.100', end: '10.42.0.120' },
+    ],
+  }, false, 'subnets');
+  assert.equal(preserved.allocation_pools.length, 2);
+
+  const cleared = window.PVN.Utils.formPayload({
+    name: 'app-v4', gateway_ip: '10.42.0.1', enable_dhcp: false,
+    allocation_pool_start: '', allocation_pool_end: '',
+  }, window.PVN.Resources.subnets.editFields, {
+    name: 'app-v4', network_id: 'network-a', cidr: '10.42.0.0/24',
+    allocation_pools: [{ start: '10.42.0.20', end: '10.42.0.80' }],
+  }, false, 'subnets');
+  assert.deepEqual(JSON.parse(JSON.stringify(cleared.allocation_pools)), []);
 });
 
 test('edit payloads never leak fields owned by another collection', () => {
