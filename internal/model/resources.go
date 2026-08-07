@@ -80,10 +80,10 @@ const (
 
 type IPAllocation struct {
 	Metadata
-	SubnetID  string            `json:"subnet_id"`
-	PortID    string            `json:"port_id,omitempty"`
-	Address   string            `json:"address"`
-	State     IPAllocationState `json:"allocation_state"`
+	SubnetID string            `json:"subnet_id"`
+	PortID   string            `json:"port_id,omitempty"`
+	Address  string            `json:"address"`
+	State    IPAllocationState `json:"allocation_state"`
 }
 
 func (*IPAllocation) ResourceKind() Kind { return KindIPAllocation }
@@ -105,9 +105,9 @@ func (r *Router) Validate() error      { return validateRouter(r) }
 
 type RouterInterface struct {
 	Metadata
-	RouterID  string `json:"router_id"`
-	SubnetID  string `json:"subnet_id"`
-	PortID    string `json:"port_id,omitempty"`
+	RouterID string `json:"router_id"`
+	SubnetID string `json:"subnet_id"`
+	PortID   string `json:"port_id,omitempty"`
 }
 
 func (*RouterInterface) ResourceKind() Kind { return KindRouterInterface }
