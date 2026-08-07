@@ -136,6 +136,12 @@ is(
     '{"name":"blue"}',
     'projectless object payload is accepted',
 );
+my $network_options_payload = '{"dns_nameservers":["1.1.1.1"],"dns_domain":"guest.example","dns_search_domains":["guest.example"],"static_routes":[{"destination":"10.60.0.0/16","next_hop":"10.42.0.2"}]}';
+is(
+    PVN::API2::validate_payload($network_options_payload),
+    $network_options_payload,
+    'nested DNS and static-route payload is forwarded byte-for-byte',
+);
 for my $payload (undef, '[]', '{broken', '{"project_id":"legacy"}') {
     my $accepted = eval { PVN::API2::validate_payload($payload); 1 };
     ok(!$accepted, 'invalid or project-bearing payload is rejected');
