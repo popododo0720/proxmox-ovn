@@ -16,18 +16,28 @@ func listenUnix(path string) (net.Listener, error) {
 	return listenUnixForGroup(path, "")
 }
 
-func listenBrowserUnix(path, peerUser, socketGroup string) (net.Listener, error) {
+func listenBrowserUnix(path string, peerUsers []string, socketGroup string) (net.Listener, error) {
 	listener, err := listenUnixForGroup(path, socketGroup)
 	if err != nil {
 		return nil, err
 	}
-	uid, err := lookupUserID(peerUser)
-	if err != nil {
+	allowedUIDs := make(map[uint32]struct{}, len(peerUsers))
+	for _, peerUser := range peerUsers {
+		uid, lookupErr := lookupUserID(peerUser)
+		if lookupErr == nil {
+			allowedUIDs[uint32(uid)] = struct{}{}
+			continue
+		}
 		_ = listener.Close()
 		_ = os.Remove(path)
-		return nil, err
+		return nil, lookupErr
 	}
-	return &peerUIDListener{Listener: listener, expectedUID: uint32(uid)}, nil
+	if len(allowedUIDs) == 0 {
+		_ = listener.Close()
+		_ = os.Remove(path)
+		return nil, errors.New("browser Unix listener requires at least one peer user")
+	}
+	return &peerUIDListener{Listener: listener, allowedUIDs: allowedUIDs}, nil
 }
 
 func listenUnixForGroup(path, groupName string) (net.Listener, error) {
@@ -123,7 +133,7 @@ func lookupGroupID(name string) (int, error) {
 
 type peerUIDListener struct {
 	net.Listener
-	expectedUID uint32
+	allowedUIDs map[uint32]struct{}
 }
 
 func (listener *peerUIDListener) Accept() (net.Conn, error) {
@@ -133,11 +143,16 @@ func (listener *peerUIDListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 		uid, credentialErr := unixPeerUID(connection)
-		if credentialErr == nil && uid == listener.expectedUID {
+		if credentialErr == nil && listener.allowsUID(uid) {
 			return connection, nil
 		}
 		_ = connection.Close()
 	}
+}
+
+func (listener *peerUIDListener) allowsUID(uid uint32) bool {
+	_, allowed := listener.allowedUIDs[uid]
+	return allowed
 }
 
 func unixPeerUID(connection net.Conn) (uint32, error) {

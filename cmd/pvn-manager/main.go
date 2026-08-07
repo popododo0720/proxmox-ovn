@@ -173,7 +173,9 @@ func run(arguments []string) error {
 		_ = runtimeListener.Close()
 		_ = os.Remove(defaults.runtimeSocket)
 	}()
-	browserListener, err := listenBrowserUnix(defaults.browserSocket, "www-data", "www-data")
+	// pveproxy forwards browser requests as www-data, while the local pvesh
+	// frontend invokes the same authenticated PVE API extension as root.
+	browserListener, err := listenBrowserUnix(defaults.browserSocket, []string{"www-data", "root"}, "www-data")
 	if err != nil {
 		return fmt.Errorf("listen for PVN browser API: %w", err)
 	}

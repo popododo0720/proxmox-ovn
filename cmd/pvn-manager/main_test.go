@@ -313,7 +313,7 @@ func TestBrowserUnixListenerAcceptsOnlyConfiguredPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "browser", "manager.sock")
-	listener, err := listenBrowserUnix(path, account.Username, group.Name)
+	listener, err := listenBrowserUnix(path, []string{account.Username}, group.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,6 +349,19 @@ func TestBrowserUnixListenerAcceptsOnlyConfiguredPeer(t *testing.T) {
 		t.Fatal(err)
 	case <-time.After(time.Second):
 		t.Fatal("browser listener did not accept the configured peer")
+	}
+}
+
+func TestBrowserUnixListenerAllowsOnlyConfiguredUIDs(t *testing.T) {
+	listener := &peerUIDListener{allowedUIDs: map[uint32]struct{}{
+		0:  {},
+		33: {},
+	}}
+	if !listener.allowsUID(0) || !listener.allowsUID(33) {
+		t.Fatal("configured browser peer UID was rejected")
+	}
+	if listener.allowsUID(1) || listener.allowsUID(65534) {
+		t.Fatal("unconfigured browser peer UID was accepted")
 	}
 }
 
