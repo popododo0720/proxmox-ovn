@@ -74,7 +74,7 @@ deb: package-check ui-test
 	trap 'rm -rf "$$pvn_pkg_tmp"' EXIT HUP INT TERM; \
 	pvn_arch=$$(dpkg --print-architecture); \
 	pvn_root="$$pvn_pkg_tmp/pvn-node"; \
-	install -d "$$pvn_root/DEBIAN" "$$pvn_root/usr/sbin" "$$pvn_root/usr/lib/pvn"; \
+	install -d "$$pvn_root/DEBIAN" "$$pvn_root/usr/sbin" "$$pvn_root/usr/lib/pvn" "$$pvn_root/usr/share/perl5/PVN"; \
 	sed -e 's/@VERSION@/$(DEB_VERSION)/g' -e "s/@ARCH@/$$pvn_arch/g" packaging/pvn-node.control > "$$pvn_root/DEBIAN/control"; \
 	install -m 0755 packaging/debian/pvn-node.postinst "$$pvn_root/DEBIAN/postinst"; \
 	install -m 0755 packaging/debian/pvn-node.prerm "$$pvn_root/DEBIAN/prerm"; \
@@ -84,6 +84,8 @@ deb: package-check ui-test
 	find deploy/scripts -mindepth 1 -maxdepth 1 -type f -name 'pvn-*' \
 		-exec install -m 0755 -t "$$pvn_root/usr/lib/pvn/" -- {} +; \
 	install -m 0755 deploy/scripts/pvn-db-backup "$$pvn_root/usr/sbin/pvn-db-backup"; \
+	install -m 0755 pve-api/inject.sh "$$pvn_root/usr/lib/pvn/pvn-api-inject"; \
+	install -m 0644 pve-api/PVN/API2.pm "$$pvn_root/usr/share/perl5/PVN/"; \
 	install -m 0755 pve-ui/inject.sh "$$pvn_root/usr/lib/pvn/pvn-ui-inject"; \
 	install -m 0644 pve-ui/pvn-loader.js "$$pvn_root/usr/lib/pvn/"; \
 	install -d "$$pvn_root/usr/share/pvn" "$$pvn_root/usr/share/doc/pvn-node/examples" "$$pvn_root/usr/share/doc/pvn-node/inventory"; \
