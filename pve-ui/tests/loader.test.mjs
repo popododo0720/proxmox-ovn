@@ -1,16 +1,14 @@
 import assert from 'node:assert/strict';
-import { webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
 
 const loaderSource = await readFile(new URL('../pvn-loader.js', import.meta.url), 'utf8');
 
-function harness(options = {}) {
-  const listeners = new Map();
-  const frames = [];
+function harness() {
   const apiRequests = [];
-  const openedWindows = [];
+  const stores = [];
+  const aliases = new Map();
 
   function BaseConfig() {}
   BaseConfig.prototype.initComponent = function initComponent() { this.initialized = true; };
@@ -26,319 +24,160 @@ function harness(options = {}) {
     ['PVE.panel.Config', BaseConfig],
     ['PVE.dc.Config', DatacenterConfig],
   ]);
+
+  function define(name, definition) {
+    function Defined(config = {}) { Object.assign(this, config); }
+    Object.assign(Defined.prototype, definition, {
+      callParent() {},
+      down() { return { update() {} }; },
+    });
+    Defined.definition = definition;
+    classes.set(name, Defined);
+    const declared = Array.isArray(definition.alias) ? definition.alias : [definition.alias];
+    declared.filter(Boolean).forEach((alias) => aliases.set(alias.replace(/^widget\./, ''), Defined));
+    return Defined;
+  }
+
+  function makeStore(config) {
+    const store = {
+      ...config,
+      loaded: 0,
+      filters: [],
+      load() { this.loaded += 1; },
+      clearFilter() { this.filters = []; },
+      filterBy(callback) { this.filters.push(callback); },
+      getRange() { return []; },
+    };
+    stores.push(store);
+    return store;
+  }
+
+  const Ext = {
+    ClassManager: { get(name) { return classes.get(name); } },
+    String: {
+      htmlEncode(value) {
+        return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+      },
+    },
+    apply(target, ...sources) { return Object.assign(target, ...sources); },
+    define,
+    override(target, methods) { Object.assign(target.prototype, methods); },
+    create(name, config) {
+      if (name === 'Ext.data.Store') return makeStore(config);
+      const Class = classes.get(name) || aliases.get(name.replace(/^widget\./, ''));
+      return Class ? new Class(config) : { ...config };
+    },
+  };
+
   const window = {
-    location: {
-      hostname: options.hostname || 'pve.example.test',
-      origin: options.origin || 'https://pve.example.test:8006',
-    },
-    crypto: webcrypto,
+    Ext,
     PVE: { panel: { Config: BaseConfig }, dc: { Config: DatacenterConfig } },
-    Proxmox: { Utils: { API2Request(options) { apiRequests.push(options); } } },
-    Ext: {
-      ClassManager: { get(name) { return classes.get(name); } },
-      override(target, methods) { Object.assign(target.prototype, methods); },
-    },
-    addEventListener(type, callback) { listeners.set(type, callback); },
-    removeEventListener(type, callback) { if (listeners.get(type) === callback) listeners.delete(type); },
-    open(url, target, features) {
-      const popup = { opener: window };
-      openedWindows.push({ url, target, features, popup });
-      return popup;
+    Proxmox: {
+      Utils: {
+        API2Request(options) { apiRequests.push(options); },
+        monStoreErrors() {},
+      },
     },
     setTimeout(callback) { callback(); return 1; },
   };
   window.window = window;
-  const document = {
-    createElement(tag) {
-      assert.equal(tag, 'iframe');
-      const frame = {
-        contentWindow: { messages: [], postMessage(message, origin) { this.messages.push({ message, origin }); } },
-        style: {},
-        setAttribute(name, value) { this[name] = value; },
-      };
-      frames.push(frame);
-      return frame;
-    },
-  };
-  const context = vm.createContext({ window, document, URL, Uint32Array, Object, Array, Number, JSON, Error, String });
+  const context = vm.createContext({ window, Object, Array, JSON, String, RegExp });
   vm.runInContext(loaderSource, context);
-  return { window, DatacenterConfig, frames, listeners, apiRequests, openedWindows };
+  return { apiRequests, classes, DatacenterConfig, stores, window };
 }
 
-const expectedPVNPanels = [
-  ['pvn', 'PVN', '/'],
-  ['pvn-projects', 'Projects', '/projects'],
-  ['pvn-networks', 'Networks', '/networks'],
-  ['pvn-routers', 'Routers', '/routers'],
-  ['pvn-ports', 'Ports', '/ports'],
-  ['pvn-floating-ips', 'Floating IPs', '/floating-ips'],
-  ['pvn-security-groups', 'Security Groups', '/security-groups'],
-  ['pvn-provider-networks', 'Provider Networks', '/provider-networks'],
-  ['pvn-nodes', 'Nodes', '/nodes'],
-  ['pvn-operations', 'Operations', '/operations'],
+const expectedPanels = [
+  ['pvn', 'pvnOverview', 'PVN'],
+  ['pvn-networks', 'pvnNetworks', 'Networks'],
+  ['pvn-routers', 'pvnRouters', 'Routers'],
+  ['pvn-ports', 'pvnPorts', 'Ports'],
+  ['pvn-floating-ips', 'pvnFloatingIPs', 'Floating IPs'],
+  ['pvn-security-groups', 'pvnSecurityGroups', 'Security Groups'],
+  ['pvn-provider-networks', 'pvnProviderNetworks', 'Provider Networks'],
+  ['pvn-nodes', 'pvnNodes', 'Nodes'],
+  ['pvn-operations', 'pvnOperations', 'Operations'],
 ];
 
-test('adds one native PVN tree to the Datacenter config', () => {
+test('installs one native PVN root with exactly eight grouped children', () => {
   const { DatacenterConfig } = harness();
   const first = new DatacenterConfig();
   first.initComponent();
-  assert.equal(first.items.filter((item) => item.itemId === 'pvn').length, 1);
+  const panels = first.items.filter((item) => item.itemId.startsWith('pvn'));
   assert.deepEqual(
-    first.items.filter((item) => item.itemId.startsWith('pvn')).map((item) => item.itemId),
-    expectedPVNPanels.map(([itemId]) => itemId),
+    panels.map(({ itemId, xtype, title }) => [itemId, xtype, title]),
+    expectedPanels,
   );
-  const root = first.items.find((item) => item.itemId === 'pvn');
-  assert.equal(root.expandedOnInit, true);
-  assert.equal(root.groups, undefined);
-  for (const [itemId] of expectedPVNPanels.slice(1)) {
-    assert.deepEqual(Array.from(first.items.find((item) => item.itemId === itemId).groups), ['pvn']);
-  }
-  assert.equal(first.items.some((item) => item.itemId === 'pvn-overview'), false);
+  assert.equal(panels[0].expandedOnInit, true);
+  assert.equal(panels[0].groups, undefined);
+  panels.slice(1).forEach((panel) => assert.deepEqual(Array.from(panel.groups), ['pvn']));
+  assert.equal(panels.some((panel) => panel.itemId === 'pvn-projects'), false);
 
   const second = new DatacenterConfig();
   second.initComponent();
   assert.equal(second.items.filter((item) => item.itemId === 'pvn').length, 1);
-  assert.equal(second.items.filter((item) => item.itemId.startsWith('pvn')).length, expectedPVNPanels.length);
 });
 
-test('each PVN card opens its matching embedded manager route', () => {
-  const { DatacenterConfig, frames } = harness();
-  const config = new DatacenterConfig();
-  config.initComponent();
+test('defines native ExtJS panels and resource grids for every menu entry', () => {
+  const { classes } = harness();
+  for (const name of [
+    'PVN.panel.Overview', 'PVN.panel.Networks', 'PVN.panel.Routers', 'PVN.panel.Ports',
+    'PVN.grid.FloatingIPs', 'PVN.panel.SecurityGroups', 'PVN.panel.ProviderNetworks',
+    'PVN.grid.Nodes', 'PVN.grid.Operations',
+  ]) {
+    assert.ok(classes.has(name), `${name} was not defined`);
+  }
+  assert.equal(classes.has('PVN.panel.Projects'), false);
+});
 
-  for (const [itemId, title, route] of expectedPVNPanels) {
-    const panelConfig = config.items.find((item) => item.itemId === itemId);
-    panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
-    const frame = frames.at(-1);
-    const url = new URL(frame.src);
-    assert.equal(url.searchParams.get('embedded'), '1');
-    assert.equal(url.searchParams.get('route'), route);
-    assert.equal(frame.title, itemId === 'pvn' ? 'PVN Overview' : `PVN ${title}`);
-    assert.ok(url.searchParams.get('pveBridgeNonce'));
-    assert.equal(url.searchParams.get('pveOrigin'), 'https://pve.example.test:8006');
+test('resource stores use only the same-origin PVN API2 path', () => {
+  const { window } = harness();
+  const networks = window.PVN.Utils.createStore('networks');
+  const operations = window.PVN.Utils.createStore('operations', { limit: 100 });
+  assert.equal(networks.proxy.url, '/pvn/networks');
+  assert.deepEqual(operations.proxy.extraParams, { limit: 100 });
+  assert.equal(operations.proxy.url, '/pvn/operations');
+});
+
+test('overview requests health through Proxmox API2Request', () => {
+  const { apiRequests, classes } = harness();
+  const Overview = classes.get('PVN.panel.Overview');
+  const updates = [];
+  const panel = new Overview();
+  panel.down = () => ({ update(value) { updates.push(value); } });
+  panel.loadOverview();
+  assert.equal(apiRequests.length, 1);
+  assert.equal(apiRequests[0].url, '/pvn/health');
+  assert.equal(apiRequests[0].method, 'GET');
+  apiRequests[0].success({ result: { data: { cluster: 'lab', status: 'ready', version: 'test' } } });
+  assert.match(updates.at(-1), /lab/);
+  assert.match(updates.at(-1), /Version test/);
+});
+
+test('human labels never fall back to UUIDs in primary cells', () => {
+  const { window } = harness();
+  const named = window.PVN.Utils.humanName({ id: 'a980c3d4-330d-4e1f-920a-aaaaabbbbbcc', name: 'edge' }, 'Unnamed');
+  const unnamed = window.PVN.Utils.humanName({ id: 'a980c3d4-330d-4e1f-920a-aaaaabbbbbcc' }, 'Unnamed');
+  assert.equal(named, 'edge');
+  assert.equal(unnamed, 'Unnamed');
+});
+
+test('loader has no detached web-console transport code', () => {
+  for (const forbidden of ['iframe', 'postMessage', ':8443', 'pveBridgeNonce', 'pvn-projects', '/session']) {
+    assert.equal(loaderSource.includes(forbidden), false, `loader still contains ${forbidden}`);
   }
 });
 
-test('certificate onboarding opens only the same-node manager in an isolated tab', () => {
-  const { DatacenterConfig, openedWindows } = harness();
-  const config = new DatacenterConfig();
-  config.initComponent();
-  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
-  const toolbar = panelConfig.dockedItems.find((item) => item.xtype === 'toolbar');
-  const help = toolbar.items.find((item) => item && item.xtype === 'tbtext');
-  const trust = toolbar.items.find((item) => item && item.itemId === 'pvn-trust-certificate');
-
-  assert.match(help.text, /trust this node's PVN certificate/);
-  assert.equal(trust.text, 'Trust local PVN certificate');
-  assert.match(trust.tooltip, /protected new tab/);
-  trust.handler();
-
-  assert.equal(openedWindows.length, 1);
-  assert.equal(openedWindows[0].url, 'https://pve.example.test:8443/');
-  assert.equal(openedWindows[0].target, '_blank');
-  assert.equal(openedWindows[0].features, 'noopener,noreferrer');
-  assert.equal(openedWindows[0].popup.opener, null);
-});
-
-test('certificate onboarding brackets a same-node IPv6 target', () => {
-  const { DatacenterConfig, openedWindows } = harness({
-    hostname: '[2001:db8::10]',
-    origin: 'https://[2001:db8::10]:8006',
-  });
-  const config = new DatacenterConfig();
-  config.initComponent();
-  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
-  const toolbar = panelConfig.dockedItems[0];
-  toolbar.items.find((item) => item && item.itemId === 'pvn-trust-certificate').handler();
-  assert.equal(openedWindows[0].url, 'https://[2001:db8::10]:8443/');
-});
-
-test('reload keeps the nonce-bound iframe URL and sandbox', () => {
-  const { DatacenterConfig, frames } = harness();
-  const config = new DatacenterConfig();
-  config.initComponent();
-  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
-  panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
-  const frame = frames[0];
-  const originalURL = frame.src;
-  frame.src = 'about:blank';
-
-  const reload = panelConfig.dockedItems[0].items.find((item) => item && item.itemId === 'pvn-reload');
-  reload.handler();
-
-  assert.equal(frame.src, originalURL);
-  assert.equal(frame.sandbox, 'allow-scripts allow-forms allow-downloads allow-same-origin allow-top-navigation-by-user-activation');
-  assert.equal(new URL(frame.src).origin, 'https://pve.example.test:8443');
-  assert.equal(new URL(frame.src).searchParams.get('embedded'), '1');
-  assert.equal(new URL(frame.src).searchParams.get('route'), '/');
-});
-
-test('bridge rejects the wrong origin and permits only an exact QEMU config path', () => {
-  const { DatacenterConfig, frames, listeners, apiRequests } = harness();
-  const config = new DatacenterConfig();
-  config.initComponent();
-  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
-  const panel = {
-    body: { dom: { appendChild() {} } },
-    on() {},
-    update() {},
-  };
-  panelConfig.listeners.afterrender(panel);
-  const frame = frames[0];
-  const url = new URL(frame.src);
-  const request = {
-    source: 'pvn-ui',
-    type: 'pvn:pve:request',
-    version: 1,
-    nonce: url.searchParams.get('pveBridgeNonce'),
-    id: 'request-1',
-    method: 'GET',
-    path: '/nodes/pve-01/qemu/100/config',
-  };
-  const onMessage = listeners.get('message');
-  onMessage({ origin: 'https://evil.example', source: frame.contentWindow, data: request });
-  onMessage({ origin: url.origin, source: {}, data: request });
-  onMessage({ origin: url.origin, source: frame.contentWindow, data: { ...request, path: '/nodes/pve-01/storage' } });
-  onMessage({ origin: url.origin, source: frame.contentWindow, data: { ...request, params: { full: 1 } } });
-  assert.equal(apiRequests.length, 0);
-  onMessage({ origin: url.origin, source: frame.contentWindow, data: request });
-  assert.equal(apiRequests.length, 1);
-  assert.equal(apiRequests[0].url, request.path);
-  assert.equal(apiRequests[0].method, 'GET');
-});
-
-test('bridge permits read-only QEMU status but never status mutations', () => {
-  const { DatacenterConfig, frames, listeners, apiRequests } = harness();
-  const config = new DatacenterConfig();
-  config.initComponent();
-  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
-  panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
-  const frame = frames[0];
-  const url = new URL(frame.src);
-  const base = {
-    source: 'pvn-ui', type: 'pvn:pve:request', version: 1,
-    nonce: url.searchParams.get('pveBridgeNonce'),
-    path: '/nodes/pve-01/qemu/100/status/current',
-  };
-
-  listeners.get('message')({
-    origin: url.origin,
-    source: frame.contentWindow,
-    data: { ...base, id: 'status-read', method: 'GET' },
-  });
-  assert.equal(apiRequests.length, 1);
-  assert.equal(apiRequests[0].url, base.path);
-  assert.equal(apiRequests[0].method, 'GET');
-
-  listeners.get('message')({
-    origin: url.origin,
-    source: frame.contentWindow,
-    data: { ...base, id: 'status-write', method: 'PUT', params: { digest: 'a'.repeat(40), delete: 'net0' } },
-  });
-  assert.equal(apiRequests.length, 1);
-});
-
-test('bridge permits only the exact read-only QEMU VM inventory query', () => {
-  const { DatacenterConfig, frames, listeners, apiRequests } = harness();
-  const config = new DatacenterConfig();
-  config.initComponent();
-  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
-  panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
-  const frame = frames[0];
-  const url = new URL(frame.src);
-  const base = {
-    source: 'pvn-ui', type: 'pvn:pve:request', version: 1,
-    nonce: url.searchParams.get('pveBridgeNonce'),
-    path: '/cluster/resources',
-  };
-
-  [
-    { id: 'inventory-no-filter', method: 'GET' },
-    { id: 'inventory-all', method: 'GET', params: { type: 'vm', full: 1 } },
-    { id: 'inventory-node', method: 'GET', params: { type: 'node' } },
-    { id: 'inventory-write', method: 'PUT', params: { type: 'vm' } },
-  ].forEach((request) => listeners.get('message')({
-    origin: url.origin,
-    source: frame.contentWindow,
-    data: { ...base, ...request },
-  }));
-  assert.equal(apiRequests.length, 0);
-
-  listeners.get('message')({
-    origin: url.origin,
-    source: frame.contentWindow,
-    data: { ...base, id: 'inventory-read', method: 'GET', params: { type: 'vm' } },
-  });
-  assert.equal(apiRequests.length, 1);
-  assert.equal(apiRequests[0].url, '/cluster/resources');
-  assert.equal(apiRequests[0].method, 'GET');
-  assert.equal(Object.keys(apiRequests[0].params).length, 1);
-  assert.equal(apiRequests[0].params.type, 'vm');
-});
-
-test('bridge sends a nonce-bound response only to the manager origin', () => {
-  const { DatacenterConfig, frames, listeners, apiRequests } = harness();
-  const config = new DatacenterConfig();
-  config.initComponent();
-  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
-  panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
-  const frame = frames[0];
-  const url = new URL(frame.src);
-  const request = {
-    source: 'pvn-ui', type: 'pvn:pve:request', version: 1,
-    nonce: url.searchParams.get('pveBridgeNonce'), id: 'request-2', method: 'PUT',
-    path: '/nodes/pve-01/qemu/101/config', params: {
-      digest: 'a'.repeat(40),
-      net1: 'virtio=02:00:00:00:00:01,bridge=br-int,firewall=0,link_down=1',
+test('missing ExtJS waits without changing the page', () => {
+  let attempts = 0;
+  const window = {
+    setTimeout(callback) {
+      attempts += 1;
+      if (attempts < 120) callback();
+      return attempts;
     },
   };
-  listeners.get('message')({ origin: url.origin, source: frame.contentWindow, data: request });
-  apiRequests[0].success({ result: { data: { digest: 'abc' } } });
-  assert.equal(frame.contentWindow.messages.length, 1);
-  assert.equal(frame.contentWindow.messages[0].origin, url.origin);
-  assert.equal(frame.contentWindow.messages[0].message.nonce, request.nonce);
-  assert.deepEqual(frame.contentWindow.messages[0].message.data, { digest: 'abc' });
-});
-
-test('PUT rejects arbitrary VM settings and permits one digest-bound NIC action', () => {
-  const { DatacenterConfig, frames, listeners, apiRequests } = harness();
-  const config = new DatacenterConfig();
-  config.initComponent();
-  const panelConfig = config.items.find((item) => item.itemId === 'pvn');
-  panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
-  const frame = frames[0];
-  const url = new URL(frame.src);
-  const base = {
-    source: 'pvn-ui', type: 'pvn:pve:request', version: 1,
-    nonce: url.searchParams.get('pveBridgeNonce'), method: 'PUT',
-    path: '/nodes/pve-01/qemu/102/config',
-  };
-  const invalidParams = [
-    { digest: 'a'.repeat(40), memory: 8192 },
-    { net0: 'virtio=02:00:00:00:00:01,bridge=br-int,firewall=0,link_down=1' },
-    {
-      digest: 'a'.repeat(40),
-      net0: 'virtio=02:00:00:00:00:01,bridge=br-int,firewall=0,link_down=1',
-      net1: 'virtio=02:00:00:00:00:02,bridge=br-int,firewall=0,link_down=1',
-    },
-    { digest: 'a'.repeat(40), net0: 'e1000=02:00:00:00:00:01,bridge=vmbr0' },
-    { digest: 'a'.repeat(40), delete: 'memory' },
-  ];
-  invalidParams.forEach((params, index) => {
-    listeners.get('message')({
-      origin: url.origin,
-      source: frame.contentWindow,
-      data: { ...base, id: `invalid-${index}`, params },
-    });
-  });
-  assert.equal(apiRequests.length, 0);
-
-  listeners.get('message')({
-    origin: url.origin,
-    source: frame.contentWindow,
-    data: { ...base, id: 'delete-1', params: { digest: 'b'.repeat(40), delete: 'net2' } },
-  });
-  assert.equal(apiRequests.length, 1);
-  assert.equal(apiRequests[0].params.delete, 'net2');
-  assert.equal(apiRequests[0].params.digest, 'b'.repeat(40));
+  window.window = window;
+  vm.runInContext(loaderSource, vm.createContext({ window, Object, Array, JSON, String, RegExp }));
+  assert.equal(attempts, 119);
+  assert.equal(window.__pvnLoaderInstalled, true);
 });
