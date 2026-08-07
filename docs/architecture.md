@@ -84,6 +84,27 @@ master-detail pattern for interfaces and rules. Subnet allocation pools are the
 shared IPv4 range used by OVN DHCP and PVN IPAM; leaving the range empty uses
 the automatically derived usable CIDR range.
 
+When DHCP is enabled, a subnet may also supply IPv4 resolvers, one guest DNS
+domain, and an ordered search-domain list. The renderer maps these to OVN
+DHCPv4 `dns_server`, `domain_name`, and `domain_search_list` options. DNS
+values remain subnet-owned; they are not host resolver settings and do not
+create an OVN authoritative DNS zone.
+
+Additional static routes are router-owned pairs of destination CIDR and
+next-hop IPv4 address. A next hop must be on-link through exactly one
+non-deleting interface of that router (including its external gateway
+attachment), which gives the renderer one deterministic output port. PVN owns
+the external router's `0.0.0.0/0` route, so an operator route cannot replace or
+duplicate it. Each additional route has a content-derived identity; reconcile
+updates its exact destination, next hop, output port, ownership metadata, and
+parent attachment, and removes stale rows.
+
+These options do not change the `PVN_Control` 2.0 schema. Existing subnet
+`dns_nameservers` storage remains authoritative for resolver addresses;
+DNS domain/search metadata uses reserved `pvn:*` subnet `external_ids`, and
+the bounded static-route JSON uses reserved router `external_ids`. Missing
+keys decode as empty values, preserving existing databases.
+
 ## VM port lifecycle
 
 Attach is deliberately fail-closed:

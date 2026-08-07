@@ -16,8 +16,8 @@ even-sized clusters are rejected before topology changes.
 
 - one cluster-global, projectless network domain
 - Geneve tenant networks and IPv4 subnets
-- OVN native DHCP
-- logical routers, centralized SNAT, and floating IPs
+- OVN native DHCP with guest DNS resolver, domain, and search-domain options
+- logical routers with owned static routes, centralized SNAT, and floating IPs
 - flat and VLAN provider networks
 - stateful security groups with a reserved cluster-global default
 - running VM NIC attach and detach

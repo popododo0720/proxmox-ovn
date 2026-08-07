@@ -451,6 +451,47 @@ to human names when the referenced object is visible. Unknown UUIDs are
 redacted instead of becoming an operator-facing label. Open **Details** for the
 raw, copyable UUIDs needed to correlate API or database records.
 
+## Guest DNS and router static routes
+
+In **PVN → Networks**, create or edit a subnet to set its DHCP allocation
+range, DNS resolver addresses, guest DNS domain, and ordered search domains.
+OVN advertises those DNS values only while DHCP is enabled. They configure
+guest DHCP clients; they do not change a PVE node's resolver or make PVN an
+authoritative DNS server. Resolver and search-domain lists are bounded to six
+entries each.
+
+In **PVN → Routers**, select a router to see interfaces and additional static
+routes side by side. Add each route as `destination via next-hop`. Create the
+needed router interface first: every next hop must be a usable address on
+exactly one subnet directly attached to that router. Deleting an interface
+used by a route is rejected until the route is removed or changed. A router
+may have at most 64 additional routes. On an external router, PVN exclusively
+owns the default `0.0.0.0/0` route through the selected provider subnet; use a
+more-specific destination for operator routes.
+
+The equivalent API fields are:
+
+```json
+{
+  "dns_nameservers": ["1.1.1.1", "9.9.9.9"],
+  "dns_domain": "guest.example",
+  "dns_search_domains": ["guest.example", "svc.example"]
+}
+```
+
+on a subnet, and:
+
+```json
+{
+  "static_routes": [
+    {"destination": "10.60.0.0/16", "next_hop": "10.42.0.2"}
+  ]
+}
+```
+
+on a router. Domain names are stored lower-case without a trailing dot, CIDRs
+are stored in masked form, and route order is not an ownership key.
+
 ## Upgrades
 
 Do not run the normal rolling updater for the PVN 0.2 to 0.3 transition.
@@ -472,6 +513,16 @@ UUID, PKI, shared configuration, and three database clusters. Never describe
 this lab reset as an identity-preserving upgrade or use it on production data.
 
 The rolling updater below is only for schema-compatible releases.
+
+Guest DNS domain/search data and additional router routes are a
+schema-compatible `PVN_Control` 2.0 addition stored in reserved `pvn:*`
+`external_ids`; no database conversion is run. Upgrade every active manager
+before using these fields. During rollback, an older manager can read the
+resource but does not understand the new keys and may remove them on a later
+write, which also removes the corresponding realized DHCP options or routes.
+Take a control-database backup first, stop writes during a mixed-version
+window, and do not roll back after using these fields without an explicit data
+recovery plan.
 
 Run the hosted rolling updater on any online PVE node. With no arguments it
 downloads the release package, updater, and native PVE lease helper, verifies
