@@ -52,8 +52,8 @@ func main() {
 
 func run(arguments []string) error {
 	defaults := managerConfig{
-		runtimeSocket:  env("PVN_RUNTIME_SOCKET", env("PVN_UNIX_SOCKET", "/run/pvn/manager.sock")),
-		browserSocket:  env("PVN_BROWSER_SOCKET", "/run/pvn-api/manager.sock"),
+		runtimeSocket:  pvnconfig.DefaultManagerRuntimeSocket,
+		browserSocket:  pvnconfig.DefaultManagerBrowserSocket,
 		pveMembersFile: os.Getenv("PVN_PVE_MEMBERS_FILE"),
 		clusterName:    os.Getenv("PVN_CLUSTER_NAME"),
 		shutdownWait:   envDuration("PVN_SHUTDOWN_TIMEOUT", 15*time.Second),
@@ -61,8 +61,6 @@ func run(arguments []string) error {
 	flags := flag.NewFlagSet("pvn-manager", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", os.Getenv("PVN_CONFIG"), "cluster configuration JSON file")
-	flags.StringVar(&defaults.runtimeSocket, "runtime-socket", defaults.runtimeSocket, "node-agent Unix socket path")
-	flags.StringVar(&defaults.browserSocket, "browser-socket", defaults.browserSocket, "local pveproxy Unix socket path")
 	flags.StringVar(&defaults.pveMembersFile, "pve-members-file", defaults.pveMembersFile, "PVE pmxcfs membership JSON used for the deployment display name")
 	flags.StringVar(&defaults.clusterName, "cluster-name", defaults.clusterName, "cluster name override")
 	flags.DurationVar(&defaults.shutdownWait, "shutdown-timeout", defaults.shutdownWait, "graceful shutdown timeout")
@@ -223,12 +221,8 @@ func run(arguments []string) error {
 }
 
 func applyClusterConfig(target *managerConfig, clusterConfig pvnconfig.Config, explicit map[string]bool) {
-	if !explicit["runtime-socket"] {
-		target.runtimeSocket = clusterConfig.Manager.UnixSocket
-	}
-	if !explicit["browser-socket"] {
-		target.browserSocket = clusterConfig.Manager.BrowserSocket
-	}
+	target.runtimeSocket = clusterConfig.Manager.UnixSocket
+	target.browserSocket = clusterConfig.Manager.BrowserSocket
 	if !explicit["cluster-name"] {
 		target.clusterName = clusterConfig.Cluster.ID
 	}
@@ -417,13 +411,6 @@ func waitForReconcileInterval(ctx context.Context, interval time.Duration) bool 
 	case <-timer.C:
 		return true
 	}
-}
-
-func env(name, fallback string) string {
-	if value := os.Getenv(name); value != "" {
-		return value
-	}
-	return fallback
 }
 
 func envDuration(name string, fallback time.Duration) time.Duration {

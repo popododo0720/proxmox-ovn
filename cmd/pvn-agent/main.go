@@ -26,23 +26,21 @@ const defaultHealthListen = "127.0.0.1:9476"
 const nodeHeartbeatInterval = 30 * time.Second
 
 type agentConfig struct {
-	configPath           string
-	node                 string
-	bridge               string
-	managerURL           string
-	managerCA            string
-	managerTLSServerName string
-	systemIDFile         string
-	watchInterval        time.Duration
-	ovsVSCTL             string
-	ovsTimeout           int
-	healthListen         string
-	membershipFile       string
-	requireAllNodes      bool
-	nodeRoles            []string
-	nodeRolesExplicit    bool
-	once                 bool
-	version              bool
+	configPath        string
+	node              string
+	bridge            string
+	managerURL        string
+	systemIDFile      string
+	watchInterval     time.Duration
+	ovsVSCTL          string
+	ovsTimeout        int
+	healthListen      string
+	membershipFile    string
+	requireAllNodes   bool
+	nodeRoles         []string
+	nodeRolesExplicit bool
+	once              bool
+	version           bool
 }
 
 func main() {
@@ -75,9 +73,7 @@ func run(arguments []string, getenv func(string) string, hostname func() (string
 		return err
 	}
 	managerClient, err := agent.NewHTTPManagerClient(agent.HTTPManagerClientConfig{
-		BaseURL:       config.managerURL,
-		CAFile:        config.managerCA,
-		TLSServerName: config.managerTLSServerName,
+		BaseURL: config.managerURL,
 	})
 	if err != nil {
 		return err
@@ -198,7 +194,6 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 		node:            clusterConfig.Cluster.NodeName,
 		bridge:          clusterConfig.Agent.Bridge,
 		managerURL:      clusterConfig.Agent.ManagerURL,
-		managerCA:       clusterConfig.Agent.ManagerCA,
 		systemIDFile:    clusterConfig.Agent.SystemIDFile,
 		watchInterval:   clusterConfig.Agent.PollEvery,
 		ovsVSCTL:        "ovs-vsctl",
@@ -221,15 +216,6 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 	}
 	if value := getenv("PVN_BRIDGE"); value != "" {
 		defaults.bridge = value
-	}
-	if value := getenv("PVN_MANAGER_URL"); value != "" {
-		defaults.managerURL = value
-	}
-	if value := getenv("PVN_MANAGER_CA"); value != "" {
-		defaults.managerCA = value
-	}
-	if value := getenv("PVN_MANAGER_TLS_SERVER_NAME"); value != "" {
-		defaults.managerTLSServerName = value
 	}
 	if value := getenv("PVN_SYSTEM_ID_FILE"); value != "" {
 		defaults.systemIDFile = value
@@ -270,9 +256,6 @@ func parseConfig(arguments []string, getenv func(string) string, hostname func()
 	flags.StringVar(&defaults.configPath, "config", defaults.configPath, "cluster configuration JSON")
 	flags.StringVar(&defaults.node, "node", defaults.node, "PVE node name")
 	flags.StringVar(&defaults.bridge, "bridge", defaults.bridge, "OVS integration bridge")
-	flags.StringVar(&defaults.managerURL, "manager-url", defaults.managerURL, "PVN manager HTTPS or Unix URL")
-	flags.StringVar(&defaults.managerCA, "manager-ca", defaults.managerCA, "PEM CA bundle for an HTTPS manager")
-	flags.StringVar(&defaults.managerTLSServerName, "manager-tls-server-name", defaults.managerTLSServerName, "TLS server name override for an HTTPS manager")
 	flags.StringVar(&defaults.systemIDFile, "system-id-file", defaults.systemIDFile, "OVS persistent system ID file")
 	flags.DurationVar(&defaults.watchInterval, "watch-interval", defaults.watchInterval, "OVS interface scan interval")
 	flags.StringVar(&defaults.ovsVSCTL, "ovs-vsctl", defaults.ovsVSCTL, "ovs-vsctl binary path")

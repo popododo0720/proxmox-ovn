@@ -3,12 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"net"
 	"net/http"
-	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -17,7 +14,7 @@ import (
 func TestHTTPManagerClientResolve(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	client := managerClientForHandler(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/v1/runtime/ports/resolve" {
 			t.Errorf("path = %q", request.URL.Path)
 		}
@@ -39,9 +36,6 @@ func TestHTTPManagerClientResolve(t *testing.T) {
 			"status":            "binding",
 		})
 	}))
-	defer server.Close()
-
-	client := managerClientForTLSServer(t, server)
 	resolution, err := client.ResolveInterface(context.Background(), InterfaceRef{Node: "pve-a", VMID: 100, NICIndex: 2})
 	if err != nil {
 		t.Fatal(err)
@@ -67,12 +61,10 @@ func TestHTTPManagerClientLeavesUnknownAndAmbiguousUnresolved(t *testing.T) {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			client := managerClientForHandler(t, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 				writer.WriteHeader(test.status)
 				_, _ = writer.Write([]byte(test.body))
 			}))
-			defer server.Close()
-			client := managerClientForTLSServer(t, server)
 			_, err := client.ResolveInterface(context.Background(), InterfaceRef{Node: "pve-a", VMID: 100, NICIndex: 0})
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want %v", err, test.want)
@@ -118,14 +110,12 @@ func TestHTTPManagerClientAcceptsBoundAndCleanupResolutions(t *testing.T) {
 		status := status
 		t.Run(status, func(t *testing.T) {
 			t.Parallel()
-			server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			client := managerClientForHandler(t, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(writer).Encode(map[string]any{
 					"port_id": "port-1", "lsp_name": "pvn-lsp-1", "mac_address": "02:00:00:00:00:01",
 					"generation": 8, "requested_chassis": "chassis-a", "status": status,
 				})
 			}))
-			defer server.Close()
-			client := managerClientForTLSServer(t, server)
 			result, err := client.ResolveInterface(context.Background(), InterfaceRef{Node: "pve-a", VMID: 100, NICIndex: 0})
 			if err != nil || result.Status != status || result.Generation != "8" {
 				t.Fatalf("resolution=%#v err=%v", result, err)
@@ -170,12 +160,6 @@ func TestHTTPManagerClientReportsOnlyOverUnixSocket(t *testing.T) {
 		t.Fatalf("report payload=%#v want=%#v", payload, want)
 	}
 
-	tlsServer := httptest.NewTLSServer(http.NotFoundHandler())
-	defer tlsServer.Close()
-	httpsClient := managerClientForTLSServer(t, tlsServer)
-	if err := httpsClient.ReportPort(context.Background(), PortReport{PortID: "port-1", Generation: "9", Status: PortStatusBound}); !errors.Is(err, ErrRuntimeUnixOnly) {
-		t.Fatalf("HTTPS report error=%v", err)
-	}
 }
 
 func TestHTTPManagerClientMapsStaleReportGeneration(t *testing.T) {
@@ -260,21 +244,26 @@ func TestHTTPManagerClientSendsNodeHeartbeatRolesOnlyWhenExplicit(t *testing.T) 
 	}
 }
 
-func TestHTTPManagerClientRejectsPlainHTTP(t *testing.T) {
+func TestHTTPManagerClientRejectsNetworkTransports(t *testing.T) {
 	t.Parallel()
-	if _, err := NewHTTPManagerClient(HTTPManagerClientConfig{BaseURL: "http://127.0.0.1:8443"}); err == nil {
-		t.Fatal("plain HTTP manager URL unexpectedly accepted")
+	for _, address := range []string{"http://127.0.0.1", "https://127.0.0.1", "unix://host/run/pvn/manager.sock", "unix://relative.sock"} {
+		if _, err := NewHTTPManagerClient(HTTPManagerClientConfig{BaseURL: address}); err == nil {
+			t.Fatalf("network or malformed manager URL %q unexpectedly accepted", address)
+		}
 	}
 }
 
-func managerClientForTLSServer(t *testing.T, server *httptest.Server) *HTTPManagerClient {
+func managerClientForHandler(t *testing.T, handler http.Handler) *HTTPManagerClient {
 	t.Helper()
-	caPath := filepath.Join(t.TempDir(), "manager-ca.pem")
-	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
-	if err := os.WriteFile(caPath, certificate, 0o600); err != nil {
+	socketPath := filepath.Join(t.TempDir(), "manager.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := NewHTTPManagerClient(HTTPManagerClientConfig{BaseURL: server.URL, CAFile: caPath})
+	server := &http.Server{Handler: handler}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := NewHTTPManagerClient(HTTPManagerClientConfig{BaseURL: "unix://" + socketPath})
 	if err != nil {
 		t.Fatal(err)
 	}

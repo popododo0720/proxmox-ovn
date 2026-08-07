@@ -193,11 +193,11 @@ func TestRuntimeNodeHeartbeatRejectsIdentityCollisionAndInvalidRoles(t *testing.
 
 func TestRuntimeNodeHeartbeatIsNotExposedOnTCP(t *testing.T) {
 	store := controlstore.NewMemory()
-	provider := &lifecycleSessionProvider{authenticated: true, csrf: "csrf", session: Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"Sys.Modify": true}}}}
+	provider := &lifecycleSessionProvider{authenticated: true, session: Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"Sys.Modify": true}}}}
 	server := testServer(t, store, provider)
 	response := request(t, server, http.MethodPost, "/api/v1/runtime/nodes/heartbeat", map[string]any{
 		"name": "pve01", "chassis_id": "chassis-01",
-	}, map[string]string{PVNCSRFHeader: "csrf"})
+	}, nil)
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("TCP heartbeat status=%d body=%s", response.Code, response.Body.String())
 	}
