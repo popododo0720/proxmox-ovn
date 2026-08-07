@@ -65,6 +65,25 @@ effective PVE permissions before each action:
 - VM attachment: global/network `SDN.Use` and VM `VM.Config.Network`
 - central, provider, and gateway changes: global administrator permission
 
+## Network resource model and UI
+
+The control API keeps three different objects because they have different
+lifecycles, while the Proxmox UI presents them in one **Networks** workspace:
+
+- a **Logical Network** is an OVN logical switch. Tenant subnets and VM ports
+  belong here; an external logical network also references a provider network;
+- a **Provider Network** groups one physical north-south domain. Its detail
+  view owns segments, external logical networks, and floating IP inventory;
+- a **Segment** describes how that provider domain reaches the underlay:
+  physical-network mapping plus flat or VLAN encapsulation. One segment is the
+  provider's active default for OVN localnet realization.
+
+Logical-network selection filters its subnet list, and subnet selection filters
+the corresponding ports. Router and security-group screens use the same
+master-detail pattern for interfaces and rules. Subnet allocation pools are the
+shared IPv4 range used by OVN DHCP and PVN IPAM; leaving the range empty uses
+the automatically derived usable CIDR range.
+
 ## VM port lifecycle
 
 Attach is deliberately fail-closed:

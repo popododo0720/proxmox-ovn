@@ -23,6 +23,12 @@ even-sized clusters are rejected before topology changes.
 - running VM NIC attach and detach
 - native ExtJS `PVN` tree in the Proxmox web interface
 
+The native **Networks** workspace keeps logical networks and physical provider
+networks together without conflating their APIs. Selecting a logical network
+shows its subnets and ports; selecting a provider shows its flat/VLAN segments,
+external networks, and floating IPs. Router interfaces and security-group rules
+use the same master-detail layout.
+
 Normal PVN tables, selectors, confirmations, and bounded error messages resolve
 known resource references to human names. Unknown UUIDs are redacted there;
 open **Details** when an operator needs the full, copyable internal UUID.
