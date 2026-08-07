@@ -67,8 +67,14 @@ the control plane is activated.
 
 ## Upgrade boundary
 
-PVN 0.2 and 0.3 managers cannot share a control database. The 0.3 cutover is a
-maintenance operation: stop every PVN writer, install the new package inert,
-discard only the three PVN/OVN databases, reset the durable control-plane
-progress while preserving cluster identity and PKI, then bootstrap all voters
-again. A normal rolling update must refuse this schema transition.
+PVN 0.2 and 0.3 managers cannot share a control database. A normal rolling
+update refuses this schema transition, and PVN 0.3 does not ship a
+state-preserving 0.2 migration tool. Existing production deployments must stay
+on 0.2 until such a migrator is available.
+
+A disposable lab may instead perform an explicitly destructive reset after a
+verified backup: stop every PVN writer, install 0.3 while inactive, remove all
+three PVN/OVN databases, the shared control ledger/configuration, every node's
+PVN PKI, and the seed CA, then bootstrap all voters as a new PVN installation.
+That reset creates a new PVN cluster UUID and new PKI. The separately verified
+PVE/Corosync state, physical underlay, and topology ledger are not reset.

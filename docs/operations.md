@@ -455,9 +455,21 @@ raw, copyable UUIDs needed to correlate API or database records.
 
 Do not run the normal rolling updater for the PVN 0.2 to 0.3 transition.
 `PVN_Control` 2.0 removes Project columns and is intentionally incompatible.
-Use the breaking-cutover procedure shipped with 0.3; it stops every writer,
-installs the package inert, discards only PVN/OVN database state, preserves the
-cluster identity and PKI, and then bootstraps all voters again.
+PVN 0.3 does not provide a state-preserving migration from 0.2. Keep an
+existing production deployment on 0.2 until a dedicated migrator is available.
+
+For an explicitly disposable lab, take a root-only backup and use a maintenance
+window to recreate PVN as a new installation. Detach PVN-owned VM NICs first,
+stop and disable both PVN targets on every node, remove their activation and
+restart-intent markers, and install the 0.3 package while it remains inactive.
+Then remove all three PVN/OVN database files and locks, `/etc/pvn/pki` on every
+node, `/var/lib/pvn-ca` on the seed, `/etc/pve/pvn/config.json`, and
+`/etc/pve/priv/pvn/control-plane.json`. Preserve and revalidate
+`/etc/pve/priv/pvn/topology.json`, the selected management/Geneve/provider
+interfaces and bridges, Corosync configuration, and non-PVN PVE state. A fresh
+`pvn-control-plane plan` and confirmed apply must then create a new PVN cluster
+UUID, PKI, shared configuration, and three database clusters. Never describe
+this lab reset as an identity-preserving upgrade or use it on production data.
 
 The rolling updater below is only for schema-compatible releases.
 
