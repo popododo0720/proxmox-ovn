@@ -751,8 +751,42 @@ check_clean_ui_template() {
         remote_fail "an unmanaged PVN UI loader already exists"
 }
 
-check_ui() {
+check_clean_api_dispatcher() {
+    pvn_dispatcher=/usr/share/perl5/PVE/API2.pm
+    pvn_api_module=/usr/share/perl5/PVN/API2.pm
+    [ -f "$pvn_dispatcher" ] || remote_fail "PVE API dispatcher is missing"
+    [ ! -L "$pvn_dispatcher" ] || remote_fail "PVE API dispatcher is a symlink"
+
+    awk '
+        $0 == "use PVE::API2::Storage::Config;" { imports++ }
+        $0 == "    subclass => \"PVE::API2::Pool\"," { pools++ }
+        $0 == "# PVN-API-IMPORT:BEGIN" || $0 == "# PVN-API-IMPORT:END" ||
+            $0 == "# PVN-API-ROUTE:BEGIN" || $0 == "# PVN-API-ROUTE:END" ||
+            $0 == "use PVN::API2;" || $0 == "    subclass => \"PVN::API2\"," { collisions++ }
+        END { if (imports != 1 || pools != 1 || collisions != 0) exit 1 }
+    ' "$pvn_dispatcher" ||
+        remote_fail "PVE 9 API dispatcher is unsupported, malformed, or already modified for PVN"
+    [ ! -e "$pvn_api_module" ] && [ ! -L "$pvn_api_module" ] ||
+        remote_fail "an unmanaged PVN API module already exists"
+}
+
+check_api() {
     pvn_package_state=$1
+    pvn_verification_mode=$2
+    if [ "$pvn_package_state" = installed ] && [ -x /usr/lib/pvn/pvn-api-verify ]; then
+        /usr/lib/pvn/pvn-api-verify ||
+            remote_fail "installed PVN API verification failed"
+        return
+    fi
+    if [ "$pvn_package_state" = installed ] && [ "$pvn_verification_mode" = strict ]; then
+        remote_fail "installed pvn-api-verify is missing"
+    fi
+    check_clean_api_dispatcher
+}
+
+check_pve_extensions() {
+    pvn_package_state=$1
+    pvn_verification_mode=$2
     if [ "$pvn_package_state" = installed ]; then
         [ -x /usr/lib/pvn/pvn-ui-verify ] ||
             remote_fail "installed pvn-ui-verify is missing"
@@ -761,6 +795,7 @@ check_ui() {
     else
         check_clean_ui_template
     fi
+    check_api "$pvn_package_state" "$pvn_verification_mode"
 }
 
 run_preflight() {
@@ -779,7 +814,10 @@ run_preflight() {
     pvn_package_state=$(package_state)
     check_pve_and_quorum
     check_inactive "$pvn_package_state"
-    check_ui "$pvn_package_state"
+    # Upgrades from the pre-gateway package do not have pvn-api-verify yet.
+    # Accept only a clean PVE dispatcher in that transition; once the new DEB
+    # is installed, apply performs the strict verifier check below.
+    check_pve_extensions "$pvn_package_state" transition
     if [ "$pvn_package_state" = absent ]; then
         check_absent_ownership
         pvn_package_version=absent
@@ -870,7 +908,7 @@ case "$pvn_action" in
         check_inactive installed
         [ "$(package_state)" = installed ] ||
             remote_fail "pvn-node is not completely installed"
-        check_ui installed
+        check_pve_extensions installed strict
         ;;
     cleanup)
         [ "$#" -eq 1 ] || remote_fail "invalid cleanup arguments"
