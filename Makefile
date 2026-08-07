@@ -15,7 +15,10 @@ LDFLAGS := -s -w \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Date=$(BUILD_DATE)
 GO_BUILD_FLAGS := -trimpath -buildvcs=false
 
-.PHONY: all build test test-race ui-test vet fmt-check package-check deb deb-artifact release-check-test release-source-check release-env-check release clean
+.PHONY: all build test test-race ui-test vet fmt-check package-check \
+	package-check-fast package-check-topology package-check-control-plane \
+	package-check-backup deb deb-artifact release-check-test \
+	release-source-check release-env-check release-artifact release clean
 
 all: test build
 
@@ -43,6 +46,18 @@ fmt-check:
 
 package-check: build
 	packaging/tests/package-check.sh
+
+package-check-fast:
+	packaging/tests/package-check.sh fast
+
+package-check-topology:
+	packaging/tests/package-check.sh topology
+
+package-check-control-plane: build
+	packaging/tests/package-check.sh control-plane
+
+package-check-backup:
+	packaging/tests/package-check.sh backup
 
 release-check-test:
 	tools/release-check-test.sh
@@ -110,8 +125,14 @@ deb-artifact:
 		--build "$$pvn_root" "$$pvn_deb"; \
 	packaging/tests/deb-check.sh "$$pvn_deb"
 
-release: release-env-check clean
-	+$(MAKE) deb DEB_VERSION=$(DEB_VERSION)
+release: release-env-check
+	+$(MAKE) package-check
+	+$(MAKE) ui-test
+	+$(MAKE) release-artifact DEB_VERSION=$(DEB_VERSION)
+
+release-artifact: release-env-check
+	+$(MAKE) clean
+	+$(MAKE) deb-artifact DEB_VERSION=$(DEB_VERSION)
 	@set -eu; \
 	pvn_arch=$$(dpkg --print-architecture); \
 	pvn_deb="pvn-node_$(DEB_VERSION)_$${pvn_arch}.deb"; \

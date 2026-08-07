@@ -4,7 +4,34 @@ set -eu
 repo=$(CDPATH= cd -P "$(dirname "$0")/../.." && pwd)
 cd "$repo"
 
-[ "$#" -eq 0 ] || { echo "usage: $0" >&2; exit 2; }
+case "$#" in
+    0) package_check_group=all ;;
+    1) package_check_group=$1 ;;
+    *) echo "usage: $0 [fast|topology|control-plane|backup|all]" >&2; exit 2 ;;
+esac
+case "$package_check_group" in
+    fast|topology|control-plane|backup|all) ;;
+    *) echo "usage: $0 [fast|topology|control-plane|backup|all]" >&2; exit 2 ;;
+esac
+
+group_selected() {
+    [ "$package_check_group" = all ] || [ "$package_check_group" = "$1" ]
+}
+
+now_ns() {
+    date +%s%N
+}
+
+report_elapsed() {
+    elapsed_ms=$(($2 / 1000000))
+    printf 'package-check: group=%s elapsed=%d.%03ds\n' \
+        "$1" "$((elapsed_ms / 1000))" "$((elapsed_ms % 1000))"
+}
+
+fast_elapsed_ns=0
+
+if group_selected fast; then
+fast_started_ns=$(now_ns)
 
 for script in deploy/scripts/pvn-*; do
     [ -f "$script" ] && [ ! -L "$script" ] || continue
@@ -40,11 +67,35 @@ deploy/tests/pvn-ovn-db-listeners-test.sh
 python3 -B deploy/tests/pvn-ovn-northd-test.py
 python3 -B deploy/tests/pvn-node-ready-test.py
 python3 -B packaging/tests/pvn-postinst-test.py
+fast_finished_ns=$(now_ns)
+fast_elapsed_ns=$((fast_elapsed_ns + fast_finished_ns - fast_started_ns))
+fi
+
+if group_selected topology; then
+group_started_ns=$(now_ns)
 deploy/tests/pvn-topology-test.sh
 python3 -B deploy/tests/pvn-topology-standalone-test.py
 python3 -B deploy/tests/pvn-topology-corosync-test.py
+group_finished_ns=$(now_ns)
+report_elapsed topology "$((group_finished_ns - group_started_ns))"
+fi
+
+if group_selected control-plane; then
+group_started_ns=$(now_ns)
 deploy/tests/pvn-control-plane-test.sh
+group_finished_ns=$(now_ns)
+report_elapsed control-plane "$((group_finished_ns - group_started_ns))"
+fi
+
+if group_selected backup; then
+group_started_ns=$(now_ns)
 python3 deploy/tests/pvn-db-backup-test.py
+group_finished_ns=$(now_ns)
+report_elapsed backup "$((group_finished_ns - group_started_ns))"
+fi
+
+if group_selected fast; then
+fast_started_ns=$(now_ns)
 
 if grep -R -n -E '(^|[[:space:]])(ovs-vsctl|ip)[[:space:]].*(add-br|add-port).*br-provider' deploy packaging; then
     echo "package must never create or attach a physical provider bridge" >&2
@@ -367,3 +418,7 @@ do
 done
 
 systemd-analyze verify --root="$verify_root" pvn-node.target pvn-central.target pve-guests.service
+fast_finished_ns=$(now_ns)
+fast_elapsed_ns=$((fast_elapsed_ns + fast_finished_ns - fast_started_ns))
+report_elapsed fast "$fast_elapsed_ns"
+fi
