@@ -33,6 +33,28 @@ install_ui() {
     /usr/lib/pvn/pvn-ui-verify
 }
 
+install_api() {
+    [ -x /usr/lib/pvn/pvn-api-inject ] || {
+        echo "PVN API injector is missing" >&2
+        return 1
+    }
+    [ -x /usr/lib/pvn/pvn-api-verify ] || {
+        echo "PVN API verifier is missing" >&2
+        return 1
+    }
+    /usr/lib/pvn/pvn-api-inject install
+    /usr/lib/pvn/pvn-api-verify
+}
+
+install_pve_extensions() {
+    install_api
+    install_ui
+    systemctl reload pveproxy.service || {
+        echo "pveproxy could not reload the installed PVN API extension" >&2
+        return 1
+    }
+}
+
 verify_corosync_runtime() {
     if ! /usr/sbin/pvnctl doctor --check corosync-runtime-config >/dev/null; then
         echo "persisted and live Corosync state differ; refusing PVN service restart" >&2
@@ -253,7 +275,7 @@ invalidate_node_readiness() {
 }
 
 if [ "${1:-}" = "triggered" ]; then
-    install_ui
+    install_pve_extensions
     exit 0
 fi
 
@@ -289,10 +311,10 @@ else
 fi
 systemctl mask ovn-host.service >/dev/null 2>&1 || true
 
-# Verify the supported PVE 9 template only after OVN aggregate services are
-# safely masked. A UI compatibility failure leaves package configuration
-# visibly failed without exposing an unmanaged OVN startup path.
-install_ui
+# Install and verify the supported PVE 9 API/UI hooks only after OVN aggregate
+# services are safely masked. A compatibility failure leaves package
+# configuration visibly failed without exposing an unmanaged OVN startup path.
+install_pve_extensions
 
 # Record and lock the transition before restarting the manager. The manager's
 # startup probe is intentionally reachability-only because the preserved old

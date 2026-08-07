@@ -10,6 +10,6 @@ Package: pvn-node
 Architecture: any
 Depends: ${misc:Depends}, ${shlibs:Depends}, adduser, ca-certificates, curl, liburi-perl, libwww-perl, openssl, python3, systemd, openvswitch-switch (>= 3.5~), ovn-host (>= 25.03~), ovn-central (>= 25.03~), pve-manager (>= 9.0), pve-manager (<< 10)
 Description: Proxmox VE cloud networking manager backed by OVN
- Installs the PVN manager, local interface binding agent, web UI adapter,
+ Installs the PVN manager, local interface binding agent, Proxmox UI extension,
  control schema, and central-role units. The same package is required on every
  online node in a PVN-enabled Proxmox cluster.

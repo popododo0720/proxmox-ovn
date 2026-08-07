@@ -89,6 +89,8 @@ def run_scenario(
         ("/var/lib/pvn", str(root / "var-lib-pvn")),
         ("/etc/pvn", str(etc_pvn)),
         ("/usr/share/doc/pvn-node/examples/ovn-host.env", str(example)),
+        ("/usr/lib/pvn/pvn-api-inject", str(commands / "pvn-api-inject")),
+        ("/usr/lib/pvn/pvn-api-verify", str(commands / "pvn-api-verify")),
         ("/usr/lib/pvn/pvn-ui-inject", str(commands / "pvn-ui-inject")),
         ("/usr/lib/pvn/pvn-ui-verify", str(commands / "pvn-ui-verify")),
         ("/usr/lib/pvn/pvn-ovn-northd", str(commands / "pvn-ovn-northd")),
@@ -104,7 +106,14 @@ def run_scenario(
     write_executable(commands / "getent", "#!/bin/sh\nexit 0\n")
     write_executable(commands / "addgroup", "#!/bin/sh\nexit 99\n")
     write_executable(commands / "adduser", "#!/bin/sh\nexit 99\n")
-    for name in ("pvn-ui-inject", "pvn-ui-verify", "pvnctl", "pvn-ovn-northd"):
+    for name in (
+        "pvn-api-inject",
+        "pvn-api-verify",
+        "pvn-ui-inject",
+        "pvn-ui-verify",
+        "pvnctl",
+        "pvn-ovn-northd",
+    ):
         write_executable(commands / name, "#!/bin/sh\nexit 0\n")
     write_executable(
         commands / "dpkg-query",
