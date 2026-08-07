@@ -1,15 +1,13 @@
 # Development
 
-Run the Go and web checks with:
+Run the Go, native UI, and package checks with:
 
 ```sh
 make test
 make build
 make package-check
 make deb
-npm --prefix web ci
-npm --prefix web test -- --run
-npm --prefix web run build
+make ui-test
 ```
 
 The unit tests use in-memory control state and fake PVE/OVS command runners.
@@ -40,7 +38,7 @@ GitHub Actions workflow and fails outside GitHub Actions.
 
 The canonical publisher uses the pinned Debian image
 `docker.io/library/debian@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958`,
-Go 1.24.13, Node 24.18.0, npm 11.16.0, and dpkg 1.22.22. The DEB uses
+Go 1.24.13, Node 24.18.0 for native UI tests, and dpkg 1.22.22. The DEB uses
 deterministic xz level 6 with one compressor thread; commit ID, build date, and
 `SOURCE_DATE_EPOCH` come from the tagged commit.
 

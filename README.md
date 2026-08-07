@@ -5,7 +5,8 @@ It exposes an NSX/Neutron-style cloud networking model while keeping Proxmox
 as the compute control plane.
 
 The installer puts the same PVN package on every online Proxmox node. Each
-node runs the manager API/UI, a local TAP binding agent, Open vSwitch, and
+node runs a local manager, the native Proxmox UI/API adapter, a TAP binding
+agent, Open vSwitch, and
 `ovn-controller`. The current bootstrap supports either one standalone PVE
 node or any quorate, odd-sized PVE cluster with at least three nodes. In
 clustered mode every PVE node is a database voter and transport node;
@@ -13,14 +14,14 @@ even-sized clusters are rejected before topology changes.
 
 ## Initial feature set
 
-- PVE Pool to PVN Project mapping
+- one cluster-global, projectless network domain
 - Geneve tenant networks and IPv4 subnets
 - OVN native DHCP
 - logical routers, centralized SNAT, and floating IPs
 - flat and VLAN provider networks
-- stateful security groups with a reserved Neutron-style project default
+- stateful security groups with a reserved cluster-global default
 - running VM NIC attach and detach
-- embedded `PVN` page in the Proxmox web interface
+- native ExtJS `PVN` tree in the Proxmox web interface
 
 Normal PVN tables, selectors, confirmations, and bounded error messages resolve
 known resource references to human names. Unknown UUIDs are redacted there;
@@ -97,5 +98,6 @@ builds and publishes exclusively through the tag-triggered GitHub Actions
 workflow; see [canonical releases](docs/development.md#canonical-releases).
 
 See [architecture](docs/architecture.md), [operations](docs/operations.md),
-and [development](docs/development.md) for the concrete topology, voter
+the [PVN 0.3 design](docs/projectless-v0.3.md), and
+[development](docs/development.md) for the concrete topology, voter
 policy, bootstrap flow, security boundary, and current scope.

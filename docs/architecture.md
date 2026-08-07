@@ -6,8 +6,10 @@ package. There is no container runtime and no separate appliance VM.
 
 ## Per-node processes
 
-- `pvn-manager`: HTTPS API and static web UI on port 8443. All managers are
-  active and reconcile the same desired state.
+- `pvn-manager`: local management and reconcile API over two Unix sockets. All
+  managers are active and reconcile the same desired state.
+- Proxmox API/UI adapter: native ExtJS screens and the authenticated
+  `/api2/json/pvn` route on the existing PVE port 8006.
 - `pvn-agent`: observes local QEMU TAP interfaces and binds only ports for
   which the manager returns an exact `(node, vmid, netN)` assignment.
 - Open vSwitch and `ovn-controller`: implement the local datapath.
@@ -29,21 +31,19 @@ usable without activating PVN.
 
 ## Source of truth
 
-`PVN_Control` is the desired-state database. It contains projects, tenant and
-provider networks, IPv4 subnets and allocations, ports, routers, floating IPs,
-security groups, nodes, and durable operations. OVN Northbound is realized
+`PVN_Control` is the desired-state database. It contains tenant and provider
+networks, IPv4 subnets and allocations, ports, routers, floating IPs, security
+groups, nodes, and durable operations. OVN Northbound is realized
 state. Reconcilers are revision- and idempotency-aware; no transaction is
 assumed to span the two databases.
 
-Every project has a reserved default security group. A newly provisioned port
+The cluster has one reserved default security group. A newly provisioned port
 receives that group when the request omits `security_group_ids`; an explicit
 selection replaces the default. The reserved group and its baseline rules are
 ordinary list results in the manager API, so operators should expect to see
-them alongside tenant-created policy. The managed baseline cannot be weakened,
-while authorized tenants may add separate rules to extend the default group.
-Ports created before this invariant may
-still have an empty group list and remain unrestricted until the supported
-default-security-group backfill migrates them.
+them alongside operator-created policy. The managed baseline cannot be
+weakened. Its self-ingress rule makes all ports using the default group one
+routed trust domain; use explicit groups when narrower trust is required.
 
 The manager's operator-facing deployment name comes from a systemd credential
 copy of `/etc/pve/.members`: clustered nodes use `cluster.name`, while a
@@ -56,13 +56,13 @@ standalone `.members` shape. Unknown fields, malformed identity metadata, or a
 non-regular credential file fail manager startup instead of falling back to
 the installation UUID.
 
-PVE pools map to PVN projects. PVN checks the authenticated user's effective
-PVE permissions before each action:
+PVN is one cluster-global administration domain and does not map PVE pools to
+network projects. The Proxmox API adapter checks the authenticated user's
+effective PVE permissions before each action:
 
 - read: `SDN.Audit`
 - network resource changes: `SDN.Allocate`
-- VM attachment: network `SDN.Use` at `/sdn/zones/pvn/<network-id>` (or the
-  project pool/global scope) and VM `VM.Config.Network`
+- VM attachment: global/network `SDN.Use` and VM `VM.Config.Network`
 - central, provider, and gateway changes: global administrator permission
 
 ## VM port lifecycle
@@ -97,22 +97,21 @@ PVE live migration/HA moves are outside v1.
 ## UI and authentication
 
 The Debian package adds one marked script tag after `pvemanagerlib.js`. The
-loader contributes a `PVN` Datacenter menu and embeds the same-node manager UI.
+loader contributes a native `PVN` Datacenter menu and ExtJS resource panels.
 It is not a stable PVE plugin ABI, so the patch is version-gated, idempotent,
 and becomes a no-op on unknown PVE versions.
 
-The browser sends the existing `PVEAuthCookie` to the same host on port 8443.
-`pvn-manager` validates it against the local PVE permissions endpoint and then
-issues a short-lived PVN session plus a PVN CSRF token. There is no anonymous
-API and no second login. Privileged calls proxied to PVE use strict
-origin/source/nonce checks and PVE's existing CSRF and audit path.
+The browser uses only the existing PVE origin on port 8006. Proxmox validates
+its ticket, CSRF token and RBAC before a fixed PVN route is forwarded over a
+browser-only Unix socket. No PVE cookie, authorization header or CSRF token is
+forwarded to `pvn-manager`; there is no anonymous API, second login, iframe,
+cross-origin request, or PVN-specific browser session.
 
 ## Ports
 
 | Port | Purpose |
 | ---: | --- |
 | 8006 | existing PVE API/UI |
-| 8443 | PVN manager HTTPS |
 | 6641 | OVN Northbound client |
 | 6642 | OVN Southbound client |
 | 6643 | OVN Northbound Raft |
