@@ -281,10 +281,8 @@ if grep -Eq '(^|[[:space:]])make[[:space:]]+deb([[:space:]\\]|$)' \
     printf 'CI workflow must not rerun the aggregate make deb target\n' >&2
     exit 1
 fi
-ci_concurrency=$(yq -r \
-    '.concurrency.group + " " + (.concurrency.cancel-in-progress | tostring)' \
-    "$ci_workflow")
-if [[ $ci_concurrency != 'ci-${{ github.ref }} true' ]]; then
+if ! grep -Fxq '  group: ci-${{ github.ref }}' "$ci_workflow" ||
+    ! grep -Fxq '  cancel-in-progress: true' "$ci_workflow"; then
     printf 'CI must cancel stale runs superseded on the same ref\n' >&2
     exit 1
 fi
