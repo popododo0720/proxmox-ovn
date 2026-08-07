@@ -281,6 +281,13 @@ if grep -Eq '(^|[[:space:]])make[[:space:]]+deb([[:space:]\\]|$)' \
     printf 'CI workflow must not rerun the aggregate make deb target\n' >&2
     exit 1
 fi
+ci_concurrency=$(yq -r \
+    '.concurrency.group + " " + (.concurrency.cancel-in-progress | tostring)' \
+    "$ci_workflow")
+if [[ $ci_concurrency != 'ci-${{ github.ref }} true' ]]; then
+    printf 'CI must cancel stale runs superseded on the same ref\n' >&2
+    exit 1
+fi
 
 grep -Fq 'libhttp-message-perl' "$release_workflow" || {
     printf 'release workflow is missing HTTP::Response prerequisites\n' >&2
