@@ -18,32 +18,31 @@ type managedPolicyAPIResource struct {
 
 func TestSecurityPolicyResponsesExposeComputedManagementMetadata(t *testing.T) {
 	store := controlstore.NewMemory()
-	project := createAPIResource(t, store, &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "managed-project").(*model.Project)
-	if _, err := defaultsecurity.New(store, nil).Ensure(context.Background(), project.ID); err != nil {
+	if _, err := defaultsecurity.New(store, nil).Ensure(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	tenantGroup := createAPIResource(t, store, &model.SecurityGroup{
-		ProjectID: project.ID, Name: "web", Stateful: true,
+		Name: "web", Stateful: true,
 	}, "tenant-group").(*model.SecurityGroup)
 	tenantRule := createAPIResource(t, store, &model.SecurityGroupRule{
-		ProjectID: project.ID, SecurityGroupID: defaultsecurity.DefaultSecurityGroupID(project.ID),
-		Direction: model.DirectionIngress, EtherType: model.EtherTypeIPv4, Action: model.ActionAllow,
+		SecurityGroupID: defaultsecurity.DefaultSecurityGroupID(),
+		Direction:       model.DirectionIngress, EtherType: model.EtherTypeIPv4, Action: model.ActionAllow,
 		Protocol: "tcp", PortRangeMin: 443, PortRangeMax: 443,
 	}, "tenant-rule").(*model.SecurityGroupRule)
 	server := testServer(t, store, nil)
 
 	groupsResponse := request(t, server, http.MethodGet, "/api/v1/security-groups", nil, nil)
 	groups := decodeData[[]managedPolicyAPIResource](t, groupsResponse)
-	assertManagedPolicyMetadata(t, groups, defaultsecurity.DefaultSecurityGroupID(project.ID), true)
+	assertManagedPolicyMetadata(t, groups, defaultsecurity.DefaultSecurityGroupID(), true)
 	assertManagedPolicyMetadata(t, groups, tenantGroup.ID, false)
 
 	rulesResponse := request(t, server, http.MethodGet, "/api/v1/security-group-rules", nil, nil)
 	rules := decodeData[[]managedPolicyAPIResource](t, rulesResponse)
-	assertManagedPolicyMetadata(t, rules, defaultsecurity.DefaultEgressRuleID(project.ID), true)
-	assertManagedPolicyMetadata(t, rules, defaultsecurity.DefaultIngressRuleID(project.ID), true)
+	assertManagedPolicyMetadata(t, rules, defaultsecurity.DefaultEgressRuleID(), true)
+	assertManagedPolicyMetadata(t, rules, defaultsecurity.DefaultIngressRuleID(), true)
 	assertManagedPolicyMetadata(t, rules, tenantRule.ID, false)
 
-	getResponse := request(t, server, http.MethodGet, "/api/v1/security-groups/"+defaultsecurity.DefaultSecurityGroupID(project.ID), nil, nil)
+	getResponse := request(t, server, http.MethodGet, "/api/v1/security-groups/"+defaultsecurity.DefaultSecurityGroupID(), nil, nil)
 	managed := decodeData[managedPolicyAPIResource](t, getResponse)
 	if !managed.Managed || !managed.ReadOnly {
 		t.Fatalf("default group metadata=%+v", managed)
