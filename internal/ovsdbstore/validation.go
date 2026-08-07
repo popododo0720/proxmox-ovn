@@ -695,7 +695,71 @@ func matches(resource model.Resource, options controlstore.ListOptions) bool {
 	if options.NIC != "" && nic != options.NIC {
 		return false
 	}
+	if options.SubnetID != "" && !resourceReferencesSubnet(resource, options.SubnetID) {
+		return false
+	}
+	if options.RouterID != "" && !resourceReferencesRouter(resource, options.RouterID) {
+		return false
+	}
+	if options.SecurityGroupID != "" && !resourceReferencesSecurityGroup(resource, options.SecurityGroupID) {
+		return false
+	}
+	if options.ProviderNetworkID != "" && !resourceReferencesProviderNetwork(resource, options.ProviderNetworkID) {
+		return false
+	}
 	return true
+}
+
+func resourceReferencesSubnet(resource model.Resource, id string) bool {
+	switch value := resource.(type) {
+	case *model.Port:
+		for _, fixedIP := range value.FixedIPs {
+			if fixedIP.SubnetID == id {
+				return true
+			}
+		}
+	case *model.IPAllocation:
+		return value.SubnetID == id
+	case *model.RouterInterface:
+		return value.SubnetID == id
+	}
+	return false
+}
+
+func resourceReferencesRouter(resource model.Resource, id string) bool {
+	switch value := resource.(type) {
+	case *model.RouterInterface:
+		return value.RouterID == id
+	case *model.FloatingIP:
+		return value.RouterID == id
+	}
+	return false
+}
+
+func resourceReferencesSecurityGroup(resource model.Resource, id string) bool {
+	switch value := resource.(type) {
+	case *model.SecurityGroupRule:
+		return value.SecurityGroupID == id
+	case *model.Port:
+		for _, groupID := range value.SecurityGroupIDs {
+			if groupID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func resourceReferencesProviderNetwork(resource model.Resource, id string) bool {
+	switch value := resource.(type) {
+	case *model.Network:
+		return value.ProviderNetworkID == id
+	case *model.ProviderSegment:
+		return value.ProviderNetworkID == id
+	case *model.FloatingIP:
+		return value.ProviderNetworkID == id
+	}
+	return false
 }
 
 func resourceFields(resource model.Resource) (networkID, nodeID string, vmid int, nic string) {

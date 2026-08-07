@@ -30,10 +30,14 @@ func storeError(kind error, format string, args ...any) error {
 }
 
 type ListOptions struct {
-	NetworkID string
-	NodeID    string
-	VMID      int
-	NIC       string
+	NetworkID         string
+	SubnetID          string
+	RouterID          string
+	SecurityGroupID   string
+	ProviderNetworkID string
+	NodeID            string
+	VMID              int
+	NIC               string
 	// RecentFirst orders matching resources by creation time descending, with
 	// the resource ID as a deterministic tie breaker. Limit is applied after
 	// filtering and ordering; zero means no store-level limit.

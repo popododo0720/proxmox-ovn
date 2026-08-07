@@ -329,6 +329,40 @@ func TestMemoryReferencesUniquenessAndFiltering(t *testing.T) {
 	}
 }
 
+func TestMemoryRelationshipListFilters(t *testing.T) {
+	const (
+		subnetID   = "subnet-a"
+		routerID   = "router-a"
+		groupID    = "group-a"
+		providerID = "provider-a"
+	)
+	tests := []struct {
+		name     string
+		resource model.Resource
+		options  ListOptions
+		matches  bool
+	}{
+		{"port by subnet", &model.Port{FixedIPs: []model.FixedIP{{SubnetID: subnetID}}}, ListOptions{SubnetID: subnetID}, true},
+		{"port by other subnet", &model.Port{FixedIPs: []model.FixedIP{{SubnetID: "subnet-b"}}}, ListOptions{SubnetID: subnetID}, false},
+		{"allocation by subnet", &model.IPAllocation{SubnetID: subnetID}, ListOptions{SubnetID: subnetID}, true},
+		{"interface by router", &model.RouterInterface{RouterID: routerID}, ListOptions{RouterID: routerID}, true},
+		{"floating ip by router", &model.FloatingIP{RouterID: routerID}, ListOptions{RouterID: routerID}, true},
+		{"rule by security group", &model.SecurityGroupRule{SecurityGroupID: groupID}, ListOptions{SecurityGroupID: groupID}, true},
+		{"port by security group", &model.Port{SecurityGroupIDs: []string{groupID}}, ListOptions{SecurityGroupID: groupID}, true},
+		{"segment by provider", &model.ProviderSegment{ProviderNetworkID: providerID}, ListOptions{ProviderNetworkID: providerID}, true},
+		{"network by provider", &model.Network{ProviderNetworkID: providerID}, ListOptions{ProviderNetworkID: providerID}, true},
+		{"floating ip by provider", &model.FloatingIP{ProviderNetworkID: providerID}, ListOptions{ProviderNetworkID: providerID}, true},
+		{"filters combine", &model.FloatingIP{ProviderNetworkID: providerID, RouterID: routerID}, ListOptions{ProviderNetworkID: providerID, RouterID: "router-b"}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := matches(test.resource, test.options); got != test.matches {
+				t.Fatalf("matches()=%t want=%t", got, test.matches)
+			}
+		})
+	}
+}
+
 func TestMemoryRouterExternalGatewayReferences(t *testing.T) {
 	store := deterministicStore()
 	_, privateNetwork, privateSubnet := baseTopology(t, store)

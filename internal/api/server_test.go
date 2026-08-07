@@ -303,6 +303,12 @@ func TestCRUDValidationReferencesAndListFilter(t *testing.T) {
 	if legacyFilter.Code != http.StatusBadRequest {
 		t.Fatalf("legacy project_id filter status=%d body=%s", legacyFilter.Code, legacyFilter.Body.String())
 	}
+	for _, filter := range []string{"subnet_id", "router_id", "security_group_id", "provider_network_id"} {
+		filtered := request(t, server, http.MethodGet, "/api/v1/networks?"+filter+"=related-resource", nil, nil)
+		if filtered.Code != http.StatusOK {
+			t.Fatalf("relationship filter %s status=%d body=%s", filter, filtered.Code, filtered.Body.String())
+		}
+	}
 	list := request(t, server, http.MethodGet, "/api/v1/networks", nil, nil)
 	data := decodeData[[]model.Network](t, list)
 	if len(data) != 1 || data[0].MTU != 1400 {

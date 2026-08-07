@@ -288,7 +288,11 @@ func (s *Server) resource(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) list(writer http.ResponseWriter, request *http.Request, kind model.Kind) {
-	allowedQuery := map[string]bool{"network_id": true, "node_id": true, "vmid": true, "nic": true}
+	allowedQuery := map[string]bool{
+		"network_id": true, "subnet_id": true, "router_id": true,
+		"security_group_id": true, "provider_network_id": true,
+		"node_id": true, "vmid": true, "nic": true,
+	}
 	if kind == model.KindOperation {
 		allowedQuery["limit"] = true
 	}
@@ -303,9 +307,13 @@ func (s *Server) list(writer http.ResponseWriter, request *http.Request, kind mo
 		}
 	}
 	options := controlstore.ListOptions{
-		NetworkID: request.URL.Query().Get("network_id"),
-		NodeID:    request.URL.Query().Get("node_id"),
-		NIC:       request.URL.Query().Get("nic"),
+		NetworkID:         request.URL.Query().Get("network_id"),
+		SubnetID:          request.URL.Query().Get("subnet_id"),
+		RouterID:          request.URL.Query().Get("router_id"),
+		SecurityGroupID:   request.URL.Query().Get("security_group_id"),
+		ProviderNetworkID: request.URL.Query().Get("provider_network_id"),
+		NodeID:            request.URL.Query().Get("node_id"),
+		NIC:               request.URL.Query().Get("nic"),
 	}
 	if rawVMID := request.URL.Query().Get("vmid"); rawVMID != "" {
 		vmid, err := strconv.Atoi(rawVMID)

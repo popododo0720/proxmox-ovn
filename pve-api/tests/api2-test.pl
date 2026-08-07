@@ -125,7 +125,9 @@ for my $collection (@writable_collections) {
 }
 ok(parameter_is_required('port_deprovision', 'revision'), 'port deprovision requires a revision');
 ok(parameter_is_required('port_deprovision', 'idempotency_key'), 'port deprovision requires an idempotency key');
-for my $parameter (qw(network_id node_id vmid nic limit)) {
+for my $parameter (qw(
+    network_id subnet_id router_id security_group_id provider_network_id node_id vmid nic limit
+)) {
     ok(parameter_is_optional('list_networks', $parameter), "list filter $parameter is optional");
 }
 

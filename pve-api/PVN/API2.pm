@@ -343,6 +343,10 @@ for my $collection (@READ_COLLECTIONS) {
             additionalProperties => 0,
             properties => {
                 network_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
+                subnet_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
+                router_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
+                security_group_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
+                provider_network_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
                 node_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
                 vmid => { type => 'integer', minimum => 1, optional => 1 },
                 nic => { type => 'string', pattern => 'net[0-9]+', optional => 1 },
@@ -352,7 +356,10 @@ for my $collection (@READ_COLLECTIONS) {
         returns => $array_return,
         code => sub {
             return forward_request(
-                'GET', "/api/v1/$collection", $_[0], [qw(network_id node_id vmid nic limit)],
+                'GET', "/api/v1/$collection", $_[0], [qw(
+                    network_id subnet_id router_id security_group_id provider_network_id
+                    node_id vmid nic limit
+                )],
             );
         },
     });

@@ -392,6 +392,39 @@ func TestStoreLookupRuntimePortsUsesTargetedReadAndResolvesAliases(t *testing.T)
 	}
 }
 
+func TestRelationshipListFilters(t *testing.T) {
+	const (
+		subnetID   = "subnet-a"
+		routerID   = "router-a"
+		groupID    = "group-a"
+		providerID = "provider-a"
+	)
+	tests := []struct {
+		name     string
+		resource model.Resource
+		options  controlstore.ListOptions
+		matches  bool
+	}{
+		{"port by subnet", &model.Port{FixedIPs: []model.FixedIP{{SubnetID: subnetID}}}, controlstore.ListOptions{SubnetID: subnetID}, true},
+		{"allocation by subnet", &model.IPAllocation{SubnetID: subnetID}, controlstore.ListOptions{SubnetID: subnetID}, true},
+		{"interface by router", &model.RouterInterface{RouterID: routerID}, controlstore.ListOptions{RouterID: routerID}, true},
+		{"floating ip by router", &model.FloatingIP{RouterID: routerID}, controlstore.ListOptions{RouterID: routerID}, true},
+		{"rule by security group", &model.SecurityGroupRule{SecurityGroupID: groupID}, controlstore.ListOptions{SecurityGroupID: groupID}, true},
+		{"port by security group", &model.Port{SecurityGroupIDs: []string{groupID}}, controlstore.ListOptions{SecurityGroupID: groupID}, true},
+		{"segment by provider", &model.ProviderSegment{ProviderNetworkID: providerID}, controlstore.ListOptions{ProviderNetworkID: providerID}, true},
+		{"network by provider", &model.Network{ProviderNetworkID: providerID}, controlstore.ListOptions{ProviderNetworkID: providerID}, true},
+		{"floating ip by provider", &model.FloatingIP{ProviderNetworkID: providerID}, controlstore.ListOptions{ProviderNetworkID: providerID}, true},
+		{"filters combine", &model.FloatingIP{ProviderNetworkID: providerID, RouterID: routerID}, controlstore.ListOptions{ProviderNetworkID: providerID, RouterID: "router-b"}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := matches(test.resource, test.options); got != test.matches {
+				t.Fatalf("matches()=%t want=%t", got, test.matches)
+			}
+		})
+	}
+}
+
 func TestRuntimePortLookupOperationsAreTargeted(t *testing.T) {
 	operations := runtimePortLookupOperations(100, "net0")
 	if len(operations) != 2 || !controlschema.Schema().ValidateOperations(operations...) {
