@@ -1,3 +1,13 @@
+proxmox-ovn (0.2.18) unstable; urgency=medium
+
+  * Expose PVN views as a native expandable Proxmox Datacenter menu while
+    preserving the authenticated VM configuration bridge.
+  * Hide duplicate navigation in embedded views and select each view through
+    a bounded loader route.
+  * Bust cached PVE loader revisions with the loader content digest.
+
+ -- PVN Project <root@localhost>  Fri, 07 Aug 2026 00:54:31 +0000
+
 proxmox-ovn (0.2.17) unstable; urgency=medium
 
   * Allow full-voter startup reachability checks while keeping strict OVN
