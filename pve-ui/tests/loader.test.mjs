@@ -39,6 +39,7 @@ function harness() {
   }
 
   function makeStore(config) {
+    const eventListeners = new Map();
     const store = {
       ...config,
       loaded: 0,
@@ -49,7 +50,14 @@ function harness() {
       filterBy(callback) { this.filters.push(callback); },
       getRange() { return this.records; },
       getById(id) { return this.records.find((record) => record.id === id || record.data?.id === id); },
-      on() {},
+      on(event, callback) {
+        const callbacks = eventListeners.get(event) || [];
+        callbacks.push(callback);
+        eventListeners.set(event, callbacks);
+      },
+      fire(event, ...args) {
+        for (const callback of eventListeners.get(event) || []) callback(...args);
+      },
     };
     stores.push(store);
     return store;
@@ -288,6 +296,30 @@ test('catalog labels use resource names and never expose reference UUIDs', () =>
   store.records = [{ id: 'network-uuid', data: { id: 'network-uuid', name: 'private' } }];
   assert.equal(window.PVN.Catalog.label('networks', 'network-uuid', 'Unavailable network'), 'private');
   assert.equal(window.PVN.Catalog.label('networks', 'missing-uuid', 'Unavailable network'), 'Unavailable network');
+});
+
+test('destroyed resource grids unsubscribe from catalog refreshes', () => {
+  const { classes, window } = harness();
+  const ResourceGrid = classes.get('PVN.grid.Resource');
+  const grid = new ResourceGrid({ collection: 'networks' });
+  let refreshes = 0;
+  const view = { ownerGrid: grid, refresh() { refreshes += 1; } };
+  grid.getView = () => view;
+  grid.initComponent();
+
+  const catalogStore = window.PVN.Catalog.get('ports');
+  catalogStore.fire('load');
+  assert.equal(refreshes, 1);
+
+  view.ownerGrid = null;
+  catalogStore.fire('load');
+  assert.equal(refreshes, 1);
+
+  grid.destroyed = true;
+  grid.listeners.destroy();
+  view.ownerGrid = grid;
+  catalogStore.fire('load');
+  assert.equal(refreshes, 1);
 });
 
 test('details contain the UUID while primary labels do not', () => {

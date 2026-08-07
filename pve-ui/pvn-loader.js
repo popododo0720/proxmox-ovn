@@ -311,6 +311,13 @@
             },
             watch: function (callback) {
                 catalogWatchers.push(callback);
+                var watching = true;
+                return function () {
+                    if (!watching) return;
+                    watching = false;
+                    var index = catalogWatchers.indexOf(callback);
+                    if (index !== -1) catalogWatchers.splice(index, 1);
+                };
             },
         };
 
@@ -1078,13 +1085,17 @@
                     emptyText: '<div class="x-grid-empty">' + html(me.emptyText) + '</div>',
                     stripeRows: true,
                 };
+                var stopCatalogWatch = PVN.Catalog.watch(function () {
+                    if (me.destroyed || me.destroying) return;
+                    var view = me.getView && me.getView();
+                    if (view && !view.destroyed && !view.destroying && view.ownerGrid && view.refresh) {
+                        view.refresh();
+                    }
+                });
                 me.listeners = Ext.apply({}, me.listeners || {}, {
                     activate: reload,
                     itemdblclick: function (_view, record) { openDetails(record); },
-                });
-                PVN.Catalog.watch(function () {
-                    var view = me.getView && me.getView();
-                    if (view && view.refresh) view.refresh();
+                    destroy: function () { stopCatalogWatch(); },
                 });
                 if (Proxmox.Utils.monStoreErrors) {
                     Proxmox.Utils.monStoreErrors(me, me.store);
