@@ -3,7 +3,6 @@ set -eu
 
 marker_begin='<!-- PVN-LOADER:BEGIN -->'
 marker_end='<!-- PVN-LOADER:END -->'
-script_tag='    <script type="text/javascript" src="/pve2/js/pvn-loader.js"></script>'
 pve9_anchor='    <script type="text/javascript" src="/pve2/js/pvemanagerlib.js?ver=[% version %]"></script>'
 
 template=${1:-/usr/share/pve-manager/index.html.tpl}
@@ -37,6 +36,16 @@ fail() {
 [ -f "$loader_source" ] || fail "packaged loader is missing: $loader_source"
 cmp -s "$loader_source" "$loader_target" ||
     fail "installed loader differs from the packaged loader"
+command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is unavailable"
+loader_sha256_output=$(sha256sum "$loader_source") ||
+    fail "could not hash the packaged loader"
+loader_sha256=${loader_sha256_output%% *}
+case "$loader_sha256" in
+    ''|*[!0-9a-f]*) fail "packaged loader has an invalid SHA-256" ;;
+esac
+[ "${#loader_sha256}" -eq 64 ] ||
+    fail "packaged loader has an invalid SHA-256"
+script_tag="    <script type=\"text/javascript\" src=\"/pve2/js/pvn-loader.js?v=$loader_sha256\"></script>"
 
 awk -v anchor="$pve9_anchor" -v begin="$marker_begin" \
     -v tag="$script_tag" -v end="$marker_end" '

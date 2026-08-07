@@ -280,6 +280,17 @@ PVN_PVE_VERSION=9.0 pve-ui/inject.sh install \
 PVN_PVE_VERSION=9.0 deploy/scripts/pvn-ui-verify \
     "$ui_test_root/index.html.tpl" "$ui_test_root/js/pvn-loader.js" \
     "$ui_test_root/source-loader.js"
+ui_loader_sha256=$(sha256sum "$ui_test_root/source-loader.js" | awk '{print $1}')
+stale_ui_loader_sha256=$(printf '%064d' 0)
+sed "s/$ui_loader_sha256/$stale_ui_loader_sha256/" \
+    "$ui_test_root/index.html.tpl" > "$ui_test_root/stale-digest.tpl"
+if PVN_PVE_VERSION=9.0 deploy/scripts/pvn-ui-verify \
+    "$ui_test_root/stale-digest.tpl" "$ui_test_root/js/pvn-loader.js" \
+    "$ui_test_root/source-loader.js" >/dev/null 2>&1
+then
+    echo "PVE 9 UI verification accepted a stale loader digest" >&2
+    exit 1
+fi
 sed '/PVN-LOADER:END/d' "$ui_test_root/index.html.tpl" > "$ui_test_root/malformed.tpl"
 if PVN_PVE_VERSION=9.0 deploy/scripts/pvn-ui-verify \
     "$ui_test_root/malformed.tpl" "$ui_test_root/js/pvn-loader.js" \
