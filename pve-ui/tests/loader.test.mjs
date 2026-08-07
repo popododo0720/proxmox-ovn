@@ -141,9 +141,11 @@ test('resource stores use only the same-origin PVN API2 path', () => {
   const { window } = harness();
   const networks = window.PVN.Utils.createStore('networks');
   const operations = window.PVN.Utils.createStore('operations', { limit: 100 });
-  assert.equal(networks.proxy.url, '/pvn/networks');
+  assert.equal(networks.proxy.url, '/api2/json/pvn/networks');
   assert.deepEqual(operations.proxy.extraParams, { limit: 100 });
-  assert.equal(operations.proxy.url, '/pvn/operations');
+  assert.equal(operations.proxy.url, '/api2/json/pvn/operations');
+  assert.equal(networks.proxy.url.startsWith('/pvn/'), false);
+  assert.equal(operations.proxy.url.startsWith('/pvn/'), false);
 });
 
 test('overview requests health through Proxmox API2Request', () => {

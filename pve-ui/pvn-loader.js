@@ -126,7 +126,10 @@
                 model: 'PVN.model.Resource',
                 proxy: {
                     type: 'proxmox',
-                    url: '/pvn/' + collection,
+                    // Proxmox.RestProxy does not add the API2 prefix. Keep the
+                    // collection request on the authenticated PVE dispatcher
+                    // instead of falling through to pveproxy's file handler.
+                    url: '/api2/json/pvn/' + collection,
                     extraParams: extraParams || {},
                 },
                 sorters: [{ property: 'name', direction: 'ASC' }],
