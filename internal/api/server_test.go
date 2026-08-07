@@ -56,17 +56,11 @@ func decodeData[T any](t *testing.T, recorder *httptest.ResponseRecorder) T {
 	return envelope.Data
 }
 
-func createAPIProject(t *testing.T, server *Server) model.Project {
-	t.Helper()
-	recorder := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{"name": "tenant", "pool_id": "pool-tenant"}, map[string]string{"Idempotency-Key": "project-create"})
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("POST project status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	return decodeData[model.Project](t, recorder)
-}
-
 func createAPIResource(t *testing.T, store controlstore.Store, resource model.Resource, key string) model.Resource {
 	t.Helper()
+	if port, ok := resource.(*model.Port); ok && len(port.SecurityGroupIDs) == 0 {
+		port.SecurityGroupIDs = []string{ensureAPITestSecurityGroup(t, store)}
+	}
 	created, replayed, err := store.Create(context.Background(), resource, key)
 	if err != nil || replayed {
 		t.Fatalf("Create(%s) replayed=%v err=%v", resource.ResourceKind(), replayed, err)
@@ -74,34 +68,46 @@ func createAPIResource(t *testing.T, store controlstore.Store, resource model.Re
 	return created
 }
 
+func ensureAPITestSecurityGroup(t *testing.T, store controlstore.Store) string {
+	t.Helper()
+	const id = "00000000-0000-5000-8000-0000000000a1"
+	if _, err := store.Get(context.Background(), model.KindSecurityGroup, id); errors.Is(err, controlstore.ErrNotFound) {
+		if _, _, err := store.Create(context.Background(), &model.SecurityGroup{
+			Metadata: model.Metadata{ID: id}, Name: "api-test-baseline",
+		}, ""); err != nil {
+			t.Fatalf("create API test security group: %v", err)
+		}
+	}
+	return id
+}
+
 func floatingIPAPIInput(t *testing.T, store controlstore.Store) model.FloatingIP {
 	t.Helper()
-	project := createAPIResource(t, store, &model.Project{Name: "tenant-fip", PoolID: "pool-fip"}, "api-fip-project").(*model.Project)
 	provider := createAPIResource(t, store, &model.ProviderNetwork{Name: "public-fip"}, "api-fip-provider").(*model.ProviderNetwork)
 	externalNetwork := createAPIResource(t, store, &model.Network{
-		ProjectID: project.ID, Name: "public-fip", External: true, ProviderNetworkID: provider.ID,
+		Name: "public-fip", External: true, ProviderNetworkID: provider.ID,
 	}, "api-fip-external-network").(*model.Network)
 	externalSubnet := createAPIResource(t, store, &model.Subnet{
-		ProjectID: project.ID, NetworkID: externalNetwork.ID, Name: "public-fip-v4", CIDR: "198.51.100.0/24",
+		NetworkID: externalNetwork.ID, Name: "public-fip-v4", CIDR: "198.51.100.0/24",
 		GatewayIP: "198.51.100.1", AllocationPools: []model.IPRange{{Start: "198.51.100.2", End: "198.51.100.200"}},
 	}, "api-fip-external-subnet").(*model.Subnet)
-	privateNetwork := createAPIResource(t, store, &model.Network{ProjectID: project.ID, Name: "private-fip"}, "api-fip-private-network").(*model.Network)
+	privateNetwork := createAPIResource(t, store, &model.Network{Name: "private-fip"}, "api-fip-private-network").(*model.Network)
 	privateSubnet := createAPIResource(t, store, &model.Subnet{
-		ProjectID: project.ID, NetworkID: privateNetwork.ID, Name: "private-fip-v4", CIDR: "10.20.0.0/24", GatewayIP: "10.20.0.1",
+		NetworkID: privateNetwork.ID, Name: "private-fip-v4", CIDR: "10.20.0.0/24", GatewayIP: "10.20.0.1",
 	}, "api-fip-private-subnet").(*model.Subnet)
 	port := createAPIResource(t, store, &model.Port{
-		ProjectID: project.ID, NetworkID: privateNetwork.ID, Name: "api-fip-port", MACAddress: "02:00:00:00:20:10",
+		NetworkID: privateNetwork.ID, Name: "api-fip-port", MACAddress: "02:00:00:00:20:10",
 		FixedIPs: []model.FixedIP{{SubnetID: privateSubnet.ID, Address: "10.20.0.10"}},
 	}, "api-fip-port").(*model.Port)
 	router := createAPIResource(t, store, &model.Router{
-		ProjectID: project.ID, Name: "api-fip-router", ExternalNetworkID: externalNetwork.ID,
+		Name: "api-fip-router", ExternalNetworkID: externalNetwork.ID,
 		ExternalSubnetID: externalSubnet.ID, ExternalIPAddress: "198.51.100.2", EnableSNAT: true,
 	}, "api-fip-router").(*model.Router)
 	createAPIResource(t, store, &model.RouterInterface{
-		ProjectID: project.ID, RouterID: router.ID, SubnetID: privateSubnet.ID,
+		RouterID: router.ID, SubnetID: privateSubnet.ID,
 	}, "api-fip-router-interface")
 	return model.FloatingIP{
-		ProjectID: project.ID, ProviderNetworkID: provider.ID, Address: "198.51.100.10",
+		ProviderNetworkID: provider.ID, Address: "198.51.100.10",
 		RouterID: router.ID, PortID: port.ID, FixedIPAddress: "10.20.0.10",
 	}
 }
@@ -177,13 +183,6 @@ func TestHealthAndSession(t *testing.T) {
 	if data.User != "root@pam" || data.CSRFToken != "csrf" || data.Cluster != deploymentName {
 		t.Fatalf("session data = %#v", data)
 	}
-	backfill := request(t, server, http.MethodGet, defaultSecurityGroupBackfillPlanPath, nil, nil)
-	if backfill.Code != http.StatusOK {
-		t.Fatalf("backfill status=%d body=%s", backfill.Code, backfill.Body.String())
-	}
-	if plan := decodeData[defaultSecurityGroupBackfillPlanData](t, backfill); plan.Cluster != deploymentName {
-		t.Fatalf("backfill deployment name=%q", plan.Cluster)
-	}
 	unauthenticated := testServer(t, controlstore.NewMemory(), SessionProviderFunc(func(context.Context, *http.Request) (Session, error) { return Session{}, ErrUnauthenticated }))
 	response := request(t, unauthenticated, http.MethodGet, "/api/v1/session", nil, nil)
 	if response.Code != http.StatusUnauthorized {
@@ -238,43 +237,44 @@ func TestOperationsListIsRecentAndBounded(t *testing.T) {
 func TestCRUDRevisionAndIdempotency(t *testing.T) {
 	store := controlstore.NewMemory()
 	server := testServer(t, store, nil)
-	project := createAPIProject(t, server)
-	if project.Revision != 1 {
-		t.Fatalf("project revision = %d", project.Revision)
+	createdResponse := request(t, server, http.MethodPost, "/api/v1/provider-networks", map[string]any{"name": "provider"}, map[string]string{"Idempotency-Key": "provider-create"})
+	if createdResponse.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createdResponse.Code, createdResponse.Body.String())
 	}
+	provider := decodeData[model.ProviderNetwork](t, createdResponse)
 
-	replay := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{"name": "tenant", "pool_id": "pool-tenant"}, map[string]string{"Idempotency-Key": "project-create"})
+	replay := request(t, server, http.MethodPost, "/api/v1/provider-networks", map[string]any{"name": "provider"}, map[string]string{"Idempotency-Key": "provider-create"})
 	if replay.Code != http.StatusOK || replay.Header().Get("Idempotency-Replayed") != "true" {
 		t.Fatalf("replay status=%d headers=%v body=%s", replay.Code, replay.Header(), replay.Body.String())
 	}
 
-	project.Description = "changed"
-	updatedResponse := request(t, server, http.MethodPut, "/api/v1/projects/"+project.ID, project, map[string]string{"Idempotency-Key": "project-update", "If-Match": `"1"`})
+	provider.Description = "changed"
+	updatedResponse := request(t, server, http.MethodPut, "/api/v1/provider-networks/"+provider.ID, provider, map[string]string{"Idempotency-Key": "provider-update", "If-Match": `"1"`})
 	if updatedResponse.Code != http.StatusOK {
 		t.Fatalf("PUT status=%d body=%s", updatedResponse.Code, updatedResponse.Body.String())
 	}
-	updated := decodeData[model.Project](t, updatedResponse)
+	updated := decodeData[model.ProviderNetwork](t, updatedResponse)
 	if updated.Revision != 2 || updated.Description != "changed" || updatedResponse.Header().Get("ETag") != `"2"` {
 		t.Fatalf("updated=%#v etag=%s", updated, updatedResponse.Header().Get("ETag"))
 	}
-	updateReplay := request(t, server, http.MethodPut, "/api/v1/projects/"+project.ID, project, map[string]string{"Idempotency-Key": "project-update", "If-Match": `"1"`})
+	updateReplay := request(t, server, http.MethodPut, "/api/v1/provider-networks/"+provider.ID, provider, map[string]string{"Idempotency-Key": "provider-update", "If-Match": `"1"`})
 	if updateReplay.Code != http.StatusOK || updateReplay.Header().Get("Idempotency-Replayed") != "true" {
 		t.Fatalf("update replay status=%d headers=%v body=%s", updateReplay.Code, updateReplay.Header(), updateReplay.Body.String())
 	}
 
-	stale := request(t, server, http.MethodPut, "/api/v1/projects/"+project.ID, project, map[string]string{"Idempotency-Key": "project-update-stale", "If-Match": `"1"`})
+	stale := request(t, server, http.MethodPut, "/api/v1/provider-networks/"+provider.ID, provider, map[string]string{"Idempotency-Key": "provider-update-stale", "If-Match": `"1"`})
 	if stale.Code != http.StatusPreconditionFailed {
 		t.Fatalf("stale status=%d body=%s", stale.Code, stale.Body.String())
 	}
-	missingPrecondition := request(t, server, http.MethodDelete, "/api/v1/projects/"+project.ID, nil, map[string]string{"Idempotency-Key": "project-delete"})
+	missingPrecondition := request(t, server, http.MethodDelete, "/api/v1/provider-networks/"+provider.ID, nil, map[string]string{"Idempotency-Key": "provider-delete"})
 	if missingPrecondition.Code != http.StatusPreconditionRequired {
 		t.Fatalf("missing precondition status=%d", missingPrecondition.Code)
 	}
-	deleted := request(t, server, http.MethodDelete, "/api/v1/projects/"+project.ID, nil, map[string]string{"Idempotency-Key": "project-delete", "If-Match": `"2"`})
+	deleted := request(t, server, http.MethodDelete, "/api/v1/provider-networks/"+provider.ID, nil, map[string]string{"Idempotency-Key": "provider-delete", "If-Match": `"2"`})
 	if deleted.Code != http.StatusNoContent {
 		t.Fatalf("delete status=%d body=%s", deleted.Code, deleted.Body.String())
 	}
-	deleteReplay := request(t, server, http.MethodDelete, "/api/v1/projects/"+project.ID, nil, map[string]string{"Idempotency-Key": "project-delete", "If-Match": `"2"`})
+	deleteReplay := request(t, server, http.MethodDelete, "/api/v1/provider-networks/"+provider.ID, nil, map[string]string{"Idempotency-Key": "provider-delete", "If-Match": `"2"`})
 	if deleteReplay.Code != http.StatusNoContent || deleteReplay.Header().Get("Idempotency-Replayed") != "true" {
 		t.Fatalf("delete replay status=%d headers=%v", deleteReplay.Code, deleteReplay.Header())
 	}
@@ -283,31 +283,31 @@ func TestCRUDRevisionAndIdempotency(t *testing.T) {
 func TestCRUDValidationReferencesAndListFilter(t *testing.T) {
 	store := controlstore.NewMemory()
 	server := testServer(t, store, nil)
-	missingKey := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{"name": "tenant", "pool_id": "pool"}, nil)
+	missingKey := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"name": "private"}, nil)
 	if missingKey.Code != http.StatusBadRequest {
 		t.Fatalf("missing key status=%d", missingKey.Code)
 	}
-	unknownField := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{"name": "tenant", "pool_id": "pool", "surprise": true}, map[string]string{"Idempotency-Key": "bad-json"})
+	unknownField := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"name": "private", "surprise": true}, map[string]string{"Idempotency-Key": "bad-json"})
 	if unknownField.Code != http.StatusBadRequest {
 		t.Fatalf("unknown field status=%d body=%s", unknownField.Code, unknownField.Body.String())
 	}
-	invalid := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{"name": "bad name", "pool_id": "pool"}, map[string]string{"Idempotency-Key": "invalid"})
+	invalid := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"name": "bad name"}, map[string]string{"Idempotency-Key": "invalid"})
 	if invalid.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("validation status=%d body=%s", invalid.Code, invalid.Body.String())
 	}
-	project := createAPIProject(t, server)
-	networkResponse := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"project_id": project.ID, "name": "private"}, map[string]string{"Idempotency-Key": "network"})
+	networkResponse := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"name": "private"}, map[string]string{"Idempotency-Key": "network"})
 	if networkResponse.Code != http.StatusCreated {
 		t.Fatalf("network status=%d body=%s", networkResponse.Code, networkResponse.Body.String())
 	}
-	missingProject := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"project_id": "missing", "name": "orphan"}, map[string]string{"Idempotency-Key": "orphan"})
-	if missingProject.Code != http.StatusConflict {
-		t.Fatalf("missing ref status=%d body=%s", missingProject.Code, missingProject.Body.String())
+	missingProvider := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"name": "orphan", "external": true, "provider_network_id": "missing"}, map[string]string{"Idempotency-Key": "orphan"})
+	if missingProvider.Code != http.StatusConflict {
+		t.Fatalf("missing ref status=%d body=%s", missingProvider.Code, missingProvider.Body.String())
 	}
-	list := request(t, server, http.MethodGet, "/api/v1/networks?project_id="+project.ID, nil, nil)
-	if list.Code != http.StatusOK {
-		t.Fatalf("list status=%d", list.Code)
+	legacyFilter := request(t, server, http.MethodGet, "/api/v1/networks?project_id=legacy", nil, nil)
+	if legacyFilter.Code != http.StatusBadRequest {
+		t.Fatalf("legacy project_id filter status=%d body=%s", legacyFilter.Code, legacyFilter.Body.String())
 	}
+	list := request(t, server, http.MethodGet, "/api/v1/networks", nil, nil)
 	data := decodeData[[]model.Network](t, list)
 	if len(data) != 1 || data[0].MTU != 1400 {
 		t.Fatalf("networks = %#v", data)
@@ -321,26 +321,23 @@ func TestCRUDValidationReferencesAndListFilter(t *testing.T) {
 func setupPort(t *testing.T, store controlstore.Store, nodeID string, vmid int, nic, mac, requested string, status model.PortBindingStatus, adminUp bool) *model.Port {
 	t.Helper()
 	ensureAPINode(t, store, nodeID, requested)
-	projects, _ := store.List(context.Background(), model.KindProject, controlstore.ListOptions{})
-	var project *model.Project
+	networks, _ := store.List(context.Background(), model.KindNetwork, controlstore.ListOptions{})
 	var network *model.Network
-	if len(projects) == 0 {
-		created, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool"}, "runtime-project")
-		if err != nil {
-			t.Fatal(err)
-		}
-		project = created.(*model.Project)
-		created, _, err = store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "runtime-network")
+	if len(networks) == 0 {
+		created, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "runtime-network")
 		if err != nil {
 			t.Fatal(err)
 		}
 		network = created.(*model.Network)
 	} else {
-		project = projects[0].(*model.Project)
-		networks, _ := store.List(context.Background(), model.KindNetwork, controlstore.ListOptions{ProjectID: project.ID})
 		network = networks[0].(*model.Network)
 	}
-	created, _, err := store.Create(context.Background(), &model.Port{ProjectID: project.ID, NetworkID: network.ID, Name: fmt.Sprintf("vm-%d-%s-%s", vmid, nic, nodeID), MACAddress: mac, AdminStateUp: adminUp, BindingStatus: status, NodeID: nodeID, VMID: vmid, NIC: nic, LSPName: "lsp-" + nodeID, Generation: 7, RequestedChassis: requested}, "port-"+nodeID+nic)
+	created, _, err := store.Create(context.Background(), &model.Port{
+		NetworkID: network.ID, Name: fmt.Sprintf("vm-%d-%s-%s", vmid, nic, nodeID), MACAddress: mac,
+		AdminStateUp: adminUp, BindingStatus: status, NodeID: nodeID, VMID: vmid, NIC: nic,
+		LSPName: "lsp-" + nodeID, Generation: 7, RequestedChassis: requested,
+		SecurityGroupIDs: []string{ensureAPITestSecurityGroup(t, store)},
+	}, "port-"+nodeID+nic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,22 +400,18 @@ func (s *runtimeListOnlyStore) List(ctx context.Context, kind model.Kind, option
 
 func TestRuntimePortResolverUsesOptionalLookupAndKeepsListFallback(t *testing.T) {
 	fastBacking := controlstore.NewMemory()
-	fastProject, _, err := fastBacking.Create(context.Background(), &model.Project{Name: "fast", PoolID: "pool-fast"}, "fast-project")
-	if err != nil {
-		t.Fatal(err)
-	}
 	fast := &runtimeLookupObservingStore{
 		Store: fastBacking,
 		ports: []*model.Port{{
-			Metadata:  model.Metadata{ID: "port-fast", Revision: 2, AppliedRevision: 2, State: model.ResourceReady},
-			ProjectID: fastProject.GetMetadata().ID, MACAddress: "02:00:00:00:00:01", AdminStateUp: true,
+			Metadata:   model.Metadata{ID: "port-fast", Revision: 2, AppliedRevision: 2, State: model.ResourceReady},
+			MACAddress: "02:00:00:00:00:01", AdminStateUp: true,
 			BindingStatus: model.PortBinding, VMID: 100, NIC: "net0", LSPName: "lsp-fast",
 			Generation: 3, RequestedChassis: "chassis-fast",
 		}},
 	}
 	allowedProvider := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
 		return Session{User: "auditor@pam", Permissions: map[string]any{
-			"/pool/pool-fast": map[string]bool{"SDN.Audit": true},
+			"/": map[string]bool{"SDN.Audit": true},
 		}}, nil
 	})
 	fastResponse := request(t, testServer(t, fast, allowedProvider), http.MethodGet, "/api/v1/runtime/ports/resolve?node=pve-fast&vmid=100&nic=net0", nil, nil)
@@ -506,94 +499,9 @@ func TestNewRequiresStore(t *testing.T) {
 	}
 }
 
-func TestProjectWritesRequireExistingPVEPoolAfterAuthorization(t *testing.T) {
-	store := controlstore.NewMemory()
-	var calls []string
-	validator := PoolValidatorFunc(func(_ context.Context, _ *http.Request, poolID string) (bool, error) {
-		calls = append(calls, poolID)
-		switch poolID {
-		case "pool-existing":
-			return true, nil
-		case "pool-error":
-			return false, errors.New("PVE unavailable")
-		default:
-			return false, nil
-		}
-	})
-	authorized := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
-		return Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"SDN.Allocate": true}}}, nil
-	})
-	server, err := New(Options{Store: store, SessionProvider: authorized, PoolValidator: validator})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	createdResponse := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{
-		"name": "tenant", "pool_id": "pool-existing",
-	}, map[string]string{"Idempotency-Key": "project-existing"})
-	if createdResponse.Code != http.StatusCreated {
-		t.Fatalf("existing pool create status=%d body=%s", createdResponse.Code, createdResponse.Body.String())
-	}
-	created := decodeData[model.Project](t, createdResponse)
-
-	missingResponse := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{
-		"name": "missing", "pool_id": "pool-missing",
-	}, map[string]string{"Idempotency-Key": "project-missing"})
-	if missingResponse.Code != http.StatusUnprocessableEntity || !strings.Contains(missingResponse.Body.String(), `"field":"pool_id"`) || !strings.Contains(missingResponse.Body.String(), "does not exist") {
-		t.Fatalf("missing pool create status=%d body=%s", missingResponse.Code, missingResponse.Body.String())
-	}
-
-	created.PoolID = "pool-missing"
-	updateResponse := request(t, server, http.MethodPut, "/api/v1/projects/"+created.ID, created, map[string]string{
-		"Idempotency-Key": "project-update-missing", "If-Match": `"1"`,
-	})
-	if updateResponse.Code != http.StatusUnprocessableEntity || !strings.Contains(updateResponse.Body.String(), "does not exist") {
-		t.Fatalf("missing pool update status=%d body=%s", updateResponse.Code, updateResponse.Body.String())
-	}
-	stored, err := store.Get(context.Background(), model.KindProject, created.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := stored.(*model.Project).PoolID; got != "pool-existing" {
-		t.Fatalf("stored pool after rejected update = %q", got)
-	}
-
-	dependencyResponse := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{
-		"name": "dependency", "pool_id": "pool-error",
-	}, map[string]string{"Idempotency-Key": "project-pool-error"})
-	if dependencyResponse.Code != http.StatusBadGateway || !strings.Contains(dependencyResponse.Body.String(), "pve_pool_validation_failed") {
-		t.Fatalf("pool lookup error status=%d body=%s", dependencyResponse.Code, dependencyResponse.Body.String())
-	}
-
-	callCount := len(calls)
-	unauthorized, err := New(Options{
-		Store: store,
-		SessionProvider: SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
-			return Session{User: "limited@pam", Permissions: map[string]any{}}, nil
-		}),
-		PoolValidator: validator,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	deniedResponse := request(t, unauthorized, http.MethodPost, "/api/v1/projects", map[string]any{
-		"name": "denied", "pool_id": "pool-missing",
-	}, map[string]string{"Idempotency-Key": "project-denied"})
-	if deniedResponse.Code != http.StatusForbidden {
-		t.Fatalf("unauthorized create status=%d body=%s", deniedResponse.Code, deniedResponse.Body.String())
-	}
-	if len(calls) != callCount {
-		t.Fatalf("pool validator called before authorization: calls=%v", calls)
-	}
-}
-
 func TestPermissionEnforcement(t *testing.T) {
 	store := controlstore.NewMemory()
-	projectResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project")
-	if err != nil {
-		t.Fatal(err)
-	}
-	networkResource, _, err := store.Create(context.Background(), &model.Network{ProjectID: projectResource.GetMetadata().ID, Name: "private"}, "network")
+	networkResource, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "network")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -602,12 +510,12 @@ func TestPermissionEnforcement(t *testing.T) {
 		return Session{User: "user@pam", Permissions: permissions}, nil
 	})
 	server := testServer(t, store, provider)
-	filteredRead := request(t, server, http.MethodGet, "/api/v1/projects", nil, nil)
-	if filteredRead.Code != http.StatusOK || len(decodeData[[]model.Project](t, filteredRead)) != 0 {
+	filteredRead := request(t, server, http.MethodGet, "/api/v1/networks", nil, nil)
+	if filteredRead.Code != http.StatusOK || len(decodeData[[]model.Network](t, filteredRead)) != 0 {
 		t.Fatalf("read without audit status=%d body=%s", filteredRead.Code, filteredRead.Body.String())
 	}
 	permissions["/"] = map[string]bool{"SDN.Audit": true}
-	allowedRead := request(t, server, http.MethodGet, "/api/v1/projects", nil, nil)
+	allowedRead := request(t, server, http.MethodGet, "/api/v1/networks", nil, nil)
 	if allowedRead.Code != http.StatusOK {
 		t.Fatalf("read with audit status=%d body=%s", allowedRead.Code, allowedRead.Body.String())
 	}
@@ -626,12 +534,11 @@ func TestPermissionEnforcement(t *testing.T) {
 		t.Fatalf("provider with global permission status=%d body=%s", allowedGlobal.Code, allowedGlobal.Body.String())
 	}
 
-	permissions["/"] = map[string]bool{"SDN.Audit": true, "Sys.Modify": true}
-	permissions["/pool/pool-tenant"] = map[string]bool{"SDN.Allocate": true}
-	portBody := map[string]any{"project_id": projectResource.GetMetadata().ID, "network_id": networkResource.GetMetadata().ID, "name": "vm100-net0", "mac_address": "02:00:00:00:00:10", "admin_state_up": true}
+	permissions["/"] = map[string]bool{"SDN.Audit": true, "SDN.Allocate": true}
+	portBody := map[string]any{"network_id": networkResource.GetMetadata().ID, "name": "vm100-net0", "mac_address": "02:00:00:00:00:10", "admin_state_up": true}
 	allowedPort := request(t, server, http.MethodPost, "/api/v1/ports", portBody, map[string]string{"Idempotency-Key": "port"})
 	if allowedPort.Code != http.StatusCreated {
-		t.Fatalf("unattached port with project allocation status=%d body=%s", allowedPort.Code, allowedPort.Body.String())
+		t.Fatalf("unattached port with global allocation status=%d body=%s", allowedPort.Code, allowedPort.Body.String())
 	}
 
 	deniedSystem := request(t, server, http.MethodPost, "/api/v1/nodes", map[string]any{"name": "pve01", "chassis_id": "chassis-01", "enabled": true}, map[string]string{"Idempotency-Key": "node"})
@@ -640,105 +547,30 @@ func TestPermissionEnforcement(t *testing.T) {
 	}
 }
 
-func TestScopedReadFilteringAndCrossProjectIsolation(t *testing.T) {
-	store := controlstore.NewMemory()
-	projectAResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant-a", PoolID: "pool-a"}, "project-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	projectBResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant-b", PoolID: "pool-b"}, "project-b")
-	if err != nil {
-		t.Fatal(err)
-	}
-	projectA := projectAResource.(*model.Project)
-	projectB := projectBResource.(*model.Project)
-	networkAResource, _, err := store.Create(context.Background(), &model.Network{ProjectID: projectA.ID, Name: "private-a"}, "network-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	networkBResource, _, err := store.Create(context.Background(), &model.Network{ProjectID: projectB.ID, Name: "private-b"}, "network-b")
-	if err != nil {
-		t.Fatal(err)
-	}
-	networkA := networkAResource.(*model.Network)
-	networkB := networkBResource.(*model.Network)
-
-	permissions := map[string]any{
-		"/pool/pool-a": map[string]bool{"SDN.Audit": true, "SDN.Allocate": true},
-	}
-	server := testServer(t, store, SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
-		return Session{User: "tenant-a@pve", Permissions: permissions}, nil
-	}))
-
-	projects := request(t, server, http.MethodGet, "/api/v1/projects", nil, nil)
-	visibleProjects := decodeData[[]model.Project](t, projects)
-	if projects.Code != http.StatusOK || len(visibleProjects) != 1 || visibleProjects[0].ID != projectA.ID {
-		t.Fatalf("visible projects status=%d data=%#v", projects.Code, visibleProjects)
-	}
-	networks := request(t, server, http.MethodGet, "/api/v1/networks", nil, nil)
-	visibleNetworks := decodeData[[]model.Network](t, networks)
-	if networks.Code != http.StatusOK || len(visibleNetworks) != 1 || visibleNetworks[0].ID != networkA.ID {
-		t.Fatalf("visible networks status=%d data=%#v", networks.Code, visibleNetworks)
-	}
-	hiddenGet := request(t, server, http.MethodGet, "/api/v1/networks/"+networkB.ID, nil, nil)
-	if hiddenGet.Code != http.StatusNotFound {
-		t.Fatalf("cross-project GET status=%d body=%s", hiddenGet.Code, hiddenGet.Body.String())
-	}
-	missingGet := request(t, server, http.MethodGet, "/api/v1/networks/does-not-exist", nil, nil)
-	if missingGet.Code != http.StatusNotFound || hiddenGet.Body.String() != missingGet.Body.String() {
-		t.Fatalf("hidden and missing GETs differ: hidden=%q missing=%q", hiddenGet.Body.String(), missingGet.Body.String())
-	}
-
-	createdA := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"project_id": projectA.ID, "name": "private-a-2"}, map[string]string{"Idempotency-Key": "create-a"})
-	if createdA.Code != http.StatusCreated {
-		t.Fatalf("create in allowed pool status=%d body=%s", createdA.Code, createdA.Body.String())
-	}
-	createdB := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{"project_id": projectB.ID, "name": "private-b-2"}, map[string]string{"Idempotency-Key": "create-b"})
-	if createdB.Code != http.StatusForbidden {
-		t.Fatalf("create in denied pool status=%d body=%s", createdB.Code, createdB.Body.String())
-	}
-
-	networkB.ProjectID = projectA.ID
-	steal := request(t, server, http.MethodPut, "/api/v1/networks/"+networkB.ID, networkB, map[string]string{"Idempotency-Key": "steal-b", "If-Match": `"1"`})
-	if steal.Code != http.StatusForbidden {
-		t.Fatalf("cross-project move status=%d body=%s", steal.Code, steal.Body.String())
-	}
-	networkA.ProjectID = projectB.ID
-	moveOut := request(t, server, http.MethodPut, "/api/v1/networks/"+networkA.ID, networkA, map[string]string{"Idempotency-Key": "move-a", "If-Match": `"1"`})
-	if moveOut.Code != http.StatusForbidden {
-		t.Fatalf("move into denied pool status=%d body=%s", moveOut.Code, moveOut.Body.String())
-	}
-}
-
 func TestServerManagedMetadataAndPortBindingFields(t *testing.T) {
 	store := controlstore.NewMemory()
-	projectResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project")
-	if err != nil {
-		t.Fatal(err)
-	}
-	project := projectResource.(*model.Project)
-	networkResource, _, err := store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "network")
+	networkResource, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "network")
 	if err != nil {
 		t.Fatal(err)
 	}
 	network := networkResource.(*model.Network)
 	ensureAPINode(t, store, "pve01", "chassis-01")
 	permissions := map[string]any{
-		"/pool/pool-tenant": map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "SDN.Use": true},
-		"/vms/100":          map[string]bool{"VM.Config.Network": true},
+		"/":        map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "SDN.Use": true},
+		"/vms/100": map[string]bool{"VM.Config.Network": true},
 	}
 	server := testServer(t, store, SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
 		return Session{User: "tenant@pve", Permissions: permissions}, nil
 	}))
 
-	metadataBody := map[string]any{"id": "chosen", "project_id": project.ID, "name": "bad-metadata"}
+	metadataBody := map[string]any{"id": "chosen", "name": "bad-metadata"}
 	metadataCreate := request(t, server, http.MethodPost, "/api/v1/networks", metadataBody, map[string]string{"Idempotency-Key": "metadata"})
 	if metadataCreate.Code != http.StatusBadRequest {
 		t.Fatalf("metadata create status=%d body=%s", metadataCreate.Code, metadataCreate.Body.String())
 	}
 
 	basePort := map[string]any{
-		"project_id": project.ID, "network_id": network.ID, "name": "vm100-net0",
+		"network_id": network.ID, "name": "vm100-net0",
 		"mac_address": "02:00:00:00:00:10", "admin_state_up": true,
 	}
 	bindingFields := map[string]any{
@@ -758,9 +590,10 @@ func TestServerManagedMetadataAndPortBindingFields(t *testing.T) {
 	}
 
 	attachedResource, _, err := store.Create(context.Background(), &model.Port{
-		ProjectID: project.ID, NetworkID: network.ID, Name: "attached", MACAddress: "02:00:00:00:00:11",
+		NetworkID: network.ID, Name: "attached", MACAddress: "02:00:00:00:00:11",
 		AdminStateUp: true, NodeID: "pve01", VMID: 100, NIC: "net0", RequestedChassis: "chassis-01",
 		BindingStatus: model.PortBound, LSPName: "pvn-attached", Generation: 3,
+		SecurityGroupIDs: []string{ensureAPITestSecurityGroup(t, store)},
 	}, "attached")
 	if err != nil {
 		t.Fatal(err)
@@ -781,23 +614,18 @@ func TestServerManagedMetadataAndPortBindingFields(t *testing.T) {
 
 func TestAttachedPortRequiresUseAndVMNetworkPrivileges(t *testing.T) {
 	store := controlstore.NewMemory()
-	projectResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project")
-	if err != nil {
-		t.Fatal(err)
-	}
-	project := projectResource.(*model.Project)
-	networkResource, _, err := store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "network")
+	networkResource, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "network")
 	if err != nil {
 		t.Fatal(err)
 	}
 	network := networkResource.(*model.Network)
 	ensureAPINode(t, store, "pve01", "chassis-01")
-	groupResource, _, err := store.Create(context.Background(), &model.SecurityGroup{ProjectID: project.ID, Name: "attached-policy"}, "attached-policy")
+	groupResource, _, err := store.Create(context.Background(), &model.SecurityGroup{Name: "attached-policy"}, "attached-policy")
 	if err != nil {
 		t.Fatal(err)
 	}
 	portResource, _, err := store.Create(context.Background(), &model.Port{
-		ProjectID: project.ID, NetworkID: network.ID, Name: "attached", MACAddress: "02:00:00:00:00:12",
+		NetworkID: network.ID, Name: "attached", MACAddress: "02:00:00:00:00:12",
 		AdminStateUp: true, NodeID: "pve01", VMID: 100, NIC: "net0", RequestedChassis: "chassis-01",
 		BindingStatus: model.PortBound, LSPName: "pvn-attached", Generation: 2, SecurityGroupIDs: []string{groupResource.GetMetadata().ID},
 	}, "port")
@@ -807,7 +635,7 @@ func TestAttachedPortRequiresUseAndVMNetworkPrivileges(t *testing.T) {
 	port := portResource.(*model.Port)
 	port.AdminStateUp = false
 	permissions := map[string]any{
-		"/pool/pool-tenant": map[string]bool{"SDN.Audit": true, "SDN.Allocate": true},
+		"/": map[string]bool{"SDN.Audit": true, "SDN.Allocate": true},
 	}
 	server := testServer(t, store, SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
 		return Session{User: "tenant@pve", Permissions: permissions}, nil

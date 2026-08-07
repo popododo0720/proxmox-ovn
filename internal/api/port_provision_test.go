@@ -58,36 +58,29 @@ func (provider *provisionSessionProvider) setPermissions(value map[string]any) {
 }
 
 type provisionTopology struct {
-	project *model.Project
 	network *model.Network
 	subnet  *model.Subnet
 }
 
 func seedProvisionTopology(t *testing.T, store controlstore.Store, cidr string, pools []model.IPRange) provisionTopology {
 	t.Helper()
-	projectResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "seed-project")
-	if err != nil {
-		t.Fatal(err)
-	}
-	project := projectResource.(*model.Project)
-	networkResource, _, err := store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "seed-network")
+	networkResource, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "seed-network")
 	if err != nil {
 		t.Fatal(err)
 	}
 	network := networkResource.(*model.Network)
 	subnetResource, _, err := store.Create(context.Background(), &model.Subnet{
-		ProjectID: project.ID, NetworkID: network.ID, Name: "private-v4", CIDR: cidr,
+		NetworkID: network.ID, Name: "private-v4", CIDR: cidr,
 		GatewayIP: "10.0.0.1", EnableDHCP: true, AllocationPools: pools,
 	}, "seed-subnet")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return provisionTopology{project: project, network: network, subnet: subnetResource.(*model.Subnet)}
+	return provisionTopology{network: network, subnet: subnetResource.(*model.Subnet)}
 }
 
 func provisionRequestBody(topology provisionTopology, name string) map[string]any {
 	return map[string]any{
-		"project_id": topology.project.ID,
 		"network_id": topology.network.ID,
 		"subnet_id":  topology.subnet.ID,
 		"name":       name,
@@ -150,7 +143,7 @@ func TestPortProvisionRequiresSessionCSRFAndAllocatePrivilege(t *testing.T) {
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("without SDN.Allocate status=%d body=%s", denied.Code, denied.Body.String())
 	}
-	provider.setPermissions(map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}})
+	provider.setPermissions(map[string]any{"/": map[string]bool{"SDN.Allocate": true}})
 	allowed := request(t, server, http.MethodPost, "/api/v1/ports/provision", body, headers)
 	if allowed.Code != http.StatusCreated {
 		t.Fatalf("allowed status=%d body=%s", allowed.Code, allowed.Body.String())
@@ -163,7 +156,7 @@ func TestPortProvisionAllocatesAndDurablyReplays(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	reconciler := &recordingProvisionReconciler{store: store}
 	server, err := New(Options{Store: store, SessionProvider: provider, Reconciler: reconciler})
@@ -188,7 +181,7 @@ func TestPortProvisionAllocatesAndDurablyReplays(t *testing.T) {
 	if len(created.FixedIPs) != 1 || created.FixedIPs[0].Address != "10.0.0.2" {
 		t.Fatalf("fixed IPs = %#v", created.FixedIPs)
 	}
-	if fmt.Sprint(created.SecurityGroupIDs) != fmt.Sprint([]string{defaultsecurity.DefaultSecurityGroupID(topology.project.ID)}) {
+	if fmt.Sprint(created.SecurityGroupIDs) != fmt.Sprint([]string{defaultsecurity.DefaultSecurityGroupID()}) {
 		t.Fatalf("security groups=%v", created.SecurityGroupIDs)
 	}
 	if createdResponse.Header().Get("Location") != "/api/v1/ports/"+created.ID || createdResponse.Header().Get("ETag") != `"1"` {
@@ -233,11 +226,11 @@ func TestPortProvisionSupportsNoAddressAndManualAddress(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	server := testServer(t, store, provider)
 
-	withoutAddress := map[string]any{"project_id": topology.project.ID, "network_id": topology.network.ID}
+	withoutAddress := map[string]any{"network_id": topology.network.ID}
 	withoutAddressResponse := request(t, server, http.MethodPost, "/api/v1/ports/provision", withoutAddress, provisionHeaders("without-address", "csrf"))
 	if withoutAddressResponse.Code != http.StatusCreated {
 		t.Fatalf("without address status=%d body=%s", withoutAddressResponse.Code, withoutAddressResponse.Body.String())
@@ -272,18 +265,13 @@ func TestPortProvisionSupportsNoAddressAndManualAddress(t *testing.T) {
 
 func TestPortProvisionRejectsProviderBackedNetwork(t *testing.T) {
 	store := controlstore.NewMemory()
-	projectResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "provider-project")
-	if err != nil {
-		t.Fatal(err)
-	}
 	providerNetworkResource, _, err := store.Create(context.Background(), &model.ProviderNetwork{Name: "public"}, "provider-network")
 	if err != nil {
 		t.Fatal(err)
 	}
-	project := projectResource.(*model.Project)
 	providerNetwork := providerNetworkResource.(*model.ProviderNetwork)
 	networkResource, _, err := store.Create(context.Background(), &model.Network{
-		ProjectID: project.ID, Name: "public", External: true, ProviderNetworkID: providerNetwork.ID,
+		Name: "public", External: true, ProviderNetworkID: providerNetwork.ID,
 	}, "external-network")
 	if err != nil {
 		t.Fatal(err)
@@ -291,10 +279,10 @@ func TestPortProvisionRejectsProviderBackedNetwork(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	server := testServer(t, store, provider)
-	body := map[string]any{"project_id": project.ID, "network_id": networkResource.(*model.Network).ID, "name": "external-port"}
+	body := map[string]any{"network_id": networkResource.(*model.Network).ID, "name": "external-port"}
 	response := request(t, server, http.MethodPost, "/api/v1/ports/provision", body, provisionHeaders("external-port", "csrf"))
 	if response.Code != http.StatusConflict || provisionErrorCode(t, response) != "provider_network_port" {
 		t.Fatalf("provider-backed status=%d body=%s", response.Code, response.Body.String())
@@ -307,7 +295,7 @@ func TestPortProvisionConcurrentAllocationHasNoDuplicates(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	// Separate handlers sharing one serialized control store model independent
 	// active pvn-manager processes racing on the same clustered OVSDB.
@@ -364,7 +352,7 @@ func TestPortProvisionReportsSubnetExhaustion(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	server := testServer(t, store, provider)
 	first := request(t, server, http.MethodPost, "/api/v1/ports/provision", provisionRequestBody(topology, "first"), provisionHeaders("first", "csrf"))
@@ -394,7 +382,7 @@ func TestPortProvisionReservesImplicitGateway(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	server := testServer(t, store, provider)
 	response := request(t, server, http.MethodPost, "/api/v1/ports/provision", provisionRequestBody(topology, "implicit-gateway"), provisionHeaders("implicit-gateway", "csrf"))
@@ -410,9 +398,13 @@ func TestPortProvisionReservesImplicitGateway(t *testing.T) {
 func TestPortProvisionRollsBackReservationAndCanRetry(t *testing.T) {
 	store := controlstore.NewMemory()
 	topology := seedProvisionTopology(t, store, "10.0.0.0/29", []model.IPRange{{Start: "10.0.0.2", End: "10.0.0.4"}})
+	defaultGroup, err := defaultsecurity.New(store, nil).Ensure(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	conflictingResource, _, err := store.Create(context.Background(), &model.Port{
-		ProjectID: topology.project.ID, NetworkID: topology.network.ID, Name: "existing",
-		MACAddress: "02:00:00:00:00:aa", AdminStateUp: true,
+		NetworkID: topology.network.ID, Name: "existing",
+		MACAddress: "02:00:00:00:00:aa", AdminStateUp: true, SecurityGroupIDs: []string{defaultGroup.ID},
 	}, "existing-port")
 	if err != nil {
 		t.Fatal(err)
@@ -420,7 +412,7 @@ func TestPortProvisionRollsBackReservationAndCanRetry(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	server := testServer(t, store, provider)
 	body := provisionRequestBody(topology, "retryable")
@@ -473,7 +465,7 @@ func TestPortProvisionRecoversPortCreatedAllocationReserved(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	server := testServer(t, store, provider)
 	body := provisionRequestBody(topology, "partial")
@@ -568,7 +560,7 @@ func TestPortDeprovisionReleasesAllocationAndDurablyReplays(t *testing.T) {
 	provider := &provisionSessionProvider{
 		authenticated: true,
 		csrf:          "csrf",
-		permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+		permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 	}
 	reconciler := &deprovisionTestReconciler{store: store}
 	server, port := provisionForDelete(t, store, provider, reconciler)
@@ -614,8 +606,8 @@ func TestPortDeprovisionRejectsAttachedPortWithoutReleasingAddress(t *testing.T)
 		authenticated: true,
 		csrf:          "csrf",
 		permissions: map[string]any{
-			"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true, "SDN.Use": true},
-			"/vms/100":          map[string]bool{"VM.Config.Network": true},
+			"/":        map[string]bool{"SDN.Allocate": true, "SDN.Use": true},
+			"/vms/100": map[string]bool{"VM.Config.Network": true},
 		},
 	}
 	server, port := provisionForDelete(t, store, provider, nil)
@@ -657,7 +649,7 @@ func TestPortDeprovisionRecoversReconciliationFailures(t *testing.T) {
 			provider := &provisionSessionProvider{
 				authenticated: true,
 				csrf:          "csrf",
-				permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+				permissions:   map[string]any{"/": map[string]bool{"SDN.Allocate": true}},
 			}
 			reconciler := &deprovisionTestReconciler{store: store, failKind: testCase.failKind, failCount: 1}
 			server, port := provisionForDelete(t, store, provider, reconciler)

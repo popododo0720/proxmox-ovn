@@ -52,18 +52,13 @@ func TestRequireAllNodesGatesNewPortCapacity(t *testing.T) {
 		t.Fatalf("ready health=%d body=%s", health.Code, health.Body.String())
 	}
 
-	projectResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "cluster-gate-project")
-	if err != nil {
-		t.Fatal(err)
-	}
-	project := projectResource.(*model.Project)
-	networkResource, _, err := store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "cluster-gate-network")
+	networkResource, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "cluster-gate-network")
 	if err != nil {
 		t.Fatal(err)
 	}
 	network := networkResource.(*model.Network)
 	created := request(t, server, http.MethodPost, "/api/v1/ports", map[string]any{
-		"project_id": project.ID, "network_id": network.ID, "name": "healthy", "mac_address": "02:00:00:00:00:01",
+		"network_id": network.ID, "name": "healthy", "mac_address": "02:00:00:00:00:01",
 	}, map[string]string{"Idempotency-Key": "cluster-gate-port-healthy"})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("healthy port create=%d body=%s", created.Code, created.Body.String())
@@ -71,7 +66,7 @@ func TestRequireAllNodesGatesNewPortCapacity(t *testing.T) {
 
 	now = now.Add(3 * time.Minute)
 	blocked := request(t, server, http.MethodPost, "/api/v1/ports", map[string]any{
-		"project_id": project.ID, "network_id": network.ID, "name": "blocked", "mac_address": "02:00:00:00:00:02",
+		"network_id": network.ID, "name": "blocked", "mac_address": "02:00:00:00:00:02",
 	}, map[string]string{"Idempotency-Key": "cluster-gate-port-blocked"})
 	if blocked.Code != http.StatusServiceUnavailable {
 		t.Fatalf("stale cluster port create=%d body=%s", blocked.Code, blocked.Body.String())
