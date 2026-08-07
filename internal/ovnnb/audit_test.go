@@ -74,9 +74,9 @@ func (runner *managedAuditRunner) Run(_ context.Context, _ string, arguments ...
 				cells = append(cells, auditTestMap(row.externalIDs))
 			case "options":
 				cells = append(cells, auditTestMap(row.options))
-			case "direction", "match", "action", "external_ip", "logical_ip", "external_port_range":
+			case "direction", "match", "action", "external_ip", "logical_ip", "external_port_range", "ip_prefix", "nexthop", "cidr":
 				cells = append(cells, row.attributes[heading])
-			case "severity", "meter", "logical_port", "external_mac":
+			case "severity", "meter", "logical_port", "external_mac", "output_port":
 				cells = append(cells, auditTestOptionalString(row.attributes[heading], row.attrPresent[heading] || row.attributes[heading] != ""))
 			case "priority", "tier", "label":
 				text := row.attributes[heading]
@@ -200,6 +200,9 @@ func comprehensiveManagedAuditFixture(t *testing.T) (*controlstore.Memory, contr
 
 	subnetUpdate := *fixture.internalSubnet
 	subnetUpdate.EnableDHCP = true
+	subnetUpdate.DNSNameservers = []string{"1.1.1.1", "9.9.9.9"}
+	subnetUpdate.DNSDomain = "guest.example"
+	subnetUpdate.DNSSearchDomains = []string{"guest.example", "svc.example"}
 	updatedSubnet, _, err := store.Update(ctx, &subnetUpdate, fixture.internalSubnet.Revision, "")
 	if err != nil {
 		t.Fatal(err)
@@ -224,6 +227,13 @@ func comprehensiveManagedAuditFixture(t *testing.T) (*controlstore.Memory, contr
 		ProviderNetworkID: fixture.provider.ID, Address: "192.0.2.55", RouterID: fixture.router.ID,
 		PortID: port.ID, FixedIPAddress: "10.42.0.55", FloatingStatus: model.FloatingIPActive,
 	})
+	routerUpdate := *fixture.router
+	routerUpdate.StaticRoutes = []model.StaticRoute{{Destination: "10.60.0.0/16", NextHop: "10.42.0.2"}}
+	updatedRouter, _, err := store.Update(ctx, &routerUpdate, fixture.router.Revision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.router = updatedRouter.(*model.Router)
 
 	snapshot, err := store.Snapshot(ctx, managedAuditControlKinds(), controlstore.ListOptions{})
 	if err != nil {
@@ -330,6 +340,27 @@ func TestAuditManagedGraphRejectsSecurityCriticalACLAndNATDrift(t *testing.T) {
 		{name: "NAT exempted external IPs", key: "floating-ip/fip-audit", mutate: func(row *managedAuditRow) {
 			row.references["exempted_ext_ips"] = []string{deterministicUUID("exempted-address-set")}
 		}, want: "exempted_ext_ips references"},
+		{name: "DHCP CIDR", key: "dhcp/internal-subnet-1", mutate: func(row *managedAuditRow) {
+			row.attributes["cidr"] = "10.43.0.0/24"
+		}, want: "cidr="},
+		{name: "DHCP DNS domain", key: "dhcp/internal-subnet-1", mutate: func(row *managedAuditRow) {
+			row.options["domain_name"] = "wrong.example"
+		}, want: "parent option domain_name="},
+		{name: "DHCP DNS search list", key: "dhcp/internal-subnet-1", mutate: func(row *managedAuditRow) {
+			row.options["domain_search_list"] = "wrong.example"
+		}, want: "parent option domain_search_list="},
+		{name: "DHCP unexpected option", key: "dhcp/internal-subnet-1", mutate: func(row *managedAuditRow) {
+			row.options["bootfile_name"] = "unexpected"
+		}, want: "has options"},
+		{name: "static route destination", key: "static-route/router-1/" + routerStaticRouteKey(model.StaticRoute{Destination: "10.60.0.0/16", NextHop: "10.42.0.2"}), mutate: func(row *managedAuditRow) {
+			row.attributes["ip_prefix"] = "10.61.0.0/16"
+		}, want: "ip_prefix="},
+		{name: "static route next hop", key: "static-route/router-1/" + routerStaticRouteKey(model.StaticRoute{Destination: "10.60.0.0/16", NextHop: "10.42.0.2"}), mutate: func(row *managedAuditRow) {
+			row.attributes["nexthop"] = "10.42.0.3"
+		}, want: "nexthop="},
+		{name: "static route output port", key: "static-route/router-1/" + routerStaticRouteKey(model.StaticRoute{Destination: "10.60.0.0/16", NextHop: "10.42.0.2"}), mutate: func(row *managedAuditRow) {
+			row.attributes["output_port"] = "wrong-port"
+		}, want: "output_port="},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

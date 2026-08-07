@@ -44,10 +44,10 @@ var managedAuditTables = []managedAuditTable{
 	{name: "Meter_Band", columns: []string{"_uuid", "external_ids"}},
 	{name: "Logical_Router", columns: []string{"_uuid", "name", "external_ids", "ports", "static_routes", "nat"}},
 	{name: "Logical_Router_Port", columns: []string{"_uuid", "name", "external_ids"}},
-	{name: "Logical_Router_Static_Route", columns: []string{"_uuid", "external_ids"}},
+	{name: "Logical_Router_Static_Route", columns: []string{"_uuid", "ip_prefix", "nexthop", "output_port", "external_ids"}},
 	{name: "Logical_Router_Policy", columns: []string{"_uuid", "external_ids"}},
 	{name: "NAT", columns: []string{"_uuid", "type", "external_ip", "logical_ip", "logical_port", "external_mac", "external_port_range", "priority", "match", "options", "allowed_ext_ips", "exempted_ext_ips", "external_ids", "gateway_port"}},
-	{name: "DHCP_Options", columns: []string{"_uuid", "external_ids"}},
+	{name: "DHCP_Options", columns: []string{"_uuid", "cidr", "options", "external_ids"}},
 	{name: "DHCP_Relay", columns: []string{"_uuid", "external_ids"}},
 	{name: "Connection", columns: []string{"_uuid", "external_ids"}},
 	{name: "DNS", columns: []string{"_uuid", "external_ids"}},
@@ -296,11 +296,11 @@ func decodeManagedAuditTable(spec managedAuditTable, output []byte) (map[string]
 				row.externalIDs, err = decodeAuditStringMap(cell)
 			case "options":
 				row.options, err = decodeAuditStringMap(cell)
-			case "direction", "match", "action", "external_ip", "logical_ip", "external_port_range":
+			case "direction", "match", "action", "external_ip", "logical_ip", "external_port_range", "ip_prefix", "nexthop", "cidr":
 				var value string
 				err = json.Unmarshal(cell, &value)
 				row.attributes[heading] = value
-			case "severity", "meter", "logical_port", "external_mac":
+			case "severity", "meter", "logical_port", "external_mac", "output_port":
 				row.attributes[heading], row.attrPresent[heading], err = decodeAuditOptionalString(cell)
 			case "priority", "tier", "label":
 				var value int
@@ -478,10 +478,38 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if !subnet.EnableDHCP {
 			continue
 		}
+		network := index.networks[subnet.NetworkID]
+		if network == nil {
+			return managedAuditPlan{}, fmt.Errorf("subnet %q references absent network %q", subnet.ID, subnet.NetworkID)
+		}
+		gateway, err := subnetGateway(subnet)
+		if err != nil {
+			return managedAuditPlan{}, fmt.Errorf("subnet %q DHCP gateway is invalid: %w", subnet.ID, err)
+		}
+		options := map[string]string{
+			"server_id": gateway.String(), "server_mac": deterministicMAC("dhcp:" + subnet.ID),
+			"lease_time": "43200", "mtu": strconv.Itoa(network.MTU), "router": gateway.String(),
+		}
+		if len(subnet.DNSNameservers) > 0 {
+			options["dns_server"] = "{" + strings.Join(subnet.DNSNameservers, ",") + "}"
+		}
+		if subnet.DNSDomain != "" {
+			options["domain_name"] = normalizedDNSDomain(subnet.DNSDomain)
+		}
+		if len(subnet.DNSSearchDomains) > 0 {
+			domains := make([]string, len(subnet.DNSSearchDomains))
+			for index, domain := range subnet.DNSSearchDomains {
+				domains[index] = normalizedDNSDomain(domain)
+			}
+			options["domain_search_list"] = strings.Join(domains, ",")
+		}
 		if err := plan.add(managedExpectedRow{
 			key: "dhcp/" + subnet.ID, label: "DHCP options " + subnet.ID, table: "DHCP_Options", preferredUUID: deterministicUUID("dhcp-options:" + subnet.ID),
 			identity:         auditIdentity(model.KindSubnet.String(), "pvn-id", subnet.ID),
 			requiredExternal: auditResourceExternal(subnet, nil),
+			requiredOptions:  options,
+			requiredAttrs:    map[string]string{"cidr": subnet.CIDR},
+			exactOptions:     true,
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -569,6 +597,29 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
+		for _, route := range router.StaticRoutes {
+			outputPort, err := auditStaticRouteOutputPort(index, router, route)
+			if err != nil {
+				return managedAuditPlan{}, err
+			}
+			key := routerStaticRouteKey(route)
+			routeKey := "static-route/" + router.ID + "/" + key
+			if err := plan.add(managedExpectedRow{
+				key: routeKey, label: "router static route " + router.ID + " " + route.Destination + " via " + route.NextHop,
+				table: "Logical_Router_Static_Route", preferredUUID: routerStaticRouteUUID(router.ID, route),
+				identity: map[string]string{
+					"pvn-managed": "true", "pvn-kind": "router-static-route", "pvn-router": router.ID, "pvn-route-key": key,
+				},
+				requiredExternal: map[string]string{
+					"pvn-managed": "true", "pvn-kind": "router-static-route", "pvn-router": router.ID, "pvn-route-key": key,
+					"pvn-revision": strconv.FormatInt(router.Revision, 10),
+				},
+				requiredAttrs: map[string]string{"ip_prefix": route.Destination, "nexthop": route.NextHop, "output_port": outputPort},
+			}); err != nil {
+				return managedAuditPlan{}, err
+			}
+			plan.expectParents("router static route parent", routeKey, "Logical_Router", "static_routes", routerKey)
+		}
 		if router.ExternalNetworkID == "" {
 			continue
 		}
@@ -600,10 +651,19 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		plan.expectParents("router gateway LSP security groups", lspKey, "Port_Group", "ports")
 
 		routeKey := "default-route/" + router.ID
+		externalSubnet := index.subnets[router.ExternalSubnetID]
+		if externalSubnet == nil {
+			return managedAuditPlan{}, fmt.Errorf("router %q references absent external subnet %q", router.ID, router.ExternalSubnetID)
+		}
+		gateway, err := model.EffectiveIPv4Gateway(externalSubnet)
+		if err != nil {
+			return managedAuditPlan{}, fmt.Errorf("router %q external subnet gateway is invalid: %w", router.ID, err)
+		}
 		if err := plan.add(managedExpectedRow{
 			key: routeKey, label: "router default route " + router.ID, table: "Logical_Router_Static_Route", preferredUUID: routerDefaultRouteUUID(router.ID),
 			identity:         map[string]string{"pvn-managed": "true", "pvn-kind": "router-default-route", "pvn-router": router.ID},
 			requiredExternal: map[string]string{"pvn-managed": "true", "pvn-kind": "router-default-route", "pvn-router": router.ID, "pvn-revision": strconv.FormatInt(router.Revision, 10)},
+			requiredAttrs:    map[string]string{"ip_prefix": "0.0.0.0/0", "nexthop": gateway.String(), "output_port": gatewayRouterPort(router.ID)},
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -727,6 +787,40 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		return managedAuditPlan{}, err
 	}
 	return plan, nil
+}
+
+func auditStaticRouteOutputPort(index managedDesiredIndex, router *model.Router, route model.StaticRoute) (string, error) {
+	matches := make([]string, 0, 2)
+	if router.ExternalSubnetID != "" {
+		subnet := index.subnets[router.ExternalSubnetID]
+		if subnet == nil {
+			return "", fmt.Errorf("router %q static route references absent external subnet %q", router.ID, router.ExternalSubnetID)
+		}
+		if subnet.State != model.ResourceDeleting && model.ValidateIPv4NextHop(subnet, route.NextHop, router.ExternalIPAddress) == nil {
+			matches = append(matches, gatewayRouterPort(router.ID))
+		}
+	}
+	for _, id := range sortedAuditMapKeys(index.interfaces) {
+		routerInterface := index.interfaces[id]
+		if routerInterface.RouterID != router.ID || routerInterface.State == model.ResourceDeleting {
+			continue
+		}
+		subnet := index.subnets[routerInterface.SubnetID]
+		if subnet == nil {
+			return "", fmt.Errorf("router interface %q references absent subnet %q", routerInterface.ID, routerInterface.SubnetID)
+		}
+		gateway, err := model.EffectiveIPv4Gateway(subnet)
+		if err == nil && subnet.State != model.ResourceDeleting && model.ValidateIPv4NextHop(subnet, route.NextHop, gateway.String()) == nil {
+			matches = append(matches, "pvn-lrp-"+compact(routerInterface.ID))
+		}
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("router %q static route %s via %s has no on-link attachment", router.ID, route.Destination, route.NextHop)
+	}
+	if len(matches) != 1 {
+		return "", fmt.Errorf("router %q static route %s via %s has ambiguous attachments %v", router.ID, route.Destination, route.NextHop, matches)
+	}
+	return matches[0], nil
 }
 
 func indexManagedDesired(snapshot controlstore.ResourceSnapshot) managedDesiredIndex {

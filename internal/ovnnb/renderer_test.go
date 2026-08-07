@@ -517,7 +517,8 @@ func TestRendererBuildsNetworkPortAndSecurityGroup(t *testing.T) {
 	subnet := mustCreate(t, store, &model.Subnet{
 		Metadata: model.Metadata{ID: "subnet-1"}, NetworkID: network.ID,
 		Name: "private-v4", CIDR: "10.42.0.0/24", GatewayIP: "10.42.0.1", EnableDHCP: true,
-		DNSNameservers: []string{"1.1.1.1"},
+		DNSNameservers: []string{"1.1.1.1"}, DNSDomain: "guest.example",
+		DNSSearchDomains: []string{"guest.example", "svc.example"},
 	}).(*model.Subnet)
 	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, Name: "web"}).(*model.SecurityGroup)
 	mustCreate(t, store, &model.Node{
@@ -550,7 +551,7 @@ func TestRendererBuildsNetworkPortAndSecurityGroup(t *testing.T) {
 	for _, expected := range [][]string{
 		{"create Logical_Switch", stringAssignment("name", logicalSwitch(network.ID)), `external_ids:pvn-id="network-1"`},
 		{"create DHCP_Options", `cidr="10.42.0.0/24"`},
-		{"dhcp-options-set-options", "server_id=10.42.0.1", "mtu=1400"},
+		{"dhcp-options-set-options", "server_id=10.42.0.1", "mtu=1400", "dns_server={1.1.1.1}", "domain_name=guest.example", "domain_search_list=guest.example,svc.example"},
 		{"create Port_Group", portGroup(group.ID), `external_ids:pvn-id="sg-1"`},
 		{"lsp-add " + logicalSwitchUUID(network.ID) + " pvn-port-1", "lsp-set-enabled pvn-port-1 enabled"},
 		{"lsp-set-options " + portUUID + " requested-chassis=chassis-a"},
@@ -996,6 +997,50 @@ func TestRouterInterfaceReconcilesRouterSNAT(t *testing.T) {
 	}
 }
 
+func TestRouterRendersAndPrunesOwnedStaticRoutes(t *testing.T) {
+	ctx := context.Background()
+	store, fixture := newNorthSouthFixture(t)
+	staleRoute := model.StaticRoute{Destination: "172.16.0.0/16", NextHop: "10.42.0.2"}
+	runner := &recordingRunner{}
+	runner.seedOwnedRow(logicalSwitchOwnedRow(fixture.externalNetwork.ID), logicalSwitchUUID(fixture.externalNetwork.ID))
+	runner.seedOwnedRow(routerStaticRouteOwnedRow(fixture.router.ID, staleRoute), routerStaticRouteUUID(fixture.router.ID, staleRoute))
+	renderer := newTestRenderer(t, runner, store)
+
+	update := *fixture.router
+	update.StaticRoutes = []model.StaticRoute{
+		{Destination: "10.60.0.0/16", NextHop: "10.42.0.2"},
+		{Destination: "203.0.113.0/24", NextHop: "192.0.2.2"},
+	}
+	updated, _, err := store.Update(ctx, &update, fixture.router.Revision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := updated.(*model.Router)
+	if err := renderer.Render(ctx, router); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, expected := range []struct {
+		route      model.StaticRoute
+		outputPort string
+	}{
+		{route: router.StaticRoutes[0], outputPort: "pvn-lrp-" + compact(fixture.routerInterface.ID)},
+		{route: router.StaticRoutes[1], outputPort: gatewayRouterPort(router.ID)},
+	} {
+		uuid := routerStaticRouteUUID(router.ID, expected.route)
+		if !runner.contains("create Logical_Router_Static_Route", uuid,
+			stringAssignment("ip_prefix", expected.route.Destination), stringAssignment("nexthop", expected.route.NextHop),
+			stringAssignment("output_port", expected.outputPort), mapAssignment("external_ids", "pvn-route-key", routerStaticRouteKey(expected.route)),
+			"add Logical_Router "+logicalRouterUUID(router.ID)+" static_routes "+uuid) {
+			t.Errorf("static route was not rendered with its inferred output port: %v", runner.calls)
+		}
+	}
+	staleUUID := routerStaticRouteUUID(router.ID, staleRoute)
+	if !runner.contains("remove Logical_Router "+logicalRouterUUID(router.ID)+" static_routes "+staleUUID, "destroy Logical_Router_Static_Route "+staleUUID) {
+		t.Fatalf("stale owned static route was not pruned: %v", runner.calls)
+	}
+}
+
 func TestRouterInterfaceMovesItsPortsAtomicallyWhenSubnetChanges(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	runner := &movingGatewayRunner{}
@@ -1085,12 +1130,15 @@ func TestRouterDeleteCleansNorthSouthArtifacts(t *testing.T) {
 	runner := &recordingRunner{routerSNATFindOutput: snatUUID + "\n"}
 	runner.seedOwnedRow(logicalRouterOwnedRow(fixture.router.ID), logicalRouterUUID(fixture.router.ID))
 	runner.seedOwnedRow(routerDefaultRouteOwnedRow(fixture.router.ID), routerDefaultRouteUUID(fixture.router.ID))
+	staticRoute := model.StaticRoute{Destination: "203.0.113.0/24", NextHop: "192.0.2.2"}
+	staticRouteUUID := routerStaticRouteUUID(fixture.router.ID, staticRoute)
+	runner.seedOwnedRow(routerStaticRouteOwnedRow(fixture.router.ID, staticRoute), staticRouteUUID)
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Delete(context.Background(), fixture.router); err != nil {
 		t.Fatal(err)
 	}
-	if !runner.contains("lsp-del "+gatewaySwitchPort(fixture.router.ID), "lrp-del "+gatewayRouterPort(fixture.router.ID), "lr-del "+logicalRouterUUID(fixture.router.ID), "destroy Logical_Router_Static_Route "+routerDefaultRouteUUID(fixture.router.ID), "destroy NAT "+snatUUID) {
+	if !runner.contains("lsp-del "+gatewaySwitchPort(fixture.router.ID), "lrp-del "+gatewayRouterPort(fixture.router.ID), "lr-del "+logicalRouterUUID(fixture.router.ID), "destroy Logical_Router_Static_Route "+routerDefaultRouteUUID(fixture.router.ID), "destroy Logical_Router_Static_Route "+staticRouteUUID, "destroy NAT "+snatUUID) {
 		t.Fatalf("router north-south artifacts were not deleted: %v", runner.calls)
 	}
 }

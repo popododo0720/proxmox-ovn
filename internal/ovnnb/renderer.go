@@ -330,6 +330,16 @@ func (renderer *Renderer) subnet(ctx context.Context, subnet *model.Subnet) erro
 	if len(subnet.DNSNameservers) > 0 {
 		options = append(options, "dns_server={"+strings.Join(subnet.DNSNameservers, ",")+"}")
 	}
+	if subnet.DNSDomain != "" {
+		options = append(options, "domain_name="+normalizedDNSDomain(subnet.DNSDomain))
+	}
+	if len(subnet.DNSSearchDomains) > 0 {
+		domains := make([]string, len(subnet.DNSSearchDomains))
+		for index, domain := range subnet.DNSSearchDomains {
+			domains[index] = normalizedDNSDomain(domain)
+		}
+		options = append(options, "domain_search_list="+strings.Join(domains, ","))
+	}
 	args := append([]string{"dhcp-options-set-options", uuid}, options...)
 	if _, err := renderer.client.run(ctx, args...); err != nil {
 		return wrapRender("subnet DHCP options", subnet.ID, err)
@@ -533,16 +543,22 @@ func (renderer *Renderer) router(ctx context.Context, router *model.Router) erro
 		return wrapRender("router", router.ID, err)
 	}
 	if external == nil {
-		return renderer.clearRouterExternal(ctx, router, routerUUID)
+		if err := renderer.clearRouterExternal(ctx, router, routerUUID); err != nil {
+			return err
+		}
+	} else {
+		externalSwitchUUID, err := renderer.requireOwnedRow(ctx, logicalSwitchOwnedRow(external.network.ID))
+		if err != nil {
+			return wrapRender("router external network", router.ID, err)
+		}
+		if err := renderer.renderRouterGateway(ctx, router, routerUUID, externalSwitchUUID, external, gatewayChassis); err != nil {
+			return err
+		}
+		if err := renderer.reconcileRouterSNAT(ctx, router, routerUUID); err != nil {
+			return err
+		}
 	}
-	externalSwitchUUID, err := renderer.requireOwnedRow(ctx, logicalSwitchOwnedRow(external.network.ID))
-	if err != nil {
-		return wrapRender("router external network", router.ID, err)
-	}
-	if err := renderer.renderRouterGateway(ctx, router, routerUUID, externalSwitchUUID, external, gatewayChassis); err != nil {
-		return err
-	}
-	return renderer.reconcileRouterSNAT(ctx, router, routerUUID)
+	return renderer.reconcileRouterStaticRoutes(ctx, router, routerUUID)
 }
 
 type routerExternal struct {
@@ -836,7 +852,10 @@ func (renderer *Renderer) routerInterface(ctx context.Context, routerInterface *
 			return wrapRender("move router interface", routerInterface.ID, retryErr)
 		}
 	}
-	return renderer.reconcileRouterSNAT(ctx, router, routerUUID)
+	if err := renderer.reconcileRouterSNAT(ctx, router, routerUUID); err != nil {
+		return err
+	}
+	return renderer.reconcileRouterStaticRoutes(ctx, router, routerUUID)
 }
 
 func (renderer *Renderer) routerInterfaceArgs(routerInterface *model.RouterInterface, routerUUID, switchUUID, routerPort, switchPort, mac, portNetwork string, move bool) []string {
@@ -947,6 +966,107 @@ func (renderer *Renderer) removeRouterSNATRows(ctx context.Context, routerID, ro
 	return wrapRender("remove stale router SNAT", routerID, err)
 }
 
+func (renderer *Renderer) reconcileRouterStaticRoutes(ctx context.Context, router *model.Router, routerUUID string) error {
+	actual, err := renderer.findMany(ctx, "Logical_Router_Static_Route",
+		mapAssignment("external_ids", "pvn-managed", "true"),
+		mapAssignment("external_ids", "pvn-kind", "router-static-route"),
+		mapAssignment("external_ids", "pvn-router", router.ID),
+	)
+	if err != nil {
+		return wrapRender("list router static routes", router.ID, err)
+	}
+	desired := make(map[string]bool, len(router.StaticRoutes))
+	if router.State != model.ResourceDeleting {
+		for _, route := range router.StaticRoutes {
+			outputPort, err := renderer.staticRouteOutputPort(ctx, router, route)
+			if err != nil {
+				return err
+			}
+			row := routerStaticRouteOwnedRow(router.ID, route)
+			desired[row.deterministicUUID] = true
+			assignments := []string{
+				stringAssignment("ip_prefix", route.Destination),
+				stringAssignment("nexthop", route.NextHop),
+				stringAssignment("output_port", outputPort),
+				mapAssignment("external_ids", "pvn-managed", "true"),
+				mapAssignment("external_ids", "pvn-kind", "router-static-route"),
+				mapAssignment("external_ids", "pvn-router", router.ID),
+				mapAssignment("external_ids", "pvn-route-key", routerStaticRouteKey(route)),
+				mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(router.Revision, 10)),
+			}
+			resolved, err := renderer.ensureOwnedAttachedRow(ctx, row, assignments, "Logical_Router", routerUUID, "static_routes")
+			if err != nil {
+				return wrapRender("router static route", router.ID, err)
+			}
+			delete(desired, row.deterministicUUID)
+			desired[resolved] = true
+		}
+	}
+	stale := make([]string, 0)
+	for _, uuid := range actual {
+		if !desired[uuid] {
+			stale = append(stale, uuid)
+		}
+	}
+	return renderer.removeRouterStaticRouteRows(ctx, router.ID, routerUUID, stale)
+}
+
+func (renderer *Renderer) staticRouteOutputPort(ctx context.Context, router *model.Router, route model.StaticRoute) (string, error) {
+	matches := make([]string, 0, 2)
+	if router.ExternalSubnetID != "" {
+		subnet, err := getResource[*model.Subnet](ctx, renderer.store, model.KindSubnet, router.ExternalSubnetID)
+		if err != nil {
+			return "", err
+		}
+		if subnet.State != model.ResourceDeleting && model.ValidateIPv4NextHop(subnet, route.NextHop, router.ExternalIPAddress) == nil {
+			matches = append(matches, gatewayRouterPort(router.ID))
+		}
+	}
+	interfaces, err := renderer.store.List(ctx, model.KindRouterInterface, controlstore.ListOptions{RouterID: router.ID})
+	if err != nil {
+		return "", err
+	}
+	for _, resource := range interfaces {
+		routerInterface, ok := resource.(*model.RouterInterface)
+		if !ok {
+			return "", fmt.Errorf("control store returned %T while listing router interfaces", resource)
+		}
+		if routerInterface.RouterID != router.ID || routerInterface.State == model.ResourceDeleting {
+			continue
+		}
+		subnet, err := getResource[*model.Subnet](ctx, renderer.store, model.KindSubnet, routerInterface.SubnetID)
+		if err != nil {
+			return "", err
+		}
+		gateway, err := model.EffectiveIPv4Gateway(subnet)
+		if err == nil && subnet.State != model.ResourceDeleting && model.ValidateIPv4NextHop(subnet, route.NextHop, gateway.String()) == nil {
+			matches = append(matches, "pvn-lrp-"+compact(routerInterface.ID))
+		}
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("router %q static route %s via %s has no on-link attachment", router.ID, route.Destination, route.NextHop)
+	}
+	if len(matches) != 1 {
+		return "", fmt.Errorf("router %q static route %s via %s has ambiguous attachments %v", router.ID, route.Destination, route.NextHop, matches)
+	}
+	return matches[0], nil
+}
+
+func (renderer *Renderer) removeRouterStaticRouteRows(ctx context.Context, routerID, routerUUID string, uuids []string) error {
+	if len(uuids) == 0 {
+		return nil
+	}
+	args := make([]string, 0, len(uuids)*12)
+	for _, uuid := range uuids {
+		args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "static_routes", uuid)
+	}
+	for _, uuid := range uuids {
+		args = append(args, "--", "--if-exists", "destroy", "Logical_Router_Static_Route", uuid)
+	}
+	_, err := renderer.client.run(ctx, args...)
+	return wrapRender("remove stale router static routes", routerID, err)
+}
+
 func (renderer *Renderer) deleteRouterInterface(ctx context.Context, routerInterface *model.RouterInterface) error {
 	routerUUID, err := renderer.lookupOwnedRow(ctx, logicalRouterOwnedRow(routerInterface.RouterID))
 	if err != nil {
@@ -1024,6 +1144,14 @@ func (renderer *Renderer) deleteRouter(ctx context.Context, router *model.Router
 	if err != nil {
 		return wrapRender("list router SNAT", router.ID, err)
 	}
+	staticRoutes, err := renderer.findMany(ctx, "Logical_Router_Static_Route",
+		mapAssignment("external_ids", "pvn-managed", "true"),
+		mapAssignment("external_ids", "pvn-kind", "router-static-route"),
+		mapAssignment("external_ids", "pvn-router", router.ID),
+	)
+	if err != nil {
+		return wrapRender("list router static routes", router.ID, err)
+	}
 	routerUUID, err := renderer.lookupOwnedRow(ctx, logicalRouterOwnedRow(router.ID))
 	if err != nil {
 		return wrapRender("read router", router.ID, err)
@@ -1039,6 +1167,11 @@ func (renderer *Renderer) deleteRouter(ctx context.Context, router *model.Router
 	if routerUUID != "" && routeUUID != "" {
 		args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "static_routes", routeUUID)
 	}
+	for _, uuid := range staticRoutes {
+		if routerUUID != "" {
+			args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "static_routes", uuid)
+		}
+	}
 	for _, uuid := range snats {
 		if routerUUID != "" {
 			args = append(args, "--", "--if-exists", "remove", "Logical_Router", routerUUID, "nat", uuid)
@@ -1049,6 +1182,9 @@ func (renderer *Renderer) deleteRouter(ctx context.Context, router *model.Router
 	}
 	if routeUUID != "" {
 		args = append(args, "--", "--if-exists", "destroy", "Logical_Router_Static_Route", routeUUID)
+	}
+	for _, uuid := range staticRoutes {
+		args = append(args, "--", "--if-exists", "destroy", "Logical_Router_Static_Route", uuid)
 	}
 	for _, uuid := range snats {
 		args = append(args, "--", "--if-exists", "destroy", "NAT", uuid)
@@ -1742,6 +1878,18 @@ func routerDefaultRouteOwnedRow(routerID string) ownedRow {
 	)
 }
 
+func routerStaticRouteOwnedRow(routerID string, route model.StaticRoute) ownedRow {
+	key := routerStaticRouteKey(route)
+	return managedRow(
+		"Logical_Router_Static_Route",
+		routerStaticRouteUUID(routerID, route),
+		"",
+		mapAssignment("external_ids", "pvn-kind", "router-static-route"),
+		mapAssignment("external_ids", "pvn-router", routerID),
+		mapAssignment("external_ids", "pvn-route-key", key),
+	)
+}
+
 func routerSNATOwnedRow(routerID, routerInterfaceID string) ownedRow {
 	return managedRow(
 		"NAT",
@@ -1937,6 +2085,15 @@ func routerDefaultRouteUUID(id string) string {
 	return deterministicUUID("router-default-route:" + id)
 }
 
+func routerStaticRouteUUID(routerID string, route model.StaticRoute) string {
+	return deterministicUUID("router-static-route:" + routerID + ":" + routerStaticRouteKey(route))
+}
+
+func routerStaticRouteKey(route model.StaticRoute) string {
+	digest := sha256.Sum256([]byte(route.Destination + "\x00" + route.NextHop))
+	return hex.EncodeToString(digest[:])
+}
+
 func routerSNATUUID(routerID, routerInterfaceID string) string {
 	return deterministicUUID("router-snat:" + routerID + ":" + routerInterfaceID)
 }
@@ -1957,6 +2114,10 @@ func subnetGateway(subnet *model.Subnet) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("subnet %q has an invalid gateway: %w", subnet.ID, err)
 	}
 	return gateway, nil
+}
+
+func normalizedDNSDomain(value string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(value), "."))
 }
 
 func safeID(value string) error {
