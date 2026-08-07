@@ -27,22 +27,6 @@ func (s *Store) LookupRuntimePorts(ctx context.Context, nodeIdentity string, vmi
 }
 
 func decodeRuntimePortLookup(raw rawRuntimePortLookup, nodeIdentity string) ([]*model.Port, error) {
-	projectIDs := make(map[string]string, len(raw.projects))
-	for index, row := range raw.projects {
-		uuid, uuidErr := rowUUID(row, "_uuid")
-		id, idErr := rowString(row, "id")
-		if err := firstError(uuidErr, idErr); err != nil {
-			return nil, rowError(controlschema.ProjectTable, index, err)
-		}
-		if id == "" {
-			return nil, rowError(controlschema.ProjectTable, index, fmt.Errorf("project id is empty"))
-		}
-		if _, duplicate := projectIDs[uuid]; duplicate {
-			return nil, rowError(controlschema.ProjectTable, index, fmt.Errorf("duplicate project UUID %q", uuid))
-		}
-		projectIDs[uuid] = id
-	}
-
 	nodeIDs := make(map[string]string, len(raw.nodes))
 	acceptedNodes := map[string]bool{nodeIdentity: true}
 	for index, row := range raw.nodes {
@@ -67,7 +51,7 @@ func decodeRuntimePortLookup(raw rawRuntimePortLookup, nodeIdentity string) ([]*
 
 	ports := make([]*model.Port, 0, len(raw.ports))
 	for index, row := range raw.ports {
-		port, err := decodeRuntimePort(row, projectIDs, nodeIDs)
+		port, err := decodeRuntimePort(row, nodeIDs)
 		if err != nil {
 			return nil, rowError(controlschema.PortTable, index, err)
 		}
@@ -79,27 +63,22 @@ func decodeRuntimePortLookup(raw rawRuntimePortLookup, nodeIdentity string) ([]*
 	return ports, nil
 }
 
-func decodeRuntimePort(row ovsdb.Row, projectIDs, nodeIDs map[string]string) (*model.Port, error) {
+func decodeRuntimePort(row ovsdb.Row, nodeIDs map[string]string) (*model.Port, error) {
 	id, e1 := rowString(row, "id")
 	revision, e2 := rowInt64(row, "revision")
 	appliedRevision, e3 := rowInt64(row, "applied_revision")
 	stateValue, e4 := rowString(row, "state")
-	projectUUID, e5 := rowReference(row, "project", false)
-	nodeUUID, e6 := rowReference(row, "node", true)
-	vmid, e7 := rowInt64(row, "vmid")
-	nic, e8 := rowString(row, "nic")
-	lspName, e9 := rowString(row, "lsp_name")
-	generation, e10 := rowInt64(row, "generation")
-	requestedChassis, e11 := rowString(row, "requested_chassis")
-	macAddress, e12 := rowString(row, "mac_address")
-	adminStateUp, e13 := rowBool(row, "admin_state_up")
-	bindingStatus, e14 := rowString(row, "binding_status")
-	if err := firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14); err != nil {
+	nodeUUID, e5 := rowReference(row, "node", true)
+	vmid, e6 := rowInt64(row, "vmid")
+	nic, e7 := rowString(row, "nic")
+	lspName, e8 := rowString(row, "lsp_name")
+	generation, e9 := rowInt64(row, "generation")
+	requestedChassis, e10 := rowString(row, "requested_chassis")
+	macAddress, e11 := rowString(row, "mac_address")
+	adminStateUp, e12 := rowBool(row, "admin_state_up")
+	bindingStatus, e13 := rowString(row, "binding_status")
+	if err := firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13); err != nil {
 		return nil, err
-	}
-	projectID, exists := projectIDs[projectUUID]
-	if !exists {
-		return nil, fmt.Errorf("column project references unknown project UUID %q", projectUUID)
 	}
 	nodeID := ""
 	if nodeUUID != "" {
@@ -120,7 +99,6 @@ func decodeRuntimePort(row ovsdb.Row, projectIDs, nodeIDs map[string]string) (*m
 		Metadata: model.Metadata{
 			ID: id, Revision: revision, AppliedRevision: appliedRevision, State: state,
 		},
-		ProjectID:        projectID,
 		MACAddress:       macAddress,
 		AdminStateUp:     adminStateUp,
 		BindingStatus:    model.PortBindingStatus(bindingStatus),

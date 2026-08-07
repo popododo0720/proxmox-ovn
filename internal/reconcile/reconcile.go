@@ -323,7 +323,6 @@ func (c *Controller) renderUntilStable(ctx context.Context, initial model.Resour
 }
 
 var dependencyOrder = []model.Kind{
-	model.KindProject,
 	model.KindProviderNetwork,
 	model.KindNetwork,
 	model.KindProviderSegment,
