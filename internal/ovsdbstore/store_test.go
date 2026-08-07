@@ -277,14 +277,14 @@ func TestStorePersistsEveryResourceKindAndFiltersInternalRows(t *testing.T) {
 	external := mustCreate(t, store, &model.Network{Name: "external", External: true, ProviderNetworkID: provider.ID}, "external-network").(*model.Network)
 	externalSubnet := mustCreate(t, store, &model.Subnet{NetworkID: external.ID, Name: "external-v4", CIDR: "198.51.100.0/24", GatewayIP: "198.51.100.1"}, "external-subnet").(*model.Subnet)
 	network := mustCreate(t, store, &model.Network{Name: "private"}, "network").(*model.Network)
-	subnet := mustCreate(t, store, &model.Subnet{NetworkID: network.ID, Name: "private-v4", CIDR: "10.10.0.0/24", EnableDHCP: true, DNSNameservers: []string{"1.1.1.1"}, AllocationPools: []model.IPRange{{Start: "10.10.0.10", End: "10.10.0.20"}}}, "subnet").(*model.Subnet)
+	subnet := mustCreate(t, store, &model.Subnet{NetworkID: network.ID, Name: "private-v4", CIDR: "10.10.0.0/24", EnableDHCP: true, DNSNameservers: []string{"1.1.1.1"}, DNSDomain: "guest.example", DNSSearchDomains: []string{"guest.example", "svc.example"}, AllocationPools: []model.IPRange{{Start: "10.10.0.10", End: "10.10.0.20"}}}, "subnet").(*model.Subnet)
 	node := mustCreate(t, store, &model.Node{Name: "pve-a", ChassisID: "chassis-a", ManagementAddress: "192.0.2.10", Roles: []model.NodeRole{model.NodeRoleCompute, model.NodeRoleGateway}, Enabled: true}, "node").(*model.Node)
 	group := mustCreate(t, store, &model.SecurityGroup{Name: "default"}, "group").(*model.SecurityGroup)
 	remoteGroup := mustCreate(t, store, &model.SecurityGroup{Name: "web"}, "remote-group").(*model.SecurityGroup)
 	rule := mustCreate(t, store, &model.SecurityGroupRule{SecurityGroupID: group.ID, Direction: model.DirectionIngress, Protocol: "tcp", PortRangeMin: 443, PortRangeMax: 443, RemoteGroupID: remoteGroup.ID}, "rule")
 	port := mustCreate(t, store, &model.Port{NetworkID: network.ID, Name: "vm-port", MACAddress: "02:00:00:00:00:10", FixedIPs: []model.FixedIP{{SubnetID: subnet.ID, Address: "10.10.0.10"}}, SecurityGroupIDs: []string{group.ID}, AdminStateUp: true, NodeID: node.ID, VMID: 100, NIC: "net0", RequestedChassis: node.ChassisID}, "port").(*model.Port)
 	allocation := mustCreate(t, store, &model.IPAllocation{SubnetID: subnet.ID, PortID: port.ID, Address: "10.10.0.10", State: model.IPAllocated}, "allocation")
-	router := mustCreate(t, store, &model.Router{Name: "router", ExternalNetworkID: external.ID, ExternalSubnetID: externalSubnet.ID, ExternalIPAddress: "198.51.100.2", EnableSNAT: true}, "router").(*model.Router)
+	router := mustCreate(t, store, &model.Router{Name: "router", ExternalNetworkID: external.ID, ExternalSubnetID: externalSubnet.ID, ExternalIPAddress: "198.51.100.2", EnableSNAT: true, StaticRoutes: []model.StaticRoute{{Destination: "203.0.113.0/24", NextHop: "198.51.100.3"}}}, "router").(*model.Router)
 	interfaceResource := mustCreate(t, store, &model.RouterInterface{RouterID: router.ID, SubnetID: subnet.ID, PortID: port.ID}, "router-interface")
 	floating := mustCreate(t, store, &model.FloatingIP{ProviderNetworkID: provider.ID, Address: "198.51.100.10", PortID: port.ID, FixedIPAddress: "10.10.0.10", RouterID: router.ID}, "floating").(*model.FloatingIP)
 	if floating.FloatingStatus != model.FloatingIPDown || floating.State != model.ResourcePending {
@@ -335,6 +335,22 @@ func TestStorePersistsEveryResourceKindAndFiltersInternalRows(t *testing.T) {
 			t.Fatalf("invalid decoded metadata for %s: %#v", expected.ResourceKind(), loaded.GetMetadata())
 		}
 		seen[expected.ResourceKind()] = true
+	}
+	loadedSubnetResource, err := store.Get(context.Background(), model.KindSubnet, subnet.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedSubnet := loadedSubnetResource.(*model.Subnet)
+	if loadedSubnet.DNSDomain != "guest.example" || len(loadedSubnet.DNSSearchDomains) != 2 || loadedSubnet.DNSSearchDomains[1] != "svc.example" {
+		t.Fatalf("decoded subnet DNS=%#v", loadedSubnet)
+	}
+	loadedRouterResource, err := store.Get(context.Background(), model.KindRouter, router.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedRouter := loadedRouterResource.(*model.Router)
+	if len(loadedRouter.StaticRoutes) != 1 || loadedRouter.StaticRoutes[0].Destination != "203.0.113.0/24" || loadedRouter.StaticRoutes[0].NextHop != "198.51.100.3" {
+		t.Fatalf("decoded router routes=%#v", loadedRouter.StaticRoutes)
 	}
 	for _, kind := range model.Kinds() {
 		if !seen[kind] {

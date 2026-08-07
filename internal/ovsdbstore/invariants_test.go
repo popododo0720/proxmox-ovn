@@ -347,3 +347,31 @@ func TestStoreReplacementPreservesCrossResourceInvariants(t *testing.T) {
 	}
 
 }
+
+func TestStoreStaticRoutesRequireOneRouterAttachment(t *testing.T) {
+	store := deterministicStore(newFakeDatabase())
+	topology := buildInvariantTopology(t, store)
+	routerInterface := mustCreate(t, store, &model.RouterInterface{RouterID: topology.router.ID, SubnetID: topology.privateSubnet.ID}, "route-interface").(*model.RouterInterface)
+
+	candidate := *topology.router
+	candidate.StaticRoutes = []model.StaticRoute{{Destination: "10.20.0.0/16", NextHop: "10.0.0.2"}, {Destination: "203.0.113.0/24", NextHop: "192.0.2.3"}}
+	updated, _, err := store.Update(context.Background(), &candidate, candidate.Revision, "route-update")
+	if err != nil {
+		t.Fatalf("valid static routes: %v", err)
+	}
+	topology.router = updated.(*model.Router)
+	if _, err := store.Delete(context.Background(), model.KindRouterInterface, routerInterface.ID, routerInterface.Revision, "route-interface-delete"); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("delete route attachment error=%v, want conflict", err)
+	}
+
+	unreachable := *topology.router
+	unreachable.StaticRoutes = []model.StaticRoute{{Destination: "10.30.0.0/16", NextHop: "172.16.0.2"}}
+	if _, _, err := store.Update(context.Background(), &unreachable, unreachable.Revision, "route-unreachable"); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("unreachable route error=%v, want conflict", err)
+	}
+	managedDefault := *topology.router
+	managedDefault.StaticRoutes = []model.StaticRoute{{Destination: "0.0.0.0/0", NextHop: "192.0.2.3"}}
+	if _, _, err := store.Update(context.Background(), &managedDefault, managedDefault.Revision, "route-default"); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("user default route error=%v, want conflict", err)
+	}
+}

@@ -32,6 +32,12 @@ var (
 	dnsLabelPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 )
 
+const (
+	maxDNSNameservers   = 6
+	maxDNSSearchDomains = 6
+	maxStaticRoutes     = 64
+)
+
 func validateName(field, value string) error {
 	if !namePattern.MatchString(value) {
 		return invalid(field, "must be 1-127 characters and contain only letters, digits, '.', '_', ':', or '-'")
@@ -74,16 +80,27 @@ func validateSubnet(s *Subnet) error {
 	if _, gatewayErr := EffectiveIPv4Gateway(s); gatewayErr != nil {
 		return invalid("gateway_ip", "%s", gatewayErr.Error())
 	}
+	if len(s.DNSNameservers) > maxDNSNameservers {
+		return invalid("dns_nameservers", "must contain at most %d addresses", maxDNSNameservers)
+	}
+	seenNameservers := make(map[string]struct{}, len(s.DNSNameservers))
 	for i, server := range s.DNSNameservers {
 		addr, parseErr := netip.ParseAddr(server)
 		if parseErr != nil || !addr.Is4() {
 			return invalid(fmt.Sprintf("dns_nameservers[%d]", i), "must be an IPv4 address")
 		}
+		if _, duplicate := seenNameservers[addr.String()]; duplicate {
+			return invalid(fmt.Sprintf("dns_nameservers[%d]", i), "duplicates another DNS server")
+		}
+		seenNameservers[addr.String()] = struct{}{}
 	}
 	if s.DNSDomain != "" {
 		if err := validateDNSDomain("dns_domain", s.DNSDomain); err != nil {
 			return err
 		}
+	}
+	if len(s.DNSSearchDomains) > maxDNSSearchDomains {
+		return invalid("dns_search_domains", "must contain at most %d domains", maxDNSSearchDomains)
 	}
 	seenSearchDomains := make(map[string]struct{}, len(s.DNSSearchDomains))
 	for i, domain := range s.DNSSearchDomains {
@@ -167,6 +184,9 @@ func validateIPAllocation(a *IPAllocation) error {
 func validateRouter(r *Router) error {
 	if err := validateName("name", r.Name); err != nil {
 		return err
+	}
+	if len(r.StaticRoutes) > maxStaticRoutes {
+		return invalid("static_routes", "must contain at most %d routes", maxStaticRoutes)
 	}
 	for i, route := range r.StaticRoutes {
 		prefix, err := netip.ParsePrefix(route.Destination)
@@ -415,6 +435,25 @@ func SetDefaults(resource Resource) {
 		if value.MTU == 0 {
 			value.MTU = 1400
 		}
+	case *Subnet:
+		value.DNSDomain = normalizeDNSDomain(value.DNSDomain)
+		for index, domain := range value.DNSSearchDomains {
+			value.DNSSearchDomains[index] = normalizeDNSDomain(domain)
+		}
+		for index, server := range value.DNSNameservers {
+			if address, err := netip.ParseAddr(server); err == nil {
+				value.DNSNameservers[index] = address.String()
+			}
+		}
+	case *Router:
+		for index, route := range value.StaticRoutes {
+			if prefix, err := netip.ParsePrefix(route.Destination); err == nil {
+				value.StaticRoutes[index].Destination = prefix.Masked().String()
+			}
+			if address, err := netip.ParseAddr(route.NextHop); err == nil {
+				value.StaticRoutes[index].NextHop = address.String()
+			}
+		}
 	case *Port:
 		if mac, err := net.ParseMAC(value.MACAddress); err == nil && len(mac) == 6 {
 			value.MACAddress = strings.ToLower(mac.String())
@@ -451,4 +490,8 @@ func SetDefaults(resource Resource) {
 			value.OperationStatus = OperationQueued
 		}
 	}
+}
+
+func normalizeDNSDomain(value string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(value), "."))
 }

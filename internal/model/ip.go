@@ -80,6 +80,38 @@ func ValidateIPv4AllocationAddress(subnet *Subnet, address string) error {
 	return fmt.Errorf("must belong to a subnet allocation pool")
 }
 
+// ValidateIPv4NextHop verifies that address is an on-link host for subnet.
+// Unlike an allocatable guest address, a next hop need not be inside an
+// allocation pool and may be the subnet's configured upstream gateway.
+func ValidateIPv4NextHop(subnet *Subnet, address, localAddress string) error {
+	if subnet == nil {
+		return fmt.Errorf("subnet is required")
+	}
+	prefix, err := netip.ParsePrefix(subnet.CIDR)
+	if err != nil || !prefix.Addr().Is4() {
+		return fmt.Errorf("subnet must use a valid IPv4 prefix")
+	}
+	prefix = prefix.Masked()
+	nextHop, err := netip.ParseAddr(address)
+	if err != nil || !nextHop.Is4() || !prefix.Contains(nextHop) {
+		return fmt.Errorf("must be an IPv4 address on the subnet")
+	}
+	network, broadcast := ipv4SubnetBounds(prefix)
+	if nextHop == network || nextHop == broadcast {
+		return fmt.Errorf("must be a usable host address")
+	}
+	if localAddress != "" {
+		local, parseErr := netip.ParseAddr(localAddress)
+		if parseErr != nil || !local.Is4() || !prefix.Contains(local) {
+			return fmt.Errorf("local router address is invalid")
+		}
+		if nextHop == local {
+			return fmt.Errorf("must differ from the router address")
+		}
+	}
+	return nil
+}
+
 // IPv4PrefixesOverlap reports whether two valid IPv4 CIDRs share any address.
 func IPv4PrefixesOverlap(leftCIDR, rightCIDR string) bool {
 	left, leftErr := netip.ParsePrefix(leftCIDR)

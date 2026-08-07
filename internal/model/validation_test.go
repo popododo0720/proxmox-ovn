@@ -95,6 +95,16 @@ func TestSetDefaults(t *testing.T) {
 	if port.Generation != 1 || port.BindingStatus != PortUnbound || port.LSPName != "pvn-port-id" || port.MACAddress != "02:00:00:00:00:aa" {
 		t.Fatalf("port defaults = %#v", port)
 	}
+	subnet := &Subnet{DNSDomain: "Guest.Example.", DNSSearchDomains: []string{"SVC.Example."}}
+	SetDefaults(subnet)
+	if subnet.DNSDomain != "guest.example" || subnet.DNSSearchDomains[0] != "svc.example" {
+		t.Fatalf("subnet DNS defaults = %#v", subnet)
+	}
+	router := &Router{StaticRoutes: []StaticRoute{{Destination: "10.20.0.3/16", NextHop: "10.0.0.002"}}}
+	SetDefaults(router)
+	if router.StaticRoutes[0].Destination != "10.20.0.0/16" {
+		t.Fatalf("router route defaults = %#v", router.StaticRoutes)
+	}
 }
 
 func TestCloneIsIndependent(t *testing.T) {

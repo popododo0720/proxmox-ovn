@@ -130,6 +130,9 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 				return storeError(controlstore.ErrConflict, "external IP address is not allocatable on the external subnet: %v", addressErr)
 			}
 		}
+		if err := validateRouterStaticRoutes(current, value); err != nil {
+			return err
+		}
 	case *model.RouterInterface:
 		if _, err := require(current, model.KindRouter, value.RouterID, "router_id"); err != nil {
 			return err
@@ -291,6 +294,45 @@ func routerReachesPortAddress(current *snapshot, routerID string, port *model.Po
 		}
 	}
 	return false
+}
+
+func validateRouterStaticRoutes(current *snapshot, router *model.Router) error {
+	for index, route := range router.StaticRoutes {
+		matches := 0
+		if router.ExternalSubnetID != "" {
+			if route.Destination == "0.0.0.0/0" {
+				return storeError(controlstore.ErrConflict, "static_routes[%d] cannot replace the managed external gateway default route", index)
+			}
+			if entry, exists := current.resources[model.KindSubnet][router.ExternalSubnetID]; exists {
+				subnet := entry.resource.(*model.Subnet)
+				if subnet.State != model.ResourceDeleting && model.ValidateIPv4NextHop(subnet, route.NextHop, router.ExternalIPAddress) == nil {
+					matches++
+				}
+			}
+		}
+		for _, entry := range current.resources[model.KindRouterInterface] {
+			routerInterface := entry.resource.(*model.RouterInterface)
+			if routerInterface.RouterID != router.ID || routerInterface.State == model.ResourceDeleting {
+				continue
+			}
+			subnetEntry, exists := current.resources[model.KindSubnet][routerInterface.SubnetID]
+			if !exists {
+				continue
+			}
+			subnet := subnetEntry.resource.(*model.Subnet)
+			gateway, err := model.EffectiveIPv4Gateway(subnet)
+			if err == nil && subnet.State != model.ResourceDeleting && model.ValidateIPv4NextHop(subnet, route.NextHop, gateway.String()) == nil {
+				matches++
+			}
+		}
+		if matches == 0 {
+			return storeError(controlstore.ErrConflict, "static_routes[%d].next_hop is not reachable through a router interface or external subnet", index)
+		}
+		if matches > 1 {
+			return storeError(controlstore.ErrConflict, "static_routes[%d].next_hop matches more than one router attachment", index)
+		}
+	}
+	return nil
 }
 
 func validateUnique(current *snapshot, candidate model.Resource, ignoredID string) error {
@@ -596,6 +638,18 @@ func firstReference(current *snapshot, kind model.Kind, id string) string {
 		routerInterfaceEntry, ok := current.resources[kind][id]
 		if ok {
 			routerInterface := routerInterfaceEntry.resource.(*model.RouterInterface)
+			if routerEntry, exists := current.resources[model.KindRouter][routerInterface.RouterID]; exists {
+				router := routerEntry.resource.(*model.Router)
+				if subnetEntry, subnetExists := current.resources[model.KindSubnet][routerInterface.SubnetID]; subnetExists {
+					subnet := subnetEntry.resource.(*model.Subnet)
+					gateway, gatewayErr := model.EffectiveIPv4Gateway(subnet)
+					for _, route := range router.StaticRoutes {
+						if gatewayErr == nil && model.ValidateIPv4NextHop(subnet, route.NextHop, gateway.String()) == nil {
+							return fmt.Sprintf("%s %q static route", model.KindRouter, router.ID)
+						}
+					}
+				}
+			}
 			ids := make([]string, 0, len(current.resources[model.KindFloatingIP]))
 			for floatingID := range current.resources[model.KindFloatingIP] {
 				ids = append(ids, floatingID)

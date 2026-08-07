@@ -17,17 +17,21 @@ import (
 )
 
 const (
-	storeLockID       = "__pvn_store_lock__"
-	internalIDPrefix  = "__pvn_internal_"
-	internalScopeKey  = "__pvn_internal_idem_scope__/"
-	internalTypeKey   = "pvn:internal-type"
-	internalLockType  = "store-lock"
-	internalIdemType  = "idempotency"
-	idemFingerprint   = "pvn:fingerprint"
-	idemResource      = "pvn:resource"
-	idemResourceKind  = "pvn:resource-kind"
-	idemDeleted       = "pvn:deleted"
-	maxStoredErrorLen = 16 * 1024
+	storeLockID                = "__pvn_store_lock__"
+	internalIDPrefix           = "__pvn_internal_"
+	internalScopeKey           = "__pvn_internal_idem_scope__/"
+	internalTypeKey            = "pvn:internal-type"
+	internalLockType           = "store-lock"
+	internalIdemType           = "idempotency"
+	idemFingerprint            = "pvn:fingerprint"
+	idemResource               = "pvn:resource"
+	idemResourceKind           = "pvn:resource-kind"
+	idemDeleted                = "pvn:deleted"
+	subnetDNSDomainKey         = "pvn:dns-domain"
+	subnetDNSSearchDomainsKey  = "pvn:dns-search-domains"
+	routerStaticRoutesKey      = "pvn:static-routes"
+	maxStoredErrorLen          = 16 * 1024
+	maxResourceExternalJSONLen = 64 * 1024
 )
 
 type idempotencyRecord struct {
@@ -308,7 +312,9 @@ func decodeResource(kind model.Kind, row ovsdb.Row, refs *snapshot) (model.Resou
 		dhcp, e5 := boolValue("enable_dhcp")
 		dns, e6 := rowStringSet(row, "dns_nameservers")
 		pools, e7 := decodeIPRanges(row, "allocation_pools")
-		return &model.Subnet{Metadata: meta, NetworkID: networkID, Name: name, CIDR: cidr, GatewayIP: gateway, EnableDHCP: dhcp, DNSNameservers: dns, AllocationPools: pools}, firstError(e1, e2, e3, e4, e5, e6, e7)
+		external, e8 := rowStringMap(row, "external_ids")
+		searchDomains, e9 := decodeExternalJSON[[]string](external, subnetDNSSearchDomainsKey)
+		return &model.Subnet{Metadata: meta, NetworkID: networkID, Name: name, CIDR: cidr, GatewayIP: gateway, EnableDHCP: dhcp, DNSNameservers: dns, DNSDomain: external[subnetDNSDomainKey], DNSSearchDomains: searchDomains, AllocationPools: pools}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9)
 	case model.KindPort:
 		networkID, e1 := ref(model.KindNetwork, "network", false)
 		name, e2 := stringValue("name")
@@ -337,7 +343,9 @@ func decodeResource(kind model.Kind, row ovsdb.Row, refs *snapshot) (model.Resou
 		externalSubnetID, e4 := ref(model.KindSubnet, "external_subnet", true)
 		externalIPAddress, e5 := stringValue("external_ip_address")
 		snat, e6 := boolValue("enable_snat")
-		return &model.Router{Metadata: meta, Name: name, Description: description, ExternalNetworkID: externalID, ExternalSubnetID: externalSubnetID, ExternalIPAddress: externalIPAddress, EnableSNAT: snat}, firstError(e1, e2, e3, e4, e5, e6)
+		external, e7 := rowStringMap(row, "external_ids")
+		staticRoutes, e8 := decodeExternalJSON[[]model.StaticRoute](external, routerStaticRoutesKey)
+		return &model.Router{Metadata: meta, Name: name, Description: description, ExternalNetworkID: externalID, ExternalSubnetID: externalSubnetID, ExternalIPAddress: externalIPAddress, EnableSNAT: snat, StaticRoutes: staticRoutes}, firstError(e1, e2, e3, e4, e5, e6, e7, e8)
 	case model.KindRouterInterface:
 		routerID, e1 := ref(model.KindRouter, "router", false)
 		subnetID, e2 := ref(model.KindSubnet, "subnet", false)
@@ -438,6 +446,7 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 		row[column], err = ref(kind, id, field, optional)
 	}
 
+	externalIDs := make(map[string]string)
 	switch value := resource.(type) {
 	case *model.Network:
 		row["name"], row["description"], row["mtu"], row["external"] = value.Name, value.Description, value.MTU, value.External
@@ -450,6 +459,12 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 		}
 		if err == nil {
 			row["allocation_pools"], err = encodeIPRanges(value.AllocationPools)
+		}
+		if value.DNSDomain != "" {
+			externalIDs[subnetDNSDomainKey] = value.DNSDomain
+		}
+		if err == nil {
+			err = encodeExternalJSON(externalIDs, subnetDNSSearchDomainsKey, value.DNSSearchDomains)
 		}
 	case *model.Port:
 		setRef("network", model.KindNetwork, value.NetworkID, "network_id", false)
@@ -473,6 +488,9 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 		setRef("external_subnet", model.KindSubnet, value.ExternalSubnetID, "external_subnet_id", true)
 		row["external_ip_address"] = value.ExternalIPAddress
 		row["enable_snat"] = value.EnableSNAT
+		if err == nil {
+			err = encodeExternalJSON(externalIDs, routerStaticRoutesKey, value.StaticRoutes)
+		}
 	case *model.RouterInterface:
 		setRef("router", model.KindRouter, value.RouterID, "router_id", false)
 		setRef("subnet", model.KindSubnet, value.SubnetID, "subnet_id", false)
@@ -515,8 +533,35 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 	if err != nil {
 		return nil, err
 	}
-	row["external_ids"] = encodeStringMap(nil)
+	row["external_ids"] = encodeStringMap(externalIDs)
 	return row, nil
+}
+
+func encodeExternalJSON[T any](externalIDs map[string]string, key string, values []T) error {
+	if len(values) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return fmt.Errorf("encode external_ids %s: %w", key, err)
+	}
+	if len(encoded) > maxResourceExternalJSONLen {
+		return fmt.Errorf("encode external_ids %s: payload exceeds %d bytes", key, maxResourceExternalJSONLen)
+	}
+	externalIDs[key] = string(encoded)
+	return nil
+}
+
+func decodeExternalJSON[T any](externalIDs map[string]string, key string) (T, error) {
+	var result T
+	encoded := externalIDs[key]
+	if encoded == "" {
+		return result, nil
+	}
+	if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+		return result, fmt.Errorf("external_ids %s contains malformed JSON: %w", key, err)
+	}
+	return result, nil
 }
 
 func encodeMetadata(meta *model.Metadata) (ovsdb.Row, error) {
