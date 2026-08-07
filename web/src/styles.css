@@ -31,6 +31,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 }
 
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 250px minmax(0, 1fr); }
+.app-shell-embedded { grid-template-columns: minmax(0, 1fr); }
+.app-shell-embedded .workspace { grid-column: 1; }
 .sidebar {
   position: fixed;
   inset: 0 auto 0 0;

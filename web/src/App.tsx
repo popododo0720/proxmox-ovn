@@ -83,8 +83,15 @@ function SessionGate({ children }: { children: (session: SessionInfo) => React.R
 }
 
 function AppShell({ session }: { session: SessionInfo }) {
+  const embedded = new URLSearchParams(window.location.search).get('embedded') === '1';
   const [menuOpen, setMenuOpen] = useState(false);
-  const readRoute = () => window.location.hash.replace(/^#/, '').replace(/\/+$/, '') || '/';
+  const readRoute = () => {
+    const params = new URLSearchParams(window.location.search);
+    const requestedRoute = window.location.hash.replace(/^#/, '')
+      || (params.get('embedded') === '1' ? params.get('route') || '' : '');
+    const rootedRoute = requestedRoute.startsWith('/') ? requestedRoute : `/${requestedRoute}`;
+    return rootedRoute.replace(/\/+$/, '') || '/';
+  };
   const [route, setRoute] = useState(readRoute);
 
   useEffect(() => {
@@ -104,32 +111,34 @@ function AppShell({ session }: { session: SessionInfo }) {
                     : route === '/operations' ? <OperationsPage />
                       : <OverviewPage />;
   return (
-    <div className="app-shell">
-      <aside className={`sidebar${menuOpen ? ' sidebar-open' : ''}`}>
-        <Brand />
-        <nav aria-label="PVN sections">
-          <span className="nav-caption">Cloud networking</span>
-          {navigation.map((item) => (
-            <a
-              href={`#${item.to}`}
-              key={item.to}
-              onClick={() => setMenuOpen(false)}
-              className={`nav-link${route === item.to ? ' active' : ''}`}
-            >
-              <span className="nav-glyph" aria-hidden="true">{item.glyph}</span>
-              <span>{item.label}</span>
-            </a>
-          ))}
-        </nav>
-        <div className="sidebar-foot">
-          <span className="connection-dot" aria-hidden="true" />
-          <div><strong>Local manager</strong><span>Encrypted session</span></div>
-        </div>
-      </aside>
-      {menuOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setMenuOpen(false)} />}
+    <div className={`app-shell${embedded ? ' app-shell-embedded' : ''}`}>
+      {!embedded && (
+        <aside className={`sidebar${menuOpen ? ' sidebar-open' : ''}`}>
+          <Brand />
+          <nav aria-label="PVN sections">
+            <span className="nav-caption">Cloud networking</span>
+            {navigation.map((item) => (
+              <a
+                href={`#${item.to}`}
+                key={item.to}
+                onClick={() => setMenuOpen(false)}
+                className={`nav-link${route === item.to ? ' active' : ''}`}
+              >
+                <span className="nav-glyph" aria-hidden="true">{item.glyph}</span>
+                <span>{item.label}</span>
+              </a>
+            ))}
+          </nav>
+          <div className="sidebar-foot">
+            <span className="connection-dot" aria-hidden="true" />
+            <div><strong>Local manager</strong><span>Encrypted session</span></div>
+          </div>
+        </aside>
+      )}
+      {!embedded && menuOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setMenuOpen(false)} />}
       <div className="workspace">
         <header className="topbar">
-          <button className="mobile-menu" aria-label="Open navigation" onClick={() => setMenuOpen(true)}>☰</button>
+          {!embedded && <button className="mobile-menu" aria-label="Open navigation" onClick={() => setMenuOpen(true)}>☰</button>}
           <div className="breadcrumb"><span>{session.cluster || 'PVE cluster'}</span><b>/</b><strong>PVN</strong></div>
           <div className="user-chip">
             <span className="user-avatar" aria-hidden="true">{session.user.slice(0, 1).toUpperCase()}</span>
