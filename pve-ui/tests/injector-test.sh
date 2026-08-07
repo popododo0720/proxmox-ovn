@@ -60,6 +60,23 @@ if PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/missing.tpl" "$WORK/js/missin
     exit 1
 fi
 
+mkdir -p "$WORK/copy-failure/bin" "$WORK/copy-failure/js"
+cp "$FIXTURE" "$WORK/copy-failure/index.html.tpl"
+cp "$TEST_DIR/../pvn-loader.js" "$WORK/copy-failure/pvn-loader.js"
+cp "$PATCHER" "$WORK/copy-failure/inject.sh"
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$WORK/copy-failure/bin/install"
+chmod 0755 "$WORK/copy-failure/bin/install"
+if PATH="$WORK/copy-failure/bin:$PATH" PVN_PVE_VERSION=9.0.1 \
+    "$WORK/copy-failure/inject.sh" install \
+    "$WORK/copy-failure/index.html.tpl" \
+    "$WORK/copy-failure/js/pvn-loader.js" 2>/dev/null
+then
+    echo "failed loader staging unexpectedly succeeded" >&2
+    exit 1
+fi
+cmp "$FIXTURE" "$WORK/copy-failure/index.html.tpl"
+[ ! -e "$WORK/copy-failure/js/pvn-loader.js" ]
+
 ln -s "$FIXTURE" "$WORK/symlink.tpl"
 if PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/symlink.tpl" "$WORK/js/symlink-loader.js" 2>/dev/null; then
     echo "symlinked supported PVE 9 template unexpectedly succeeded" >&2

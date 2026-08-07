@@ -85,8 +85,10 @@ if [ "$ACTION" = install ]; then
 fi
 
 TMP=$(mktemp "${TEMPLATE}.pvn.XXXXXX")
+LOADER_TMP=
 cleanup() {
     [ -z "${TMP:-}" ] || rm -f "$TMP"
+    [ -z "${LOADER_TMP:-}" ] || rm -f "$LOADER_TMP"
 }
 trap cleanup EXIT HUP INT TERM
 cp -p "$TEMPLATE" "$TMP"
@@ -113,12 +115,19 @@ case "$ACTION" in
             echo "PVN UI: unknown or malformed PVE 9 template signature; leaving the Proxmox UI unchanged" >&2
             exit 1
         }
+        if [ "$SOURCE_LOADER" != "$LOADER_TARGET" ]; then
+            LOADER_TMP=$(mktemp "${LOADER_TARGET}.pvn.XXXXXX")
+            install -m 0644 "$SOURCE_LOADER" "$LOADER_TMP"
+            cmp -s "$SOURCE_LOADER" "$LOADER_TMP" || {
+                echo "PVN UI: staged loader differs from its source; leaving the template unchanged" >&2
+                exit 1
+            }
+            mv "$LOADER_TMP" "$LOADER_TARGET"
+            LOADER_TMP=''
+        fi
         if ! cmp -s "$TEMPLATE" "$TMP"; then
             mv "$TMP" "$TEMPLATE"
             TMP=''
-        fi
-        if [ "$SOURCE_LOADER" != "$LOADER_TARGET" ]; then
-            install -m 0644 "$SOURCE_LOADER" "$LOADER_TARGET"
         fi
         ;;
     remove)
