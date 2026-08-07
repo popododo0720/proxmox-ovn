@@ -15,7 +15,7 @@ LDFLAGS := -s -w \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Date=$(BUILD_DATE)
 GO_BUILD_FLAGS := -trimpath -buildvcs=false
 
-.PHONY: all build test test-race ui-test vet fmt-check package-check deb release-check-test release-source-check release-env-check release clean
+.PHONY: all build test test-race ui-test vet fmt-check package-check deb deb-artifact release-check-test release-source-check release-env-check release clean
 
 all: test build
 
@@ -68,6 +68,9 @@ release-env-check: release-source-check
 	}
 
 deb: package-check ui-test
+	+$(MAKE) deb-artifact DEB_VERSION=$(DEB_VERSION)
+
+deb-artifact:
 	$(MAKE) build VERSION=$(DEB_VERSION)
 	@set -eu; \
 	pvn_pkg_tmp=$$(mktemp -d); \

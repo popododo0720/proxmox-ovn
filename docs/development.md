@@ -29,6 +29,11 @@ versions without repeating the long topology/control-plane fixtures. CI
 performs these builds in a Debian 13 container. Static unit verification is not
 a substitute for a staged PVE 9 host test.
 
+After the source and UI gates have already passed for the current commit,
+`make deb-artifact` rebuilds and checks only the DEB artifact. Do not use that
+shortcut as a replacement for the full `make deb` gate in CI or a canonical
+release.
+
 ## Canonical releases
 
 `make deb` builds a local development/test package. It may be used for staged
