@@ -74,9 +74,8 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 - [x] Pin the future canonical publisher image, toolchains, action SHAs,
       tag-derived metadata, and deterministic compression; cover those gates
       with release-check tests
-- [ ] Obtain a hosted-runner CI green run for the pinned canonical publisher
-      path (the latest run was cancelled before any step during a GitHub Actions
-      outage)
+- [x] Obtain a hosted-runner CI green run for the pinned canonical publisher
+      path (`v0.3.1`, release run `31159258197`, 2026-08-07)
 
 ### Current product work
 
