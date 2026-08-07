@@ -105,7 +105,7 @@ deb: package-check ui-test
 	pvn_deb="dist/pvn-node_$(DEB_VERSION)_$${pvn_arch}.deb"; \
 	dpkg-deb --root-owner-group --uniform-compression -Zxz -z6 --threads-max=1 \
 		--build "$$pvn_root" "$$pvn_deb"; \
-	packaging/tests/package-check.sh "$$pvn_deb"
+	packaging/tests/deb-check.sh "$$pvn_deb"
 
 release: release-env-check clean
 	+$(MAKE) deb DEB_VERSION=$(DEB_VERSION)
