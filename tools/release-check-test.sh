@@ -72,6 +72,19 @@ TEST_BUILD_DATE=1970-01-01T00:00:01Z \
 TEST_GITHUB_ACTIONS=false expect_failure 'a non-Actions publisher' run_check
 
 release_workflow=$repo_root/.github/workflows/release.yml
+ci_workflow=$repo_root/.github/workflows/ci.yml
+grep -Fq 'libhttp-message-perl' "$release_workflow" || {
+    printf 'release workflow is missing HTTP::Response prerequisites\n' >&2
+    exit 1
+}
+awk '
+    /^  package:/ { in_package = 1 }
+    in_package && /libhttp-message-perl/ { found = 1 }
+    END { exit found ? 0 : 1 }
+' "$ci_workflow" || {
+    printf 'package CI is missing HTTP::Response prerequisites\n' >&2
+    exit 1
+}
 if grep -Fq 'releases/tags/$GITHUB_REF_NAME' "$release_workflow"; then
     printf 'release workflow uses an API endpoint that cannot resolve drafts\n' >&2
     exit 1
