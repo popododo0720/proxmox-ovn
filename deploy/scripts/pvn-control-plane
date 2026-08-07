@@ -668,7 +668,7 @@ def read_owner(path, label):
         fail(f"{label} is not an object")
     return value
 
-def join_stub_remote(path, required):
+def join_stub_remote(path, required, expected_local):
     log = run(["/usr/bin/ovsdb-tool", "--more", "show-log", path], check=False)
     if log.returncode != 0 or log.stderr != "":
         fail(f"cannot inspect clustered database record-0 join log: {path}")
@@ -681,7 +681,13 @@ def join_stub_remote(path, required):
             fail(f"pending clustered database has an invalid record-0 join log: {path}")
         return None
     if not remotes and not required:
-        return None
+        previous = re.findall(r'(?m)^ prev_servers: ([^\n]+)$', log.stdout)
+        previous_addresses = re.findall(
+            r'\("(ssl:[^"]+)"\)', previous[0] if len(previous) == 1 else ""
+        )
+        if previous_addresses != [expected_local]:
+            fail(f"clustered seed database record-0 membership is not local-only: {path}")
+        return []
     if len(remotes) != 1:
         fail(f"clustered database record-0 join remote is not singular: {path}")
     remote = re.fullmatch(r"ssl:([^:]+):([0-9]+)", remotes[0])
@@ -709,9 +715,10 @@ def db_info(path, inspect_join_stub=False):
                 fail(f"clustered database returned an empty cluster ID: {path}")
             result["cluster_id_pending"] = False
             if inspect_join_stub:
-                remotes = join_stub_remote(path, False)
-                result["preactivation_join"] = remotes is not None
-                if remotes is not None:
+                remotes = join_stub_remote(path, False, result["local_address"])
+                result["preactivation_seed"] = remotes == []
+                result["preactivation_join"] = remotes not in (None, [])
+                if remotes:
                     result["remote_addresses"] = remotes
         elif cluster_id.returncode == 2 and cluster_id.stdout == "" and \
                 cluster_id.stderr == f"{path}: cluster ID not yet known\n":
@@ -722,7 +729,9 @@ def db_info(path, inspect_join_stub=False):
             result["cluster_id"] = None
             result["cluster_id_pending"] = True
             result["preactivation_join"] = True
-            result["remote_addresses"] = join_stub_remote(path, True)
+            result["remote_addresses"] = join_stub_remote(
+                path, True, result["local_address"]
+            )
         else:
             detail = cluster_id.stderr.strip() or cluster_id.stdout.strip()
             fail(f"/usr/bin/ovsdb-tool db-cid {path}: {detail or 'command failed'}")
@@ -1132,8 +1141,8 @@ elif action == "init-control":
     if expected_cluster_id is not None and (
             not isinstance(expected_cluster_id, str) or not expected_cluster_id):
         fail("expected Control DB cluster ID is invalid")
-    inspect_join = payload["mode"] == "raft" and bool(payload.get("join"))
-    current = db_info(database, inspect_join_stub=inspect_join)
+    inspect_record_zero = payload["mode"] == "raft"
+    current = db_info(database, inspect_join_stub=inspect_record_zero)
     created = not current["exists"]
     central_marked = os.path.exists("/etc/pvn/central/enabled")
     central_active = run(
@@ -1148,7 +1157,10 @@ elif action == "init-control":
                 fail("existing Control DB cluster ID is not pinned by the ledger")
             if not current.get("server_id"):
                 fail("existing Control DB has no server ID")
-            if current.get("cluster_id_pending") is True or \
+            if current.get("preactivation_seed") is True:
+                if payload.get("join") or central_marked or central_active:
+                    fail("existing Control DB is not an exact inactive pre-activation seed")
+            elif current.get("cluster_id_pending") is True or \
                     current.get("preactivation_join") is True:
                 if current.get("preactivation_join") is not True or \
                         current.get("remote_addresses") != [payload.get("join")] or \
@@ -1173,7 +1185,7 @@ elif action == "init-control":
         if payload.get("join") and expected_cluster_id:
             command += ["--cid", expected_cluster_id]
         run(command)
-        current = db_info(database, inspect_join_stub=inspect_join)
+        current = db_info(database, inspect_join_stub=inspect_record_zero)
         if not current.get("exists") or current.get("name") != "PVN_Control":
             fail("Control DB initialization did not create the expected schema")
         if payload["mode"] == "raft":
@@ -1184,6 +1196,8 @@ elif action == "init-control":
                     current.get("remote_addresses") != [payload.get("join")] or
                     not current.get("server_id")):
                 fail("new Control DB is not an exact pre-activation join")
+            if not payload.get("join") and current.get("preactivation_seed") is not True:
+                fail("new Control DB is not an exact pre-activation seed")
             if current.get("cluster_id_pending") is True:
                 if expected_cluster_id is None or not payload.get("join"):
                     fail("new Control DB has an invalid pending cluster ID state")

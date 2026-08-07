@@ -427,6 +427,7 @@ with tempfile.TemporaryDirectory() as temporary:
     )(str(database), True)
     assert info["cluster_id"] == "expected-cid"
     assert info["preactivation_join"] is False
+    assert info["preactivation_seed"] is True
     assert "remote_addresses" not in info
 
     for rejected in (
@@ -636,7 +637,8 @@ expect_remote_failure(guard, "appeared during")
 
 # Exercise the production init-control dispatch with fake ovsdb-tool,
 # pvnctl, and systemctl processes. This covers the legacy unknown-CID stub,
-# new --cid-pinned stub, and the post-activation/pre-ledger-write resume state.
+# new --cid-pinned stub, inactive seed resume, and the
+# post-activation/pre-ledger-write resume state.
 with tempfile.TemporaryDirectory() as temporary:
     root = pathlib.Path(temporary)
     database = root / "pvn_control.db"
@@ -717,7 +719,7 @@ raise SystemExit(0 if active else 3)
         "join": "ssl:192.0.2.11:6646",
     }
 
-    def control_helper(state, *, exists=True, marked=False, active=False):
+    def control_helper(state, *, exists=True, marked=False, active=False, payload=None):
         if exists:
             database.touch()
         elif database.exists():
@@ -738,7 +740,7 @@ raise SystemExit(0 if active else 3)
         }
         return subprocess.run(
             [sys.executable, "-c", helper_source, "init-control"],
-            input=json.dumps(request), text=True, stdout=subprocess.PIPE,
+            input=json.dumps(payload or request), text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=environment, check=False,
         )
 
@@ -767,6 +769,23 @@ raise SystemExit(0 if active else 3)
     result = control_helper(pinned_stub)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["cluster_id"] == expected_cid
+
+    seed_request = {**request, "join": None}
+    seed_record = {
+        "cid": expected_cid,
+        "local": request["local"],
+        "sid": "seed-sid",
+        "log": (
+            'record 0:\n name: "PVN_Control\'\n'
+            ' local address: "ssl:192.0.2.12:6646"\n'
+            ' prev_servers: seed("ssl:192.0.2.12:6646")\n\n'
+        ),
+    }
+    result = control_helper(seed_record, payload=seed_request)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["preactivation_seed"] is True
+    result = control_helper(seed_record, payload=request)
+    assert result.returncode != 0 and "pre-activation seed" in result.stderr
 
     joined = {
         **pinned_stub,
