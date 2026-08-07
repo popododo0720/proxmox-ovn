@@ -94,6 +94,13 @@ func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) 
 	return c.reconcile(ctx, kind, id, false, time.Time{})
 }
 
+// ReconcileForced renders one resource even when its desired revision is
+// already marked ready. Root-only VM start checks use this to repair or reject
+// external OVN drift immediately before QEMU is allowed to start.
+func (c *Controller) ReconcileForced(ctx context.Context, kind model.Kind, id string) error {
+	return c.reconcile(ctx, kind, id, true, time.Time{})
+}
+
 func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, force bool, freshSince time.Time) error {
 	if c == nil || c.store == nil || c.renderer == nil {
 		return errors.New("reconciler is not configured")

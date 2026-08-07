@@ -67,6 +67,11 @@ type Options struct {
 	SouthboundProbe  HealthProber
 	ReconcilerProbe  HealthProber
 	HealthTimeout    time.Duration
+	// ComputeNode identifies the PVE node served by the root-only compute
+	// listener. ComputeProbe must report the local pvn-agent watcher/OVS health.
+	// Both are mandatory at request time for fail-closed VM starts.
+	ComputeNode  string
+	ComputeProbe HealthProber
 }
 
 type Server struct {
@@ -82,6 +87,8 @@ type Server struct {
 	southboundProbe HealthProber
 	reconcilerProbe HealthProber
 	healthTimeout   time.Duration
+	computeNode     string
+	computeProbe    HealthProber
 }
 
 type sessionContextKey struct{}
@@ -114,6 +121,7 @@ func New(options Options) (*Server, error) {
 		guestMTU: options.GuestMTU, physnet: strings.TrimSpace(options.Physnet), clusterName: strings.TrimSpace(options.ClusterName),
 		northboundProbe: options.NorthboundProbe, southboundProbe: options.SouthboundProbe,
 		reconcilerProbe: options.ReconcilerProbe, healthTimeout: options.HealthTimeout,
+		computeNode: strings.TrimSpace(options.ComputeNode), computeProbe: options.ComputeProbe,
 	}, nil
 }
 
@@ -168,6 +176,21 @@ func (s *Server) RuntimeHandler() http.Handler {
 		default:
 			writeError(writer, http.StatusNotFound, "not_found", "endpoint was not found", nil)
 		}
+	})
+}
+
+// ComputeHandler exposes privileged QEMU lifecycle mutations. It must only be
+// mounted on a Unix listener that verifies the connecting peer UID is root;
+// unlike RuntimeHandler it is not safe for the pvn-agent service account.
+func (s *Server) ComputeHandler() http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Header().Set("X-Content-Type-Options", "nosniff")
+		if !strings.HasPrefix(request.URL.Path, "/api/v1/runtime/compute/") {
+			writeError(writer, http.StatusNotFound, "not_found", "endpoint was not found", nil)
+			return
+		}
+		s.computeLifecycle(writer, request)
 	})
 }
 
@@ -668,7 +691,12 @@ func (s *Server) lookupRuntimePorts(ctx context.Context, nodeName string, vmid i
 	matches := make([]*model.Port, 0, 1)
 	for _, resource := range resources {
 		port := resource.(*model.Port)
-		if acceptedNodes[port.NodeID] || acceptedNodes[port.RequestedChassis] {
+		requestedLocal := false
+		requested, _ := model.ParseRequestedChassis(port.RequestedChassis)
+		for _, chassisID := range requested {
+			requestedLocal = requestedLocal || acceptedNodes[chassisID]
+		}
+		if acceptedNodes[port.NodeID] || requestedLocal {
 			matches = append(matches, port)
 		}
 	}
