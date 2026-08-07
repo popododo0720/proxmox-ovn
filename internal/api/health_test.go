@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
+	"github.com/popododo0720/proxmox-ovn/internal/defaultsecurity"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
 )
 
@@ -25,8 +26,28 @@ func (store healthTestStore) List(ctx context.Context, kind model.Kind, options 
 
 func TestHealthReportsLiveOperationalComponents(t *testing.T) {
 	ready := HealthProbeFunc(func(context.Context) error { return nil })
+	store := controlstore.NewMemory()
+	if _, err := defaultsecurity.New(store, nil).Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []struct {
+		kind model.Kind
+		id   string
+	}{
+		{model.KindSecurityGroup, defaultsecurity.DefaultSecurityGroupID()},
+		{model.KindSecurityGroupRule, defaultsecurity.DefaultEgressRuleID()},
+		{model.KindSecurityGroupRule, defaultsecurity.DefaultIngressRuleID()},
+	} {
+		resource, err := store.Get(context.Background(), target.kind, target.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.MarkReconciled(context.Background(), target.kind, target.id, resource.GetMetadata().Revision, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
 	server, err := New(Options{
-		Store: controlstore.NewMemory(), NorthboundProbe: ready,
+		Store: store, NorthboundProbe: ready,
 		SouthboundProbe: ready, ReconcilerProbe: ready,
 	})
 	if err != nil {
@@ -51,9 +72,6 @@ func TestHealthReportsLiveOperationalComponents(t *testing.T) {
 
 func TestHealthDegradesForMissingDefaultSecurityPolicy(t *testing.T) {
 	store := controlstore.NewMemory()
-	if _, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project"); err != nil {
-		t.Fatal(err)
-	}
 	ready := HealthProbeFunc(func(context.Context) error { return nil })
 	server, err := New(Options{Store: store, NorthboundProbe: ready, SouthboundProbe: ready, ReconcilerProbe: ready})
 	if err != nil {
