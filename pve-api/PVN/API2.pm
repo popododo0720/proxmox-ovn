@@ -161,7 +161,11 @@ sub unix_request {
         local $SIG{ALRM} = sub { die "PVN browser request timed out\n" };
         alarm($TIMEOUT);
         write_all($socket, $request);
-        shutdown($socket, 1);
+        # Do not half-close the client write side here. Go's net/http server
+        # treats the resulting EOF as a disconnected client and cancels the
+        # request context before PVN can query its control databases. The
+        # explicit Content-Length is sufficient to delimit the request body,
+        # and Connection: close makes the manager close after its response.
         $raw = read_response($socket);
         alarm(0);
     };

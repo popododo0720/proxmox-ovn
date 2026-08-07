@@ -169,4 +169,15 @@ my $valid_response = eval { PVN::API2::response_data($invalid); 1 };
 ok(!$valid_response, 'invalid manager response is rejected');
 like($@, qr/raise:502:/, 'invalid manager response maps to a bad gateway error');
 
+open my $module_source_handle, '<', "$Bin/../PVN/API2.pm"
+    or die "open PVN API module source: $!";
+local $/;
+my $module_source = <$module_source_handle>;
+close $module_source_handle;
+unlike(
+    $module_source,
+    qr/\bshutdown\s*\(\s*\$socket\s*,\s*1\s*\)/,
+    'gateway does not half-close the request and cancel the manager context',
+);
+
 done_testing();
