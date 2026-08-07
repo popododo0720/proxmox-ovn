@@ -14,7 +14,6 @@ func TestDefaultSecurityPolicyIsDurableAndConcurrent(t *testing.T) {
 	database := newFakeDatabase()
 	firstStore := deterministicStore(database)
 	secondStore := deterministicStore(database)
-	project := mustCreate(t, firstStore, &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project").(*model.Project)
 
 	start := make(chan struct{})
 	errorsByManager := make(chan error, 2)
@@ -24,7 +23,7 @@ func TestDefaultSecurityPolicyIsDurableAndConcurrent(t *testing.T) {
 		go func(store controlstore.Store) {
 			defer wait.Done()
 			<-start
-			_, err := defaultsecurity.New(store, nil).Ensure(context.Background(), project.ID)
+			_, err := defaultsecurity.New(store, nil).Ensure(context.Background())
 			errorsByManager <- err
 		}(store)
 	}
@@ -37,21 +36,23 @@ func TestDefaultSecurityPolicyIsDurableAndConcurrent(t *testing.T) {
 		}
 	}
 
-	group, err := secondStore.Get(context.Background(), model.KindSecurityGroup, defaultsecurity.DefaultSecurityGroupID(project.ID))
+	group, err := secondStore.Get(context.Background(), model.KindSecurityGroup, defaultsecurity.DefaultSecurityGroupID())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if group.(*model.SecurityGroup).Name != defaultsecurity.DefaultSecurityGroupName {
 		t.Fatalf("group=%+v", group)
 	}
-	rules, err := secondStore.List(context.Background(), model.KindSecurityGroupRule, controlstore.ListOptions{ProjectID: project.ID})
+	rules, err := secondStore.List(context.Background(), model.KindSecurityGroupRule, controlstore.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rules) != 2 {
 		t.Fatalf("rules=%d want 2", len(rules))
 	}
-	for _, id := range []string{defaultsecurity.DefaultEgressRuleID(project.ID), defaultsecurity.DefaultIngressRuleID(project.ID)} {
+	// Every port using this one durable default security group belongs to the
+	// same routed self-ingress trust domain across the cluster.
+	for _, id := range []string{defaultsecurity.DefaultEgressRuleID(), defaultsecurity.DefaultIngressRuleID()} {
 		if _, err := secondStore.Get(context.Background(), model.KindSecurityGroupRule, id); err != nil {
 			t.Fatalf("Get(rule %s): %v", id, err)
 		}

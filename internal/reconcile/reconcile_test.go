@@ -231,66 +231,70 @@ func (r *unfencedRevisionRenderer) drift(revision int64) {
 	r.mu.Unlock()
 }
 
-func createProject(t *testing.T, store controlstore.Store) *model.Project {
+func createProject(t *testing.T, store controlstore.Store) *model.ProviderNetwork {
 	t.Helper()
-	resource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool"}, "create-project")
+	resource, _, err := store.Create(context.Background(), &model.ProviderNetwork{Name: "tenant"}, "create-project")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return resource.(*model.Project)
+	return resource.(*model.ProviderNetwork)
 }
 
 func createAssociatedFloatingIP(t *testing.T, store controlstore.Store) *model.FloatingIP {
 	t.Helper()
-	project := createProject(t, store)
 	provider, _, err := store.Create(context.Background(), &model.ProviderNetwork{Name: "public"}, "fip-provider")
 	if err != nil {
 		t.Fatal(err)
 	}
 	externalNetwork, _, err := store.Create(context.Background(), &model.Network{
-		ProjectID: project.ID, Name: "public", External: true, ProviderNetworkID: provider.GetMetadata().ID,
+		Name: "public", External: true, ProviderNetworkID: provider.GetMetadata().ID,
 	}, "fip-external-network")
 	if err != nil {
 		t.Fatal(err)
 	}
 	externalSubnet, _, err := store.Create(context.Background(), &model.Subnet{
-		ProjectID: project.ID, NetworkID: externalNetwork.GetMetadata().ID, Name: "public-v4",
+		NetworkID: externalNetwork.GetMetadata().ID, Name: "public-v4",
 		CIDR: "192.0.2.0/24", GatewayIP: "192.0.2.1", AllocationPools: []model.IPRange{{Start: "192.0.2.2", End: "192.0.2.200"}},
 	}, "fip-external-subnet")
 	if err != nil {
 		t.Fatal(err)
 	}
-	privateNetwork, _, err := store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "fip-private-network")
+	privateNetwork, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "fip-private-network")
 	if err != nil {
 		t.Fatal(err)
 	}
 	privateSubnet, _, err := store.Create(context.Background(), &model.Subnet{
-		ProjectID: project.ID, NetworkID: privateNetwork.GetMetadata().ID, Name: "private-v4", CIDR: "10.0.0.0/24", GatewayIP: "10.0.0.1",
+		NetworkID: privateNetwork.GetMetadata().ID, Name: "private-v4", CIDR: "10.0.0.0/24", GatewayIP: "10.0.0.1",
 	}, "fip-private-subnet")
 	if err != nil {
 		t.Fatal(err)
 	}
+	group, _, err := store.Create(context.Background(), &model.SecurityGroup{Name: "fip-test-baseline"}, "fip-group")
+	if err != nil {
+		t.Fatal(err)
+	}
 	port, _, err := store.Create(context.Background(), &model.Port{
-		ProjectID: project.ID, NetworkID: privateNetwork.GetMetadata().ID, Name: "vm-port", MACAddress: "02:00:00:00:00:10",
-		FixedIPs: []model.FixedIP{{SubnetID: privateSubnet.GetMetadata().ID, Address: "10.0.0.10"}},
+		NetworkID: privateNetwork.GetMetadata().ID, Name: "vm-port", MACAddress: "02:00:00:00:00:10",
+		FixedIPs:         []model.FixedIP{{SubnetID: privateSubnet.GetMetadata().ID, Address: "10.0.0.10"}},
+		SecurityGroupIDs: []string{group.GetMetadata().ID},
 	}, "fip-port")
 	if err != nil {
 		t.Fatal(err)
 	}
 	router, _, err := store.Create(context.Background(), &model.Router{
-		ProjectID: project.ID, Name: "router", ExternalNetworkID: externalNetwork.GetMetadata().ID,
+		Name: "router", ExternalNetworkID: externalNetwork.GetMetadata().ID,
 		ExternalSubnetID: externalSubnet.GetMetadata().ID, ExternalIPAddress: "192.0.2.2", EnableSNAT: true,
 	}, "fip-router")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.Create(context.Background(), &model.RouterInterface{
-		ProjectID: project.ID, RouterID: router.GetMetadata().ID, SubnetID: privateSubnet.GetMetadata().ID,
+		RouterID: router.GetMetadata().ID, SubnetID: privateSubnet.GetMetadata().ID,
 	}, "fip-router-interface"); err != nil {
 		t.Fatal(err)
 	}
 	floatingIP, _, err := store.Create(context.Background(), &model.FloatingIP{
-		ProjectID: project.ID, ProviderNetworkID: provider.GetMetadata().ID, Address: "192.0.2.10",
+		ProviderNetworkID: provider.GetMetadata().ID, Address: "192.0.2.10",
 		RouterID: router.GetMetadata().ID, PortID: port.GetMetadata().ID, FixedIPAddress: "10.0.0.10",
 	}, "fip-create")
 	if err != nil {
@@ -324,16 +328,16 @@ func TestControllerRendersRevisionOnce(t *testing.T) {
 	project := createProject(t, store)
 	renderer := NewFakeRenderer()
 	controller := NewController(store, renderer)
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	if calls := renderer.Calls(model.KindProject, project.ID); calls != 1 {
+	if calls := renderer.Calls(model.KindProviderNetwork, project.ID); calls != 1 {
 		t.Fatalf("renderer calls = %d", calls)
 	}
-	ready, err := store.Get(context.Background(), model.KindProject, project.ID)
+	ready, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,13 +364,13 @@ func TestControllerSerializesConcurrentReconcile(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+			if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 				t.Errorf("Reconcile: %v", err)
 			}
 		}()
 	}
 	wait.Wait()
-	if calls := renderer.Calls(model.KindProject, project.ID); calls != 1 {
+	if calls := renderer.Calls(model.KindProviderNetwork, project.ID); calls != 1 {
 		t.Fatalf("renderer calls = %d", calls)
 	}
 }
@@ -375,12 +379,12 @@ func TestControllerFailureCanBeRetried(t *testing.T) {
 	store := controlstore.NewMemory()
 	project := createProject(t, store)
 	renderer := NewFakeRenderer()
-	renderer.SetFailure(model.KindProject, project.ID, errors.New("northbound unavailable"))
+	renderer.SetFailure(model.KindProviderNetwork, project.ID, errors.New("northbound unavailable"))
 	controller := NewController(store, renderer)
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err == nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err == nil {
 		t.Fatal("render failure was not returned")
 	}
-	failed, err := store.Get(context.Background(), model.KindProject, project.ID)
+	failed, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,11 +392,11 @@ func TestControllerFailureCanBeRetried(t *testing.T) {
 		t.Fatalf("failed metadata = %#v", failed.GetMetadata())
 	}
 
-	renderer.SetFailure(model.KindProject, project.ID, nil)
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	renderer.SetFailure(model.KindProviderNetwork, project.ID, nil)
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
-	ready, err := store.Get(context.Background(), model.KindProject, project.ID)
+	ready, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,23 +523,23 @@ func TestControllerRendersNewDesiredRevision(t *testing.T) {
 	project := createProject(t, store)
 	renderer := NewFakeRenderer()
 	controller := NewController(store, renderer)
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	current, _ := store.Get(context.Background(), model.KindProject, project.ID)
-	updatedProject := current.(*model.Project)
+	current, _ := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
+	updatedProject := current.(*model.ProviderNetwork)
 	updatedProject.Description = "changed"
 	updated, _, err := store.Update(context.Background(), updatedProject, updatedProject.Revision, "update")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.Reconcile(context.Background(), model.KindProject, updated.GetMetadata().ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, updated.GetMetadata().ID); err != nil {
 		t.Fatal(err)
 	}
-	if calls := renderer.Calls(model.KindProject, project.ID); calls != 2 {
+	if calls := renderer.Calls(model.KindProviderNetwork, project.ID); calls != 2 {
 		t.Fatalf("renderer calls = %d", calls)
 	}
-	rendered, ok := renderer.Rendered(model.KindProject, project.ID)
+	rendered, ok := renderer.Rendered(model.KindProviderNetwork, project.ID)
 	if !ok || rendered.GetMetadata().Revision != 2 {
 		t.Fatalf("rendered = %#v, ok=%v", rendered, ok)
 	}
@@ -553,7 +557,7 @@ func TestControllerReconcileAll(t *testing.T) {
 	if err := controller.ReconcileAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	projects, _ := store.List(context.Background(), model.KindProject, controlstore.ListOptions{})
+	projects, _ := store.List(context.Background(), model.KindProviderNetwork, controlstore.ListOptions{})
 	providers, _ := store.List(context.Background(), model.KindProviderNetwork, controlstore.ListOptions{})
 	if projects[0].GetMetadata().State != model.ResourceReady || providers[0].GetMetadata().State != model.ResourceReady {
 		t.Fatal("ReconcileAll did not render all resources")
@@ -599,7 +603,7 @@ func TestControllerFullPassRecoversSupersededQueuedReconcile(t *testing.T) {
 	store := controlstore.NewMemory()
 	project := createProject(t, store)
 	staleResource, _, err := store.Create(context.Background(), &model.Operation{
-		Action: "reconcile", TargetKind: model.KindProject, TargetID: project.ID,
+		Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID,
 		TargetRevision: project.Revision, OperationStatus: model.OperationQueued,
 	}, "stale-queued-reconcile")
 	if err != nil {
@@ -611,7 +615,7 @@ func TestControllerFullPassRecoversSupersededQueuedReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated := updatedResource.(*model.Project)
+	updated := updatedResource.(*model.ProviderNetwork)
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
 	controller := NewController(store, NewFakeRenderer(), WithLeaseDuration(5*time.Minute))
 	controller.now = func() time.Time { return now }
@@ -627,7 +631,7 @@ func TestControllerFullPassRecoversSupersededQueuedReconcile(t *testing.T) {
 	if failed.OperationStatus != model.OperationFailed || failed.CompletedAt == nil || !failed.CompletedAt.Equal(now) || !strings.Contains(failed.Error, "superseded before claim") {
 		t.Fatalf("stale operation=%#v", failed)
 	}
-	ready, err := store.Get(context.Background(), model.KindProject, project.ID)
+	ready, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,13 +649,13 @@ func TestControllerFullPassReadsOneDependencySnapshot(t *testing.T) {
 	if err := controller.ReconcileAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if calls := renderer.Calls(model.KindProject, project.ID); calls != 1 {
+	if calls := renderer.Calls(model.KindProviderNetwork, project.ID); calls != 1 {
 		t.Fatalf("initial renderer calls=%d want 1", calls)
 	}
 	if err := controller.ReconcilePeriodic(context.Background(), time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if calls := renderer.Calls(model.KindProject, project.ID); calls != 1 {
+	if calls := renderer.Calls(model.KindProviderNetwork, project.ID); calls != 1 {
 		t.Fatalf("fresh periodic renderer calls=%d want 1", calls)
 	}
 
@@ -723,10 +727,10 @@ func TestControllerReconcilePeriodicDoesNotHideUnreadyExactRevision(t *testing.T
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
 	controller := NewController(store, renderer)
 	controller.now = func() time.Time { return now }
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.MarkReconciled(context.Background(), model.KindProject, project.ID, project.Revision, errors.New("realized state lost")); err != nil {
+	if _, err := store.MarkReconciled(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, errors.New("realized state lost")); err != nil {
 		t.Fatal(err)
 	}
 	if err := controller.ReconcilePeriodic(context.Background(), time.Hour); err != nil {
@@ -746,7 +750,6 @@ func TestControllerReconcilePeriodicRejectsNonPositiveFreshness(t *testing.T) {
 
 func TestControllerReconcileAllUsesDependencyOrder(t *testing.T) {
 	store := controlstore.NewMemory()
-	project := createProject(t, store)
 	provider, _, err := store.Create(context.Background(), &model.ProviderNetwork{Name: "provider"}, "provider")
 	if err != nil {
 		t.Fatal(err)
@@ -755,19 +758,19 @@ func TestControllerReconcileAllUsesDependencyOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	network, _, err := store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "network")
+	network, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "network")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = store.Create(context.Background(), &model.Subnet{ProjectID: project.ID, NetworkID: network.GetMetadata().ID, Name: "v4", CIDR: "10.0.0.0/24"}, "subnet")
+	_, _, err = store.Create(context.Background(), &model.Subnet{NetworkID: network.GetMetadata().ID, Name: "v4", CIDR: "10.0.0.0/24"}, "subnet")
 	if err != nil {
 		t.Fatal(err)
 	}
-	group, _, err := store.Create(context.Background(), &model.SecurityGroup{ProjectID: project.ID, Name: "default"}, "group")
+	group, _, err := store.Create(context.Background(), &model.SecurityGroup{Name: "default"}, "group")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = store.Create(context.Background(), &model.SecurityGroupRule{ProjectID: project.ID, SecurityGroupID: group.GetMetadata().ID, Direction: model.DirectionIngress, EtherType: model.EtherTypeIPv4, Action: model.ActionAllow}, "rule")
+	_, _, err = store.Create(context.Background(), &model.SecurityGroupRule{SecurityGroupID: group.GetMetadata().ID, Direction: model.DirectionIngress, EtherType: model.EtherTypeIPv4, Action: model.ActionAllow}, "rule")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -779,7 +782,7 @@ func TestControllerReconcileAllUsesDependencyOrder(t *testing.T) {
 	if err := NewController(store, recorder).ReconcileAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []model.Kind{model.KindProject, model.KindProviderNetwork, model.KindNetwork, model.KindProviderSegment, model.KindSubnet, model.KindSecurityGroup, model.KindSecurityGroupRule, model.KindNode}
+	want := []model.Kind{model.KindProviderNetwork, model.KindNetwork, model.KindProviderSegment, model.KindSubnet, model.KindSecurityGroup, model.KindSecurityGroupRule, model.KindNode}
 	if len(recorder.kinds) != len(want) {
 		t.Fatalf("render order=%v want=%v", recorder.kinds, want)
 	}
@@ -795,23 +798,23 @@ func TestControllerDeleteCleansRendererBeforePurge(t *testing.T) {
 	project := createProject(t, store)
 	renderer := NewFakeRenderer()
 	controller := NewController(store, renderer)
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, 1, "delete")
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, 1, "delete")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := controller.Delete(context.Background(), tombstone); err != nil {
 		t.Fatal(err)
 	}
-	if renderer.DeleteCalls(model.KindProject, project.ID) != 1 {
-		t.Fatalf("delete calls=%d", renderer.DeleteCalls(model.KindProject, project.ID))
+	if renderer.DeleteCalls(model.KindProviderNetwork, project.ID) != 1 {
+		t.Fatalf("delete calls=%d", renderer.DeleteCalls(model.KindProviderNetwork, project.ID))
 	}
-	if _, ok := renderer.Rendered(model.KindProject, project.ID); ok {
+	if _, ok := renderer.Rendered(model.KindProviderNetwork, project.ID); ok {
 		t.Fatal("renderer still contains deleted resource")
 	}
-	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); err != nil {
 		t.Fatal(err)
 	}
 	operations, _ := store.List(context.Background(), model.KindOperation, controlstore.ListOptions{})
@@ -832,29 +835,29 @@ func TestControllerDeleteFailureKeepsRetryableTombstone(t *testing.T) {
 	project := createProject(t, store)
 	renderer := NewFakeRenderer()
 	controller := NewController(store, renderer)
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-with-retry")
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete-with-retry")
 	if err != nil {
 		t.Fatal(err)
 	}
-	renderer.SetDeleteFailure(model.KindProject, project.ID, errors.New("OVN unavailable"))
+	renderer.SetDeleteFailure(model.KindProviderNetwork, project.ID, errors.New("OVN unavailable"))
 	if err := controller.Delete(context.Background(), tombstone); err == nil {
 		t.Fatal("Delete() unexpectedly succeeded")
 	}
-	stored, err := store.Get(context.Background(), model.KindProject, project.ID)
+	stored, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stored.GetMetadata().State != model.ResourceDeleting {
 		t.Fatalf("failed delete changed tombstone state to %s", stored.GetMetadata().State)
 	}
-	renderer.SetDeleteFailure(model.KindProject, project.ID, nil)
+	renderer.SetDeleteFailure(model.KindProviderNetwork, project.ID, nil)
 	if err := controller.ReconcileAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+	if _, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
 		t.Fatalf("Get() error=%v, want tombstone purged after retry", err)
 	}
 }
@@ -864,19 +867,19 @@ func TestControllerReconcileRecoversPersistedTombstone(t *testing.T) {
 	project := createProject(t, store)
 	renderer := NewFakeRenderer()
 	controller := NewController(store, renderer)
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete"); err != nil {
+	if _, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete"); err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+	if _, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
 		t.Fatalf("Get() error=%v, want not found", err)
 	}
-	if _, ok := renderer.Rendered(model.KindProject, project.ID); ok {
+	if _, ok := renderer.Rendered(model.KindProviderNetwork, project.ID); ok {
 		t.Fatal("renderer still contains recovered tombstone")
 	}
 }
@@ -891,34 +894,34 @@ func TestControllerCleansRenderThatRacesWithDistributedDelete(t *testing.T) {
 
 	reconcileDone := make(chan error, 1)
 	go func() {
-		reconcileDone <- reconcileController.Reconcile(context.Background(), model.KindProject, project.ID)
+		reconcileDone <- reconcileController.Reconcile(context.Background(), model.KindProviderNetwork, project.ID)
 	}()
 	<-renderer.started
 
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete")
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := deleteController.Delete(context.Background(), tombstone); !errors.Is(err, ErrReconcileLeaseActive) {
 		t.Fatalf("Delete() error=%v, want active reconcile lease", err)
 	}
-	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
 		t.Fatalf("Purge() error=%v, want running reconcile conflict", err)
 	}
 	close(renderer.release)
 	if err := <-reconcileDone; err != nil {
 		t.Fatal(err)
 	}
-	if err := deleteController.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := deleteController.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+	if _, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
 		t.Fatalf("Get() error=%v, want purged tombstone", err)
 	}
-	if _, ok := delegate.Rendered(model.KindProject, project.ID); ok {
+	if _, ok := delegate.Rendered(model.KindProviderNetwork, project.ID); ok {
 		t.Fatal("stale render survived the distributed delete")
 	}
-	if calls := delegate.DeleteCalls(model.KindProject, project.ID); calls != 2 {
+	if calls := delegate.DeleteCalls(model.KindProviderNetwork, project.ID); calls != 2 {
 		t.Fatalf("delete calls=%d, want distributed delete plus stale cleanup", calls)
 	}
 }
@@ -929,12 +932,12 @@ func TestReconcileAllRecoversCrashAfterExternalWriteBeforeDeleteCheck(t *testing
 	renderer := NewFakeRenderer()
 	operationResource, _, err := store.Create(context.Background(), &model.Operation{
 		Action:          "reconcile",
-		TargetKind:      model.KindProject,
+		TargetKind:      model.KindProviderNetwork,
 		TargetID:        project.ID,
 		TargetRevision:  project.Revision,
 		OperationStatus: model.OperationQueued,
-		IdempotencyKey:  operationKey(model.KindProject, project.ID, project.Revision),
-	}, operationKey(model.KindProject, project.ID, project.Revision))
+		IdempotencyKey:  operationKey(model.KindProviderNetwork, project.ID, project.Revision),
+	}, operationKey(model.KindProviderNetwork, project.ID, project.Revision))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -946,11 +949,11 @@ func TestReconcileAllRecoversCrashAfterExternalWriteBeforeDeleteCheck(t *testing
 	if err := renderer.Render(context.Background(), project); err != nil {
 		t.Fatal(err)
 	}
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-after-crash")
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete-after-crash")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
 		t.Fatalf("Purge() error=%v, want crashed operation fence", err)
 	}
 
@@ -958,10 +961,10 @@ func TestReconcileAllRecoversCrashAfterExternalWriteBeforeDeleteCheck(t *testing
 	if err := controller.ReconcileAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+	if _, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
 		t.Fatalf("Get() error=%v, want recovered tombstone purged", err)
 	}
-	if _, ok := renderer.Rendered(model.KindProject, project.ID); ok {
+	if _, ok := renderer.Rendered(model.KindProviderNetwork, project.ID); ok {
 		t.Fatal("realized row written immediately before the crash survived recovery")
 	}
 	storedOperation, err := store.Get(context.Background(), model.KindOperation, operation.ID)
@@ -987,7 +990,7 @@ func TestControllersCorrectOutOfOrderDesiredRevisions(t *testing.T) {
 
 	oldDone := make(chan error, 1)
 	go func() {
-		oldDone <- oldController.Reconcile(context.Background(), model.KindProject, project.ID)
+		oldDone <- oldController.Reconcile(context.Background(), model.KindProviderNetwork, project.ID)
 	}()
 	<-renderer.started
 
@@ -996,7 +999,7 @@ func TestControllersCorrectOutOfOrderDesiredRevisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := newController.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := newController.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
 	if revision, _ := renderer.state(); revision != updated.GetMetadata().Revision {
@@ -1017,7 +1020,7 @@ func TestReconcileAllRepairsReadyResourceDrift(t *testing.T) {
 	project := createProject(t, store)
 	renderer := &unfencedRevisionRenderer{blockRevision: -1}
 	controller := NewController(store, renderer)
-	if err := controller.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
 	renderer.drift(0)
@@ -1040,9 +1043,9 @@ func TestControllersShareRunningOperationLease(t *testing.T) {
 	first := NewController(store, renderer)
 	second := NewController(store, renderer)
 	done := make(chan error, 1)
-	go func() { done <- first.Reconcile(context.Background(), model.KindProject, project.ID) }()
+	go func() { done <- first.Reconcile(context.Background(), model.KindProviderNetwork, project.ID) }()
 	<-renderer.started
-	if err := second.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := second.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
 	close(renderer.release)
@@ -1064,28 +1067,30 @@ func TestHeartbeatKeepsBlockedRenderFencedPastLease(t *testing.T) {
 	reconcileController := NewController(store, renderer, WithLeaseDuration(lease))
 	deleteController := NewController(store, renderer, WithLeaseDuration(lease))
 	done := make(chan error, 1)
-	go func() { done <- reconcileController.Reconcile(context.Background(), model.KindProject, project.ID) }()
+	go func() {
+		done <- reconcileController.Reconcile(context.Background(), model.KindProviderNetwork, project.ID)
+	}()
 	<-renderer.started
 	waitForRenewalSpan(t, store.renewed, lease)
 
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-after-long-render")
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete-after-long-render")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := deleteController.Delete(context.Background(), tombstone); !errors.Is(err, ErrReconcileLeaseActive) {
 		t.Fatalf("Delete() error=%v, want renewed writer lease", err)
 	}
-	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
 		t.Fatalf("Purge() error=%v, want renewed writer fence", err)
 	}
 	close(renderer.release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if err := deleteController.Reconcile(context.Background(), model.KindProject, project.ID); err != nil {
+	if err := deleteController.Reconcile(context.Background(), model.KindProviderNetwork, project.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Get(context.Background(), model.KindProject, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
+	if _, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID); !errors.Is(err, controlstore.ErrNotFound) {
 		t.Fatalf("Get() error=%v, want purged tombstone", err)
 	}
 }
@@ -1095,7 +1100,7 @@ func TestHeartbeatKeepsBlockedDeleteFencedPastLease(t *testing.T) {
 	baseStore := controlstore.NewMemory()
 	store := &renewalObservingStore{Store: baseStore, renewed: make(chan time.Time, 64)}
 	project := createProject(t, store)
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "begin-long-delete")
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "begin-long-delete")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1107,7 +1112,7 @@ func TestHeartbeatKeepsBlockedDeleteFencedPastLease(t *testing.T) {
 	go func() { done <- first.Delete(context.Background(), tombstone) }()
 	<-renderer.started
 	waitForRenewalSpan(t, store.renewed, lease)
-	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
 		t.Fatalf("Purge() error=%v, want running delete fence", err)
 	}
 	if err := second.Delete(context.Background(), tombstone); !errors.Is(err, ErrReconcileLeaseActive) {
@@ -1117,7 +1122,7 @@ func TestHeartbeatKeepsBlockedDeleteFencedPastLease(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Purge(context.Background(), model.KindProject, project.ID, tombstone.GetMetadata().Revision); err != nil {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1129,7 +1134,7 @@ func TestHeartbeatLossCancelsBlockedRendererWithoutCompletingOperation(t *testin
 	renderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
 	controller := NewController(store, renderer, WithLeaseDuration(30*time.Millisecond))
 	done := make(chan error, 1)
-	go func() { done <- controller.Reconcile(context.Background(), model.KindProject, project.ID) }()
+	go func() { done <- controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID) }()
 	<-renderer.started
 	select {
 	case <-store.renewed:
@@ -1160,7 +1165,7 @@ func TestForeignCancellationLeaseFailureRemainsRunning(t *testing.T) {
 	renderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
 	controller := NewController(store, renderer, WithLeaseDuration(30*time.Millisecond))
 
-	err := controller.Reconcile(ctx, model.KindProject, project.ID)
+	err := controller.Reconcile(ctx, model.KindProviderNetwork, project.ID)
 	if err == nil || !strings.Contains(err.Error(), "lost its writer lease") {
 		t.Fatalf("Reconcile() error=%v, want foreign lease loss", err)
 	}
@@ -1180,7 +1185,7 @@ func TestParentCancellationStopsHeartbeatAndReturnsContextError(t *testing.T) {
 	controller := NewController(store, renderer, WithLeaseDuration(30*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- controller.Reconcile(ctx, model.KindProject, project.ID) }()
+	go func() { done <- controller.Reconcile(ctx, model.KindProviderNetwork, project.ID) }()
 	<-renderer.started
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -1203,11 +1208,11 @@ func TestParentCancellationStopsHeartbeatAndReturnsContextError(t *testing.T) {
 	if err := controller.ReconcilePeriodic(context.Background(), time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	readyResource, err := store.Get(context.Background(), model.KindProject, project.ID)
+	readyResource, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ready := readyResource.(*model.Project)
+	ready := readyResource.(*model.ProviderNetwork)
 	if ready.State != model.ResourceReady || ready.AppliedRevision != ready.Revision {
 		t.Fatalf("project after periodic retry=%#v", ready)
 	}
@@ -1231,14 +1236,14 @@ func TestLateParentCancellationStillPersistsSuccessfulOperation(t *testing.T) {
 	project := createProject(t, store)
 	controller := NewController(store, NewFakeRenderer())
 
-	if err := controller.Reconcile(ctx, model.KindProject, project.ID); !errors.Is(err, context.Canceled) {
+	if err := controller.Reconcile(ctx, model.KindProviderNetwork, project.ID); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Reconcile() error=%v, want late context cancellation", err)
 	}
-	resource, err := store.Get(context.Background(), model.KindProject, project.ID)
+	resource, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ready := resource.(*model.Project)
+	ready := resource.(*model.ProviderNetwork)
 	if ready.State != model.ResourceReady || ready.AppliedRevision != ready.Revision {
 		t.Fatalf("project=%#v, want realized revision preserved", ready)
 	}
@@ -1259,7 +1264,7 @@ func TestParentDeadlineImmediatelyTerminalizesOperation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	err := controller.Reconcile(ctx, model.KindProject, project.ID)
+	err := controller.Reconcile(ctx, model.KindProviderNetwork, project.ID)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Reconcile() error=%v, want parent deadline", err)
 	}
@@ -1284,7 +1289,7 @@ func TestOperationCompletionTimeoutIsBounded(t *testing.T) {
 	controller.completionTimeout = 20 * time.Millisecond
 
 	started := time.Now()
-	err := controller.Reconcile(context.Background(), model.KindProject, project.ID)
+	err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Reconcile() error=%v, want bounded completion deadline", err)
 	}
@@ -1311,11 +1316,11 @@ func TestRenderAndOperationCompletionErrorsAreBothReturned(t *testing.T) {
 	project := createProject(t, store)
 	renderErr := errors.New("render rejected")
 	renderer := NewFakeRenderer()
-	renderer.SetFailure(model.KindProject, project.ID, renderErr)
+	renderer.SetFailure(model.KindProviderNetwork, project.ID, renderErr)
 	controller := NewController(store, renderer)
 	controller.completionTimeout = 20 * time.Millisecond
 
-	err := controller.Reconcile(context.Background(), model.KindProject, project.ID)
+	err := controller.Reconcile(context.Background(), model.KindProviderNetwork, project.ID)
 	if !errors.Is(err, renderErr) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Reconcile() error=%v, want render and completion errors", err)
 	}
@@ -1324,11 +1329,11 @@ func TestRenderAndOperationCompletionErrorsAreBothReturned(t *testing.T) {
 func TestDeleteCancellationImmediatelyTerminalizesAndRetriesSameOperation(t *testing.T) {
 	store := controlstore.NewMemory()
 	project := createProject(t, store)
-	tombstoneResource, _, err := store.BeginDelete(context.Background(), model.KindProject, project.ID, project.Revision, "delete-cancel")
+	tombstoneResource, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete-cancel")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tombstone := tombstoneResource.(*model.Project)
+	tombstone := tombstoneResource.(*model.ProviderNetwork)
 	renderer := &blockingDeleteRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
 	controller := NewController(store, renderer, WithLeaseDuration(30*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())

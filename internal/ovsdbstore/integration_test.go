@@ -73,29 +73,28 @@ func TestOpenAgainstInMemoryOVSDBServer(t *testing.T) {
 	}
 	store := newStore(&inMemoryTestDatabase{ovsDatabase: live})
 	t.Cleanup(store.Close)
-	created, replayed, err := store.Create(ctx, &model.Project{Name: "tenant", PoolID: "pool-a"}, "create-tenant")
+	created, replayed, err := store.Create(ctx, &model.ProviderNetwork{Name: "tenant"}, "create-tenant")
 	if err != nil || replayed {
 		t.Fatalf("Create replayed=%v err=%v", replayed, err)
 	}
-	loaded, err := store.Get(ctx, model.KindProject, created.GetMetadata().ID)
-	if err != nil || loaded.(*model.Project).Name != "tenant" {
+	loaded, err := store.Get(ctx, model.KindProviderNetwork, created.GetMetadata().ID)
+	if err != nil || loaded.(*model.ProviderNetwork).Name != "tenant" {
 		t.Fatalf("Get loaded=%#v err=%v", loaded, err)
 	}
-	replay, replayed, err := store.Create(ctx, &model.Project{Name: "tenant", PoolID: "pool-a"}, "create-tenant")
+	replay, replayed, err := store.Create(ctx, &model.ProviderNetwork{Name: "tenant"}, "create-tenant")
 	if err != nil || !replayed || replay.GetMetadata().ID != created.GetMetadata().ID {
 		t.Fatalf("replay resource=%#v replayed=%v err=%v", replay, replayed, err)
 	}
-	project := created.(*model.Project)
-	networkResource, _, err := store.Create(ctx, &model.Network{ProjectID: project.ID, Name: "private"}, "create-network")
+	networkResource, _, err := store.Create(ctx, &model.Network{Name: "private"}, "create-network")
 	if err != nil {
 		t.Fatal(err)
 	}
 	network := networkResource.(*model.Network)
-	subnetResource, _, err := store.Create(ctx, &model.Subnet{ProjectID: project.ID, NetworkID: network.ID, Name: "private-v4", CIDR: "10.0.0.0/24"}, "create-subnet")
+	subnetResource, _, err := store.Create(ctx, &model.Subnet{NetworkID: network.ID, Name: "private-v4", CIDR: "10.0.0.0/24"}, "create-subnet")
 	if err != nil {
 		t.Fatal(err)
 	}
-	groupResource, _, err := store.Create(ctx, &model.SecurityGroup{ProjectID: project.ID, Name: "default"}, "create-group")
+	groupResource, _, err := store.Create(ctx, &model.SecurityGroup{Name: "default"}, "create-group")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +103,7 @@ func TestOpenAgainstInMemoryOVSDBServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	portResource, _, err := store.Create(ctx, &model.Port{
-		ProjectID: project.ID, NetworkID: network.ID, Name: "vm-port", MACAddress: "02:00:00:00:00:01",
+		NetworkID: network.ID, Name: "vm-port", MACAddress: "02:00:00:00:00:01",
 		FixedIPs:         []model.FixedIP{{SubnetID: subnetResource.GetMetadata().ID, Address: "10.0.0.10"}},
 		SecurityGroupIDs: []string{groupResource.GetMetadata().ID}, NodeID: nodeResource.GetMetadata().ID,
 		VMID: 100, NIC: "net0", AdminStateUp: true,
@@ -116,7 +115,7 @@ func TestOpenAgainstInMemoryOVSDBServer(t *testing.T) {
 	if err != nil || len(runtimePorts) != 1 {
 		t.Fatalf("targeted runtime port lookup ports=%#v err=%v", runtimePorts, err)
 	}
-	if runtimePorts[0].ID != portResource.GetMetadata().ID || runtimePorts[0].ProjectID != project.ID || runtimePorts[0].NodeID != nodeResource.GetMetadata().ID {
+	if runtimePorts[0].ID != portResource.GetMetadata().ID || runtimePorts[0].NodeID != nodeResource.GetMetadata().ID {
 		t.Fatalf("targeted runtime port lookup decoded wrong references: %#v", runtimePorts[0])
 	}
 	loadedPort, err := store.Get(ctx, model.KindPort, portResource.GetMetadata().ID)
@@ -134,8 +133,8 @@ func TestOpenAgainstInMemoryOVSDBServer(t *testing.T) {
 	live.client.Disconnect()
 	reconnectCtx, reconnectCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer reconnectCancel()
-	loaded, err = store.Get(reconnectCtx, model.KindProject, created.GetMetadata().ID)
-	if err != nil || loaded.(*model.Project).Name != "tenant" {
+	loaded, err = store.Get(reconnectCtx, model.KindProviderNetwork, created.GetMetadata().ID)
+	if err != nil || loaded.(*model.ProviderNetwork).Name != "tenant" {
 		t.Fatalf("Get after OVSDB reconnect loaded=%#v err=%v", loaded, err)
 	}
 	logs := clientLogs.String()
