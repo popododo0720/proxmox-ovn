@@ -6,7 +6,7 @@ use warnings;
 use bytes ();
 use HTTP::Response;
 use IO::Socket::UNIX;
-use JSON qw(decode_json encode_json);
+use JSON::PP qw(decode_json encode_json);
 use MIME::Base64 qw(encode_base64);
 use Socket qw(SOCK_STREAM);
 use URI::Escape qw(uri_escape_utf8);
