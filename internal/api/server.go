@@ -631,7 +631,12 @@ func (s *Server) resolvePort(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusConflict, "port_not_bindable", "the matching PVN port has an unknown binding status", map[string]any{"status": port.BindingStatus})
 		return
 	}
-	writeJSON(writer, http.StatusOK, resolvedPort{PortID: port.ID, LSPName: port.LSPName, MACAddress: port.MACAddress, Generation: port.Generation, RequestedChassis: port.RequestedChassis, Status: port.BindingStatus})
+	resolved := resolvedPort{PortID: port.ID, LSPName: port.LSPName, MACAddress: port.MACAddress, Generation: port.Generation, RequestedChassis: port.RequestedChassis, Status: port.BindingStatus}
+	if _, browserRequest := request.Context().Value(sessionContextKey{}).(Session); browserRequest {
+		writeJSON(writer, http.StatusOK, map[string]any{"data": resolved})
+		return
+	}
+	writeJSON(writer, http.StatusOK, resolved)
 }
 
 func (s *Server) lookupRuntimePorts(ctx context.Context, nodeName string, vmid int, nic string) ([]*model.Port, error) {

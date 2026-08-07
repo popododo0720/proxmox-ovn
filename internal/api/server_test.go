@@ -414,6 +414,10 @@ func TestRuntimePortResolverUsesOptionalLookupAndKeepsListFallback(t *testing.T)
 	if fastResponse.Code != http.StatusOK || fast.lookupCalls != 1 || fast.listCalls != 0 {
 		t.Fatalf("fast resolver status=%d lookups=%d lists=%d body=%s", fastResponse.Code, fast.lookupCalls, fast.listCalls, fastResponse.Body.String())
 	}
+	fastResolution := decodeData[resolvedPort](t, fastResponse)
+	if fastResolution.PortID != "port-fast" || fastResolution.Status != model.PortBinding {
+		t.Fatalf("browser resolution envelope = %#v", fastResolution)
+	}
 	deniedProvider := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
 		return Session{User: "denied@pam", Permissions: map[string]any{}}, nil
 	})
