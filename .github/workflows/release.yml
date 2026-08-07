@@ -13,7 +13,50 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  package-check:
+    name: release check (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    container: debian:13@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - fast
+          - topology
+          - control-plane
+          - backup
+    steps:
+      - name: Install Debian 13 prerequisites
+        run: >-
+          apt-get update &&
+          apt-get install -y --no-install-recommends
+          ca-certificates file gcc git libc6-dev libhttp-message-perl make python3 systemd
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Trust checked-out workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: matrix.suite == 'fast' || matrix.suite == 'control-plane'
+        with:
+          go-version: '1.24.13'
+          cache: true
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: matrix.suite == 'fast'
+        with:
+          node-version: '24.18.0'
+
+      - name: Run fast release checks
+        if: matrix.suite == 'fast'
+        run: make fmt-check vet test test-race ui-test release-check-test
+
+      - name: Run package check (${{ matrix.suite }})
+        run: make package-check-${{ matrix.suite }}
+
   release:
+    needs: package-check
     runs-on: ubuntu-latest
     container: debian:13@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
     steps:
@@ -143,12 +186,9 @@ jobs:
           }
           verify_asset_uploaders
 
-      - name: Run release source gates
-        run: make fmt-check vet test test-race release-check-test
-
       - name: Build and verify release
         run: >-
-          make release
+          make release-artifact
           DEB_VERSION="$PVN_RELEASE_VERSION"
           COMMIT="$PVN_RELEASE_COMMIT"
           BUILD_DATE="$PVN_RELEASE_BUILD_DATE"
