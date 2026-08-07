@@ -41,6 +41,7 @@ SAFE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?")
 SAFE_VERSION = re.compile(r"[A-Za-z0-9.+:~_-]+")
 SAFE_ARCH = re.compile(r"[A-Za-z0-9_-]+")
 SAFE_SHA = re.compile(r"[0-9a-f]{64}")
+PROJECTLESS_SCHEMA_FIRST_VERSION = "0.3.0"
 
 
 class UpdateError(RuntimeError):
@@ -1714,6 +1715,13 @@ def compare_versions(left: str, operator: str, right: str) -> bool:
 def validate_rollout_versions(probes: dict[str, Probe], target: str) -> None:
     older: set[str] = set()
     for probe in probes.values():
+        if compare_versions(target, "ge", PROJECTLESS_SCHEMA_FIRST_VERSION) and \
+                compare_versions(probe.version, "lt", PROJECTLESS_SCHEMA_FIRST_VERSION):
+            fail(
+                f"breaking PVN_Control transition refused: {probe.node.name} has "
+                f"{probe.version}, target is {target}; stop all PVN writers and use the "
+                "documented projectless database reset instead of rolling update"
+            )
         if probe.central_state == "inactive" and probe.central_pending != "none":
             fail(
                 f"{probe.node.name} has an inactive central target with an unresolved "

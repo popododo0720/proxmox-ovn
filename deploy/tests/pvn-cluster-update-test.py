@@ -217,6 +217,26 @@ module.validate_rollout_versions(
     "0.2.1",
 )
 
+pre_projectless = module.parse_probe(
+    nodes[0], probe_line(snapshot, nodes[0], "0.2.19"), snapshot
+)
+try:
+    module.validate_rollout_versions(
+        {pre_projectless.node.name: pre_projectless}, "0.3.0"
+    )
+except module.UpdateError as error:
+    check(
+        "projectless database reset" in str(error),
+        "breaking transition did not explain the required reset",
+    )
+else:
+    raise AssertionError("rolling updater accepted the PVN_Control 1.x to 2.x transition")
+
+projectless = module.parse_probe(
+    nodes[0], probe_line(snapshot, nodes[0], "0.3.0"), snapshot
+)
+module.validate_rollout_versions({projectless.node.name: projectless}, "0.3.1")
+
 old_pending = module.parse_probe(
     nodes[0],
     probe_line(
