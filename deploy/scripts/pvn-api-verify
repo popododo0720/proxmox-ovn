@@ -1,0 +1,121 @@
+#!/bin/sh
+set -eu
+
+import_begin='# PVN-API-IMPORT:BEGIN'
+import_end='# PVN-API-IMPORT:END'
+route_begin='# PVN-API-ROUTE:BEGIN'
+route_end='# PVN-API-ROUTE:END'
+import_anchor='use PVE::API2::Storage::Config;'
+pool_class='    subclass => "PVE::API2::Pool",'
+
+dispatcher=${1:-/usr/share/perl5/PVE/API2.pm}
+module=${2:-/usr/share/perl5/PVN/API2.pm}
+
+[ "$#" -le 2 ] || {
+    echo "usage: pvn-api-verify [PVE/API2.pm [PVN/API2.pm]]" >&2
+    exit 2
+}
+
+pve_version=${PVN_PVE_VERSION:-}
+if [ -z "$pve_version" ] && command -v dpkg-query >/dev/null 2>&1; then
+    pve_version=$(dpkg-query -W -f='${Version}' pve-manager 2>/dev/null || true)
+fi
+pve_version=${pve_version#*:}
+case "$pve_version" in
+    9|9.*) ;;
+    *) exit 0 ;;
+esac
+
+fail() {
+    echo "PVN API verification failed on pve-manager $pve_version: $*" >&2
+    exit 1
+}
+
+[ -f "$dispatcher" ] || fail "PVE dispatcher is missing: $dispatcher"
+[ ! -L "$dispatcher" ] || fail "PVE dispatcher is a symlink: $dispatcher"
+[ -f "$module" ] || fail "PVN API module is missing: $module"
+[ ! -L "$module" ] || fail "PVN API module is a symlink: $module"
+
+awk -v import_anchor="$import_anchor" -v pool_class="$pool_class" \
+    -v import_begin="$import_begin" -v import_end="$import_end" \
+    -v route_begin="$route_begin" -v route_end="$route_end" '
+    $0 == import_anchor { import_anchors++; expect_import_begin=1; next }
+    expect_import_begin {
+        expect_import_begin=0
+        if ($0 != import_begin) { bad=1; next }
+        import_begins++
+        import_state=1
+        next
+    }
+    import_state == 1 {
+        if ($0 != "use PVN::API2;") { bad=1; import_state=0; next }
+        import_uses++
+        import_state=2
+        next
+    }
+    import_state == 2 {
+        if ($0 != import_end) { bad=1; import_state=0; next }
+        import_ends++
+        import_blocks++
+        import_state=0
+        next
+    }
+    $0 == pool_class { pool_classes++; pool_open=1; next }
+    pool_open && $0 == "});" { pool_open=0; expect_route_begin=1; next }
+    expect_route_begin {
+        expect_route_begin=0
+        if ($0 != route_begin) { bad=1; next }
+        route_begins++
+        route_state=1
+        next
+    }
+    route_state == 1 {
+        if ($0 != "__PACKAGE__->register_method({") { bad=1; route_state=0; next }
+        route_state=2
+        next
+    }
+    route_state == 2 {
+        if ($0 != "    subclass => \"PVN::API2\",") { bad=1; route_state=0; next }
+        route_state=3
+        next
+    }
+    route_state == 3 {
+        if ($0 != "    path => '\''pvn'\'',") { bad=1; route_state=0; next }
+        route_state=4
+        next
+    }
+    route_state == 4 {
+        if ($0 != "});") { bad=1; route_state=0; next }
+        route_state=5
+        next
+    }
+    route_state == 5 {
+        if ($0 != route_end) { bad=1; route_state=0; next }
+        route_ends++
+        route_blocks++
+        route_state=0
+        next
+    }
+    $0 == import_begin || $0 == import_end || $0 == route_begin || $0 == route_end ||
+        $0 == "use PVN::API2;" || $0 == "    subclass => \"PVN::API2\"," { bad=1 }
+    END {
+        if (bad || expect_import_begin || import_state != 0 || pool_open || expect_route_begin || route_state != 0 ||
+            import_anchors != 1 || import_begins != 1 || import_uses != 1 || import_ends != 1 || import_blocks != 1 ||
+            pool_classes != 1 || route_begins != 1 || route_ends != 1 || route_blocks != 1) exit 1
+    }
+' "$dispatcher" || fail "exact supported PVE 9 PVN route block is absent or malformed"
+
+if grep -Eq 'protected[[:space:]]*=>[[:space:]]*1' "$module"; then
+    fail "PVN methods must run in the unprivileged pveproxy worker"
+fi
+grep -Fq "our \$SOCKET_PATH = '/run/pvn-api/manager.sock';" "$module" ||
+    fail "PVN API module does not use the fixed browser socket"
+
+if [ "${PVN_API_SKIP_PERL_CHECK:-0}" != 1 ]; then
+    command -v perl >/dev/null 2>&1 || fail "perl is unavailable"
+    module_root=$(dirname "$(dirname "$module")")
+    perl -T -I "$module_root" -c "$module" >/dev/null || fail "PVN API module failed its Perl check"
+    perl -T -I "$module_root" -c "$dispatcher" >/dev/null || fail "PVE dispatcher failed its Perl check"
+fi
+
+exit 0
