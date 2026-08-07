@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 VERSION ?= dev
-DEB_VERSION ?= 0.2.19
+DEB_VERSION ?= 0.3.0
 SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD 2>/dev/null || date +%s)
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_DATE ?= $(shell date -u -d '@$(SOURCE_DATE_EPOCH)' +%Y-%m-%dT%H:%M:%SZ)

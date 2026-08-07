@@ -1,3 +1,14 @@
+proxmox-ovn (0.3.0) unstable; urgency=medium
+
+  * Remove Projects and make PVN resource names cluster-global.
+  * Replace the React iframe and port 8443 with native Proxmox ExtJS panels
+    and an authenticated same-origin API extension over a Unix socket.
+  * Recreate one cluster-global default security policy and provide bounded,
+    fail-closed VM NIC attach and detach workflows.
+  * Refuse rolling upgrades from the incompatible PVN 0.2 control schema.
+
+ -- PVN Project <root@localhost>  Fri, 07 Aug 2026 03:39:02 +0000
+
 proxmox-ovn (0.2.19) unstable; urgency=medium
 
   * Publish the native PVN Datacenter menu through draft-aware canonical
