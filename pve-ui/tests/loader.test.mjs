@@ -65,14 +65,58 @@ function harness(options = {}) {
   return { window, DatacenterConfig, frames, listeners, apiRequests, openedWindows };
 }
 
-test('adds one PVN item to the Datacenter config', () => {
+const expectedPVNPanels = [
+  ['pvn', 'PVN', '/'],
+  ['pvn-projects', 'Projects', '/projects'],
+  ['pvn-networks', 'Networks', '/networks'],
+  ['pvn-routers', 'Routers', '/routers'],
+  ['pvn-ports', 'Ports', '/ports'],
+  ['pvn-floating-ips', 'Floating IPs', '/floating-ips'],
+  ['pvn-security-groups', 'Security Groups', '/security-groups'],
+  ['pvn-provider-networks', 'Provider Networks', '/provider-networks'],
+  ['pvn-nodes', 'Nodes', '/nodes'],
+  ['pvn-operations', 'Operations', '/operations'],
+];
+
+test('adds one native PVN tree to the Datacenter config', () => {
   const { DatacenterConfig } = harness();
   const first = new DatacenterConfig();
   first.initComponent();
   assert.equal(first.items.filter((item) => item.itemId === 'pvn').length, 1);
+  assert.deepEqual(
+    first.items.filter((item) => item.itemId.startsWith('pvn')).map((item) => item.itemId),
+    expectedPVNPanels.map(([itemId]) => itemId),
+  );
+  const root = first.items.find((item) => item.itemId === 'pvn');
+  assert.equal(root.expandedOnInit, true);
+  assert.equal(root.groups, undefined);
+  for (const [itemId] of expectedPVNPanels.slice(1)) {
+    assert.deepEqual(Array.from(first.items.find((item) => item.itemId === itemId).groups), ['pvn']);
+  }
+  assert.equal(first.items.some((item) => item.itemId === 'pvn-overview'), false);
+
   const second = new DatacenterConfig();
   second.initComponent();
   assert.equal(second.items.filter((item) => item.itemId === 'pvn').length, 1);
+  assert.equal(second.items.filter((item) => item.itemId.startsWith('pvn')).length, expectedPVNPanels.length);
+});
+
+test('each PVN card opens its matching embedded manager route', () => {
+  const { DatacenterConfig, frames } = harness();
+  const config = new DatacenterConfig();
+  config.initComponent();
+
+  for (const [itemId, title, route] of expectedPVNPanels) {
+    const panelConfig = config.items.find((item) => item.itemId === itemId);
+    panelConfig.listeners.afterrender({ body: { dom: { appendChild() {} } }, on() {}, update() {} });
+    const frame = frames.at(-1);
+    const url = new URL(frame.src);
+    assert.equal(url.searchParams.get('embedded'), '1');
+    assert.equal(url.searchParams.get('route'), route);
+    assert.equal(frame.title, itemId === 'pvn' ? 'PVN Overview' : `PVN ${title}`);
+    assert.ok(url.searchParams.get('pveBridgeNonce'));
+    assert.equal(url.searchParams.get('pveOrigin'), 'https://pve.example.test:8006');
+  }
 });
 
 test('certificate onboarding opens only the same-node manager in an isolated tab', () => {
@@ -125,6 +169,8 @@ test('reload keeps the nonce-bound iframe URL and sandbox', () => {
   assert.equal(frame.src, originalURL);
   assert.equal(frame.sandbox, 'allow-scripts allow-forms allow-downloads allow-same-origin allow-top-navigation-by-user-activation');
   assert.equal(new URL(frame.src).origin, 'https://pve.example.test:8443');
+  assert.equal(new URL(frame.src).searchParams.get('embedded'), '1');
+  assert.equal(new URL(frame.src).searchParams.get('route'), '/');
 });
 
 test('bridge rejects the wrong origin and permits only an exact QEMU config path', () => {

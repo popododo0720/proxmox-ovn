@@ -237,14 +237,27 @@
         };
     }
 
-    function iframePanel() {
+    var PVN_PANELS = [
+        { itemId: 'pvn', title: 'PVN', route: '/', iconCls: 'fa fa-sitemap', expandedOnInit: true },
+        { itemId: 'pvn-projects', title: 'Projects', route: '/projects', iconCls: 'fa fa-folder-o' },
+        { itemId: 'pvn-networks', title: 'Networks', route: '/networks', iconCls: 'fa fa-cloud' },
+        { itemId: 'pvn-routers', title: 'Routers', route: '/routers', iconCls: 'fa fa-random' },
+        { itemId: 'pvn-ports', title: 'Ports', route: '/ports', iconCls: 'fa fa-plug' },
+        { itemId: 'pvn-floating-ips', title: 'Floating IPs', route: '/floating-ips', iconCls: 'fa fa-globe' },
+        { itemId: 'pvn-security-groups', title: 'Security Groups', route: '/security-groups', iconCls: 'fa fa-shield' },
+        { itemId: 'pvn-provider-networks', title: 'Provider Networks', route: '/provider-networks', iconCls: 'fa fa-exchange' },
+        { itemId: 'pvn-nodes', title: 'Nodes', route: '/nodes', iconCls: 'fa fa-server' },
+        { itemId: 'pvn-operations', title: 'Operations', route: '/operations', iconCls: 'fa fa-tasks' },
+    ];
+
+    function iframePanel(definition) {
         var frame;
         var frameURL;
-        return {
+        var panel = {
             xtype: 'panel',
-            itemId: 'pvn',
-            title: 'PVN',
-            iconCls: 'fa fa-sitemap',
+            itemId: definition.itemId,
+            title: definition.title,
+            iconCls: definition.iconCls,
             layout: 'fit',
             border: false,
             dockedItems: [{
@@ -284,11 +297,13 @@
                         return;
                     }
                     var url = new URL('/', origin);
+                    url.searchParams.set('embedded', '1');
+                    url.searchParams.set('route', definition.route);
                     url.searchParams.set('pveBridgeNonce', nonce);
                     url.searchParams.set('pveOrigin', window.location.origin);
                     frameURL = url.toString();
                     frame = document.createElement('iframe');
-                    frame.title = 'PVN Network Manager';
+                    frame.title = definition.itemId === 'pvn' ? 'PVN Overview' : 'PVN ' + definition.title;
                     frame.src = frameURL;
                     frame.referrerPolicy = 'strict-origin';
                     frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-downloads allow-same-origin allow-top-navigation-by-user-activation');
@@ -299,6 +314,19 @@
                 },
             },
         };
+        if (definition.itemId !== 'pvn') {
+            panel.groups = ['pvn'];
+        }
+        if (definition.expandedOnInit === true) {
+            panel.expandedOnInit = true;
+        }
+        return panel;
+    }
+
+    function pvnPanels() {
+        return PVN_PANELS.map(function (definition) {
+            return iframePanel(definition);
+        });
     }
 
     function hasPVNItem(items) {
@@ -327,7 +355,7 @@
             initComponent: function () {
                 var isDatacenter = this instanceof dcClass || this.$className === 'PVE.dc.Config';
                 if (isDatacenter && Array.isArray(this.items) && !hasPVNItem(this.items)) {
-                    this.items.push(iframePanel());
+                    Array.prototype.push.apply(this.items, pvnPanels());
                 }
                 return original.apply(this, arguments);
             },
