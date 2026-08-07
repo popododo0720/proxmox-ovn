@@ -1,3 +1,10 @@
+proxmox-ovn (0.2.19) unstable; urgency=medium
+
+  * Publish the native PVN Datacenter menu through draft-aware canonical
+    release provenance checks.
+
+ -- PVN Project <root@localhost>  Fri, 07 Aug 2026 01:20:00 +0000
+
 proxmox-ovn (0.2.18) unstable; urgency=medium
 
   * Expose PVN views as a native expandable Proxmox Datacenter menu while
