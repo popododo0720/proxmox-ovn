@@ -6,6 +6,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.1.3
 	github.com/go-logr/logr v1.2.2
 	github.com/ovn-org/libovsdb v0.7.0
+	golang.org/x/sys v0.18.0
 )
 
 require (
@@ -24,7 +25,6 @@ require (
 	github.com/prometheus/common v0.32.1 // indirect
 	github.com/prometheus/procfs v0.7.3 // indirect
 	github.com/stretchr/testify v1.8.0 // indirect
-	golang.org/x/sys v0.18.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

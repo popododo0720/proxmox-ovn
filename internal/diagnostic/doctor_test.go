@@ -97,8 +97,6 @@ func TestRunReportsHostFailures(t *testing.T) {
 	cfg := config.Default()
 	cfg.Cluster.ID = "lab"
 	cfg.Networking.EncapIP = "192.0.2.10"
-	cfg.Manager.TLSCert = t.TempDir() + "/missing-cert"
-	cfg.Manager.TLSKey = t.TempDir() + "/missing-key"
 	runner := fakeRunner{
 		outputs: map[string]string{"pveversion": "pve-manager/9.0", "ovn-appctl": "ovn 25.03"},
 		errors:  map[string]error{"ovs-vsctl": errors.New("bridge missing")},
