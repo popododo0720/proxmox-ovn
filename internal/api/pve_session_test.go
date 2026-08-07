@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,46 +13,6 @@ import (
 	"github.com/popododo0720/proxmox-ovn/internal/auth"
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 )
-
-func TestPVESessionProviderChecksPoolWithIncomingTicket(t *testing.T) {
-	ticket := url.QueryEscape("PVE:root@pam:01234567::signature")
-	pve := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodGet || request.URL.Path != "/api2/json/pools" {
-			t.Errorf("request = %s %s", request.Method, request.URL.Path)
-		}
-		cookie, err := request.Cookie(auth.PVECookieName)
-		if err != nil || cookie.Value != ticket {
-			t.Errorf("PVE ticket = %#v, %v", cookie, err)
-		}
-		poolID := request.URL.Query().Get("poolid")
-		if poolID == "pool-existing" {
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": []map[string]string{{"poolid": poolID}}})
-			return
-		}
-		writer.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(writer).Encode(map[string]any{"data": nil, "message": "pool '" + poolID + "' does not exist\n"})
-	}))
-	defer pve.Close()
-	provider, err := NewPVESessionProvider(PVESessionProviderOptions{BaseURL: pve.URL, HTTPClient: pve.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	incoming := httptest.NewRequest(http.MethodPost, "/api/v1/projects", nil)
-	incoming.AddCookie(&http.Cookie{Name: auth.PVECookieName, Value: ticket})
-
-	exists, err := provider.PoolExists(context.Background(), incoming, "pool-existing")
-	if err != nil || !exists {
-		t.Fatalf("existing pool: exists=%v err=%v", exists, err)
-	}
-	exists, err = provider.PoolExists(context.Background(), incoming, "pool-missing")
-	if err != nil || exists {
-		t.Fatalf("missing pool: exists=%v err=%v", exists, err)
-	}
-	withoutTicket := httptest.NewRequest(http.MethodPost, "/api/v1/projects", nil)
-	if _, err := provider.PoolExists(context.Background(), withoutTicket, "pool-existing"); !errors.Is(err, ErrUnauthenticated) {
-		t.Fatalf("missing ticket error = %v", err)
-	}
-}
 
 func TestPVESessionExchangeAndCSRFProtection(t *testing.T) {
 	pve := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -108,9 +67,9 @@ func TestPVESessionExchangeAndCSRFProtection(t *testing.T) {
 	}
 
 	post := func(csrf string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(`{"name":"tenant","pool_id":"pool"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/networks", strings.NewReader(`{"name":"private"}`))
 		req.AddCookie(pvnCookie)
-		req.Header.Set("Idempotency-Key", "create-project")
+		req.Header.Set("Idempotency-Key", "create-network")
 		if csrf != "" {
 			req.Header.Set(PVNCSRFHeader, csrf)
 		}
@@ -127,7 +86,7 @@ func TestPVESessionExchangeAndCSRFProtection(t *testing.T) {
 		t.Fatalf("with CSRF status=%d body=%s", withCSRF.Code, withCSRF.Body.String())
 	}
 
-	getRequest := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	getRequest := httptest.NewRequest(http.MethodGet, "/api/v1/networks", nil)
 	getRequest.AddCookie(pvnCookie)
 	getRecorder := httptest.NewRecorder()
 	server.ServeHTTP(getRecorder, getRequest)
@@ -175,7 +134,7 @@ func TestPVESessionUsesConfiguredDeploymentName(t *testing.T) {
 	if sessionCookie == nil {
 		t.Fatal("PVN session cookie is missing")
 	}
-	followup := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	followup := httptest.NewRequest(http.MethodGet, "/api/v1/networks", nil)
 	followup.AddCookie(sessionCookie)
 	persisted, err := provider.Session(context.Background(), followup)
 	if err != nil || persisted.Cluster != "human-cluster" {

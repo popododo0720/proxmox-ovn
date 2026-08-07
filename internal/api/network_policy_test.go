@@ -13,9 +13,8 @@ func TestConfiguredGuestMTUAndPhysnetAreEnforced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	project := createAPIProject(t, server)
 	networkResponse := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{
-		"project_id": project.ID, "name": "private",
+		"name": "private",
 	}, map[string]string{"Idempotency-Key": "configured-mtu"})
 	if networkResponse.Code != http.StatusCreated {
 		t.Fatalf("network create=%d body=%s", networkResponse.Code, networkResponse.Body.String())
@@ -25,7 +24,7 @@ func TestConfiguredGuestMTUAndPhysnetAreEnforced(t *testing.T) {
 		t.Fatalf("network MTU=%d", network.MTU)
 	}
 	tooLarge := request(t, server, http.MethodPost, "/api/v1/networks", map[string]any{
-		"project_id": project.ID, "name": "jumbo", "mtu": 1500,
+		"name": "jumbo", "mtu": 1500,
 	}, map[string]string{"Idempotency-Key": "oversized-mtu"})
 	if tooLarge.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("oversized MTU=%d body=%s", tooLarge.Code, tooLarge.Body.String())

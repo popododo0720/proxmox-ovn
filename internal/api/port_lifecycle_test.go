@@ -35,15 +35,10 @@ func (provider *lifecycleSessionProvider) Authorize(_ context.Context, request *
 	return provider.session, nil
 }
 
-func lifecycleTopology(t *testing.T) (controlstore.Store, *model.Project, *model.Network, *model.Node, *model.Port) {
+func lifecycleTopology(t *testing.T) (controlstore.Store, *model.Network, *model.Node, *model.Port) {
 	t.Helper()
 	store := controlstore.NewMemory()
-	projectResource, _, err := store.Create(context.Background(), &model.Project{Name: "tenant", PoolID: "pool-tenant"}, "project")
-	if err != nil {
-		t.Fatal(err)
-	}
-	project := projectResource.(*model.Project)
-	networkResource, _, err := store.Create(context.Background(), &model.Network{ProjectID: project.ID, Name: "private"}, "network")
+	networkResource, _, err := store.Create(context.Background(), &model.Network{Name: "private"}, "network")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,20 +48,25 @@ func lifecycleTopology(t *testing.T) (controlstore.Store, *model.Project, *model
 		t.Fatal(err)
 	}
 	node := nodeResource.(*model.Node)
+	groupResource, _, err := store.Create(context.Background(), &model.SecurityGroup{Name: "test-baseline"}, "group")
+	if err != nil {
+		t.Fatal(err)
+	}
 	portResource, _, err := store.Create(context.Background(), &model.Port{
-		ProjectID: project.ID, NetworkID: network.ID, Name: "vm100-net0",
+		NetworkID: network.ID, Name: "vm100-net0",
 		MACAddress: "02:00:00:00:00:10", AdminStateUp: true,
+		SecurityGroupIDs: []string{groupResource.GetMetadata().ID},
 	}, "port")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return store, project, network, node, portResource.(*model.Port)
+	return store, network, node, portResource.(*model.Port)
 }
 
 func TestPortAttachRequiresSessionCSRFAndScopedPrivileges(t *testing.T) {
-	store, _, _, node, port := lifecycleTopology(t)
+	store, network, node, port := lifecycleTopology(t)
 	permissions := map[string]any{
-		"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true},
+		"/": map[string]bool{"SDN.Allocate": true},
 	}
 	provider := &lifecycleSessionProvider{
 		csrf:    "csrf-good",
@@ -90,7 +90,7 @@ func TestPortAttachRequiresSessionCSRFAndScopedPrivileges(t *testing.T) {
 	if withoutUse.Code != http.StatusForbidden {
 		t.Fatalf("without SDN.Use status=%d body=%s", withoutUse.Code, withoutUse.Body.String())
 	}
-	permissions["/pool/pool-tenant"] = map[string]bool{"SDN.Allocate": true, "SDN.Use": true}
+	permissions[networkPathPrefix+network.ID] = map[string]bool{"SDN.Use": true}
 	withoutVM := request(t, server, http.MethodPost, target, body, headers)
 	if withoutVM.Code != http.StatusForbidden {
 		t.Fatalf("without VM.Config.Network status=%d body=%s", withoutVM.Code, withoutVM.Body.String())
@@ -152,11 +152,12 @@ func TestPortAttachRequiresSessionCSRFAndScopedPrivileges(t *testing.T) {
 }
 
 func TestPortAttachRejectsIdempotencyKeyReuseForAnotherRequest(t *testing.T) {
-	store, _, _, node, port := lifecycleTopology(t)
+	store, network, node, port := lifecycleTopology(t)
 	permissions := map[string]any{
-		"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true, "SDN.Use": true},
-		"/vms/100":          map[string]bool{"VM.Config.Network": true},
-		"/vms/101":          map[string]bool{"VM.Config.Network": true},
+		"/":                            map[string]bool{"SDN.Allocate": true},
+		networkPathPrefix + network.ID: map[string]bool{"SDN.Use": true},
+		"/vms/100":                     map[string]bool{"VM.Config.Network": true},
+		"/vms/101":                     map[string]bool{"VM.Config.Network": true},
 	}
 	provider := &lifecycleSessionProvider{authenticated: true, csrf: "csrf", session: Session{User: "tenant@pve", Permissions: permissions}}
 	server := testServer(t, store, provider)
@@ -173,7 +174,7 @@ func TestPortAttachRejectsIdempotencyKeyReuseForAnotherRequest(t *testing.T) {
 }
 
 func TestRuntimePortReportsUseGenerationCASAndAreUnixOnly(t *testing.T) {
-	store, _, _, node, port := lifecycleTopology(t)
+	store, _, node, port := lifecycleTopology(t)
 	port.NodeID, port.VMID, port.NIC, port.RequestedChassis = node.ID, 100, "net0", node.ChassisID
 	port.BindingStatus, port.Generation = model.PortBinding, 2
 	_, _, err := store.Update(context.Background(), port, port.Revision, "prepare")
@@ -235,7 +236,7 @@ func TestRuntimePortReportsUseGenerationCASAndAreUnixOnly(t *testing.T) {
 }
 
 func TestRuntimePortResolverFailsClosedUntilOVNRevisionIsApplied(t *testing.T) {
-	store, _, _, node, port := lifecycleTopology(t)
+	store, _, node, port := lifecycleTopology(t)
 	port.NodeID, port.VMID, port.NIC, port.RequestedChassis = node.ID, 100, "net0", node.ChassisID
 	port.BindingStatus, port.Generation = model.PortBinding, 2
 	pendingResource, _, err := store.Update(context.Background(), port, port.Revision, "prepare-pending")
