@@ -174,17 +174,26 @@
             });
         }
 
-        function editableResource(resource) {
+        var writableFields = {
+            networks: ['name', 'description', 'mtu', 'external', 'provider_network_id'],
+            subnets: ['name', 'network_id', 'cidr', 'gateway_ip', 'enable_dhcp', 'allocation_pools'],
+            routers: ['name', 'description', 'external_network_id', 'external_subnet_id', 'external_ip_address', 'enable_snat'],
+            ports: ['name', 'network_id', 'subnet_id', 'fixed_ip_address', 'mac_address', 'security_group_ids'],
+            'floating-ips': ['provider_network_id', 'address', 'fixed_ip_address', 'port_id', 'router_id'],
+            'security-groups': ['name', 'description', 'stateful'],
+            'security-group-rules': [
+                'security_group_id', 'direction', 'ethertype', 'protocol', 'port_range_min',
+                'port_range_max', 'remote_cidr', 'remote_group_id', 'action', 'description',
+            ],
+            'provider-networks': ['name', 'description', 'default_segment_id'],
+            'provider-segments': ['name', 'provider_network_id', 'network_type', 'physical_network', 'vlan_id'],
+        };
+
+        function editableResource(resource, collection) {
             var data = dataOf(resource);
             var result = {};
-            var managed = {
-                id: true, revision: true, applied_revision: true, state: true, status: true,
-                last_error: true, created_at: true, updated_at: true, read_only: true,
-                managed: true, node_id: true, vmid: true, nic: true, binding_status: true,
-                requested_chassis: true, lsp_name: true, generation: true,
-            };
-            Object.keys(data).forEach(function (key) {
-                if (!managed[key] && !/_name$/.test(key) && !/_label$/.test(key)) {
+            (writableFields[collection] || []).forEach(function (key) {
+                if (data[key] !== undefined) {
                     result[key] = data[key];
                 }
             });
@@ -207,13 +216,16 @@
             return typeof value === 'string' ? value.trim() : value;
         }
 
-        function formPayload(values, fields, resource, isCreate) {
-            var payload = isCreate ? {} : editableResource(resource);
+        function formPayload(values, fields, resource, isCreate, collection) {
+            var payload = isCreate ? {} : editableResource(resource, collection);
             fields.forEach(function (spec) {
                 var value = normalizeFieldValue(spec, values[spec.name]);
                 if (isCreate && !spec.required && !spec.includeEmpty &&
                     (value === '' || value === undefined || value === null || Array.isArray(value) && value.length === 0)) {
                     return;
+                }
+                if (!isCreate && spec.type === 'number' && value === '') {
+                    value = 0;
                 }
                 payload[spec.name] = value;
             });
@@ -237,6 +249,7 @@
             resourceURL: resourceURL,
             statusRenderer: statusRenderer,
             writeParams: writeParams,
+            writableFields: writableFields,
         };
 
         Ext.define('PVN.model.Resource', {
@@ -247,7 +260,8 @@
                 'revision', 'applied_revision', 'created_at', 'updated_at',
                 'network_id', 'subnet_id', 'router_id', 'port_id',
                 'security_group_id', 'security_group_ids', 'provider_network_id',
-                'default_segment_id', 'node_id', 'cidr', 'gateway_ip',
+                'default_segment_id', 'node_id', 'cidr', 'gateway_ip', 'address',
+                'allocation_pools', 'chassis_id', 'ovn_controller', 'gateway_priority',
                 'external_network_id', 'external_subnet_id', 'external_ip_address',
                 'fixed_ip_address', 'fixed_ips', 'mac_address', 'management_address',
                 'physical_network', 'network_type', 'vlan_id', 'mtu', 'roles',
@@ -257,7 +271,7 @@
                 'generation', 'protocol', 'direction', 'ethertype', 'remote_cidr',
                 'remote_group_id', 'port_range_min', 'port_range_max', 'read_only',
                 'managed', 'enable_dhcp', 'enable_snat', 'external',
-                'stateful', 'admin_state_up', 'enabled', 'action',
+                'stateful', 'admin_state_up', 'enabled',
                 'network_name', 'subnet_name', 'subnet_cidr', 'router_name',
                 'port_name', 'security_group_name', 'provider_network_name',
                 'default_segment_name', 'external_network_name', 'node_name',
@@ -436,7 +450,7 @@
                 var panel = Ext.create('Proxmox.panel.InputPanel', {
                     items: fields.map(fieldConfig),
                     onGetValues: function (values) {
-                        var payload = formPayload(values, fields, resource, isCreate);
+                        var payload = formPayload(values, fields, resource, isCreate, me.collection);
                         return writeParams(payload, isCreate ? undefined : resource.revision);
                     },
                 });
@@ -486,6 +500,443 @@
                 me.callParent();
             },
         });
+
+        function requestPromise(url, method, params) {
+            return new Promise(function (resolve, reject) {
+                request({
+                    url: url,
+                    method: method || 'GET',
+                    params: params || {},
+                    success: function (response) {
+                        resolve(response && response.result ? response.result.data : null);
+                    },
+                    failure: function (response) {
+                        reject(new Error(apiError(response)));
+                    },
+                });
+            });
+        }
+
+        function validNodeName(value) {
+            return typeof value === 'string' && /^[A-Za-z0-9._-]+$/.test(value);
+        }
+
+        function validVMID(value) {
+            return Number.isSafeInteger(Number(value)) && Number(value) > 0;
+        }
+
+        function validNIC(value) {
+            return typeof value === 'string' && /^net(?:[0-9]|[12][0-9]|3[01])$/.test(value);
+        }
+
+        function validMAC(value) {
+            return typeof value === 'string' && /^[A-Fa-f0-9]{2}(?::[A-Fa-f0-9]{2}){5}$/.test(value);
+        }
+
+        function digestOf(config) {
+            var digest = config && config.digest;
+            if (typeof digest !== 'string' || !/^[A-Fa-f0-9]{40,128}$/.test(digest)) {
+                throw new Error('PVE returned a VM config without a valid digest');
+            }
+            return digest;
+        }
+
+        function revisionOf(port) {
+            if (!Number.isSafeInteger(Number(port.revision)) || Number(port.revision) < 1) {
+                throw new Error('PVN port has no valid revision');
+            }
+            return Number(port.revision);
+        }
+
+        function generationOf(port) {
+            if (!Number.isSafeInteger(Number(port.generation)) || Number(port.generation) < 1) {
+                throw new Error('PVN port has no valid generation');
+            }
+            return Number(port.generation);
+        }
+
+        function nicOptions(value) {
+            if (typeof value !== 'string') return null;
+            var parts = value.split(',');
+            var first = parts.shift().split('=', 2);
+            if (first.length !== 2) return null;
+            var result = { model: first[0], mac: first[1] };
+            parts.forEach(function (part) {
+                var separator = part.indexOf('=');
+                var key = separator > 0 ? part.slice(0, separator) : '';
+                if (!key || Object.prototype.hasOwnProperty.call(result, key)) {
+                    result.invalid = true;
+                } else {
+                    result[key] = part.slice(separator + 1);
+                }
+            });
+            return result;
+        }
+
+        function isOwnedPVNNIC(value, macAddress, linkDown) {
+            var options = nicOptions(value);
+            if (!options || options.model !== 'virtio' || options.bridge !== 'br-int' || options.firewall !== '0') return false;
+            if (String(options.mac).toLowerCase() !== String(macAddress).trim().toLowerCase()) return false;
+            var allowed = { model: true, mac: true, bridge: true, firewall: true, link_down: true };
+            if (Object.keys(options).some(function (key) { return !allowed[key]; })) return false;
+            if (options.link_down !== undefined && options.link_down !== '0' && options.link_down !== '1') return false;
+            if (linkDown === undefined) return true;
+            return (options.link_down === '1') === linkDown;
+        }
+
+        function qemuPath(node, vmid, suffix) {
+            if (!validNodeName(node) || !validVMID(vmid)) throw new Error('Select a valid PVE node and QEMU VM');
+            return '/nodes/' + encodeURIComponent(node) + '/qemu/' + Number(vmid) + '/' + suffix;
+        }
+
+        var pveBridge = {
+            getQemuConfig: function (node, vmid) {
+                return requestPromise(qemuPath(node, vmid, 'config'), 'GET');
+            },
+            getQemuStatus: function (node, vmid) {
+                return requestPromise(qemuPath(node, vmid, 'status/current'), 'GET');
+            },
+            listQemuVMs: function () {
+                return requestPromise('/cluster/resources', 'GET', { type: 'vm' }).then(function (items) {
+                    if (!Array.isArray(items)) return [];
+                    return items.filter(function (item) {
+                        return item && item.type === 'qemu' && validVMID(item.vmid) && validNodeName(item.node);
+                    }).map(function (item) {
+                        return {
+                            vmid: Number(item.vmid),
+                            node: item.node,
+                            name: text(item.name),
+                            display: (text(item.name) || 'Unnamed VM') + ' (VM ' + Number(item.vmid) + ') on ' + item.node,
+                        };
+                    });
+                });
+            },
+            setQemuNIC: function (node, vmid, update) {
+                if (!validNIC(update.nic) || !validMAC(update.macAddress)) throw new Error('Invalid PVN VM NIC identity');
+                var params = { digest: update.digest };
+                digestOf(params);
+                params[update.nic] = 'virtio=' + update.macAddress + ',bridge=br-int,firewall=0,link_down=' + (update.linkDown ? '1' : '0');
+                return requestPromise(qemuPath(node, vmid, 'config'), 'PUT', params);
+            },
+            deleteQemuNIC: function (node, vmid, digest, nic) {
+                if (!validNIC(nic)) throw new Error('Invalid PVN VM NIC slot');
+                digestOf({ digest: digest });
+                return requestPromise(qemuPath(node, vmid, 'config'), 'PUT', { digest: digest, delete: nic });
+            },
+        };
+
+        var managerAPI = {
+            getPort: function (id) {
+                return requestPromise(resourceURL('ports', id), 'GET');
+            },
+            attach: function (id, input, revision) {
+                return requestPromise(resourceURL('ports', id, 'attach'), 'POST', writeParams(input, revision));
+            },
+            detach: function (id, input, revision) {
+                return requestPromise(resourceURL('ports', id, 'detach'), 'POST', writeParams(input, revision));
+            },
+            resolve: function (node, vmid, nic) {
+                return requestPromise('/pvn/runtime/ports/resolve', 'GET', {
+                    node: node, vmid: Number(vmid), nic: nic,
+                });
+            },
+        };
+
+        function assertPortIdentity(port) {
+            if (!port || !port.id || !validMAC(port.mac_address)) throw new Error('PVN port has no valid ID or MAC address');
+            revisionOf(port);
+            generationOf(port);
+        }
+
+        function assertTarget(target) {
+            if (!target || !target.nodeID || !validNodeName(target.nodeName) ||
+                !validVMID(target.vmid) || !validNIC(target.nic)) {
+                throw new Error('Select a valid PVN node, QEMU VM, and netN slot');
+            }
+        }
+
+        function lifecycleRuntime(options) {
+            options = options || {};
+            return {
+                attempts: options.pollAttempts === undefined ? 90 : options.pollAttempts,
+                interval: options.pollIntervalMs === undefined ? 500 : options.pollIntervalMs,
+                sleep: options.sleep || function (delay) {
+                    return new Promise(function (resolve) { window.setTimeout(resolve, delay); });
+                },
+                emit: options.onStep || function () {},
+            };
+        }
+
+        async function assertRunning(bridge, target) {
+            var status = await bridge.getQemuStatus(target.nodeName, target.vmid);
+            if (!status || status.status !== 'running' && status.qmpstatus !== 'running') {
+                throw new Error('PVN can attach or detach only a running QEMU VM');
+            }
+        }
+
+        async function waitForPort(api, portID, expected, options) {
+            var runtime = lifecycleRuntime(options);
+            for (var attempt = 0; attempt < runtime.attempts; attempt += 1) {
+                var port = await api.getPort(portID);
+                if (port.binding_status === expected) return port;
+                if (port.state === 'error' || port.binding_status === 'error') {
+                    throw new Error(port.last_error || 'PVN port entered an error state');
+                }
+                var valid = expected === 'bound' ? port.binding_status === 'binding' : port.binding_status === 'detaching';
+                if (!valid) throw new Error('PVN port changed unexpectedly to ' + (port.binding_status || 'unknown'));
+                await runtime.sleep(runtime.interval);
+            }
+            throw new Error('Timed out waiting for PVN port to become ' + expected);
+        }
+
+        async function waitForNIC(bridge, target, predicate, options) {
+            var runtime = lifecycleRuntime(options);
+            for (var attempt = 0; attempt < runtime.attempts; attempt += 1) {
+                var config = await bridge.getQemuConfig(target.nodeName, target.vmid);
+                if (predicate(config[target.nic])) return config;
+                await runtime.sleep(runtime.interval);
+            }
+            throw new Error('Timed out waiting for PVE ' + target.nic + ' configuration');
+        }
+
+        function matchesTarget(port, target, generation) {
+            return port && port.node_id === target.nodeID && Number(port.vmid) === Number(target.vmid) &&
+                port.nic === target.nic && Number(port.generation) === Number(generation);
+        }
+
+        function sameAttachment(port, target, generation) {
+            return matchesTarget(port, target, generation) &&
+                ['binding', 'bound', 'error'].indexOf(port.binding_status) !== -1;
+        }
+
+        function sameUnboundGeneration(port, generation) {
+            return port && Number(port.generation) === Number(generation) && port.binding_status === 'unbound' &&
+                !text(port.node_id) && !Number(port.vmid) && !text(port.nic);
+        }
+
+        async function removeOwnedNIC(bridge, port, target, options) {
+            var config = await bridge.getQemuConfig(target.nodeName, target.vmid);
+            if (config[target.nic] === undefined) return;
+            if (!isOwnedPVNNIC(config[target.nic], port.mac_address)) {
+                throw new Error('Refusing to delete ' + target.nic + ' because it is not the selected PVN port');
+            }
+            await bridge.deleteQemuNIC(target.nodeName, target.vmid, digestOf(config), target.nic);
+            await waitForNIC(bridge, target, function (value) { return value === undefined; }, options);
+        }
+
+        async function rollbackAttach(api, bridge, port, target, managerAccepted, nicMayBeStaged, options) {
+            var errors = [];
+            var safeToDelete = nicMayBeStaged && !managerAccepted;
+            if (managerAccepted) {
+                try {
+                    var current = await api.getPort(port.id);
+                    if (current.binding_status === 'binding' || current.binding_status === 'bound' || current.binding_status === 'error') {
+                        current = await api.detach(current.id, { generation: generationOf(current) }, revisionOf(current));
+                    }
+                    if (current.binding_status === 'detaching') current = await waitForPort(api, current.id, 'unbound', options);
+                    safeToDelete = nicMayBeStaged && current.binding_status === 'unbound';
+                } catch (error) {
+                    errors.push(error instanceof Error ? error : new Error(String(error)));
+                }
+            }
+            if (safeToDelete) {
+                try {
+                    await removeOwnedNIC(bridge, port, target, options);
+                } catch (error) {
+                    errors.push(error instanceof Error ? error : new Error(String(error)));
+                }
+            }
+            return errors;
+        }
+
+        function lifecycleError(step, reason, rollbackErrors) {
+            var message = reason instanceof Error ? reason.message : String(reason);
+            if (rollbackErrors && rollbackErrors.length) {
+                message += '. Cleanup also failed: ' + rollbackErrors.map(function (error) { return error.message; }).join('; ');
+            }
+            var error = new Error('VM port operation failed while ' + step.replace(/-/g, ' ') + ': ' + message);
+            error.step = step;
+            error.rollbackErrors = rollbackErrors || [];
+            return error;
+        }
+
+        async function attachVMPort(api, bridge, initialPort, target, options) {
+            options = options || {};
+            var port = initialPort;
+            var step = 'checking-vm';
+            var managerAccepted = false;
+            var managerStateAmbiguous = false;
+            var nicMayBeStaged = false;
+            function emit(next) { step = next; if (options.onStep) options.onStep(next); }
+            try {
+                assertPortIdentity(port);
+                assertTarget(target);
+                if (port.binding_status !== 'unbound') throw new Error('Only an unbound PVN port can be attached');
+                emit('checking-vm');
+                await assertRunning(bridge, target);
+                var config = await bridge.getQemuConfig(target.nodeName, target.vmid);
+                if (config[target.nic] !== undefined) throw new Error(target.nic + ' already exists on VM ' + target.vmid);
+
+                emit('staging-nic');
+                nicMayBeStaged = true;
+                await bridge.setQemuNIC(target.nodeName, target.vmid, {
+                    digest: digestOf(config), nic: target.nic, macAddress: port.mac_address, linkDown: true,
+                });
+                await waitForNIC(bridge, target, function (value) {
+                    return isOwnedPVNNIC(value, port.mac_address, true);
+                }, options);
+
+                emit('requesting-binding');
+                var nextGeneration = generationOf(port) + 1;
+                try {
+                    port = await api.attach(port.id, {
+                        node_id: target.nodeID, vmid: Number(target.vmid), nic: target.nic,
+                        generation: generationOf(port),
+                    }, revisionOf(port));
+                    managerAccepted = true;
+                } catch (reason) {
+                    var current;
+                    try {
+                        current = await api.getPort(port.id);
+                    } catch (_error) {
+                        managerStateAmbiguous = true;
+                        throw reason;
+                    }
+                    if (!sameAttachment(current, target, nextGeneration)) {
+                        managerStateAmbiguous = !sameUnboundGeneration(current, generationOf(port));
+                        throw reason;
+                    }
+                    port = current;
+                    managerAccepted = true;
+                }
+
+                emit('waiting-for-binding');
+                if (port.binding_status !== 'bound') port = await waitForPort(api, port.id, 'bound', options);
+                emit('enabling-nic');
+                config = await bridge.getQemuConfig(target.nodeName, target.vmid);
+                if (!isOwnedPVNNIC(config[target.nic], port.mac_address)) {
+                    throw new Error(target.nic + ' no longer matches the PVN port');
+                }
+                await bridge.setQemuNIC(target.nodeName, target.vmid, {
+                    digest: digestOf(config), nic: target.nic, macAddress: port.mac_address, linkDown: false,
+                });
+                await waitForNIC(bridge, target, function (value) {
+                    return isOwnedPVNNIC(value, port.mac_address, false);
+                }, options);
+                return port;
+            } catch (reason) {
+                if (options.onStep) options.onStep('rolling-back');
+                var rollbackErrors = managerStateAmbiguous
+                    ? [new Error('PVN manager state is unknown; the staged NIC was left link-down')]
+                    : await rollbackAttach(api, bridge, port, target, managerAccepted, nicMayBeStaged, options);
+                throw lifecycleError(step, reason, rollbackErrors);
+            }
+        }
+
+        async function detachVMPort(api, bridge, initialPort, target, options) {
+            options = options || {};
+            var port = initialPort;
+            var step = 'checking-vm';
+            var detachAccepted = false;
+            var managerStateAmbiguous = false;
+            var nicMayBeDisabled = false;
+            function emit(next) { step = next; if (options.onStep) options.onStep(next); }
+            try {
+                assertPortIdentity(port);
+                assertTarget(target);
+                if (port.node_id !== target.nodeID || Number(port.vmid) !== Number(target.vmid) || port.nic !== target.nic) {
+                    throw new Error('The selected VM target does not match this PVN port attachment');
+                }
+                if (['binding', 'bound', 'error'].indexOf(port.binding_status) === -1) {
+                    throw new Error('Only an attached PVN port can be detached');
+                }
+                emit('checking-vm');
+                await assertRunning(bridge, target);
+                var config = await bridge.getQemuConfig(target.nodeName, target.vmid);
+                if (!isOwnedPVNNIC(config[target.nic], port.mac_address)) {
+                    throw new Error('Refusing to change ' + target.nic + ' because it is not the selected PVN port');
+                }
+
+                emit('disabling-nic');
+                nicMayBeDisabled = true;
+                await bridge.setQemuNIC(target.nodeName, target.vmid, {
+                    digest: digestOf(config), nic: target.nic, macAddress: port.mac_address, linkDown: true,
+                });
+                await waitForNIC(bridge, target, function (value) {
+                    return isOwnedPVNNIC(value, port.mac_address, true);
+                }, options);
+
+                emit('requesting-detach');
+                var originalGeneration = generationOf(port);
+                try {
+                    port = await api.detach(port.id, { generation: originalGeneration }, revisionOf(port));
+                    detachAccepted = true;
+                } catch (reason) {
+                    var current;
+                    try {
+                        current = await api.getPort(port.id);
+                    } catch (_error) {
+                        managerStateAmbiguous = true;
+                        throw reason;
+                    }
+                    var accepted = Number(current.generation) === originalGeneration &&
+                        (current.binding_status === 'unbound' ||
+                            current.binding_status === 'detaching' && matchesTarget(current, target, originalGeneration));
+                    if (!accepted) {
+                        var unchanged = sameAttachment(current, target, originalGeneration) &&
+                            ['binding', 'bound', 'error'].indexOf(current.binding_status) !== -1;
+                        managerStateAmbiguous = !unchanged;
+                        throw reason;
+                    }
+                    port = current;
+                    detachAccepted = true;
+                }
+
+                emit('waiting-for-detach');
+                if (port.binding_status !== 'unbound') port = await waitForPort(api, port.id, 'unbound', options);
+                emit('deleting-nic');
+                await removeOwnedNIC(bridge, port, target, options);
+                return port;
+            } catch (reason) {
+                var rollbackErrors = [];
+                if (managerStateAmbiguous) {
+                    rollbackErrors.push(new Error('PVN manager state is unknown; the VM NIC was left link-down'));
+                } else if (!detachAccepted && nicMayBeDisabled) {
+                    if (options.onStep) options.onStep('rolling-back');
+                    try {
+                        var rollbackConfig = await bridge.getQemuConfig(target.nodeName, target.vmid);
+                        if (isOwnedPVNNIC(rollbackConfig[target.nic], port.mac_address)) {
+                            await bridge.setQemuNIC(target.nodeName, target.vmid, {
+                                digest: digestOf(rollbackConfig), nic: target.nic,
+                                macAddress: port.mac_address, linkDown: false,
+                            });
+                            await waitForNIC(bridge, target, function (value) {
+                                return isOwnedPVNNIC(value, port.mac_address, false);
+                            }, options);
+                        }
+                    } catch (rollbackReason) {
+                        rollbackErrors.push(rollbackReason instanceof Error ? rollbackReason : new Error(String(rollbackReason)));
+                    }
+                }
+                throw lifecycleError(step, reason, rollbackErrors);
+            }
+        }
+
+        function firstFreeNIC(config) {
+            for (var index = 0; index < 32; index += 1) {
+                if (config['net' + index] === undefined) return 'net' + index;
+            }
+            return null;
+        }
+
+        PVN.PortLifecycle = {
+            attach: attachVMPort,
+            detach: detachVMPort,
+            firstFreeNIC: firstFreeNIC,
+            isOwnedPVNNIC: isOwnedPVNNIC,
+            managerAPI: managerAPI,
+            pveBridge: pveBridge,
+        };
 
         Ext.define('PVN.grid.Resource', {
             extend: 'Ext.grid.Panel',
@@ -797,6 +1248,303 @@
             'provider-segments': { createFields: providerSegmentCreateFields, editFields: [providerSegmentCreateFields[0]].concat(providerSegmentCreateFields.slice(2)) },
         };
 
+        Ext.define('PVN.model.QemuVM', {
+            extend: 'Ext.data.Model',
+            idProperty: 'vmid',
+            fields: ['vmid', 'name', 'node', 'display'],
+        });
+
+        Ext.define('PVN.form.QemuCombo', {
+            extend: 'Ext.form.field.ComboBox',
+            alias: 'widget.pvnQemuCombo',
+            queryMode: 'local',
+            valueField: 'vmid',
+            displayField: 'display',
+            forceSelection: true,
+            editable: true,
+
+            setNodeName: function (nodeName) {
+                var me = this;
+                me.nodeName = nodeName || '';
+                me.store.clearFilter();
+                if (me.nodeName) {
+                    me.store.filterBy(function (record) { return record.get('node') === me.nodeName; });
+                }
+            },
+
+            loadVMs: function () {
+                var me = this;
+                return pveBridge.listQemuVMs().then(function (items) {
+                    me.store.loadData(items);
+                    me.setNodeName(me.nodeName);
+                    return items;
+                }).catch(function (error) {
+                    Ext.Msg.alert('VM inventory unavailable', html(error.message));
+                    return [];
+                });
+            },
+
+            initComponent: function () {
+                var me = this;
+                me.store = Ext.create('Ext.data.Store', { model: 'PVN.model.QemuVM', data: [] });
+                me.listConfig = {
+                    emptyText: 'No running or stopped QEMU VMs on this node',
+                    getInnerTpl: function () { return '<b>{name:htmlEncode}</b> (VM {vmid})'; },
+                };
+                me.callParent();
+            },
+        });
+
+        var lifecycleStepLabels = {
+            'checking-vm': 'Checking VM state',
+            'staging-nic': 'Creating a fail-closed NIC',
+            'requesting-binding': 'Requesting OVN binding',
+            'waiting-for-binding': 'Waiting for OVN binding',
+            'enabling-nic': 'Enabling the VM NIC',
+            'disabling-nic': 'Disabling the VM NIC',
+            'requesting-detach': 'Requesting detach',
+            'waiting-for-detach': 'Waiting for OVN cleanup',
+            'deleting-nic': 'Removing the VM NIC',
+            'rolling-back': 'Rolling back safely',
+        };
+
+        Ext.define('PVN.panel.PortAttachments', {
+            extend: 'Ext.panel.Panel',
+            alias: 'widget.pvnPortAttachments',
+            border: false,
+            bodyPadding: 16,
+            scrollable: true,
+
+            initComponent: function () {
+                var me = this;
+                var portStore = createStore('ports');
+                var nodeStore = createStore('nodes');
+                var busy = false;
+                var inspectedConfig = null;
+
+                var portField = Ext.create('Ext.form.field.ComboBox', {
+                    fieldLabel: 'PVN port', store: portStore, queryMode: 'local',
+                    valueField: 'id', displayField: 'pvn_label', forceSelection: true,
+                    editable: true, width: 430,
+                });
+                var nodeField = Ext.create('Ext.form.field.ComboBox', {
+                    fieldLabel: 'PVE node', store: nodeStore, queryMode: 'local',
+                    valueField: 'id', displayField: 'pvn_label', forceSelection: true,
+                    editable: true, width: 380,
+                });
+                var vmField = Ext.create('PVN.form.QemuCombo', {
+                    fieldLabel: 'QEMU VM', width: 430,
+                });
+                var nicField = Ext.create('Ext.form.field.Text', {
+                    fieldLabel: 'NIC slot', value: 'net0', width: 250,
+                    regex: /^net(?:[0-9]|[12][0-9]|3[01])$/,
+                    regexText: 'Use a net0 through net31 slot',
+                });
+                var progress = Ext.create('Ext.Component', {
+                    hidden: true,
+                    margin: '12 0 0 0',
+                });
+                var evidence = Ext.create('Ext.Component', {
+                    margin: '16 0 0 0',
+                    html: '<p>Select a port, node, and VM, then inspect the configuration.</p>',
+                });
+                var inspectButton;
+                var attachButton;
+                var detachButton;
+
+                function recordByID(store, id) {
+                    return id && store.getById ? store.getById(id) : null;
+                }
+
+                function selectedPort() {
+                    return dataOf(recordByID(portStore, portField.getValue()));
+                }
+
+                function selectedNode() {
+                    return dataOf(recordByID(nodeStore, nodeField.getValue()));
+                }
+
+                function selectedTarget() {
+                    var node = selectedNode();
+                    var vmid = Number(vmField.getValue());
+                    var nic = text(nicField.getValue());
+                    var target = { nodeID: node.id, nodeName: node.name, vmid: vmid, nic: nic };
+                    assertTarget(target);
+                    return target;
+                }
+
+                function setProgress(step) {
+                    busy = Boolean(step);
+                    if (step) {
+                        progress.setHidden(false);
+                        progress.update('<p><i class="fa fa-spinner fa-pulse"></i> <b>' +
+                            html(lifecycleStepLabels[step] || step) + '</b><br>The VM NIC remains fail-closed during this step.</p>');
+                    } else {
+                        progress.setHidden(true);
+                    }
+                    updateControls();
+                }
+
+                function updateControls() {
+                    var port = selectedPort();
+                    var attached = port.id && port.binding_status !== 'unbound';
+                    var node = selectedNode();
+                    var actionable = Boolean(port.id && node.id && validVMID(vmField.getValue()) &&
+                        validNIC(text(nicField.getValue())) && !busy);
+                    nodeField.setDisabled(Boolean(attached || busy));
+                    vmField.setDisabled(Boolean(attached || busy));
+                    nicField.setDisabled(Boolean(attached || busy));
+                    portField.setDisabled(busy);
+                    inspectButton.setDisabled(!actionable);
+                    attachButton.setHidden(Boolean(attached));
+                    attachButton.setDisabled(!actionable || port.admin_state_up === false || node.enabled === false);
+                    detachButton.setHidden(!attached);
+                    detachButton.setDisabled(!actionable || ['binding', 'bound', 'error'].indexOf(port.binding_status) === -1);
+                }
+
+                function syncAttachment() {
+                    var port = selectedPort();
+                    inspectedConfig = null;
+                    if (port.id && port.binding_status !== 'unbound') {
+                        nodeField.setValue(port.node_id || '');
+                        vmField.setValue(port.vmid || '');
+                        nicField.setValue(port.nic || 'net0');
+                    }
+                    evidence.update('<p>' + html(port.id
+                        ? humanName(port, 'Unnamed port', ['name', 'mac_address']) + ' is ' + (port.binding_status || 'unknown') + '.'
+                        : 'No PVN ports are available.') + '</p>');
+                    updateControls();
+                }
+
+                function syncNode() {
+                    var node = selectedNode();
+                    vmField.setNodeName(node.name || '');
+                    vmField.setValue('');
+                    updateControls();
+                }
+
+                async function inspect() {
+                    var port = selectedPort();
+                    var target;
+                    try {
+                        assertPortIdentity(port);
+                        target = selectedTarget();
+                        setProgress('checking-vm');
+                        var results = await Promise.all([
+                            pveBridge.getQemuConfig(target.nodeName, target.vmid),
+                            pveBridge.getQemuStatus(target.nodeName, target.vmid),
+                        ]);
+                        inspectedConfig = results[0];
+                        var status = results[1] || {};
+                        if (port.binding_status === 'unbound') {
+                            var available = firstFreeNIC(inspectedConfig);
+                            if (available) nicField.setValue(available);
+                        }
+                        var runtime = null;
+                        if (port.binding_status !== 'unbound') {
+                            try {
+                                runtime = await managerAPI.resolve(target.nodeName, target.vmid, target.nic);
+                            } catch (_error) {
+                                runtime = { status: 'unavailable' };
+                            }
+                        }
+                        var nics = Object.keys(inspectedConfig).filter(function (key) { return /^net[0-9]+$/.test(key); }).sort();
+                        var rows = nics.length ? nics.map(function (key) {
+                            return '<tr><td><b>' + html(key) + '</b></td><td>' + html(inspectedConfig[key]) + '</td></tr>';
+                        }).join('') : '<tr><td colspan="2">No configured NICs</td></tr>';
+                        var owned = isOwnedPVNNIC(inspectedConfig[target.nic], port.mac_address);
+                        evidence.update(
+                            '<h3 style="margin-top:0">' + html(humanName(port, 'Unnamed port', ['name', 'mac_address'])) + '</h3>' +
+                            '<p>VM status: <b>' + html(status.status || status.qmpstatus || 'unknown') + '</b> &middot; ' +
+                            html(target.nic) + ': <b>' + html(owned ? 'matches selected PVN port' : inspectedConfig[target.nic] === undefined ? 'free' : 'owned by another NIC') + '</b>' +
+                            (runtime ? ' &middot; runtime: <b>' + html(runtime.status || 'matched') + '</b>' : '') + '</p>' +
+                            '<table class="x-grid-item" style="width:100%"><tbody>' + rows + '</tbody></table>'
+                        );
+                    } catch (error) {
+                        Ext.Msg.alert('VM inspection failed', html(error.message));
+                    } finally {
+                        setProgress(null);
+                    }
+                }
+
+                async function runLifecycle(action) {
+                    var port = selectedPort();
+                    try {
+                        var target = selectedTarget();
+                        var result = action === 'attach'
+                            ? await attachVMPort(managerAPI, pveBridge, port, target, { onStep: setProgress })
+                            : await detachVMPort(managerAPI, pveBridge, port, target, { onStep: setProgress });
+                        evidence.update('<p><i class="fa fa-check good"></i> <b>' +
+                            html(humanName(result, 'Port', ['name', 'mac_address'])) + '</b> is now ' +
+                            html(result.binding_status) + '.</p>');
+                        refreshStore(portStore);
+                    } catch (error) {
+                        Ext.Msg.alert('VM port operation failed', html(error.message));
+                        refreshStore(portStore);
+                    } finally {
+                        setProgress(null);
+                    }
+                }
+
+                inspectButton = Ext.create('Ext.button.Button', {
+                    text: 'Inspect', iconCls: 'fa fa-search', disabled: true, handler: inspect,
+                });
+                attachButton = Ext.create('Ext.button.Button', {
+                    text: 'Attach', iconCls: 'fa fa-plug', disabled: true,
+                    handler: function () { runLifecycle('attach'); },
+                });
+                detachButton = Ext.create('Ext.button.Button', {
+                    text: 'Detach', iconCls: 'fa fa-unlink', disabled: true, hidden: true,
+                    handler: function () { runLifecycle('detach'); },
+                });
+
+                if (portField.on) portField.on('change', syncAttachment);
+                if (nodeField.on) nodeField.on('change', syncNode);
+                if (vmField.on) vmField.on('change', updateControls);
+                if (nicField.on) nicField.on('change', updateControls);
+                if (portStore.on) portStore.on('load', function () {
+                    if (!recordByID(portStore, portField.getValue())) {
+                        var first = portStore.getAt ? portStore.getAt(0) : null;
+                        portField.setValue(first ? first.get('id') : '');
+                    }
+                    syncAttachment();
+                });
+                if (nodeStore.on) nodeStore.on('load', function () {
+                    var port = selectedPort();
+                    var node = selectedNode();
+                    vmField.setNodeName(node.name || '');
+                    if (port.id && port.binding_status !== 'unbound') {
+                        vmField.setValue(port.vmid || '');
+                    }
+                    updateControls();
+                });
+
+                Ext.apply(me, {
+                    items: [{
+                        xtype: 'form', border: false, bodyStyle: 'background:transparent',
+                        fieldDefaults: { labelWidth: 100 },
+                        items: [portField, nodeField, vmField, nicField],
+                        buttons: [inspectButton, attachButton, detachButton],
+                    }, progress, evidence],
+                    tbar: [{
+                        text: 'Refresh', iconCls: 'fa fa-refresh', handler: function () {
+                            refreshStore(portStore);
+                            refreshStore(nodeStore);
+                            vmField.loadVMs();
+                        },
+                    }],
+                    listeners: {
+                        activate: function () {
+                            refreshStore(portStore);
+                            refreshStore(nodeStore);
+                            vmField.loadVMs();
+                        },
+                    },
+                });
+                me.callParent();
+            },
+        });
+
         Ext.define('PVN.panel.Networks', {
             extend: 'Ext.tab.Panel', alias: 'widget.pvnNetworks', border: false,
             items: [{
@@ -868,8 +1616,7 @@
                     stateColumn(),
                 ],
             }, {
-                xtype: 'panel', title: 'VM Attachments', itemId: 'pvn-port-attachments',
-                bodyPadding: 18, html: '<p>Choose a port to inspect or change its VM attachment.</p>',
+                xtype: 'pvnPortAttachments', title: 'VM Attachments', itemId: 'pvn-port-attachments',
             }],
         });
 

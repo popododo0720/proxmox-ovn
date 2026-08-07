@@ -201,7 +201,7 @@ test('form payloads omit empty create options and strip managed edit fields', ()
   const created = window.PVN.Utils.formPayload({
     name: '', network_id: 'network-a', subnet_id: '', fixed_ip_address: '',
     mac_address: '', security_group_ids: ['sg-a', ''],
-  }, fields, null, true);
+  }, fields, null, true, 'ports');
   assert.deepEqual(JSON.parse(JSON.stringify(created)), { network_id: 'network-a', security_group_ids: ['sg-a'] });
 
   const edited = window.PVN.Utils.formPayload({ name: 'renamed', description: '' }, [
@@ -209,8 +209,33 @@ test('form payloads omit empty create options and strip managed edit fields', ()
   ], {
     id: 'uuid', revision: 4, state: 'ready', name: 'old', description: 'old',
     network_name: 'human-only', external: true,
-  }, false);
+    protocol: 'tcp', binding_status: 'bound', node_id: 'node-a',
+  }, false, 'networks');
   assert.deepEqual(JSON.parse(JSON.stringify(edited)), { name: 'renamed', description: '', external: true });
+});
+
+test('edit payloads never leak fields owned by another collection', () => {
+  const { window } = harness();
+  const edited = window.PVN.Utils.formPayload({ name: 'renamed' }, [
+    { name: 'name', required: true },
+  ], {
+    id: 'network-a', revision: 3, name: 'old', mtu: 1400, external: false,
+    protocol: 'tcp', security_group_id: 'sg-a', node_id: 'node-a', vmid: 100,
+  }, false, 'networks');
+  assert.deepEqual(JSON.parse(JSON.stringify(edited)), {
+    name: 'renamed', mtu: 1400, external: false,
+  });
+});
+
+test('clearing an optional numeric edit serializes as the API zero value', () => {
+  const { window } = harness();
+  const edited = window.PVN.Utils.formPayload({ vlan_id: '' }, [
+    { name: 'vlan_id', type: 'number' },
+  ], {
+    name: 'public-flat', provider_network_id: 'provider-a', network_type: 'flat',
+    physical_network: 'provider', vlan_id: 123,
+  }, false, 'provider-segments');
+  assert.equal(edited.vlan_id, 0);
 });
 
 test('delete and port deprovision use revision and idempotency params', () => {
@@ -237,6 +262,215 @@ test('details contain the UUID while primary labels do not', () => {
   const rows = window.PVN.Utils.detailRows(resource);
   assert.equal(rows.find((row) => row.field === 'id').value, resource.id);
   assert.equal(window.PVN.Utils.humanName(resource, 'Unnamed'), 'edge');
+});
+
+function lifecyclePort(overrides = {}) {
+  return {
+    id: 'port-a', name: 'web-01', revision: 1, generation: 1,
+    state: 'ready', applied_revision: 1, mac_address: '02:00:00:00:00:01',
+    binding_status: 'unbound', ...overrides,
+  };
+}
+
+function lifecycleTarget() {
+  return { nodeID: 'node-a', nodeName: 'pve-a', vmid: 100, nic: 'net1' };
+}
+
+function fakeLifecycleBridge() {
+  const events = [];
+  const bridge = {
+    config: { digest: 'a'.repeat(40) },
+    status: 'running',
+    async getQemuConfig() { return { ...this.config }; },
+    async getQemuStatus() { return { status: this.status }; },
+    async setQemuNIC(_node, _vmid, update) {
+      events.push(`set:${update.nic}:${update.linkDown ? 'down' : 'up'}`);
+      this.config[update.nic] = `virtio=${update.macAddress},bridge=br-int,firewall=0,link_down=${update.linkDown ? 1 : 0}`;
+      this.config.digest = update.linkDown ? 'b'.repeat(40) : 'c'.repeat(40);
+    },
+    async deleteQemuNIC(_node, _vmid, _digest, nic) {
+      events.push(`delete:${nic}`);
+      delete this.config[nic];
+      this.config.digest = 'd'.repeat(40);
+    },
+  };
+  return { bridge, events };
+}
+
+function fakeLifecycleAPI(initial) {
+  let current = initial;
+  const events = [];
+  const api = {
+    async getPort() {
+      events.push('get-port');
+      if (current.binding_status === 'binding') current = lifecyclePort({ ...current, revision: 3, binding_status: 'bound' });
+      if (current.binding_status === 'detaching') current = lifecyclePort({ ...current, revision: 6, binding_status: 'unbound' });
+      return current;
+    },
+    async attach(_id, input, revision) {
+      events.push(`attach:${revision}:${input.generation}`);
+      current = lifecyclePort({
+        ...current, revision: revision + 1, generation: input.generation + 1,
+        node_id: input.node_id, vmid: input.vmid, nic: input.nic, binding_status: 'binding',
+      });
+      return current;
+    },
+    async detach(_id, input, revision) {
+      events.push(`detach:${revision}:${input.generation}`);
+      current = lifecyclePort({ ...current, revision: revision + 1, binding_status: 'detaching' });
+      return current;
+    },
+  };
+  return { api, events, get current() { return current; }, set current(value) { current = value; } };
+}
+
+const instantLifecycle = { pollAttempts: 3, pollIntervalMs: 0, sleep: async () => {} };
+
+test('attach keeps a staged NIC down until manager binding is confirmed', async () => {
+  const { window } = harness();
+  const state = fakeLifecycleAPI(lifecyclePort());
+  const { bridge, events } = fakeLifecycleBridge();
+  const steps = [];
+  const result = await window.PVN.PortLifecycle.attach(
+    state.api, bridge, state.current, lifecycleTarget(),
+    { ...instantLifecycle, onStep(step) { steps.push(step); } },
+  );
+  assert.equal(result.binding_status, 'bound');
+  assert.deepEqual(events, ['set:net1:down', 'set:net1:up']);
+  assert.deepEqual(state.events, ['attach:1:1', 'get-port']);
+  assert.deepEqual(steps, [
+    'checking-vm', 'staging-nic', 'requesting-binding',
+    'waiting-for-binding', 'enabling-nic',
+  ]);
+});
+
+test('rejected attach deletes only the NIC staged for the selected PVN port', async () => {
+  const { window } = harness();
+  const original = lifecyclePort();
+  const state = fakeLifecycleAPI(original);
+  state.api.attach = async () => { throw new Error('forbidden'); };
+  const { bridge, events } = fakeLifecycleBridge();
+  await assert.rejects(
+    window.PVN.PortLifecycle.attach(state.api, bridge, original, lifecycleTarget(), instantLifecycle),
+    /forbidden/,
+  );
+  assert.deepEqual(events, ['set:net1:down', 'delete:net1']);
+});
+
+test('ambiguous attach failure leaves the staged NIC link-down', async () => {
+  const { window } = harness();
+  const original = lifecyclePort();
+  const state = fakeLifecycleAPI(original);
+  state.api.attach = async () => { throw new Error('connection lost'); };
+  state.api.getPort = async () => { throw new Error('manager unavailable'); };
+  const { bridge, events } = fakeLifecycleBridge();
+  await assert.rejects(
+    window.PVN.PortLifecycle.attach(state.api, bridge, original, lifecycleTarget(), instantLifecycle),
+    /manager state is unknown.*left link-down/,
+  );
+  assert.deepEqual(events, ['set:net1:down']);
+  assert.match(bridge.config.net1, /link_down=1/);
+});
+
+test('attach never changes a pre-existing VM NIC', async () => {
+  const { window } = harness();
+  const state = fakeLifecycleAPI(lifecyclePort());
+  const { bridge, events } = fakeLifecycleBridge();
+  bridge.config.net1 = 'virtio=02:00:00:00:00:99,bridge=vmbr0,firewall=1,link_down=0';
+  await assert.rejects(
+    window.PVN.PortLifecycle.attach(state.api, bridge, state.current, lifecycleTarget(), instantLifecycle),
+    /already exists/,
+  );
+  assert.deepEqual(events, []);
+  assert.equal(bridge.config.net1.includes('vmbr0'), true);
+});
+
+test('detach disables and unbinds before deleting the owned NIC', async () => {
+  const { window } = harness();
+  const attached = lifecyclePort({
+    revision: 4, generation: 2, node_id: 'node-a', vmid: 100, nic: 'net1', binding_status: 'bound',
+  });
+  const state = fakeLifecycleAPI(attached);
+  const { bridge, events } = fakeLifecycleBridge();
+  bridge.config.net1 = 'virtio=02:00:00:00:00:01,bridge=br-int,firewall=0,link_down=0';
+  const result = await window.PVN.PortLifecycle.detach(
+    state.api, bridge, attached, lifecycleTarget(), instantLifecycle,
+  );
+  assert.equal(result.binding_status, 'unbound');
+  assert.deepEqual(events, ['set:net1:down', 'delete:net1']);
+  assert.deepEqual(state.events, ['detach:4:2', 'get-port']);
+});
+
+test('ambiguous detach failure keeps the owned NIC link-down', async () => {
+  const { window } = harness();
+  const attached = lifecyclePort({
+    revision: 4, generation: 2, node_id: 'node-a', vmid: 100, nic: 'net1', binding_status: 'bound',
+  });
+  const state = fakeLifecycleAPI(attached);
+  state.api.detach = async () => { throw new Error('connection lost'); };
+  state.api.getPort = async () => { throw new Error('manager unavailable'); };
+  const { bridge, events } = fakeLifecycleBridge();
+  bridge.config.net1 = 'virtio=02:00:00:00:00:01,bridge=br-int,firewall=0,link_down=0';
+  await assert.rejects(
+    window.PVN.PortLifecycle.detach(state.api, bridge, attached, lifecycleTarget(), instantLifecycle),
+    /manager state is unknown.*left link-down/,
+  );
+  assert.deepEqual(events, ['set:net1:down']);
+  assert.match(bridge.config.net1, /link_down=1/);
+});
+
+test('stopped VMs are rejected before any NIC mutation', async () => {
+  const { window } = harness();
+  const state = fakeLifecycleAPI(lifecyclePort());
+  const { bridge, events } = fakeLifecycleBridge();
+  bridge.status = 'stopped';
+  await assert.rejects(
+    window.PVN.PortLifecycle.attach(state.api, bridge, state.current, lifecycleTarget(), instantLifecycle),
+    /running QEMU VM/,
+  );
+  assert.deepEqual(events, []);
+});
+
+test('PVN NIC ownership requires exact model, MAC, bridge and firewall', () => {
+  const { window } = harness();
+  const owned = window.PVN.PortLifecycle.isOwnedPVNNIC;
+  assert.equal(owned('virtio=02:00:00:00:00:01,bridge=br-int,firewall=0,link_down=1', '02:00:00:00:00:01', true), true);
+  assert.equal(owned('virtio=02:00:00:00:00:01,bridge=vmbr0,firewall=0,link_down=1', '02:00:00:00:00:01'), false);
+  assert.equal(owned('e1000=02:00:00:00:00:01,bridge=br-int,firewall=0,link_down=1', '02:00:00:00:00:01'), false);
+  assert.equal(owned('virtio=02:00:00:00:00:01,bridge=br-int,firewall=0,rate=10,link_down=1', '02:00:00:00:00:01'), false);
+});
+
+test('native PVE NIC writes are digest-bound and restricted to one netN action', async () => {
+  const { apiRequests, window } = harness();
+  const operation = window.PVN.PortLifecycle.pveBridge.setQemuNIC('pve-a', 100, {
+    digest: 'a'.repeat(40), nic: 'net2', macAddress: '02:00:00:00:00:01', linkDown: true,
+  });
+  assert.equal(apiRequests.length, 1);
+  assert.equal(apiRequests[0].url, '/nodes/pve-a/qemu/100/config');
+  assert.equal(apiRequests[0].method, 'PUT');
+  assert.deepEqual(Object.keys(apiRequests[0].params).sort(), ['digest', 'net2']);
+  assert.equal(apiRequests[0].params.net2, 'virtio=02:00:00:00:00:01,bridge=br-int,firewall=0,link_down=1');
+  apiRequests[0].success({ result: { data: null } });
+  await operation;
+  assert.throws(() => window.PVN.PortLifecycle.pveBridge.setQemuNIC('pve-a', 100, {
+    digest: 'a'.repeat(40), nic: 'net99', macAddress: '02:00:00:00:00:01', linkDown: true,
+  }), /Invalid PVN VM NIC identity/);
+});
+
+test('manager port lifecycle calls use the exact PVN payload contract', async () => {
+  const { apiRequests, window } = harness();
+  const operation = window.PVN.PortLifecycle.managerAPI.attach('port-a', {
+    node_id: 'node-a', vmid: 100, nic: 'net1', generation: 2,
+  }, 8);
+  assert.equal(apiRequests[0].url, '/pvn/ports/port-a/attach');
+  assert.equal(apiRequests[0].method, 'POST');
+  assert.deepEqual(JSON.parse(apiRequests[0].params.payload), {
+    node_id: 'node-a', vmid: 100, nic: 'net1', generation: 2,
+  });
+  assert.equal(apiRequests[0].params.revision, 8);
+  assert.equal(apiRequests[0].params.idempotency_key, '11111111-2222-4333-8444-555555555555');
+  apiRequests[0].success({ result: { data: lifecyclePort({ binding_status: 'binding' }) } });
+  assert.equal((await operation).binding_status, 'binding');
 });
 
 test('loader has no detached web-console transport code', () => {
