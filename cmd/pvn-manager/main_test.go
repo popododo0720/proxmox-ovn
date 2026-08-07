@@ -17,7 +17,7 @@ import (
 	"github.com/popododo0720/proxmox-ovn/internal/pki"
 )
 
-func TestApplyClusterConfigHonorsExplicitFlags(t *testing.T) {
+func TestApplyClusterConfigPinsManagerSockets(t *testing.T) {
 	target := managerConfig{runtimeSocket: "flag-runtime", browserSocket: "old-browser", clusterName: "old-cluster"}
 	cluster := pvnconfig.Default()
 	cluster.Cluster.ID = "cluster-a"
@@ -29,9 +29,9 @@ func TestApplyClusterConfigHonorsExplicitFlags(t *testing.T) {
 	cluster.OVN.TLSCA = "/etc/pvn/pki/ca.pem"
 	cluster.OVN.TLSCert = "/etc/pvn/pki/node.pem"
 	cluster.OVN.TLSKey = "/etc/pvn/pki/node-key.pem"
-	applyClusterConfig(&target, cluster, map[string]bool{"runtime-socket": true})
-	if target.runtimeSocket != "flag-runtime" {
-		t.Fatalf("explicit runtime socket overwritten: %q", target.runtimeSocket)
+	applyClusterConfig(&target, cluster, nil)
+	if target.runtimeSocket != cluster.Manager.UnixSocket {
+		t.Fatalf("cluster runtime socket not applied: %q", target.runtimeSocket)
 	}
 	if target.browserSocket != cluster.Manager.BrowserSocket || target.clusterName != "cluster-a" {
 		t.Fatalf("cluster config not applied: %#v", target)

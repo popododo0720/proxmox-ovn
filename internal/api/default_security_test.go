@@ -343,8 +343,8 @@ func TestInterruptedProvisionAdoptsDefaultButSucceededLegacyReplayDoesNot(t *tes
 			store := controlstore.NewMemory()
 			topology := seedProvisionTopology(t, store, "10.0.0.0/29", nil)
 			provider := &provisionSessionProvider{
-				authenticated: true, csrf: "csrf",
-				permissions: map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
+				authenticated: true,
+				permissions:   map[string]any{"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true}},
 			}
 			server := testServer(t, store, provider)
 			key := "upgrade-replay-" + name
@@ -371,7 +371,7 @@ func TestInterruptedProvisionAdoptsDefaultButSucceededLegacyReplayDoesNot(t *tes
 			}
 			response := request(t, server, http.MethodPost, "/api/v1/ports/provision", map[string]any{
 				"project_id": topology.project.ID, "network_id": topology.network.ID, "name": "upgrade-port",
-			}, provisionHeaders(key, "csrf"))
+			}, provisionHeaders(key))
 			if response.Code != http.StatusOK {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}

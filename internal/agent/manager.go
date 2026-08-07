@@ -3,8 +3,6 @@ package agent
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,7 +21,6 @@ var (
 	ErrAmbiguous       = errors.New("interface maps to multiple PVN ports")
 	ErrNotBindable     = errors.New("PVN port is not bindable")
 	ErrStaleGeneration = errors.New("PVN port report generation is stale")
-	ErrRuntimeUnixOnly = errors.New("PVN runtime reports require a Unix manager socket")
 )
 
 const (
@@ -74,16 +70,13 @@ type ManagerClient interface {
 }
 
 type HTTPManagerClientConfig struct {
-	BaseURL       string
-	HTTPClient    *http.Client
-	CAFile        string
-	TLSServerName string
+	BaseURL    string
+	HTTPClient *http.Client
 }
 
 type HTTPManagerClient struct {
-	baseURL       string
-	httpClient    *http.Client
-	runtimeSocket bool
+	baseURL    string
+	httpClient *http.Client
 }
 
 func NewHTTPManagerClient(config HTTPManagerClientConfig) (*HTTPManagerClient, error) {
@@ -92,39 +85,26 @@ func NewHTTPManagerClient(config HTTPManagerClientConfig) (*HTTPManagerClient, e
 	if err != nil || parsed.Scheme == "" {
 		return nil, fmt.Errorf("invalid PVN manager URL %q", config.BaseURL)
 	}
-	if parsed.Scheme != "unix" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("unsupported PVN manager URL scheme %q", parsed.Scheme)
+	if parsed.Scheme != "unix" {
+		return nil, errors.New("PVN manager URL must use a Unix socket")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, errors.New("PVN manager URL must not contain a query or fragment")
 	}
 
-	var httpClient *http.Client
-	runtimeSocket := parsed.Scheme == "unix"
-	if runtimeSocket {
-		if parsed.Host != "" || !filepath.IsAbs(parsed.Path) {
-			return nil, errors.New("PVN manager Unix URL must contain an absolute socket path and no host")
-		}
-		socketPath := filepath.Clean(parsed.Path)
-		transport := &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
-			},
-			DisableCompression: true,
-		}
-		httpClient = cloneHTTPClient(config.HTTPClient)
-		httpClient.Transport = transport
-		baseURL = "http://pvn-manager.local"
-	} else {
-		if parsed.Host == "" {
-			return nil, errors.New("PVN manager HTTPS URL must include a host")
-		}
-		httpClient, err = newTLSHTTPClient(config.HTTPClient, config.CAFile, config.TLSServerName)
-		if err != nil {
-			return nil, err
-		}
+	if parsed.Host != "" || !filepath.IsAbs(parsed.Path) {
+		return nil, errors.New("PVN manager Unix URL must contain an absolute socket path and no host")
 	}
-	return &HTTPManagerClient{baseURL: baseURL, httpClient: httpClient, runtimeSocket: runtimeSocket}, nil
+	socketPath := filepath.Clean(parsed.Path)
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
+		DisableCompression: true,
+	}
+	httpClient := cloneHTTPClient(config.HTTPClient)
+	httpClient.Transport = transport
+	return &HTTPManagerClient{baseURL: "http://pvn-manager.local", httpClient: httpClient}, nil
 }
 
 func cloneHTTPClient(source *http.Client) *http.Client {
@@ -133,52 +113,6 @@ func cloneHTTPClient(source *http.Client) *http.Client {
 	}
 	copy := *source
 	return &copy
-}
-
-func newTLSHTTPClient(source *http.Client, caFile, serverName string) (*http.Client, error) {
-	client := cloneHTTPClient(source)
-	var transport *http.Transport
-	switch existing := client.Transport.(type) {
-	case nil:
-		transport = http.DefaultTransport.(*http.Transport).Clone()
-	case *http.Transport:
-		transport = existing.Clone()
-	default:
-		if caFile != "" || serverName != "" {
-			return nil, errors.New("manager CA cannot be combined with a non-standard HTTP transport")
-		}
-		return client, nil
-	}
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
-	if transport.TLSClientConfig != nil {
-		tlsConfig = transport.TLSClientConfig.Clone()
-		if tlsConfig.InsecureSkipVerify {
-			return nil, errors.New("PVN manager TLS verification cannot be disabled")
-		}
-		if tlsConfig.MinVersion < tls.VersionTLS12 {
-			tlsConfig.MinVersion = tls.VersionTLS12
-		}
-		if serverName != "" {
-			tlsConfig.ServerName = serverName
-		}
-	}
-	if caFile != "" {
-		certificate, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, fmt.Errorf("read PVN manager CA %q: %w", caFile, err)
-		}
-		roots, err := x509.SystemCertPool()
-		if err != nil || roots == nil {
-			roots = x509.NewCertPool()
-		}
-		if !roots.AppendCertsFromPEM(certificate) {
-			return nil, fmt.Errorf("PVN manager CA %q contains no certificates", caFile)
-		}
-		tlsConfig.RootCAs = roots
-	}
-	transport.TLSClientConfig = tlsConfig
-	client.Transport = transport
-	return client, nil
 }
 
 type managerResolution struct {
@@ -265,9 +199,6 @@ func (client *HTTPManagerClient) ResolveInterface(ctx context.Context, reference
 }
 
 func (client *HTTPManagerClient) ReportPort(ctx context.Context, report PortReport) error {
-	if !client.runtimeSocket {
-		return ErrRuntimeUnixOnly
-	}
 	if report.PortID == "" || (report.Status != PortStatusBound && report.Status != PortStatusUnbound) {
 		return errors.New("port ID and a bound or unbound report status are required")
 	}
@@ -312,9 +243,6 @@ func (client *HTTPManagerClient) ReportPort(ctx context.Context, report PortRepo
 }
 
 func (client *HTTPManagerClient) HeartbeatNode(ctx context.Context, heartbeat NodeHeartbeat) error {
-	if !client.runtimeSocket {
-		return ErrRuntimeUnixOnly
-	}
 	if strings.TrimSpace(heartbeat.Name) == "" || strings.TrimSpace(heartbeat.ChassisID) == "" {
 		return errors.New("node name and chassis ID are required")
 	}

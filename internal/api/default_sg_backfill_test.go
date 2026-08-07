@@ -392,19 +392,18 @@ func TestDefaultSecurityGroupBackfillRequiresReadyBaseline(t *testing.T) {
 	assertDefaultSecurityGroupBackfillPort(t, store, port.ID, port.Revision, nil)
 }
 
-func newDefaultSecurityGroupBackfillTestServer(t *testing.T, store controlstore.Store, reconciler Reconciler, permissions map[string]any) *Server {
+func newDefaultSecurityGroupBackfillTestServer(t *testing.T, store controlstore.Store, reconciler Reconciler, permissions map[string]any) *testAPIHandler {
 	t.Helper()
 	server, err := New(Options{
 		Store: store, Reconciler: reconciler, ClusterName: "cluster-a",
 		Clock: func() time.Time { return time.Date(2026, 8, 6, 1, 2, 3, 0, time.UTC) },
-		SessionProvider: SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
-			return Session{User: "root@pam", Permissions: permissions, Cluster: "cluster-a"}, nil
-		}),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return server
+	return newTestAPIHandler(server, SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
+		return Session{User: "root@pam", Permissions: permissions, Cluster: "cluster-a"}, nil
+	}))
 }
 
 func createDefaultSecurityGroupBackfillProject(t *testing.T, store controlstore.Store, name, pool string) (*model.Project, *model.Network) {

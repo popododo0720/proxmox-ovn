@@ -17,13 +17,13 @@ import (
 	"github.com/popododo0720/proxmox-ovn/internal/reconcile"
 )
 
-func testServer(t *testing.T, store controlstore.Store, provider SessionProvider) *Server {
+func testServer(t *testing.T, store controlstore.Store, provider SessionProvider) *testAPIHandler {
 	t.Helper()
-	server, err := New(Options{Store: store, SessionProvider: provider})
+	server, err := New(Options{Store: store})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return server
+	return newTestAPIHandler(server, provider)
 }
 
 func request(t *testing.T, handler http.Handler, method, target string, body any, headers map[string]string) *httptest.ResponseRecorder {
@@ -41,6 +41,9 @@ func request(t *testing.T, handler http.Handler, method, target string, body any
 		req.Header.Set(name, value)
 	}
 	recorder := httptest.NewRecorder()
+	if server, ok := handler.(*Server); ok {
+		handler = newTestAPIHandler(server, nil)
+	}
 	handler.ServeHTTP(recorder, req)
 	return recorder
 }
@@ -56,7 +59,7 @@ func decodeData[T any](t *testing.T, recorder *httptest.ResponseRecorder) T {
 	return envelope.Data
 }
 
-func createAPIProject(t *testing.T, server *Server) model.Project {
+func createAPIProject(t *testing.T, server http.Handler) model.Project {
 	t.Helper()
 	recorder := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{"name": "tenant", "pool_id": "pool-tenant"}, map[string]string{"Idempotency-Key": "project-create"})
 	if recorder.Code != http.StatusCreated {
@@ -153,31 +156,28 @@ func TestFloatingIPAPIUsesServerManagedRealizedStatus(t *testing.T) {
 	}
 }
 
-func TestHealthAndSession(t *testing.T) {
+func TestHealthRequiresGatewaySession(t *testing.T) {
 	const deploymentName = "human-cluster"
 	provider := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
-		return Session{User: "root@pam", CSRFToken: "csrf", Permissions: map[string]any{"/": map[string]bool{"SDN.Audit": true}}, Cluster: deploymentName}, nil
+		return Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"SDN.Audit": true}}, Cluster: deploymentName}, nil
 	})
-	server, err := New(Options{Store: controlstore.NewMemory(), SessionProvider: provider, ClusterName: deploymentName})
+	server, err := New(Options{Store: controlstore.NewMemory(), ClusterName: deploymentName})
 	if err != nil {
 		t.Fatal(err)
 	}
-	health := request(t, server, http.MethodGet, "/api/v1/health", nil, nil)
+	handler := newTestAPIHandler(server, provider)
+	health := request(t, handler, http.MethodGet, "/api/v1/health", nil, nil)
 	if health.Code != http.StatusOK {
 		t.Fatalf("health status=%d", health.Code)
 	}
 	if cluster := decodeData[map[string]any](t, health)["cluster"]; cluster != deploymentName {
 		t.Fatalf("health deployment name=%v", cluster)
 	}
-	session := request(t, server, http.MethodGet, "/api/v1/session", nil, nil)
-	if session.Code != http.StatusOK {
-		t.Fatalf("session status=%d body=%s", session.Code, session.Body.String())
+	session := request(t, handler, http.MethodGet, "/api/v1/session", nil, nil)
+	if session.Code != http.StatusNotFound {
+		t.Fatalf("removed session endpoint status=%d body=%s", session.Code, session.Body.String())
 	}
-	data := decodeData[Session](t, session)
-	if data.User != "root@pam" || data.CSRFToken != "csrf" || data.Cluster != deploymentName {
-		t.Fatalf("session data = %#v", data)
-	}
-	backfill := request(t, server, http.MethodGet, defaultSecurityGroupBackfillPlanPath, nil, nil)
+	backfill := request(t, handler, http.MethodGet, defaultSecurityGroupBackfillPlanPath, nil, nil)
 	if backfill.Code != http.StatusOK {
 		t.Fatalf("backfill status=%d body=%s", backfill.Code, backfill.Body.String())
 	}
@@ -185,10 +185,6 @@ func TestHealthAndSession(t *testing.T) {
 		t.Fatalf("backfill deployment name=%q", plan.Cluster)
 	}
 	unauthenticated := testServer(t, controlstore.NewMemory(), SessionProviderFunc(func(context.Context, *http.Request) (Session, error) { return Session{}, ErrUnauthenticated }))
-	response := request(t, unauthenticated, http.MethodGet, "/api/v1/session", nil, nil)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated session status=%d", response.Code)
-	}
 	health = request(t, unauthenticated, http.MethodGet, "/api/v1/health", nil, nil)
 	if health.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated health status=%d body=%s", health.Code, health.Body.String())
@@ -523,10 +519,11 @@ func TestProjectWritesRequireExistingPVEPoolAfterAuthorization(t *testing.T) {
 	authorized := SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
 		return Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"SDN.Allocate": true}}}, nil
 	})
-	server, err := New(Options{Store: store, SessionProvider: authorized, PoolValidator: validator})
+	apiServer, err := New(Options{Store: store, PoolValidator: validator})
 	if err != nil {
 		t.Fatal(err)
 	}
+	server := newTestAPIHandler(apiServer, authorized)
 
 	createdResponse := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{
 		"name": "tenant", "pool_id": "pool-existing",
@@ -566,16 +563,13 @@ func TestProjectWritesRequireExistingPVEPoolAfterAuthorization(t *testing.T) {
 	}
 
 	callCount := len(calls)
-	unauthorized, err := New(Options{
-		Store: store,
-		SessionProvider: SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
-			return Session{User: "limited@pam", Permissions: map[string]any{}}, nil
-		}),
-		PoolValidator: validator,
-	})
+	unauthorizedServer, err := New(Options{Store: store, PoolValidator: validator})
 	if err != nil {
 		t.Fatal(err)
 	}
+	unauthorized := newTestAPIHandler(unauthorizedServer, SessionProviderFunc(func(context.Context, *http.Request) (Session, error) {
+		return Session{User: "limited@pam", Permissions: map[string]any{}}, nil
+	}))
 	deniedResponse := request(t, unauthorized, http.MethodPost, "/api/v1/projects", map[string]any{
 		"name": "denied", "pool_id": "pool-missing",
 	}, map[string]string{"Idempotency-Key": "project-denied"})

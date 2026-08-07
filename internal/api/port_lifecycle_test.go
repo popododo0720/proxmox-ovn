@@ -14,23 +14,12 @@ import (
 
 type lifecycleSessionProvider struct {
 	authenticated bool
-	csrf          string
 	session       Session
 }
 
 func (provider *lifecycleSessionProvider) Session(context.Context, *http.Request) (Session, error) {
 	if !provider.authenticated {
 		return Session{}, ErrUnauthenticated
-	}
-	return provider.session, nil
-}
-
-func (provider *lifecycleSessionProvider) Authorize(_ context.Context, request *http.Request, unsafe bool) (Session, error) {
-	if !provider.authenticated {
-		return Session{}, ErrUnauthenticated
-	}
-	if unsafe && request.Header.Get(PVNCSRFHeader) != provider.csrf {
-		return Session{}, ErrInvalidCSRF
 	}
 	return provider.session, nil
 }
@@ -63,29 +52,22 @@ func lifecycleTopology(t *testing.T) (controlstore.Store, *model.Project, *model
 	return store, project, network, node, portResource.(*model.Port)
 }
 
-func TestPortAttachRequiresSessionCSRFAndScopedPrivileges(t *testing.T) {
+func TestPortAttachRequiresSessionAndScopedPrivileges(t *testing.T) {
 	store, _, _, node, port := lifecycleTopology(t)
 	permissions := map[string]any{
 		"/pool/pool-tenant": map[string]bool{"SDN.Allocate": true},
 	}
-	provider := &lifecycleSessionProvider{
-		csrf:    "csrf-good",
-		session: Session{User: "tenant@pve", Permissions: permissions},
-	}
+	provider := &lifecycleSessionProvider{session: Session{User: "tenant@pve", Permissions: permissions}}
 	server := testServer(t, store, provider)
 	target := "/api/v1/ports/" + port.ID + "/attach"
 	body := map[string]any{"node_id": node.ID, "vmid": 100, "nic": "net0", "generation": port.Generation}
-	headers := map[string]string{"Idempotency-Key": "attach-port", "If-Match": `"1"`, PVNCSRFHeader: "csrf-good"}
+	headers := map[string]string{"Idempotency-Key": "attach-port", "If-Match": `"1"`}
 
 	unauthenticated := request(t, server, http.MethodPost, target, body, headers)
 	if unauthenticated.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated status=%d body=%s", unauthenticated.Code, unauthenticated.Body.String())
 	}
 	provider.authenticated = true
-	withoutCSRF := request(t, server, http.MethodPost, target, body, map[string]string{"Idempotency-Key": "attach-port", "If-Match": `"1"`})
-	if withoutCSRF.Code != http.StatusForbidden {
-		t.Fatalf("without CSRF status=%d body=%s", withoutCSRF.Code, withoutCSRF.Body.String())
-	}
 	withoutUse := request(t, server, http.MethodPost, target, body, headers)
 	if withoutUse.Code != http.StatusForbidden {
 		t.Fatalf("without SDN.Use status=%d body=%s", withoutUse.Code, withoutUse.Body.String())
@@ -97,7 +79,7 @@ func TestPortAttachRequiresSessionCSRFAndScopedPrivileges(t *testing.T) {
 	}
 	permissions["/vms/100"] = map[string]bool{"VM.Config.Network": true}
 	staleGenerationBody := map[string]any{"node_id": node.ID, "vmid": 100, "nic": "net0", "generation": port.Generation + 1}
-	staleGenerationHeaders := map[string]string{"Idempotency-Key": "attach-stale-generation", "If-Match": `"1"`, PVNCSRFHeader: "csrf-good"}
+	staleGenerationHeaders := map[string]string{"Idempotency-Key": "attach-stale-generation", "If-Match": `"1"`}
 	staleGeneration := request(t, server, http.MethodPost, target, staleGenerationBody, staleGenerationHeaders)
 	if staleGeneration.Code != http.StatusConflict || apiErrorCode(t, staleGeneration) != "stale_generation" {
 		t.Fatalf("stale generation status=%d body=%s", staleGeneration.Code, staleGeneration.Body.String())
@@ -118,14 +100,14 @@ func TestPortAttachRequiresSessionCSRFAndScopedPrivileges(t *testing.T) {
 	if replayed.Code != http.StatusOK || replayed.Header().Get("Idempotency-Replayed") != "true" {
 		t.Fatalf("attach replay status=%d headers=%v body=%s", replayed.Code, replayed.Header(), replayed.Body.String())
 	}
-	staleHeaders := map[string]string{"Idempotency-Key": "attach-stale", "If-Match": `"1"`, PVNCSRFHeader: "csrf-good"}
+	staleHeaders := map[string]string{"Idempotency-Key": "attach-stale", "If-Match": `"1"`}
 	stale := request(t, server, http.MethodPost, target, body, staleHeaders)
 	if stale.Code != http.StatusPreconditionFailed && stale.Code != http.StatusConflict {
 		t.Fatalf("stale attach status=%d body=%s", stale.Code, stale.Body.String())
 	}
 
 	detachBody := map[string]any{"generation": attached.Generation}
-	detachHeaders := map[string]string{"Idempotency-Key": "detach-port", "If-Match": fmt.Sprintf(`"%d"`, attached.Revision), PVNCSRFHeader: "csrf-good"}
+	detachHeaders := map[string]string{"Idempotency-Key": "detach-port", "If-Match": fmt.Sprintf(`"%d"`, attached.Revision)}
 	delete(permissions, "/vms/100")
 	deniedDetach := request(t, server, http.MethodPost, "/api/v1/ports/"+port.ID+"/detach", detachBody, detachHeaders)
 	if deniedDetach.Code != http.StatusForbidden {
@@ -158,10 +140,10 @@ func TestPortAttachRejectsIdempotencyKeyReuseForAnotherRequest(t *testing.T) {
 		"/vms/100":          map[string]bool{"VM.Config.Network": true},
 		"/vms/101":          map[string]bool{"VM.Config.Network": true},
 	}
-	provider := &lifecycleSessionProvider{authenticated: true, csrf: "csrf", session: Session{User: "tenant@pve", Permissions: permissions}}
+	provider := &lifecycleSessionProvider{authenticated: true, session: Session{User: "tenant@pve", Permissions: permissions}}
 	server := testServer(t, store, provider)
 	target := "/api/v1/ports/" + port.ID + "/attach"
-	headers := map[string]string{"Idempotency-Key": "same-key", "If-Match": `"1"`, PVNCSRFHeader: "csrf"}
+	headers := map[string]string{"Idempotency-Key": "same-key", "If-Match": `"1"`}
 	first := request(t, server, http.MethodPost, target, map[string]any{"node_id": node.ID, "vmid": 100, "nic": "net0", "generation": 1}, headers)
 	if first.Code != http.StatusOK {
 		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
@@ -180,11 +162,11 @@ func TestRuntimePortReportsUseGenerationCASAndAreUnixOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := &lifecycleSessionProvider{authenticated: true, csrf: "csrf", session: Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "SDN.Use": true, "VM.Config.Network": true}}}}
+	provider := &lifecycleSessionProvider{authenticated: true, session: Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"SDN.Audit": true, "SDN.Allocate": true, "SDN.Use": true, "VM.Config.Network": true}}}}
 	server := testServer(t, store, provider)
 	reportPath := "/api/v1/runtime/ports/" + port.ID + "/report"
 
-	tcp := request(t, server, http.MethodPost, reportPath, map[string]any{"generation": 2, "status": "bound"}, map[string]string{PVNCSRFHeader: "csrf"})
+	tcp := request(t, server, http.MethodPost, reportPath, map[string]any{"generation": 2, "status": "bound"}, nil)
 	if tcp.Code != http.StatusNotFound {
 		t.Fatalf("TCP report status=%d body=%s", tcp.Code, tcp.Body.String())
 	}

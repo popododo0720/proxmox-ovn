@@ -30,27 +30,8 @@ var ErrUnauthenticated = errors.New("PVE session is not authenticated")
 
 type Session struct {
 	User        string         `json:"user"`
-	CSRFToken   string         `json:"csrf_token"`
 	Permissions map[string]any `json:"permissions"`
 	Cluster     string         `json:"cluster"`
-}
-
-type SessionProvider interface {
-	Session(context.Context, *http.Request) (Session, error)
-}
-
-type SessionIssuer interface {
-	IssueSession(context.Context, http.ResponseWriter, *http.Request) (Session, error)
-}
-
-type SessionAuthorizer interface {
-	Authorize(context.Context, *http.Request, bool) (Session, error)
-}
-
-type SessionProviderFunc func(context.Context, *http.Request) (Session, error)
-
-func (f SessionProviderFunc) Session(ctx context.Context, request *http.Request) (Session, error) {
-	return f(ctx, request)
 }
 
 // PoolValidator verifies project pool references against the Proxmox API.
@@ -89,7 +70,6 @@ type DeletionReconciler interface {
 type Options struct {
 	Store            controlstore.Store
 	Reconciler       Reconciler
-	SessionProvider  SessionProvider
 	PoolValidator    PoolValidator
 	Logger           *slog.Logger
 	RequireAllNodes  bool
@@ -108,7 +88,6 @@ type Server struct {
 	store           controlstore.Store
 	reconciler      Reconciler
 	defaultSecurity *defaultsecurity.Manager
-	sessionProvider SessionProvider
 	poolValidator   PoolValidator
 	logger          *slog.Logger
 	clusterGate     *clusterCapacityGate
@@ -146,7 +125,7 @@ func New(options Options) (*Server, error) {
 		options.HealthTimeout = defaultHealthTimeout
 	}
 	return &Server{
-		store: options.Store, reconciler: options.Reconciler, defaultSecurity: defaultsecurity.New(options.Store, options.Reconciler), sessionProvider: options.SessionProvider, poolValidator: options.PoolValidator,
+		store: options.Store, reconciler: options.Reconciler, defaultSecurity: defaultsecurity.New(options.Store, options.Reconciler), poolValidator: options.PoolValidator,
 		logger: options.Logger, clusterGate: newClusterCapacityGate(options.RequireAllNodes, options.NodeHeartbeatTTL, options.Clock),
 		guestMTU: options.GuestMTU, physnet: strings.TrimSpace(options.Physnet), clusterName: strings.TrimSpace(options.ClusterName),
 		northboundProbe: options.NorthboundProbe, southboundProbe: options.SouthboundProbe,
@@ -157,31 +136,13 @@ func New(options Options) (*Server, error) {
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
-	if request.URL.Path == "/api/v1/session" {
-		s.session(writer, request)
-		return
-	}
 	if !strings.HasPrefix(request.URL.Path, "/api/v1/") {
 		writeError(writer, http.StatusNotFound, "not_found", "endpoint was not found", nil)
 		return
 	}
-	if s.sessionProvider != nil {
-		var session Session
-		var err error
-		if authorizer, ok := s.sessionProvider.(SessionAuthorizer); ok {
-			session, err = authorizer.Authorize(request.Context(), request, isUnsafe(request.Method))
-		} else {
-			session, err = s.sessionProvider.Session(request.Context(), request)
-		}
-		if errors.Is(err, ErrInvalidCSRF) {
-			writeError(writer, http.StatusForbidden, "invalid_csrf", "a valid PVN CSRF token is required", nil)
-			return
-		}
-		if err != nil {
-			writeError(writer, http.StatusUnauthorized, "unauthenticated", "a valid Proxmox session is required", nil)
-			return
-		}
-		request = request.WithContext(context.WithValue(request.Context(), sessionContextKey{}, session))
+	if _, authenticated := request.Context().Value(sessionContextKey{}).(Session); !authenticated {
+		writeError(writer, http.StatusUnauthorized, "unauthenticated", "a valid Proxmox session is required", nil)
+		return
 	}
 	if request.URL.Path == "/api/v1/health" {
 		s.health(writer, request)
@@ -298,36 +259,6 @@ func (s *Server) componentHealth(parent context.Context) map[string]string {
 		result[item.name] = statuses[index]
 	}
 	return result
-}
-
-func (s *Server) session(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet {
-		methodNotAllowed(writer, http.MethodGet)
-		return
-	}
-	if s.sessionProvider == nil {
-		writeError(writer, http.StatusUnauthorized, "unauthenticated", "a valid Proxmox session is required", nil)
-		return
-	}
-	var session Session
-	var err error
-	if issuer, ok := s.sessionProvider.(SessionIssuer); ok {
-		session, err = issuer.IssueSession(request.Context(), writer, request)
-	} else {
-		session, err = s.sessionProvider.Session(request.Context(), request)
-	}
-	if err != nil || session.User == "" {
-		writeError(writer, http.StatusUnauthorized, "unauthenticated", "a valid Proxmox session is required", nil)
-		return
-	}
-	if session.Permissions == nil {
-		session.Permissions = map[string]any{}
-	}
-	writeJSON(writer, http.StatusOK, map[string]any{"data": session})
-}
-
-func isUnsafe(method string) bool {
-	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 }
 
 func (s *Server) resource(writer http.ResponseWriter, request *http.Request) {
