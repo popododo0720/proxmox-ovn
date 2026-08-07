@@ -1,24 +1,28 @@
 # PVN — shipped, verified, and still needed
 
 Status snapshot for follow-up work. Reflects the intended v1 feature set in
-`README.md` / `docs/architecture.md`, published v0.2.17, and the live three-node
-PVE 9 lab after uniform rollout, topology schema-2/control-snapshot repin, full
-E2E validation, and independent database recovery drills.
+`README.md` / `docs/architecture.md`, the breaking projectless v0.3 design, and
+the live three-node PVE 9 lab used for the 0.3 cutover.
 
 **How to use:** treat “v1 must-pass” as release gates; everything else is
 prioritized backlog. Update this file when items ship or scope changes.
 
 ---
 
-## Already in v1 (do not re-build; verify on real PVE)
+## PVN 0.3 cutover (active goal)
 
-- [x] PVE Pool → PVN Project mapping
+- [ ] Remove Project/PVE pool mapping and make names cluster-global
+- [ ] Replace React/iframe with native ExtJS on the PVE :8006 origin
+- [ ] Replace :8443 with the authenticated PVE API and split Unix sockets
+- [ ] Recreate PVN_Control/OVN state and verify the live three-node cluster
+
+## Retained foundations (verify on real PVE)
+
 - [x] Geneve tenant networks + IPv4 subnets + OVN native DHCP
 - [x] Logical routers, centralized SNAT, floating IPs
 - [x] Flat / VLAN provider networks
 - [x] Stateful security groups (+ rules)
 - [x] Running VM NIC attach / detach (fail-closed)
-- [x] Embedded PVN page in Proxmox UI
 - [x] Durable control store (OVSDB) + OVN NB reconcile
 - [x] Cluster install / bootstrap / activation markers
 - [x] Unit tests green (`make test`)
@@ -37,7 +41,7 @@ These are not new product features so much as **proof the current code works**.
 - [x] Full install path: preflight → package stage → config/PKI → central →
       `node-enabled` / targets → services healthy
 - [x] `pvnctl doctor` / health green on all members
-- [x] Create project → network → subnet → DHCP works in guest
+- [x] Create network → subnet → DHCP works in guest
 - [x] Attach NIC to **running** VM → link up → same-subnet ping
 - [x] Detach cleanly; no orphan LSP / TAP drift
 - [x] SNAT and/or floating IP path to provider network
@@ -77,11 +81,10 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 ### Current product work
 
 - [x] Show human names in tables/selectors and keep full UUIDs in Details only
-- [x] Validate that a Project mapping names an existing PVE pool
-- [x] Guide first-use browser trust for the same-node `:8443` manager certificate
+- [ ] Remove Project/PVE pool mapping and make names cluster-global
+- [ ] Use only the PVE :8006 origin; remove iframe, :8443, and second certificate trust
 - [x] Keep the stateful-only security-group UI honest (no ineffective toggle)
-- [x] Auto-provision and continuously repair a project default security policy;
-      keep legacy unrestricted ports explicit until preview-token backfill
+- [ ] Auto-provision and continuously repair one cluster-global default security policy
 - [x] Fence Corosync Geneve-to-management migration through an N/N dual-ring
       safety path, exact persisted/runtime gates, resumable stage boundaries,
       and strict recovery of the uniform v0.2.13 stale-runtime shape before any
@@ -118,7 +121,7 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 
 ### Day-2 networking
 
-- [ ] DNS integration (guest resolver via DHCP options and/or project DNS)
+- [ ] DNS integration (guest resolver via DHCP options and/or network DNS)
 - [ ] Static / extra routes beyond basic router interfaces
 - [ ] Better multi-exit / gateway HA story (beyond single centralized SNAT model)
 - [x] Port / chassis / binding diagnostics in UI (control, PVE NIC, runtime
@@ -127,7 +130,7 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 
 ### Multitenancy & safety
 
-- [ ] Quotas (ports, IPs, FIPs per project)
+- [ ] Optional cluster/network quotas for ports, IPs, and FIPs
 - [ ] Stronger audit trail for attach/detach and policy changes
 - [ ] Isolation self-test tool (east-west matrix)
 
