@@ -387,6 +387,7 @@ for path in \
     usr/lib/pvn/pvn-api-inject \
     usr/lib/pvn/pvn-api-verify \
     usr/lib/pvn/pvn-ui-inject \
+    usr/lib/pvn/pvn-loader.js \
     usr/lib/pvn/pvn-control-db-run \
     usr/lib/pvn/pvn-central-preflight \
     usr/lib/pvn/pvn-ovn-host-preflight \
@@ -416,6 +417,34 @@ for path in \
 do
     [ -e "$package_root/$path" ] || { echo "package is missing $path" >&2; exit 1; }
 done
+
+check_packaged_payload() {
+    source=$1
+    target=$2
+    mode=$3
+    [ -f "$target" ] && [ ! -L "$target" ] || {
+        echo "packaged payload is not a regular file: $target" >&2
+        exit 1
+    }
+    [ "$(stat -c '%a' "$target")" = "$mode" ] || {
+        echo "packaged payload has the wrong mode: $target" >&2
+        exit 1
+    }
+    cmp "$source" "$target" >/dev/null || {
+        echo "packaged payload differs from its source: $target" >&2
+        exit 1
+    }
+}
+
+check_packaged_payload pve-api/inject.sh \
+    "$package_root/usr/lib/pvn/pvn-api-inject" 755
+check_packaged_payload pve-api/PVN/API2.pm \
+    "$package_root/usr/share/perl5/PVN/API2.pm" 644
+check_packaged_payload pve-ui/inject.sh \
+    "$package_root/usr/lib/pvn/pvn-ui-inject" 755
+check_packaged_payload pve-ui/pvn-loader.js \
+    "$package_root/usr/lib/pvn/pvn-loader.js" 644
+check_packaged_payload packaging/debian/triggers "$control_root/triggers" 644
 
 if [ "$(grep -Fxc 'PIDFile=/run/ovn/ovnsb_db.pid' \
         "$package_root/usr/lib/systemd/system/ovn-ovsdb-server-sb.service.d/90-pvn.conf")" -ne 1 ]; then
