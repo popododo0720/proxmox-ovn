@@ -5,7 +5,7 @@ use warnings;
 
 use FindBin qw($Bin);
 use HTTP::Response;
-use JSON qw(decode_json);
+use JSON::PP qw(decode_json);
 use MIME::Base64 qw(decode_base64);
 use Test::More;
 
@@ -85,6 +85,31 @@ like($methods{list_resources}->{path}, qr/operations/, 'operations are readable'
 unlike($methods{create_resource}->{path}, qr/operations/, 'operations cannot be created');
 unlike($methods{update_resource}->{path}, qr/operations/, 'operations cannot be updated');
 unlike($methods{delete_resource}->{path}, qr/operations/, 'operations cannot be deleted');
+
+sub parameter_is_required {
+    my ($method, $parameter) = @_;
+    my $schema = $methods{$method}->{parameters}->{properties}->{$parameter};
+    return defined($schema) && !$schema->{optional};
+}
+
+sub parameter_is_optional {
+    my ($method, $parameter) = @_;
+    my $schema = $methods{$method}->{parameters}->{properties}->{$parameter};
+    return defined($schema) && $schema->{optional};
+}
+
+for my $method (qw(port_provision port_attach port_detach create_resource)) {
+    ok(parameter_is_required($method, 'payload'), "$method requires a JSON payload under PVE schema rules");
+    ok(parameter_is_required($method, 'idempotency_key'), "$method requires an idempotency key under PVE schema rules");
+}
+ok(parameter_is_required('port_deprovision', 'revision'), 'port deprovision requires a revision');
+ok(parameter_is_required('port_deprovision', 'idempotency_key'), 'port deprovision requires an idempotency key');
+ok(parameter_is_required('update_resource', 'payload'), 'resource update requires a JSON payload');
+ok(parameter_is_optional('update_resource', 'revision'), 'resource update may take revision from its JSON payload');
+ok(parameter_is_required('update_resource', 'idempotency_key'), 'resource update requires an idempotency key');
+for my $parameter (qw(network_id node_id vmid nic limit)) {
+    ok(parameter_is_optional('list_resources', $parameter), "list filter $parameter is optional");
+}
 
 is(
     PVN::API2::validate_payload('{"name":"blue"}'),
