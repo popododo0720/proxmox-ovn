@@ -43,10 +43,10 @@ func mustCreate(t *testing.T, store Store, resource model.Resource, key string) 
 
 func baseTopology(t *testing.T, store Store) (*model.ProviderNetwork, *model.Network, *model.Subnet) {
 	t.Helper()
-	project := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "project").(*model.ProviderNetwork)
+	subject := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "subject-provider").(*model.ProviderNetwork)
 	network := mustCreate(t, store, &model.Network{Name: "private"}, "network").(*model.Network)
 	subnet := mustCreate(t, store, &model.Subnet{NetworkID: network.ID, Name: "private-v4", CIDR: "10.0.0.0/24", EnableDHCP: true}, "subnet").(*model.Subnet)
-	return project, network, subnet
+	return subject, network, subnet
 }
 
 func TestMemoryCreateReplayAndIsolation(t *testing.T) {
@@ -247,21 +247,21 @@ func TestMemoryLookupRuntimePortsResolvesNodeAliasesAndClonesMatches(t *testing.
 func TestMemoryPrunesOnlyOldSupersededReconcileAudits(t *testing.T) {
 	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	store := NewMemory(WithClock(func() time.Time { return now }))
-	project := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "project").(*model.ProviderNetwork)
+	subject := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "subject-provider").(*model.ProviderNetwork)
 	for revision := int64(2); revision <= 5; revision++ {
-		project.Description = fmt.Sprintf("revision-%d", revision)
-		updated, _, err := store.Update(context.Background(), project, project.Revision, fmt.Sprintf("project-%d", revision))
+		subject.Description = fmt.Sprintf("revision-%d", revision)
+		updated, _, err := store.Update(context.Background(), subject, subject.Revision, fmt.Sprintf("provider-%d", revision))
 		if err != nil {
 			t.Fatal(err)
 		}
-		project = updated.(*model.ProviderNetwork)
+		subject = updated.(*model.ProviderNetwork)
 	}
 	for revision := int64(1); revision <= 4; revision++ {
 		now = now.Add(time.Hour)
 		operation := mustCreate(t, store, &model.Operation{
-			Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID, TargetRevision: revision,
+			Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: subject.ID, TargetRevision: revision,
 			OperationStatus: model.OperationQueued,
-		}, fmt.Sprintf("reconcile:%s:%d", project.ID, revision)).(*model.Operation)
+		}, fmt.Sprintf("reconcile:%s:%d", subject.ID, revision)).(*model.Operation)
 		completed := now
 		operation.CompletedAt = &completed
 		operation.OperationStatus = model.OperationSucceeded
@@ -282,9 +282,9 @@ func TestMemoryPrunesOnlyOldSupersededReconcileAudits(t *testing.T) {
 	// Even beyond the age/count thresholds, the operation for the active
 	// desired revision is retained so periodic forced audits can replay it.
 	current := mustCreate(t, store, &model.Operation{
-		Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID, TargetRevision: project.Revision,
+		Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: subject.ID, TargetRevision: subject.Revision,
 		OperationStatus: model.OperationQueued,
-	}, fmt.Sprintf("reconcile:%s:%d", project.ID, project.Revision)).(*model.Operation)
+	}, fmt.Sprintf("reconcile:%s:%d", subject.ID, subject.Revision)).(*model.Operation)
 	completed := now.Add(-48 * time.Hour)
 	current.CompletedAt = &completed
 	current.OperationStatus = model.OperationSucceeded
@@ -298,7 +298,7 @@ func TestMemoryPrunesOnlyOldSupersededReconcileAudits(t *testing.T) {
 		t.Fatalf("second PruneOperations() pruned=%d err=%v", pruned, err)
 	}
 	operations, err = store.List(context.Background(), model.KindOperation, ListOptions{})
-	if err != nil || len(operations) != 1 || operations[0].(*model.Operation).TargetRevision != project.Revision {
+	if err != nil || len(operations) != 1 || operations[0].(*model.Operation).TargetRevision != subject.Revision {
 		t.Fatalf("active revision operation was not retained: %#v err=%v", operations, err)
 	}
 }
@@ -445,9 +445,9 @@ func TestMemoryMarkReconciledHonorsDesiredRevision(t *testing.T) {
 	if ready.GetMetadata().State != model.ResourceReady || ready.GetMetadata().AppliedRevision != 1 {
 		t.Fatalf("ready metadata = %#v", ready.GetMetadata())
 	}
-	project := ready.(*model.ProviderNetwork)
-	project.Description = "revision two"
-	updated, _, err := store.Update(context.Background(), project, 1, "update")
+	subject := ready.(*model.ProviderNetwork)
+	subject.Description = "revision two"
+	updated, _, err := store.Update(context.Background(), subject, 1, "update")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -490,28 +490,28 @@ func TestMemoryOperationUsesRequestIdempotencyKey(t *testing.T) {
 
 func TestMemoryDeleteTombstoneMustBePurged(t *testing.T) {
 	store := deterministicStore()
-	project := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "create").(*model.ProviderNetwork)
-	tombstone, replayed, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, 1, "delete")
+	subject := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "create").(*model.ProviderNetwork)
+	tombstone, replayed, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, subject.ID, 1, "delete")
 	if err != nil || replayed {
 		t.Fatalf("BeginDelete replayed=%v err=%v", replayed, err)
 	}
 	if tombstone.GetMetadata().State != model.ResourceDeleting || tombstone.GetMetadata().Revision != 2 {
 		t.Fatalf("tombstone metadata = %#v", tombstone.GetMetadata())
 	}
-	stored, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID)
+	stored, err := store.Get(context.Background(), model.KindProviderNetwork, subject.ID)
 	if err != nil || stored.GetMetadata().State != model.ResourceDeleting {
 		t.Fatalf("stored tombstone=%#v err=%v", stored, err)
 	}
-	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, 1); !errors.Is(err, ErrPrecondition) {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, subject.ID, 1); !errors.Is(err, ErrPrecondition) {
 		t.Fatalf("stale Purge error=%v", err)
 	}
-	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, 2); err != nil {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, subject.ID, 2); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Get(context.Background(), model.KindProviderNetwork, project.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := store.Get(context.Background(), model.KindProviderNetwork, subject.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get after purge error=%v", err)
 	}
-	replayedTombstone, replayed, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, 1, "delete")
+	replayedTombstone, replayed, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, subject.ID, 1, "delete")
 	if err != nil || !replayed || replayedTombstone.GetMetadata().Revision != 2 {
 		t.Fatalf("tombstone replay=%#v replayed=%v err=%v", replayedTombstone, replayed, err)
 	}
@@ -538,14 +538,14 @@ func TestMemoryPurgeRejectsReferenceCreatedAfterBeginDelete(t *testing.T) {
 
 func TestMemoryReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 	store := deterministicStore()
-	project := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "create-fenced-project").(*model.ProviderNetwork)
+	subject := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "create-fenced-provider").(*model.ProviderNetwork)
 	operation := mustCreate(t, store, &model.Operation{
 		Action:          "reconcile",
 		TargetKind:      model.KindProviderNetwork,
-		TargetID:        project.ID,
-		TargetRevision:  project.Revision,
+		TargetID:        subject.ID,
+		TargetRevision:  subject.Revision,
 		OperationStatus: model.OperationQueued,
-	}, "reconcile-fenced-project").(*model.Operation)
+	}, "reconcile-fenced-provider").(*model.Operation)
 	started := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
 	claimed, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-memory", started, started.Add(-2*time.Minute))
 	if err != nil || claimed.OperationStatus != model.OperationRunning || claimed.StartedAt == nil || !claimed.StartedAt.Equal(started) {
@@ -559,18 +559,18 @@ func TestMemoryReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 	if err != nil || claimed.Revision != operation.Revision+2 || claimed.StartedAt == nil || !claimed.StartedAt.Equal(started) || !claimed.UpdatedAt.Equal(renewedAt) {
 		t.Fatalf("RenewOperationLease() operation=%#v err=%v", claimed, err)
 	}
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete-fenced-project")
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, subject.ID, subject.Revision, "delete-fenced-provider")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, ErrConflict) {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, subject.ID, tombstone.GetMetadata().Revision); !errors.Is(err, ErrConflict) {
 		t.Fatalf("Purge() error=%v, want reconcile fence", err)
 	}
-	active, recovered, err := store.FenceReconciles(context.Background(), model.KindProviderNetwork, project.ID, renewedAt.Add(-time.Minute), renewedAt.Add(time.Minute))
+	active, recovered, err := store.FenceReconciles(context.Background(), model.KindProviderNetwork, subject.ID, renewedAt.Add(-time.Minute), renewedAt.Add(time.Minute))
 	if err != nil || !active || recovered {
 		t.Fatalf("live FenceReconciles() active=%v recovered=%v err=%v", active, recovered, err)
 	}
-	active, recovered, err = store.FenceReconciles(context.Background(), model.KindProviderNetwork, project.ID, renewedAt.Add(time.Second), renewedAt.Add(3*time.Minute))
+	active, recovered, err = store.FenceReconciles(context.Background(), model.KindProviderNetwork, subject.ID, renewedAt.Add(time.Second), renewedAt.Add(3*time.Minute))
 	if err != nil || active || !recovered {
 		t.Fatalf("expired FenceReconciles() active=%v recovered=%v err=%v", active, recovered, err)
 	}
@@ -582,7 +582,7 @@ func TestMemoryReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 	if failed.OperationStatus != model.OperationFailed || failed.CompletedAt == nil || failed.Error == "" {
 		t.Fatalf("expired operation=%#v", failed)
 	}
-	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); err != nil {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, subject.ID, tombstone.GetMetadata().Revision); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -591,41 +591,41 @@ func TestMemoryRecoverExpiredOperationsIsBoundedAndIncludesSupersededTargets(t *
 	store := deterministicStore()
 	base := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
 	createRunningReconcile := func(name string, started time.Time) (*model.ProviderNetwork, *model.Operation) {
-		project := mustCreate(t, store, &model.ProviderNetwork{Name: name}, "project-"+name).(*model.ProviderNetwork)
+		subject := mustCreate(t, store, &model.ProviderNetwork{Name: name}, "provider-"+name).(*model.ProviderNetwork)
 		operation := mustCreate(t, store, &model.Operation{
-			Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID,
-			TargetRevision: project.Revision, OperationStatus: model.OperationQueued,
+			Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: subject.ID,
+			TargetRevision: subject.Revision, OperationStatus: model.OperationQueued,
 		}, "operation-"+name).(*model.Operation)
 		claimed, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-"+name, started, started.Add(-time.Minute))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return project, claimed
+		return subject, claimed
 	}
 
-	supersededProject, superseded := createRunningReconcile("superseded", base)
-	supersededProject.Description = "new desired revision"
-	if _, _, err := store.Update(context.Background(), supersededProject, supersededProject.Revision, "supersede-project"); err != nil {
+	supersededSubject, superseded := createRunningReconcile("superseded", base)
+	supersededSubject.Description = "new desired revision"
+	if _, _, err := store.Update(context.Background(), supersededSubject, supersededSubject.Revision, "supersede-provider"); err != nil {
 		t.Fatal(err)
 	}
 	_, current := createRunningReconcile("current", base.Add(time.Minute))
 
-	deleteProject := mustCreate(t, store, &model.ProviderNetwork{Name: "deleting"}, "project-deleting").(*model.ProviderNetwork)
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, deleteProject.ID, deleteProject.Revision, "begin-delete")
+	deleteSubject := mustCreate(t, store, &model.ProviderNetwork{Name: "deleting"}, "provider-deleting").(*model.ProviderNetwork)
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, deleteSubject.ID, deleteSubject.Revision, "begin-delete")
 	if err != nil {
 		t.Fatal(err)
 	}
 	deleteOperation := mustCreate(t, store, &model.Operation{
-		Action: "delete", TargetKind: model.KindProviderNetwork, TargetID: deleteProject.ID,
+		Action: "delete", TargetKind: model.KindProviderNetwork, TargetID: deleteSubject.ID,
 		TargetRevision: tombstone.GetMetadata().Revision, OperationStatus: model.OperationQueued,
 	}, "operation-delete").(*model.Operation)
 	deleting, err := store.ClaimDelete(context.Background(), deleteOperation.ID, deleteOperation.Revision, "lease-delete", base.Add(2*time.Minute), base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	liveProject, live := createRunningReconcile("live", base.Add(2*time.Hour))
-	liveProject.Description = "superseded while lease remains live"
-	if _, _, err := store.Update(context.Background(), liveProject, liveProject.Revision, "supersede-live-project"); err != nil {
+	liveSubject, live := createRunningReconcile("live", base.Add(2*time.Hour))
+	liveSubject.Description = "superseded while lease remains live"
+	if _, _, err := store.Update(context.Background(), liveSubject, liveSubject.Revision, "supersede-live-provider"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -669,27 +669,27 @@ func TestMemoryRecoverExpiredOperationsIsBoundedAndIncludesSupersededTargets(t *
 
 func TestMemoryRecoversSupersededQueuedReconcilesWithReplayAndRetention(t *testing.T) {
 	store := deterministicStore()
-	request := func(project *model.ProviderNetwork, revision int64) *model.Operation {
+	request := func(subject *model.ProviderNetwork, revision int64) *model.Operation {
 		return &model.Operation{
-			Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID,
+			Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: subject.ID,
 			TargetRevision: revision, OperationStatus: model.OperationQueued,
 		}
 	}
 	createSuperseded := func(name, key string) (*model.ProviderNetwork, *model.Operation) {
-		project := mustCreate(t, store, &model.ProviderNetwork{Name: name}, "project-"+name).(*model.ProviderNetwork)
-		operation := mustCreate(t, store, request(project, project.Revision), key).(*model.Operation)
-		project.Description = "new desired revision"
-		updated, _, err := store.Update(context.Background(), project, project.Revision, "supersede-"+name)
+		subject := mustCreate(t, store, &model.ProviderNetwork{Name: name}, "provider-"+name).(*model.ProviderNetwork)
+		operation := mustCreate(t, store, request(subject, subject.Revision), key).(*model.Operation)
+		subject.Description = "new desired revision"
+		updated, _, err := store.Update(context.Background(), subject, subject.Revision, "supersede-"+name)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return updated.(*model.ProviderNetwork), operation
 	}
 
-	firstProject, first := createSuperseded("first", "queued-first")
+	firstSubject, first := createSuperseded("first", "queued-first")
 	_, second := createSuperseded("second", "queued-second")
-	currentProject := mustCreate(t, store, &model.ProviderNetwork{Name: "current"}, "project-current").(*model.ProviderNetwork)
-	current := mustCreate(t, store, request(currentProject, currentProject.Revision), "queued-current").(*model.Operation)
+	currentSubject := mustCreate(t, store, &model.ProviderNetwork{Name: "current"}, "provider-current").(*model.ProviderNetwork)
+	current := mustCreate(t, store, request(currentSubject, currentSubject.Revision), "queued-current").(*model.Operation)
 
 	base := time.Date(2026, 8, 5, 4, 0, 0, 0, time.UTC)
 	recovered, err := store.RecoverExpiredOperations(context.Background(), base.Add(-time.Hour), base, 1)
@@ -711,7 +711,7 @@ func TestMemoryRecoversSupersededQueuedReconcilesWithReplayAndRetention(t *testi
 		}
 	}
 
-	replayedResource, replayed, err := store.Create(context.Background(), request(firstProject, first.TargetRevision), "queued-first")
+	replayedResource, replayed, err := store.Create(context.Background(), request(firstSubject, first.TargetRevision), "queued-first")
 	if err != nil || !replayed || replayedResource.GetMetadata().ID != first.ID {
 		t.Fatalf("failed operation replay=%#v replayed=%v err=%v", replayedResource, replayed, err)
 	}
@@ -755,7 +755,7 @@ func TestMemoryRecoversSupersededQueuedReconcilesWithReplayAndRetention(t *testi
 	if _, err := store.Get(context.Background(), model.KindOperation, first.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("pruned operation error=%v", err)
 	}
-	recreated, replayed, err := store.Create(context.Background(), request(firstProject, first.TargetRevision), "queued-first")
+	recreated, replayed, err := store.Create(context.Background(), request(firstSubject, first.TargetRevision), "queued-first")
 	if err != nil || replayed || recreated.GetMetadata().ID == first.ID {
 		t.Fatalf("pruned replay token remained: resource=%#v replayed=%v err=%v", recreated, replayed, err)
 	}
@@ -764,10 +764,10 @@ func TestMemoryRecoversSupersededQueuedReconcilesWithReplayAndRetention(t *testi
 func TestMemoryExpiredRecoveryAndHeartbeatAreSerialized(t *testing.T) {
 	for iteration := 0; iteration < 64; iteration++ {
 		store := NewMemory()
-		project := mustCreate(t, store, &model.ProviderNetwork{Name: fmt.Sprintf("tenant-%d", iteration)}, "project").(*model.ProviderNetwork)
+		subject := mustCreate(t, store, &model.ProviderNetwork{Name: fmt.Sprintf("tenant-%d", iteration)}, "subject-provider").(*model.ProviderNetwork)
 		operation := mustCreate(t, store, &model.Operation{
-			Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID,
-			TargetRevision: project.Revision, OperationStatus: model.OperationQueued,
+			Action: "reconcile", TargetKind: model.KindProviderNetwork, TargetID: subject.ID,
+			TargetRevision: subject.Revision, OperationStatus: model.OperationQueued,
 		}, "operation").(*model.Operation)
 		started := time.Now().UTC()
 		claimed, err := store.ClaimReconcile(context.Background(), operation.ID, operation.Revision, "lease-race", started, started.Add(-time.Minute))
@@ -820,15 +820,15 @@ func TestMemoryExpiredRecoveryAndHeartbeatAreSerialized(t *testing.T) {
 
 func TestMemoryReconcileCannotStartAfterTombstone(t *testing.T) {
 	store := deterministicStore()
-	project := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "create-claim-project").(*model.ProviderNetwork)
+	subject := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "create-claim-provider").(*model.ProviderNetwork)
 	operation := mustCreate(t, store, &model.Operation{
 		Action:          "reconcile",
 		TargetKind:      model.KindProviderNetwork,
-		TargetID:        project.ID,
-		TargetRevision:  project.Revision,
+		TargetID:        subject.ID,
+		TargetRevision:  subject.Revision,
 		OperationStatus: model.OperationQueued,
-	}, "reconcile-claim-project").(*model.Operation)
-	if _, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete-before-claim"); err != nil {
+	}, "reconcile-claim-provider").(*model.Operation)
+	if _, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, subject.ID, subject.Revision, "delete-before-claim"); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
@@ -851,18 +851,18 @@ func TestMemoryReconcileCannotStartAfterTombstone(t *testing.T) {
 
 func TestMemoryDeleteLeaseBlocksPurgeUntilOwnerCompletes(t *testing.T) {
 	store := deterministicStore()
-	project := mustCreate(t, store, &model.ProviderNetwork{Name: "delete-tenant"}, "delete-project").(*model.ProviderNetwork)
-	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "begin-delete")
+	subject := mustCreate(t, store, &model.ProviderNetwork{Name: "delete-tenant"}, "delete-provider").(*model.ProviderNetwork)
+	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, subject.ID, subject.Revision, "begin-delete")
 	if err != nil {
 		t.Fatal(err)
 	}
-	operation := mustCreate(t, store, &model.Operation{Action: "delete", TargetKind: model.KindProviderNetwork, TargetID: project.ID, TargetRevision: tombstone.GetMetadata().Revision, OperationStatus: model.OperationQueued}, "delete-operation").(*model.Operation)
+	operation := mustCreate(t, store, &model.Operation{Action: "delete", TargetKind: model.KindProviderNetwork, TargetID: subject.ID, TargetRevision: tombstone.GetMetadata().Revision, OperationStatus: model.OperationQueued}, "delete-operation").(*model.Operation)
 	now := time.Date(2026, 8, 5, 3, 0, 0, 0, time.UTC)
 	claimed, err := store.ClaimDelete(context.Background(), operation.ID, operation.Revision, "lease-delete", now, now.Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); !errors.Is(err, ErrConflict) {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, subject.ID, tombstone.GetMetadata().Revision); !errors.Is(err, ErrConflict) {
 		t.Fatalf("Purge() error=%v, want delete lease fence", err)
 	}
 	claimed, err = store.RenewOperationLease(context.Background(), claimed.ID, claimed.Revision, "lease-delete", now.Add(time.Second))
@@ -875,7 +875,7 @@ func TestMemoryDeleteLeaseBlocksPurgeUntilOwnerCompletes(t *testing.T) {
 	if _, _, err := store.Update(context.Background(), claimed, claimed.Revision, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Purge(context.Background(), model.KindProviderNetwork, project.ID, tombstone.GetMetadata().Revision); err != nil {
+	if err := store.Purge(context.Background(), model.KindProviderNetwork, subject.ID, tombstone.GetMetadata().Revision); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -883,12 +883,12 @@ func TestMemoryDeleteLeaseBlocksPurgeUntilOwnerCompletes(t *testing.T) {
 func TestMemoryClaimAndDeleteAreSerialized(t *testing.T) {
 	for iteration := 0; iteration < 64; iteration++ {
 		store := NewMemory()
-		project := mustCreate(t, store, &model.ProviderNetwork{Name: fmt.Sprintf("tenant-%d", iteration)}, "project").(*model.ProviderNetwork)
+		subject := mustCreate(t, store, &model.ProviderNetwork{Name: fmt.Sprintf("tenant-%d", iteration)}, "subject-provider").(*model.ProviderNetwork)
 		operation := mustCreate(t, store, &model.Operation{
 			Action:          "reconcile",
 			TargetKind:      model.KindProviderNetwork,
-			TargetID:        project.ID,
-			TargetRevision:  project.Revision,
+			TargetID:        subject.ID,
+			TargetRevision:  subject.Revision,
 			OperationStatus: model.OperationQueued,
 		}, "operation").(*model.Operation)
 		start := make(chan struct{})
@@ -902,7 +902,7 @@ func TestMemoryClaimAndDeleteAreSerialized(t *testing.T) {
 		}()
 		go func() {
 			<-start
-			_, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, project.ID, project.Revision, "delete")
+			_, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, subject.ID, subject.Revision, "delete")
 			deleteResult <- err
 		}()
 		close(start)

@@ -234,7 +234,7 @@ func (s *Server) detachPort(writer http.ResponseWriter, request *http.Request, p
 		return
 	}
 	// A completed detach clears the VM identity needed for VM.Config.Network
-	// evaluation. Permit only an exact, durable replay after ordinary project
+	// evaluation. Permit only an exact, durable replay after ordinary global
 	// allocation authorization; the original transition was fully authorized before
 	// its operation could be marked successful.
 	if replayCandidate && current.BindingStatus == model.PortUnbound {
