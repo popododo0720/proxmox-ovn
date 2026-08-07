@@ -14,7 +14,7 @@ prioritized backlog. Update this file when items ship or scope changes.
 - [x] Remove Project/PVE pool mapping and make names cluster-global
 - [x] Replace React/iframe with native ExtJS on the PVE :8006 origin
 - [x] Replace :8443 with the authenticated PVE API and split Unix sockets
-- [ ] Recreate PVN_Control/OVN state and verify the live three-node cluster
+- [x] Recreate PVN_Control/OVN state and verify the live three-node cluster
 
 ## Retained foundations (verify on real PVE)
 
@@ -178,4 +178,7 @@ Do not block v1 on these unless product goals change:
 
 ---
 
-*Live validation snapshot: PVN 0.2.17 on the three-node PVE 9 lab, 2026-08-07.*
+*Live validation snapshot: PVN 0.3.1 on the three-node PVE 9 lab, 2026-08-07.
+Projectless cutover, native same-origin UI/API, east-west networking, SG policy,
+SNAT/FIP north-south paths, rolling update, and independent one-database-at-a-time
+PVN Control/OVN NB/OVN SB restore drills all passed.*
