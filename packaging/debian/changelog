@@ -1,3 +1,13 @@
+proxmox-ovn (0.3.1) unstable; urgency=medium
+
+  * Preserve authenticated same-origin API request context and return native
+    Proxmox API envelopes for browser resource stores.
+  * Fix native ExtJS component inheritance, resource presentation, and
+    realized VM port binding checks.
+  * Resume a pinned inactive-seed control-plane bootstrap safely.
+
+ -- PVN Project <root@localhost>  Fri, 07 Aug 2026 05:46:57 +0000
+
 proxmox-ovn (0.3.0) unstable; urgency=medium
 
   * Remove Projects and make PVN resource names cluster-global.
