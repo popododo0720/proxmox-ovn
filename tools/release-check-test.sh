@@ -7,12 +7,10 @@ work_root=$(mktemp -d)
 trap 'rm -rf "$work_root"' EXIT HUP INT TERM
 fixture=$work_root/repository
 install -d "$fixture/deploy/scripts" "$fixture/deploy/tests" \
-    "$fixture/packaging/debian" "$fixture/tools" "$fixture/web"
+    "$fixture/packaging/debian" "$fixture/tools"
 install -m 0644 "$repo_root/Makefile" "$fixture/Makefile"
 install -m 0644 "$repo_root/packaging/debian/changelog" \
     "$fixture/packaging/debian/changelog"
-install -m 0644 "$repo_root/web/package.json" "$repo_root/web/package-lock.json" \
-    "$fixture/web/"
 install -m 0755 "$repo_root/deploy/scripts/pvn-install.sh" \
     "$repo_root/deploy/scripts/pvn-update.sh" "$fixture/deploy/scripts/"
 install -m 0755 "$repo_root/deploy/tests/pvn-install-test.sh" \
