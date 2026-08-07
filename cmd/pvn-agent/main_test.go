@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -101,8 +102,9 @@ func TestHeartbeatWithStandaloneMembership(t *testing.T) {
 func TestHealthHandlerReflectsWatcherReadiness(t *testing.T) {
 	t.Parallel()
 
+	now := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
 	status := agent.WatcherStatus{}
-	handler := newHealthHandler(func() agent.WatcherStatus { return status }, time.Second)
+	handler := newHealthHandlerWithClock(func() agent.WatcherStatus { return status }, time.Second, func() time.Time { return now })
 
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	response := httptest.NewRecorder()
@@ -111,11 +113,129 @@ func TestHealthHandlerReflectsWatcherReadiness(t *testing.T) {
 		t.Fatalf("unready status = %d", response.Code)
 	}
 
-	status.LastSuccess = time.Now()
+	status.LastSuccess = now
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("ready status = %d", response.Code)
+	}
+
+	status.LastError = "OVS unavailable"
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("error status = %d", response.Code)
+	}
+
+	status.LastError = ""
+	status.Report.Errors = 1
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("reported-error status = %d", response.Code)
+	}
+
+	status.Report.Errors = 0
+	status.LastSuccess = now.Add(-30*time.Second - time.Nanosecond)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stale status = %d", response.Code)
+	}
+}
+
+func TestWatcherReadyRequiresFreshErrorFreeScan(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name     string
+		status   agent.WatcherStatus
+		interval time.Duration
+		ready    bool
+	}{
+		{name: "never scanned", status: agent.WatcherStatus{}, interval: time.Second},
+		{name: "healthy", status: agent.WatcherStatus{LastSuccess: now}, interval: time.Second, ready: true},
+		{name: "last error", status: agent.WatcherStatus{LastSuccess: now, LastError: "manager unavailable"}, interval: time.Second},
+		{name: "report errors", status: agent.WatcherStatus{LastSuccess: now, Report: agent.ScanReport{Errors: 1}}, interval: time.Second},
+		{name: "minimum freshness boundary", status: agent.WatcherStatus{LastSuccess: now.Add(-30 * time.Second)}, interval: time.Second, ready: true},
+		{name: "minimum freshness stale", status: agent.WatcherStatus{LastSuccess: now.Add(-30*time.Second - time.Nanosecond)}, interval: time.Second},
+		{name: "scaled freshness boundary", status: agent.WatcherStatus{LastSuccess: now.Add(-60 * time.Second)}, interval: 20 * time.Second, ready: true},
+		{name: "scaled freshness stale", status: agent.WatcherStatus{LastSuccess: now.Add(-60*time.Second - time.Nanosecond)}, interval: 20 * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ready, reason := watcherReady(test.status, test.interval, now)
+			if ready != test.ready {
+				t.Fatalf("ready=%t reason=%q want=%t", ready, reason, test.ready)
+			}
+			if ready && reason != "" {
+				t.Fatalf("ready watcher returned reason %q", reason)
+			}
+			if !ready && reason == "" {
+				t.Fatal("unready watcher returned no reason")
+			}
+		})
+	}
+}
+
+type recordingHeartbeatClient struct {
+	heartbeats []agent.NodeHeartbeat
+}
+
+func (client *recordingHeartbeatClient) HeartbeatNode(_ context.Context, heartbeat agent.NodeHeartbeat) error {
+	client.heartbeats = append(client.heartbeats, heartbeat)
+	return nil
+}
+
+func TestHeartbeatReadinessSkipsMembershipUntilHealthyAndRecovers(t *testing.T) {
+	now := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
+	client := &recordingHeartbeatClient{}
+	heartbeat := agent.NodeHeartbeat{Name: "pve-a", ChassisID: "chassis-a"}
+	unhealthy := agent.WatcherStatus{LastError: "OVS unavailable", Report: agent.ScanReport{Errors: 1}}
+
+	sent, reason, err := heartbeatNodeIfReady(
+		context.Background(), client, heartbeat, filepath.Join(t.TempDir(), "missing-membership"), true,
+		unhealthy, time.Second, now,
+	)
+	if err != nil || sent || reason == "" || len(client.heartbeats) != 0 {
+		t.Fatalf("unhealthy heartbeat sent=%t reason=%q err=%v calls=%d", sent, reason, err, len(client.heartbeats))
+	}
+
+	membershipPath := filepath.Join(t.TempDir(), ".members")
+	if err := os.WriteFile(membershipPath, []byte(`{"nodename":"pve-a","cluster":{"quorate":1},"nodelist":{"pve-a":{"online":1},"pve-b":{"online":1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	healthy := agent.WatcherStatus{LastSuccess: now}
+	sent, reason, err = heartbeatNodeIfReady(
+		context.Background(), client, heartbeat, membershipPath, true,
+		healthy, time.Second, now,
+	)
+	if err != nil || !sent || reason != "" || len(client.heartbeats) != 1 {
+		t.Fatalf("healthy heartbeat sent=%t reason=%q err=%v calls=%d", sent, reason, err, len(client.heartbeats))
+	}
+	got := client.heartbeats[0]
+	if got.Quorate == nil || !*got.Quorate || fmt.Sprint(got.OnlineNodes) != "[pve-a pve-b]" {
+		t.Fatalf("membership heartbeat=%#v", got)
+	}
+
+	failed := agent.WatcherStatus{LastSuccess: now, LastError: "resolve failed", Report: agent.ScanReport{Errors: 1}}
+	sent, _, err = heartbeatNodeIfReady(
+		context.Background(), client, heartbeat, membershipPath, true,
+		failed, time.Second, now.Add(time.Second),
+	)
+	if err != nil || sent || len(client.heartbeats) != 1 {
+		t.Fatalf("failed watcher sent=%t err=%v calls=%d", sent, err, len(client.heartbeats))
+	}
+
+	recoveredAt := now.Add(2 * time.Second)
+	recovered := agent.WatcherStatus{LastSuccess: recoveredAt}
+	sent, _, err = heartbeatNodeIfReady(
+		context.Background(), client, heartbeat, membershipPath, true,
+		recovered, time.Second, recoveredAt,
+	)
+	if err != nil || !sent || len(client.heartbeats) != 2 {
+		t.Fatalf("recovered watcher sent=%t err=%v calls=%d", sent, err, len(client.heartbeats))
 	}
 }
 

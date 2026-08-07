@@ -64,6 +64,102 @@ func (binder *fakeBinder) ClearManagedBinding(_ context.Context, name string) er
 	return nil
 }
 
+type signalingSource struct {
+	interfaces []ovs.Interface
+	calls      chan struct{}
+}
+
+func (source *signalingSource) ListInterfaces(context.Context, string) ([]ovs.Interface, error) {
+	source.calls <- struct{}{}
+	return source.interfaces, nil
+}
+
+type manualTicker struct {
+	ticks   chan time.Time
+	stopped chan struct{}
+}
+
+func (ticker *manualTicker) C() <-chan time.Time { return ticker.ticks }
+func (ticker *manualTicker) Stop()               { close(ticker.stopped) }
+
+func TestWatcherRunAfterInitialScanDoesNotRepeatStartupSideEffects(t *testing.T) {
+	source := &signalingSource{
+		interfaces: []ovs.Interface{{Name: "tap100i0", ExternalIDs: map[string]string{}}},
+		calls:      make(chan struct{}, 3),
+	}
+	binder := &fakeBinder{}
+	ticker := &manualTicker{ticks: make(chan time.Time), stopped: make(chan struct{})}
+	tickerCreated := make(chan struct{})
+	watcher, err := NewWatcher(WatcherConfig{
+		Node: "pve-a", ChassisID: "chassis-a", Bridge: "br-int", Interval: time.Second,
+		Source: source, Binder: binder,
+		Manager: fakeManager{results: map[int]Resolution{100: {
+			PortID: "port-1", LSPName: "pvn-lsp-1", MACAddress: "02:00:00:00:00:01",
+			Generation: "1", RequestedChassis: "chassis-a", Status: PortStatusBinding,
+		}}},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		TickerFactory: func(time.Duration) TickSource {
+			close(tickerCreated)
+			return ticker
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watcher.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-source.calls
+	if len(binder.set) != 1 {
+		t.Fatalf("initial binding calls=%d", len(binder.set))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- watcher.RunAfterInitialScan(ctx) }()
+	<-tickerCreated
+	select {
+	case <-source.calls:
+		t.Fatal("RunAfterInitialScan repeated the initial scan before the first tick")
+	default:
+	}
+	if len(binder.set) != 1 {
+		t.Fatalf("binding repeated before first tick: calls=%d", len(binder.set))
+	}
+
+	ticker.ticks <- time.Now()
+	select {
+	case <-source.calls:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not scan on tick")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ticker.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not stop ticker")
+	}
+}
+
+func TestWatcherRunAfterInitialScanRequiresInitialAttempt(t *testing.T) {
+	t.Parallel()
+
+	watcher, err := NewWatcher(WatcherConfig{
+		Node: "pve-a", Bridge: "br-int", Interval: time.Second,
+		Source: fakeSource{}, Binder: &fakeBinder{}, Manager: fakeManager{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := watcher.RunAfterInitialScan(context.Background()); err == nil {
+		t.Fatal("RunAfterInitialScan unexpectedly accepted a missing initial scan")
+	}
+}
+
 func TestWatcherBindsExactlyResolvedInterfaces(t *testing.T) {
 	t.Parallel()
 

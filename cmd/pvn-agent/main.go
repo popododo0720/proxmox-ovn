@@ -82,18 +82,6 @@ func run(arguments []string, getenv func(string) string, hostname func() (string
 		Name: config.node, ChassisID: chassisID,
 		Roles: config.nodeRoles, RolesExplicit: config.nodeRolesExplicit,
 	}
-	if config.requireAllNodes {
-		heartbeat, err = heartbeatWithMembership(heartbeat, config.membershipFile)
-		if err != nil {
-			return err
-		}
-	}
-	heartbeatCtx, heartbeatCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err = managerClient.HeartbeatNode(heartbeatCtx, heartbeat)
-	heartbeatCancel()
-	if err != nil {
-		return fmt.Errorf("register node with PVN manager: %w", err)
-	}
 	watcher, err := agent.NewWatcher(agent.WatcherConfig{
 		Node:      config.node,
 		ChassisID: chassisID,
@@ -108,11 +96,26 @@ func run(arguments []string, getenv func(string) string, hostname func() (string
 		return err
 	}
 
+	initialReport, initialScanErr := watcher.ScanOnce(context.Background())
 	if config.once {
-		report, err := watcher.ScanOnce(context.Background())
-		encoded, _ := json.Marshal(report)
+		encoded, _ := json.Marshal(initialReport)
 		fmt.Println(string(encoded))
-		return err
+		if initialScanErr != nil {
+			return initialScanErr
+		}
+		heartbeatCtx, heartbeatCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		sent, reason, heartbeatErr := heartbeatNodeIfReady(
+			heartbeatCtx, managerClient, heartbeat, config.membershipFile, config.requireAllNodes,
+			watcher.Status(), config.watchInterval, time.Now().UTC(),
+		)
+		heartbeatCancel()
+		if heartbeatErr != nil {
+			return fmt.Errorf("register node with PVN manager: %w", heartbeatErr)
+		}
+		if !sent {
+			return fmt.Errorf("register node with PVN manager: OVS watcher is not ready: %s", reason)
+		}
+		return nil
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -128,10 +131,29 @@ func run(arguments []string, getenv func(string) string, hostname func() (string
 		"manager_url", config.managerURL,
 		"interval", config.watchInterval,
 	)
+	if initialScanErr != nil {
+		logger.Error("initial OVS interface scan failed; withholding PVN node heartbeat", "error", initialScanErr)
+	} else {
+		heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, 10*time.Second)
+		sent, reason, heartbeatErr := heartbeatNodeIfReady(
+			heartbeatCtx, managerClient, heartbeat, config.membershipFile, config.requireAllNodes,
+			watcher.Status(), config.watchInterval, time.Now().UTC(),
+		)
+		heartbeatCancel()
+		if heartbeatErr != nil {
+			return fmt.Errorf("register node with PVN manager: %w", heartbeatErr)
+		}
+		if !sent {
+			return fmt.Errorf("register node with PVN manager: OVS watcher is not ready: %s", reason)
+		}
+	}
 
 	watchErrors := make(chan error, 1)
-	go func() { watchErrors <- watcher.Run(ctx) }()
-	go runNodeHeartbeats(ctx, managerClient, heartbeat, config.membershipFile, config.requireAllNodes, logger)
+	go func() { watchErrors <- watcher.RunAfterInitialScan(ctx) }()
+	go runNodeHeartbeats(
+		ctx, managerClient, heartbeat, config.membershipFile, config.requireAllNodes,
+		watcher.Status, config.watchInterval, logger,
+	)
 
 	var server *http.Server
 	serverErrors := make(chan error, 1)
@@ -306,7 +328,20 @@ func parseNodeRoles(value string) ([]string, error) {
 	return roles, nil
 }
 
-func runNodeHeartbeats(ctx context.Context, client *agent.HTTPManagerClient, heartbeat agent.NodeHeartbeat, membershipFile string, requireAllNodes bool, logger *slog.Logger) {
+type nodeHeartbeatClient interface {
+	HeartbeatNode(context.Context, agent.NodeHeartbeat) error
+}
+
+func runNodeHeartbeats(
+	ctx context.Context,
+	client nodeHeartbeatClient,
+	heartbeat agent.NodeHeartbeat,
+	membershipFile string,
+	requireAllNodes bool,
+	watcherStatus func() agent.WatcherStatus,
+	watchInterval time.Duration,
+	logger *slog.Logger,
+) {
 	ticker := time.NewTicker(nodeHeartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -314,23 +349,74 @@ func runNodeHeartbeats(ctx context.Context, client *agent.HTTPManagerClient, hea
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			current := heartbeat
-			if requireAllNodes {
-				var err error
-				current, err = heartbeatWithMembership(current, membershipFile)
-				if err != nil {
-					logger.Error("read PVE cluster membership for heartbeat", "error", err)
-					continue
-				}
-			}
 			heartbeatCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := client.HeartbeatNode(heartbeatCtx, current)
+			sent, reason, err := heartbeatNodeIfReady(
+				heartbeatCtx, client, heartbeat, membershipFile, requireAllNodes,
+				watcherStatus(), watchInterval, time.Now().UTC(),
+			)
 			cancel()
+			if !sent && err == nil {
+				logger.Warn("skipping PVN node heartbeat because OVS watcher is unhealthy", "reason", reason)
+				continue
+			}
 			if err != nil && ctx.Err() == nil {
 				logger.Error("PVN node heartbeat failed", "error", err)
 			}
 		}
 	}
+}
+
+func heartbeatNodeIfReady(
+	ctx context.Context,
+	client nodeHeartbeatClient,
+	heartbeat agent.NodeHeartbeat,
+	membershipFile string,
+	requireAllNodes bool,
+	status agent.WatcherStatus,
+	watchInterval time.Duration,
+	now time.Time,
+) (bool, string, error) {
+	ready, reason := watcherReady(status, watchInterval, now)
+	if !ready {
+		return false, reason, nil
+	}
+	current := heartbeat
+	if requireAllNodes {
+		var err error
+		current, err = heartbeatWithMembership(current, membershipFile)
+		if err != nil {
+			return false, "", fmt.Errorf("read PVE cluster membership for heartbeat: %w", err)
+		}
+	}
+	if err := client.HeartbeatNode(ctx, current); err != nil {
+		return false, "", err
+	}
+	return true, "", nil
+}
+
+func watcherReady(status agent.WatcherStatus, interval time.Duration, now time.Time) (bool, string) {
+	if status.LastSuccess.IsZero() {
+		return false, "no successful OVS interface scan"
+	}
+	if status.LastError != "" {
+		return false, "last OVS interface scan failed: " + status.LastError
+	}
+	if status.Report.Errors != 0 {
+		return false, fmt.Sprintf("last OVS interface scan reported %d errors", status.Report.Errors)
+	}
+	staleAfter := watcherStaleAfter(interval)
+	if now.Sub(status.LastSuccess) > staleAfter {
+		return false, fmt.Sprintf("last successful OVS interface scan is older than %s", staleAfter)
+	}
+	return true, ""
+}
+
+func watcherStaleAfter(interval time.Duration) time.Duration {
+	staleAfter := 3 * interval
+	if staleAfter < 30*time.Second {
+		return 30 * time.Second
+	}
+	return staleAfter
 }
 
 func heartbeatWithMembership(heartbeat agent.NodeHeartbeat, path string) (agent.NodeHeartbeat, error) {
@@ -399,15 +485,15 @@ func firstNonEmpty(values ...string) string {
 }
 
 func newHealthHandler(status func() agent.WatcherStatus, interval time.Duration) http.Handler {
+	return newHealthHandlerWithClock(status, interval, time.Now)
+}
+
+func newHealthHandlerWithClock(status func() agent.WatcherStatus, interval time.Duration, now func() time.Time) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		current := status()
 		writer.Header().Set("Content-Type", "application/json")
-		staleAfter := 3 * interval
-		if staleAfter < 30*time.Second {
-			staleAfter = 30 * time.Second
-		}
-		if current.LastSuccess.IsZero() || time.Since(current.LastSuccess) > staleAfter {
+		if ready, _ := watcherReady(current, interval, now().UTC()); !ready {
 			writer.WriteHeader(http.StatusServiceUnavailable)
 		}
 		_ = json.NewEncoder(writer).Encode(current)

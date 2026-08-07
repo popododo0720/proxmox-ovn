@@ -108,8 +108,24 @@ type realTicker struct{ *time.Ticker }
 func (ticker realTicker) C() <-chan time.Time { return ticker.Ticker.C }
 
 func (watcher *Watcher) Run(ctx context.Context) error {
-	if _, err := watcher.ScanOnce(ctx); err != nil {
-		watcher.logger.Error("initial OVS interface scan failed", "error", err)
+	return watcher.run(ctx, true)
+}
+
+// RunAfterInitialScan continues periodic scans after the caller has performed
+// the initial ScanOnce. It lets startup gates inspect the first result without
+// immediately repeating binding and runtime-report side effects.
+func (watcher *Watcher) RunAfterInitialScan(ctx context.Context) error {
+	if watcher.Status().LastScan.IsZero() {
+		return errors.New("initial OVS interface scan has not been performed")
+	}
+	return watcher.run(ctx, false)
+}
+
+func (watcher *Watcher) run(ctx context.Context, scanInitially bool) error {
+	if scanInitially {
+		if _, err := watcher.ScanOnce(ctx); err != nil {
+			watcher.logger.Error("initial OVS interface scan failed", "error", err)
+		}
 	}
 	ticker := watcher.tickerFactory(watcher.interval)
 	defer ticker.Stop()
