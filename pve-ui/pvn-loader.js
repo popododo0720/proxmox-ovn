@@ -1,5 +1,7 @@
 (function pvnLoader(window) {
-    'use strict';
+    // Ext JS 7 resolves callParent() through Function.caller. Keeping the
+    // class overrides below in strict mode makes that caller invisible and
+    // aborts component construction before the PVN navigation tree mounts.
 
     if (window.__pvnLoaderInstalled === true) {
         return;

@@ -506,6 +506,7 @@ test('manager port lifecycle calls use the exact PVN payload contract', async ()
 });
 
 test('loader has no detached web-console transport code', () => {
+  assert.equal(loaderSource.includes("'use strict'"), false, 'Ext JS callParent overrides must remain non-strict');
   for (const forbidden of ['iframe', 'postMessage', ':8443', 'pveBridgeNonce', 'pvn-projects', '/session']) {
     assert.equal(loaderSource.includes(forbidden), false, `loader still contains ${forbidden}`);
   }
