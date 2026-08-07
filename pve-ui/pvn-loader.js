@@ -678,7 +678,12 @@
             var runtime = lifecycleRuntime(options);
             for (var attempt = 0; attempt < runtime.attempts; attempt += 1) {
                 var port = await api.getPort(portID);
-                if (port.binding_status === expected) return port;
+                if (port.binding_status === expected) {
+                    if (port.state === 'ready' && Number(port.revision) > 0 &&
+                        Number(port.applied_revision) === Number(port.revision)) return port;
+                    await runtime.sleep(runtime.interval);
+                    continue;
+                }
                 if (port.state === 'error' || port.binding_status === 'error') {
                     throw new Error(port.last_error || 'PVN port entered an error state');
                 }

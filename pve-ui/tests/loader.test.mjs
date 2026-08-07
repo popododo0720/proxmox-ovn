@@ -303,8 +303,8 @@ function fakeLifecycleAPI(initial) {
   const api = {
     async getPort() {
       events.push('get-port');
-      if (current.binding_status === 'binding') current = lifecyclePort({ ...current, revision: 3, binding_status: 'bound' });
-      if (current.binding_status === 'detaching') current = lifecyclePort({ ...current, revision: 6, binding_status: 'unbound' });
+      if (current.binding_status === 'binding') current = lifecyclePort({ ...current, revision: 3, applied_revision: 3, binding_status: 'bound' });
+      if (current.binding_status === 'detaching') current = lifecyclePort({ ...current, revision: 6, applied_revision: 6, binding_status: 'unbound' });
       return current;
     },
     async attach(_id, input, revision) {
@@ -342,6 +342,38 @@ test('attach keeps a staged NIC down until manager binding is confirmed', async 
     'checking-vm', 'staging-nic', 'requesting-binding',
     'waiting-for-binding', 'enabling-nic',
   ]);
+});
+
+test('attach keeps the NIC down until the bound revision is realized', async () => {
+  const { window } = harness();
+  const original = lifecyclePort();
+  let current = original;
+  let polls = 0;
+  const api = {
+    async attach(_id, input, revision) {
+      current = lifecyclePort({
+        ...current, revision: revision + 1, generation: input.generation + 1,
+        node_id: input.node_id, vmid: input.vmid, nic: input.nic,
+        binding_status: 'binding', applied_revision: revision,
+      });
+      return current;
+    },
+    async getPort() {
+      polls += 1;
+      current = lifecyclePort({
+        ...current, revision: 3, applied_revision: polls === 1 ? 2 : 3,
+        binding_status: 'bound',
+      });
+      return current;
+    },
+  };
+  const { bridge, events } = fakeLifecycleBridge();
+  const result = await window.PVN.PortLifecycle.attach(
+    api, bridge, original, lifecycleTarget(), instantLifecycle,
+  );
+  assert.equal(result.applied_revision, result.revision);
+  assert.equal(polls, 2);
+  assert.deepEqual(events, ['set:net1:down', 'set:net1:up']);
 });
 
 test('rejected attach deletes only the NIC staged for the selected PVN port', async () => {
