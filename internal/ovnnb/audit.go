@@ -723,10 +723,22 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 			return managedAuditPlan{}, fmt.Errorf("port %q references absent network %q", port.ID, port.NetworkID)
 		}
 		portKey := "port/" + port.ID
+		portOptions := make(map[string]string)
+		if port.RequestedChassis != "" {
+			requested, err := model.ParseRequestedChassis(port.RequestedChassis)
+			if err != nil {
+				return managedAuditPlan{}, fmt.Errorf("port %q requested chassis: %w", port.ID, err)
+			}
+			portOptions["requested-chassis"] = port.RequestedChassis
+			if len(requested) == 2 {
+				portOptions["activation-strategy"] = "rarp"
+			}
+		}
 		if err := plan.add(managedExpectedRow{
 			key: portKey, label: "port " + port.ID, table: "Logical_Switch_Port", preferredUUID: deterministicUUID("logical-switch-port:" + port.ID), name: port.LSPName,
 			identity:         auditIdentity(model.KindPort.String(), "pvn-id", port.ID),
 			requiredExternal: auditResourceExternal(port, map[string]string{"pvn-network": port.NetworkID}),
+			requiredOptions:  portOptions, exactOptions: true,
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}

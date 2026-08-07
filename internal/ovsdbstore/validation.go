@@ -77,8 +77,17 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 			if err != nil {
 				return err
 			}
-			if value.RequestedChassis != "" && nodeResource.(*model.Node).ChassisID != value.RequestedChassis {
-				return storeError(controlstore.ErrConflict, "requested chassis does not match the selected node")
+			requested, parseErr := model.ParseRequestedChassis(value.RequestedChassis)
+			if parseErr != nil {
+				return storeError(controlstore.ErrConflict, "requested chassis is invalid: %v", parseErr)
+			}
+			if len(requested) != 0 && !model.RequestedChassisContains(value.RequestedChassis, nodeResource.(*model.Node).ChassisID) {
+				return storeError(controlstore.ErrConflict, "requested chassis does not include the selected node")
+			}
+			for _, chassisID := range requested {
+				if !snapshotHasChassis(current, chassisID) {
+					return storeError(controlstore.ErrConflict, "requested chassis %q is not registered", chassisID)
+				}
 			}
 		} else if value.RequestedChassis != "" {
 			return storeError(controlstore.ErrConflict, "requested chassis requires a selected node")
@@ -235,6 +244,15 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 		}
 	}
 	return nil
+}
+
+func snapshotHasChassis(current *snapshot, chassisID string) bool {
+	for _, entry := range current.resources[model.KindNode] {
+		if entry.resource.(*model.Node).ChassisID == chassisID {
+			return true
+		}
+	}
+	return false
 }
 
 func providerHasAllocatableAddress(current *snapshot, providerID, address, ignoredSubnetID string) bool {

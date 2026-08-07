@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/popododo0720/proxmox-ovn/internal/model"
 	"github.com/popododo0720/proxmox-ovn/internal/ovs"
 	"github.com/popododo0720/proxmox-ovn/internal/pve"
 )
@@ -202,7 +203,9 @@ func (watcher *Watcher) ScanOnce(ctx context.Context) (ScanReport, error) {
 		// manager reconciler. It does not belong in local Interface external
 		// IDs; the agent uses it as a guard against binding a TAP on the wrong
 		// transport node.
-		if resolution.RequestedChassis != watcher.node && resolution.RequestedChassis != watcher.chassisID {
+		requestedLocal := model.RequestedChassisContains(resolution.RequestedChassis, watcher.node) ||
+			model.RequestedChassisContains(resolution.RequestedChassis, watcher.chassisID)
+		if !requestedLocal {
 			report.Conflicts++
 			watcher.logger.Warn("leaving OVS interface unresolved because requested chassis is not local",
 				"interface", ovsInterface.Name,

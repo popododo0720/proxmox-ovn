@@ -55,7 +55,15 @@ func decodeRuntimePortLookup(raw rawRuntimePortLookup, nodeIdentity string) ([]*
 		if err != nil {
 			return nil, rowError(controlschema.PortTable, index, err)
 		}
-		if acceptedNodes[port.NodeID] || acceptedNodes[port.RequestedChassis] {
+		requestedLocal := false
+		requested, parseErr := model.ParseRequestedChassis(port.RequestedChassis)
+		if parseErr != nil {
+			return nil, rowError(controlschema.PortTable, index, parseErr)
+		}
+		for _, chassisID := range requested {
+			requestedLocal = requestedLocal || acceptedNodes[chassisID]
+		}
+		if acceptedNodes[port.NodeID] || requestedLocal {
 			ports = append(ports, port)
 		}
 	}

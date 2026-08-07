@@ -158,6 +158,9 @@ func validatePort(p *Port) error {
 	if p.Generation < 0 {
 		return invalid("generation", "must not be negative")
 	}
+	if _, err := ParseRequestedChassis(p.RequestedChassis); err != nil {
+		return invalid("requested_chassis", "%s", err)
+	}
 	if p.BindingStatus != "" && p.BindingStatus != PortUnbound && p.BindingStatus != PortBinding && p.BindingStatus != PortBound && p.BindingStatus != PortDetaching && p.BindingStatus != PortBindingError {
 		return invalid("binding_status", "is not recognized")
 	}

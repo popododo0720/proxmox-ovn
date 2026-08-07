@@ -477,10 +477,19 @@ func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
 	}
 	optionArgs := []string{"lsp-set-options", portUUID}
 	if port.RequestedChassis != "" {
-		if err := safeID(port.RequestedChassis); err != nil {
-			return fmt.Errorf("invalid requested chassis: %w", err)
+		requested, parseErr := model.ParseRequestedChassis(port.RequestedChassis)
+		if parseErr != nil {
+			return fmt.Errorf("invalid requested chassis: %w", parseErr)
+		}
+		for _, chassisID := range requested {
+			if err := safeID(chassisID); err != nil {
+				return fmt.Errorf("invalid requested chassis: %w", err)
+			}
 		}
 		optionArgs = append(optionArgs, "requested-chassis="+port.RequestedChassis)
+		if len(requested) == 2 {
+			optionArgs = append(optionArgs, "activation-strategy=rarp")
+		}
 	}
 	if _, err := renderer.client.run(ctx, optionArgs...); err != nil {
 		return wrapRender("port chassis request", port.ID, err)

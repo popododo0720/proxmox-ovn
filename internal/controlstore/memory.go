@@ -234,7 +234,11 @@ func (s *Memory) LookupRuntimePorts(ctx context.Context, nodeIdentity string, vm
 	matching := make([]*model.Port, 0, 1)
 	for _, resource := range s.resources[model.KindPort] {
 		port := resource.(*model.Port)
-		if port.VMID != vmid || port.NIC != nic || (!acceptedNodes[port.NodeID] && !acceptedNodes[port.RequestedChassis]) {
+		requestedLocal := false
+		for _, chassisID := range requestedChassisOrEmpty(port.RequestedChassis) {
+			requestedLocal = requestedLocal || acceptedNodes[chassisID]
+		}
+		if port.VMID != vmid || port.NIC != nic || (!acceptedNodes[port.NodeID] && !requestedLocal) {
 			continue
 		}
 		copyResource, err := model.Clone(port)
@@ -245,6 +249,14 @@ func (s *Memory) LookupRuntimePorts(ctx context.Context, nodeIdentity string, vm
 	}
 	sort.Slice(matching, func(i, j int) bool { return matching[i].ID < matching[j].ID })
 	return matching, nil
+}
+
+func requestedChassisOrEmpty(value string) []string {
+	requested, err := model.ParseRequestedChassis(value)
+	if err != nil {
+		return nil
+	}
+	return requested
 }
 
 func (s *Memory) ObserveNodeHeartbeat(ctx context.Context, id string, expectedRevision int64, observedAt time.Time) (*model.Node, error) {
@@ -1035,8 +1047,17 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 			if err != nil {
 				return err
 			}
-			if value.RequestedChassis != "" && nodeResource.(*model.Node).ChassisID != value.RequestedChassis {
-				return storeError(ErrConflict, "requested chassis does not match the selected node")
+			requested, parseErr := model.ParseRequestedChassis(value.RequestedChassis)
+			if parseErr != nil {
+				return storeError(ErrConflict, "requested chassis is invalid: %v", parseErr)
+			}
+			if len(requested) != 0 && !model.RequestedChassisContains(value.RequestedChassis, nodeResource.(*model.Node).ChassisID) {
+				return storeError(ErrConflict, "requested chassis does not include the selected node")
+			}
+			for _, chassisID := range requested {
+				if !s.hasChassisLocked(chassisID) {
+					return storeError(ErrConflict, "requested chassis %q is not registered", chassisID)
+				}
 			}
 		} else if value.RequestedChassis != "" {
 			return storeError(ErrConflict, "requested chassis requires a selected node")
@@ -1193,6 +1214,15 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 		}
 	}
 	return nil
+}
+
+func (s *Memory) hasChassisLocked(chassisID string) bool {
+	for _, resource := range s.resources[model.KindNode] {
+		if resource.(*model.Node).ChassisID == chassisID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Memory) providerHasAllocatableAddressLocked(providerID, address, ignoredSubnetID string) bool {
