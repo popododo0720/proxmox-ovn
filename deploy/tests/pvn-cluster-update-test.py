@@ -1019,6 +1019,27 @@ for odd_count in (1, 3, 5):
         )
 
 
+# Applying the exact installed version is a health-only retry. It must never
+# stage, copy, verify, install, or clean up a package payload on any node.
+same_nodes, same_versions, same_events, same_error = exercise_inactive_odd_rollout(
+    3, initially_updated=3
+)
+check(same_error is None, f"same-version health retry failed: {same_error}")
+check(set(same_versions.values()) == {"0.2.1"}, "same-version retry changed package versions")
+check(
+    not any(
+        event.startswith(("prepare:", "copy:", "verify:", "apply:", "cleanup:"))
+        for event in same_events
+    ),
+    "same-version health retry staged or mutated a package",
+)
+for same_node in same_nodes:
+    check(
+        f"corosync-gate:{same_node.name}" in same_events,
+        f"same-version retry did not health-gate {same_node.name}",
+    )
+
+
 # A stale v0.2.13 runtime is rejected by the embedded checker before even a
 # remote staging file or first dpkg transaction can be created.
 _, _, stale_events, stale_error = exercise_inactive_odd_rollout(
