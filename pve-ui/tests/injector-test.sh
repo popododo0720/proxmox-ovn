@@ -12,9 +12,11 @@ cp "$FIXTURE" "$WORK/index.html.tpl"
 mkdir "$WORK/js"
 
 PVN_PVE_VERSION=9.0.1 "$PATCHER" install "$WORK/index.html.tpl" "$WORK/js/pvn-loader.js"
+LOADER_SHA256=$(sha256sum "$TEST_DIR/../pvn-loader.js" | awk '{print $1}')
 [ "$(grep -c 'PVN-LOADER:BEGIN' "$WORK/index.html.tpl")" -eq 1 ]
 [ "$(grep -c 'PVN-LOADER:END' "$WORK/index.html.tpl")" -eq 1 ]
 [ "$(grep -c '/pve2/js/pvn-loader.js' "$WORK/index.html.tpl")" -eq 1 ]
+grep -Fq "/pve2/js/pvn-loader.js?v=$LOADER_SHA256" "$WORK/index.html.tpl"
 [ -f "$WORK/js/pvn-loader.js" ]
 ANCHOR_LINE=$(grep -n 'pvemanagerlib.js?ver=' "$WORK/index.html.tpl" | cut -d: -f1)
 MARKER_LINE=$(grep -n 'PVN-LOADER:BEGIN' "$WORK/index.html.tpl" | cut -d: -f1)
@@ -73,5 +75,33 @@ PVN_PVE_VERSION=9.0.1 "$WORK/packaged/inject.sh" install "$WORK/packaged/index.h
 "$WORK/packaged/inject.sh" remove "$WORK/packaged/index.html.tpl" "$WORK/packaged/js/pvn-loader.js"
 [ ! -e "$WORK/packaged/js/pvn-loader.js" ]
 "$WORK/packaged/inject.sh" remove "$WORK/packaged/index.html.tpl" "$WORK/packaged/js/pvn-loader.js"
+
+mkdir -p "$WORK/update/js"
+cp "$FIXTURE" "$WORK/update/index.html.tpl"
+cp "$PATCHER" "$WORK/update/inject.sh"
+cp "$TEST_DIR/../pvn-loader.js" "$WORK/update/pvn-loader.js"
+PVN_PVE_VERSION=9.0.1 "$WORK/update/inject.sh" install "$WORK/update/index.html.tpl" "$WORK/update/js/pvn-loader.js"
+FIRST_SHA256=$(sha256sum "$WORK/update/pvn-loader.js" | awk '{print $1}')
+grep -Fq "/pve2/js/pvn-loader.js?v=$FIRST_SHA256" "$WORK/update/index.html.tpl"
+cmp "$WORK/update/pvn-loader.js" "$WORK/update/js/pvn-loader.js"
+
+printf '%s\n' '// cache-buster update test' >> "$WORK/update/pvn-loader.js"
+SECOND_SHA256=$(sha256sum "$WORK/update/pvn-loader.js" | awk '{print $1}')
+[ "$FIRST_SHA256" != "$SECOND_SHA256" ]
+PVN_PVE_VERSION=9.0.1 "$WORK/update/inject.sh" install "$WORK/update/index.html.tpl" "$WORK/update/js/pvn-loader.js"
+[ "$(grep -c 'PVN-LOADER:BEGIN' "$WORK/update/index.html.tpl")" -eq 1 ]
+grep -Fq "/pve2/js/pvn-loader.js?v=$SECOND_SHA256" "$WORK/update/index.html.tpl"
+if grep -Fq "/pve2/js/pvn-loader.js?v=$FIRST_SHA256" "$WORK/update/index.html.tpl"; then
+    echo "stale loader cache-buster remained after loader update" >&2
+    exit 1
+fi
+cmp "$WORK/update/pvn-loader.js" "$WORK/update/js/pvn-loader.js"
+
+cp "$WORK/update/index.html.tpl" "$WORK/update/once.tpl"
+PVN_PVE_VERSION=9.0.1 "$WORK/update/inject.sh" install "$WORK/update/index.html.tpl" "$WORK/update/js/pvn-loader.js"
+cmp "$WORK/update/once.tpl" "$WORK/update/index.html.tpl"
+"$WORK/update/inject.sh" remove "$WORK/update/index.html.tpl" "$WORK/update/js/pvn-loader.js"
+cmp "$FIXTURE" "$WORK/update/index.html.tpl"
+[ ! -e "$WORK/update/js/pvn-loader.js" ]
 
 echo 'injector tests passed'

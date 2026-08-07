@@ -3,7 +3,6 @@ set -eu
 
 MARKER_BEGIN='<!-- PVN-LOADER:BEGIN -->'
 MARKER_END='<!-- PVN-LOADER:END -->'
-SCRIPT_TAG='    <script type="text/javascript" src="/pve2/js/pvn-loader.js"></script>'
 PVE9_ANCHOR='    <script type="text/javascript" src="/pve2/js/pvemanagerlib.js?ver=[% version %]"></script>'
 DEFAULT_TEMPLATE='/usr/share/pve-manager/index.html.tpl'
 DEFAULT_LOADER='/usr/share/pve-manager/js/pvn-loader.js'
@@ -63,6 +62,26 @@ if [ "$ACTION" = install ]; then
         echo "PVN UI: loader target directory is missing; leaving the Proxmox UI unchanged" >&2
         exit 1
     }
+    command -v sha256sum >/dev/null 2>&1 || {
+        echo "PVN UI: sha256sum is required; leaving the Proxmox UI unchanged" >&2
+        exit 1
+    }
+    LOADER_SHA256_OUTPUT=$(sha256sum "$SOURCE_LOADER") || {
+        echo "PVN UI: could not hash the loader source; leaving the Proxmox UI unchanged" >&2
+        exit 1
+    }
+    LOADER_SHA256=${LOADER_SHA256_OUTPUT%% *}
+    case "$LOADER_SHA256" in
+        ''|*[!0-9a-f]*)
+            echo "PVN UI: invalid loader SHA-256; leaving the Proxmox UI unchanged" >&2
+            exit 1
+            ;;
+    esac
+    [ "${#LOADER_SHA256}" -eq 64 ] || {
+        echo "PVN UI: invalid loader SHA-256; leaving the Proxmox UI unchanged" >&2
+        exit 1
+    }
+    SCRIPT_TAG="    <script type=\"text/javascript\" src=\"/pve2/js/pvn-loader.js?v=$LOADER_SHA256\"></script>"
 fi
 
 TMP=$(mktemp "${TEMPLATE}.pvn.XXXXXX")
