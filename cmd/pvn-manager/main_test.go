@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
 	"time"
@@ -17,29 +18,23 @@ import (
 )
 
 func TestApplyClusterConfigHonorsExplicitFlags(t *testing.T) {
-	target := managerConfig{listen: "flag-listen", unixSocket: "old-socket", tlsCert: "old-cert", tlsKey: "old-key", pveAPIURL: "old-pve", clusterName: "old-cluster", webRoot: "old-web", sessionTTL: time.Minute}
+	target := managerConfig{runtimeSocket: "flag-runtime", browserSocket: "old-browser", clusterName: "old-cluster"}
 	cluster := pvnconfig.Default()
 	cluster.Cluster.ID = "cluster-a"
-	cluster.Manager.ListenAddress = ":8443"
 	cluster.Manager.UnixSocket = "/run/pvn/manager.sock"
-	cluster.Manager.WebRoot = "/usr/share/pvn/web"
-	cluster.Security.SessionTTL = 20 * time.Minute
-	cluster.Security.AllowedOrigins = []string{"https://pve.example:8006"}
+	cluster.Manager.BrowserSocket = "/run/pvn-api/manager.sock"
 	cluster.OVN.ControlDB = []string{"ssl:192.0.2.10:6645"}
 	cluster.OVN.Northbound = []string{"ssl:192.0.2.10:6641"}
 	cluster.OVN.Southbound = []string{"ssl:192.0.2.10:6642"}
 	cluster.OVN.TLSCA = "/etc/pvn/pki/ca.pem"
 	cluster.OVN.TLSCert = "/etc/pvn/pki/node.pem"
 	cluster.OVN.TLSKey = "/etc/pvn/pki/node-key.pem"
-	applyClusterConfig(&target, cluster, map[string]bool{"listen": true})
-	if target.listen != "flag-listen" {
-		t.Fatalf("explicit listen overwritten: %q", target.listen)
+	applyClusterConfig(&target, cluster, map[string]bool{"runtime-socket": true})
+	if target.runtimeSocket != "flag-runtime" {
+		t.Fatalf("explicit runtime socket overwritten: %q", target.runtimeSocket)
 	}
-	if target.unixSocket != cluster.Manager.UnixSocket || target.clusterName != "cluster-a" || target.webRoot != cluster.Manager.WebRoot || target.sessionTTL != 20*time.Minute {
+	if target.browserSocket != cluster.Manager.BrowserSocket || target.clusterName != "cluster-a" {
 		t.Fatalf("cluster config not applied: %#v", target)
-	}
-	if len(target.frameAncestors) != 1 || target.frameAncestors[0] != "https://pve.example:8006" {
-		t.Fatalf("frame ancestors=%v", target.frameAncestors)
 	}
 	if len(target.controlDB) != 1 || len(target.northbound) != 1 || len(target.southbound) != 1 || target.southbound[0] != cluster.OVN.Southbound[0] || target.ovnTLSCA != cluster.OVN.TLSCA || target.reconcileEvery != cluster.Cluster.ReconcileEvery {
 		t.Fatalf("OVN settings not applied: %#v", target)
@@ -305,6 +300,55 @@ func TestListenUnixRefusesRegularFile(t *testing.T) {
 	content, err := os.ReadFile(path)
 	if err != nil || string(content) != "do not replace" {
 		t.Fatalf("regular file changed: %q err=%v", content, err)
+	}
+}
+
+func TestBrowserUnixListenerAcceptsOnlyConfiguredPeer(t *testing.T) {
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := user.LookupGroupId(account.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "browser", "manager.sock")
+	listener, err := listenBrowserUnix(path, account.Username, group.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	errors := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			errors <- acceptErr
+			return
+		}
+		accepted <- connection
+	}()
+	client, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	select {
+	case connection := <-accepted:
+		defer connection.Close()
+		uid, err := unixPeerUID(connection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected, err := lookupUserID(account.Username)
+		if err != nil || uid != uint32(expected) {
+			t.Fatalf("peer uid=%d expected=%d err=%v", uid, expected, err)
+		}
+	case err := <-errors:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("browser listener did not accept the configured peer")
 	}
 }
 

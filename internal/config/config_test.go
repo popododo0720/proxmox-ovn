@@ -114,8 +114,6 @@ func TestLoadAndEnvironmentOverrides(t *testing.T) {
 	}
 	t.Setenv("PVN_NODE_NAME", "pve-a")
 	t.Setenv("PVN_GUEST_MTU", "1450")
-	t.Setenv("PVN_TLS_CERT", "/run/credentials/pvn-manager.service/cert")
-	t.Setenv("PVN_TLS_KEY", "/run/credentials/pvn-manager.service/key")
 	t.Setenv("PVN_MANAGER_CA", "/etc/pve/pve-root-ca.pem")
 	cfg, err := Load(path)
 	if err != nil {
@@ -123,9 +121,6 @@ func TestLoadAndEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.Cluster.NodeName != "pve-a" || cfg.Networking.GuestMTU != 1450 {
 		t.Fatalf("environment overrides not applied: %+v", cfg)
-	}
-	if cfg.Manager.TLSCert != "/run/credentials/pvn-manager.service/cert" || cfg.Manager.TLSKey != "/run/credentials/pvn-manager.service/key" {
-		t.Fatalf("credential overrides not applied: %+v", cfg.Manager)
 	}
 	if cfg.Agent.ManagerCA != "/etc/pve/pve-root-ca.pem" {
 		t.Fatalf("agent manager CA override not applied: %+v", cfg.Agent)
@@ -138,22 +133,26 @@ func TestValidateAgentManagerTransport(t *testing.T) {
 		t.Fatalf("Unix socket default should validate: %v", err)
 	}
 	cfg.Agent.ManagerURL = "http://127.0.0.1:8443"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "HTTPS or a Unix socket") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must use a Unix socket") {
 		t.Fatalf("plain HTTP manager URL must fail: %v", err)
 	}
 }
 
-func TestValidatePinsManagerPortToPVNLoader(t *testing.T) {
+func TestValidateSeparatesManagerSockets(t *testing.T) {
 	cfg := validConfig()
-	cfg.Manager.PublicPort = 9443
-	cfg.Manager.ListenAddress = ":9443"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be 8443") {
-		t.Fatalf("non-loader manager port must fail: %v", err)
+	cfg.Manager.BrowserSocket = cfg.Manager.UnixSocket
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("shared manager sockets must fail: %v", err)
 	}
 	cfg = validConfig()
-	cfg.Manager.ListenAddress = ":9443"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must use manager.public_port") {
-		t.Fatalf("mismatched listen port must fail: %v", err)
+	cfg.Manager.BrowserSocket = "relative.sock"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "browser_socket must be an absolute path") {
+		t.Fatalf("relative browser socket must fail: %v", err)
+	}
+	cfg = validConfig()
+	cfg.Agent.ManagerURL = "unix:///run/pvn-api/manager.sock"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must not use manager.browser_socket") {
+		t.Fatalf("browser socket used by agent must fail: %v", err)
 	}
 }
 

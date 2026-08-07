@@ -24,7 +24,6 @@ type Config struct {
 	Agent      AgentConfig      `json:"agent"`
 	OVN        OVNConfig        `json:"ovn"`
 	Networking NetworkingConfig `json:"networking"`
-	Security   SecurityConfig   `json:"security"`
 }
 
 type ClusterConfig struct {
@@ -37,13 +36,8 @@ type ClusterConfig struct {
 }
 
 type ManagerConfig struct {
-	ListenAddress string `json:"listen_address"`
-	PublicPort    int    `json:"public_port"`
-	PVEURL        string `json:"pve_url"`
 	UnixSocket    string `json:"unix_socket"`
-	WebRoot       string `json:"web_root"`
-	TLSCert       string `json:"tls_cert"`
-	TLSKey        string `json:"tls_key"`
+	BrowserSocket string `json:"browser_socket"`
 }
 
 type AgentConfig struct {
@@ -71,11 +65,6 @@ type NetworkingConfig struct {
 	ProviderBridge string `json:"provider_bridge"`
 }
 
-type SecurityConfig struct {
-	AllowedOrigins []string      `json:"allowed_origins,omitempty"`
-	SessionTTL     time.Duration `json:"session_ttl"`
-}
-
 func Default() Config {
 	return Config{
 		Cluster: ClusterConfig{
@@ -85,13 +74,8 @@ func Default() Config {
 			SupportedPVEMajor: 9,
 		},
 		Manager: ManagerConfig{
-			ListenAddress: ":8443",
-			PublicPort:    8443,
-			PVEURL:        "https://127.0.0.1:8006",
 			UnixSocket:    "/run/pvn/manager.sock",
-			WebRoot:       "/usr/share/pvn/web",
-			TLSCert:       "/etc/pve/local/pve-ssl.pem",
-			TLSKey:        "/etc/pve/local/pve-ssl.key",
+			BrowserSocket: "/run/pvn-api/manager.sock",
 		},
 		Agent: AgentConfig{
 			PollEvery:    2 * time.Second,
@@ -105,7 +89,6 @@ func Default() Config {
 			Physnet:        "provider",
 			ProviderBridge: "br-provider",
 		},
-		Security: SecurityConfig{SessionTTL: 15 * time.Minute},
 	}
 }
 
@@ -148,9 +131,6 @@ func LoadNode(path, nodeEnvPath string) (Config, error) {
 		cfg.Cluster.NodeName = value
 	}
 	cfg.Networking.EncapIP = values["PVN_ENCAP_IP"]
-	if value := values["PVN_PVE_URL"]; value != "" {
-		cfg.Manager.PVEURL = value
-	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate config with node environment %q: %w", nodeEnvPath, err)
 	}
@@ -217,18 +197,6 @@ func readNodeEnv(path string) (map[string]string, error) {
 }
 
 func applyEnv(cfg *Config) {
-	if value := os.Getenv("PVN_LISTEN_ADDRESS"); value != "" {
-		cfg.Manager.ListenAddress = value
-	}
-	if value := os.Getenv("PVN_PVE_URL"); value != "" {
-		cfg.Manager.PVEURL = value
-	}
-	if value := os.Getenv("PVN_TLS_CERT"); value != "" {
-		cfg.Manager.TLSCert = value
-	}
-	if value := os.Getenv("PVN_TLS_KEY"); value != "" {
-		cfg.Manager.TLSKey = value
-	}
 	if value := os.Getenv("PVN_NODE_NAME"); value != "" {
 		cfg.Cluster.NodeName = value
 	}
@@ -265,13 +233,14 @@ func (c Config) Validate() error {
 	if c.Agent.PollEvery <= 0 {
 		problems = append(problems, "agent.poll_every must be positive")
 	}
-	if c.Manager.PublicPort != 8443 {
-		problems = append(problems, "manager.public_port must be 8443 for the Proxmox PVN UI")
+	if !filepath.IsAbs(c.Manager.UnixSocket) {
+		problems = append(problems, "manager.unix_socket must be an absolute path")
 	}
-	listenHost, listenPort, listenErr := net.SplitHostPort(c.Manager.ListenAddress)
-	_ = listenHost
-	if listenErr != nil || listenPort != strconv.Itoa(c.Manager.PublicPort) {
-		problems = append(problems, "manager.listen_address must use manager.public_port")
+	if !filepath.IsAbs(c.Manager.BrowserSocket) {
+		problems = append(problems, "manager.browser_socket must be an absolute path")
+	}
+	if filepath.Clean(c.Manager.UnixSocket) == filepath.Clean(c.Manager.BrowserSocket) {
+		problems = append(problems, "manager.browser_socket must differ from manager.unix_socket")
 	}
 	if c.Agent.Bridge == "" {
 		problems = append(problems, "agent.bridge is required")
@@ -297,17 +266,13 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Networking.ProviderBridge) == "" {
 		problems = append(problems, "networking.provider_bridge is required")
 	}
-	parsedPVE, err := url.Parse(c.Manager.PVEURL)
-	if err != nil || parsedPVE.Scheme != "https" || parsedPVE.Host == "" {
-		problems = append(problems, "manager.pve_url must be an absolute HTTPS URL")
-	}
 	parsedManager, err := url.Parse(c.Agent.ManagerURL)
-	if err != nil || (parsedManager.Scheme != "https" && parsedManager.Scheme != "unix") {
-		problems = append(problems, "agent.manager_url must use HTTPS or a Unix socket URL")
-	} else if parsedManager.Scheme == "https" && parsedManager.Host == "" {
-		problems = append(problems, "agent.manager_url HTTPS address must include a host")
-	} else if parsedManager.Scheme == "unix" && (parsedManager.Path == "" || parsedManager.Host != "") {
+	if err != nil || parsedManager.Scheme != "unix" {
+		problems = append(problems, "agent.manager_url must use a Unix socket URL")
+	} else if !filepath.IsAbs(parsedManager.Path) || parsedManager.Host != "" {
 		problems = append(problems, "agent.manager_url Unix address must be an absolute socket path")
+	} else if filepath.Clean(parsedManager.Path) == filepath.Clean(c.Manager.BrowserSocket) {
+		problems = append(problems, "agent.manager_url must not use manager.browser_socket")
 	}
 	usesOVNTLS := false
 	for label, endpoints := range map[string][]string{

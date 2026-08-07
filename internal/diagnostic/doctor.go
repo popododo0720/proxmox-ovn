@@ -87,19 +87,6 @@ func Run(ctx context.Context, cfg config.Config, runner Runner) []Check {
 		return nil
 	}, "--if-exists", "get", "Open_vSwitch", ".", "external_ids:ovn-remote"))
 
-	for _, item := range []struct {
-		name string
-		path string
-	}{
-		{"tls-certificate", cfg.Manager.TLSCert},
-		{"tls-private-key", cfg.Manager.TLSKey},
-	} {
-		if _, err := os.Stat(item.path); err != nil {
-			checks = append(checks, Check{Name: item.name, Status: Fail, Message: err.Error()})
-		} else {
-			checks = append(checks, Check{Name: item.name, Status: Pass, Message: item.path})
-		}
-	}
 	if strings.TrimSpace(cfg.Networking.EncapIP) == "" {
 		checks = append(checks, Check{Name: "encap-ip", Status: Fail, Message: "networking.encap_ip is required on every node"})
 	} else {
@@ -109,6 +96,7 @@ func Run(ctx context.Context, cfg config.Config, runner Runner) []Check {
 		}, "-j", "address", "show"))
 	}
 	checks = append(checks, socketCheck("manager-runtime-socket", cfg.Manager.UnixSocket))
+	checks = append(checks, socketCheck("manager-browser-socket", cfg.Manager.BrowserSocket))
 	return checks
 }
 

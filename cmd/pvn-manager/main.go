@@ -8,12 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,16 +25,10 @@ import (
 )
 
 type managerConfig struct {
-	listen          string
-	unixSocket      string
-	tlsCert         string
-	tlsKey          string
-	pveAPIURL       string
-	pveCAFile       string
+	runtimeSocket   string
+	browserSocket   string
 	pveMembersFile  string
 	clusterName     string
-	webRoot         string
-	frameAncestors  []string
 	controlDB       []string
 	northbound      []string
 	southbound      []string
@@ -49,9 +40,7 @@ type managerConfig struct {
 	requireAllNodes bool
 	guestMTU        int
 	physnet         string
-	insecureNoAuth  bool
 	shutdownWait    time.Duration
-	sessionTTL      time.Duration
 }
 
 func main() {
@@ -62,36 +51,21 @@ func main() {
 }
 
 func run(arguments []string) error {
-	hostname, _ := os.Hostname()
 	defaults := managerConfig{
-		listen:         env("PVN_LISTEN_ADDR", "127.0.0.1:8443"),
-		unixSocket:     env("PVN_UNIX_SOCKET", "/run/pvn/manager.sock"),
-		tlsCert:        os.Getenv("PVN_TLS_CERT"),
-		tlsKey:         os.Getenv("PVN_TLS_KEY"),
-		pveAPIURL:      env("PVN_PVE_API_URL", "https://"+hostname+":8006"),
-		pveCAFile:      env("PVN_PVE_CA_FILE", "/etc/pve/pve-root-ca.pem"),
+		runtimeSocket:  env("PVN_RUNTIME_SOCKET", env("PVN_UNIX_SOCKET", "/run/pvn/manager.sock")),
+		browserSocket:  env("PVN_BROWSER_SOCKET", "/run/pvn-api/manager.sock"),
 		pveMembersFile: os.Getenv("PVN_PVE_MEMBERS_FILE"),
 		clusterName:    os.Getenv("PVN_CLUSTER_NAME"),
-		webRoot:        env("PVN_WEB_ROOT", "/usr/share/pvn/web"),
-		insecureNoAuth: envBool("PVN_INSECURE_NO_AUTH", false),
 		shutdownWait:   envDuration("PVN_SHUTDOWN_TIMEOUT", 15*time.Second),
-		sessionTTL:     envDuration("PVN_SESSION_TTL", 15*time.Minute),
 	}
 	flags := flag.NewFlagSet("pvn-manager", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", os.Getenv("PVN_CONFIG"), "cluster configuration JSON file")
-	flags.StringVar(&defaults.listen, "listen", defaults.listen, "HTTP listen address")
-	flags.StringVar(&defaults.unixSocket, "unix-socket", defaults.unixSocket, "node-agent Unix socket path (empty disables)")
-	flags.StringVar(&defaults.tlsCert, "tls-cert", defaults.tlsCert, "TLS certificate file")
-	flags.StringVar(&defaults.tlsKey, "tls-key", defaults.tlsKey, "TLS private key file")
-	flags.StringVar(&defaults.pveAPIURL, "pve-api-url", defaults.pveAPIURL, "local Proxmox API base URL")
-	flags.StringVar(&defaults.pveCAFile, "pve-ca-file", defaults.pveCAFile, "Proxmox cluster CA PEM file")
+	flags.StringVar(&defaults.runtimeSocket, "runtime-socket", defaults.runtimeSocket, "node-agent Unix socket path")
+	flags.StringVar(&defaults.browserSocket, "browser-socket", defaults.browserSocket, "local pveproxy Unix socket path")
 	flags.StringVar(&defaults.pveMembersFile, "pve-members-file", defaults.pveMembersFile, "PVE pmxcfs membership JSON used for the deployment display name")
 	flags.StringVar(&defaults.clusterName, "cluster-name", defaults.clusterName, "cluster name override")
-	flags.StringVar(&defaults.webRoot, "web-root", defaults.webRoot, "compiled PVN UI directory")
-	flags.BoolVar(&defaults.insecureNoAuth, "insecure-no-auth", defaults.insecureNoAuth, "disable PVE session validation (development only)")
 	flags.DurationVar(&defaults.shutdownWait, "shutdown-timeout", defaults.shutdownWait, "graceful shutdown timeout")
-	flags.DurationVar(&defaults.sessionTTL, "session-ttl", defaults.sessionTTL, "PVN browser session lifetime")
 	showVersion := flags.Bool("version", false, "print version and exit")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -113,18 +87,11 @@ func run(arguments []string) error {
 	if err := applyPVEDeploymentName(&defaults, explicit["cluster-name"]); err != nil {
 		return err
 	}
-	if (defaults.tlsCert == "") != (defaults.tlsKey == "") {
-		return errors.New("tls-cert and tls-key must be configured together")
-	}
 	if defaults.shutdownWait <= 0 {
 		return errors.New("shutdown-timeout must be positive")
 	}
-	if defaults.sessionTTL <= 0 {
-		return errors.New("session-ttl must be positive")
-	}
-	_, listenPort, listenErr := net.SplitHostPort(defaults.listen)
-	if listenErr != nil || listenPort != "8443" {
-		return errors.New("listen address must use port 8443 for the Proxmox PVN UI")
+	if defaults.runtimeSocket == "" || defaults.browserSocket == "" || defaults.runtimeSocket == defaults.browserSocket {
+		return errors.New("distinct runtime and browser Unix sockets are required")
 	}
 	if defaults.reconcileEvery <= 0 {
 		return errors.New("reconcile interval must be positive")
@@ -174,19 +141,9 @@ func run(arguments []string) error {
 		return err
 	}
 	controller := reconcile.NewController(store, renderer, reconcile.WithLeaseDuration(defaults.orphanGrace))
-	var sessionProvider api.SessionProvider
-	if defaults.insecureNoAuth {
-		logger.Warn("PVE authentication is disabled; do not use this mode in production")
-	} else {
-		provider, err := api.NewPVESessionProvider(api.PVESessionProviderOptions{BaseURL: defaults.pveAPIURL, CAFile: defaults.pveCAFile, ClusterName: defaults.clusterName, SessionTTL: defaults.sessionTTL})
-		if err != nil {
-			return err
-		}
-		sessionProvider = provider
-	}
 	reconcilerHealth := newReconcilerHealth(defaults.reconcileEvery, time.Now)
 	handler, err := api.New(api.Options{
-		Store: store, Reconciler: controller, SessionProvider: sessionProvider, Logger: logger,
+		Store: store, Reconciler: controller, Logger: logger,
 		RequireAllNodes: defaults.requireAllNodes, NodeHeartbeatTTL: 2 * time.Minute,
 		GuestMTU: defaults.guestMTU, Physnet: defaults.physnet,
 		ClusterName: defaults.clusterName, NorthboundProbe: ovnClient,
@@ -196,17 +153,12 @@ func run(arguments []string) error {
 		return err
 	}
 	repairDefaultSecurityOnStartup(startupContext, handler, logger)
-	application, err := api.NewApplicationHandler(handler, api.WebOptions{Root: defaults.webRoot, FrameAncestors: defaults.frameAncestors})
-	if err != nil {
-		return err
-	}
-	httpServer := &http.Server{
-		Addr:              defaults.listen,
-		Handler:           application,
+	browserServer := &http.Server{
+		Handler:           handler.BrowserHandler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       2 * time.Minute,
+		IdleTimeout:       30 * time.Second,
 	}
 	runtimeServer := &http.Server{
 		Handler:           handler.RuntimeHandler(),
@@ -215,41 +167,34 @@ func run(arguments []string) error {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
-	httpListener, err := net.Listen("tcp", defaults.listen)
+	runtimeListener, err := listenUnix(defaults.runtimeSocket)
 	if err != nil {
-		return fmt.Errorf("listen for PVN UI on %q: %w", defaults.listen, err)
+		return fmt.Errorf("listen for PVN runtime API: %w", err)
 	}
-	defer httpListener.Close()
-	var runtimeListener net.Listener
-	if defaults.unixSocket != "" {
-		listener, listenErr := listenUnix(defaults.unixSocket)
-		if listenErr != nil {
-			return listenErr
-		}
-		runtimeListener = listener
-		defer func() {
-			_ = runtimeListener.Close()
-			_ = os.Remove(defaults.unixSocket)
-		}()
+	defer func() {
+		_ = runtimeListener.Close()
+		_ = os.Remove(defaults.runtimeSocket)
+	}()
+	browserListener, err := listenBrowserUnix(defaults.browserSocket, "www-data", "www-data")
+	if err != nil {
+		return fmt.Errorf("listen for PVN browser API: %w", err)
 	}
+	defer func() {
+		_ = browserListener.Close()
+		_ = os.Remove(defaults.browserSocket)
+	}()
 	reconcileContext, stopReconciler := context.WithCancel(context.Background())
 	defer stopReconciler()
 
 	serverErrors := make(chan error, 2)
 	go func() {
-		logger.Info("pvn-manager listening", "address", defaults.listen, "version", buildinfo.Version, "tls", defaults.tlsCert != "")
-		if defaults.tlsCert != "" {
-			serverErrors <- httpServer.ServeTLS(httpListener, defaults.tlsCert, defaults.tlsKey)
-			return
-		}
-		serverErrors <- httpServer.Serve(httpListener)
+		logger.Info("pvn-manager browser API listening", "socket", defaults.browserSocket, "version", buildinfo.Version)
+		serverErrors <- browserServer.Serve(browserListener)
 	}()
-	if runtimeListener != nil {
-		go func() {
-			logger.Info("pvn-manager runtime API listening", "socket", defaults.unixSocket)
-			serverErrors <- runtimeServer.Serve(runtimeListener)
-		}()
-	}
+	go func() {
+		logger.Info("pvn-manager runtime API listening", "socket", defaults.runtimeSocket)
+		serverErrors <- runtimeServer.Serve(runtimeListener)
+	}()
 	go reconcilePeriodically(reconcileContext, managerPeriodicReconciler{controller: controller, defaultSecurity: handler}, defaults.reconcileEvery, reconcilerHealth, logger)
 
 	signalContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -266,45 +211,27 @@ func run(arguments []string) error {
 	stopReconciler()
 	shutdownContext, cancel := context.WithTimeout(context.Background(), defaults.shutdownWait)
 	defer cancel()
-	if err := httpServer.Shutdown(shutdownContext); err != nil {
-		_ = httpServer.Close()
-		runError = errors.Join(runError, fmt.Errorf("graceful shutdown: %w", err))
+	if err := browserServer.Shutdown(shutdownContext); err != nil {
+		_ = browserServer.Close()
+		runError = errors.Join(runError, fmt.Errorf("browser API graceful shutdown: %w", err))
 	}
-	if runtimeListener != nil {
-		if err := runtimeServer.Shutdown(shutdownContext); err != nil {
-			_ = runtimeServer.Close()
-			runError = errors.Join(runError, fmt.Errorf("runtime API graceful shutdown: %w", err))
-		}
+	if err := runtimeServer.Shutdown(shutdownContext); err != nil {
+		_ = runtimeServer.Close()
+		runError = errors.Join(runError, fmt.Errorf("runtime API graceful shutdown: %w", err))
 	}
 	return runError
 }
 
 func applyClusterConfig(target *managerConfig, clusterConfig pvnconfig.Config, explicit map[string]bool) {
-	if !explicit["listen"] {
-		target.listen = clusterConfig.Manager.ListenAddress
+	if !explicit["runtime-socket"] {
+		target.runtimeSocket = clusterConfig.Manager.UnixSocket
 	}
-	if !explicit["unix-socket"] {
-		target.unixSocket = clusterConfig.Manager.UnixSocket
-	}
-	if !explicit["tls-cert"] {
-		target.tlsCert = clusterConfig.Manager.TLSCert
-	}
-	if !explicit["tls-key"] {
-		target.tlsKey = clusterConfig.Manager.TLSKey
-	}
-	if !explicit["pve-api-url"] {
-		target.pveAPIURL = clusterConfig.Manager.PVEURL
+	if !explicit["browser-socket"] {
+		target.browserSocket = clusterConfig.Manager.BrowserSocket
 	}
 	if !explicit["cluster-name"] {
 		target.clusterName = clusterConfig.Cluster.ID
 	}
-	if !explicit["web-root"] {
-		target.webRoot = clusterConfig.Manager.WebRoot
-	}
-	if !explicit["session-ttl"] {
-		target.sessionTTL = clusterConfig.Security.SessionTTL
-	}
-	target.frameAncestors = append([]string(nil), clusterConfig.Security.AllowedOrigins...)
 	target.controlDB = append([]string(nil), clusterConfig.OVN.ControlDB...)
 	target.northbound = append([]string(nil), clusterConfig.OVN.Northbound...)
 	target.southbound = append([]string(nil), clusterConfig.OVN.Southbound...)
@@ -492,50 +419,11 @@ func waitForReconcileInterval(ctx context.Context, interval time.Duration) bool 
 	}
 }
 
-func listenUnix(path string) (net.Listener, error) {
-	directory := filepath.Dir(path)
-	if err := os.MkdirAll(directory, 0o750); err != nil {
-		return nil, fmt.Errorf("create Unix socket directory: %w", err)
-	}
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSocket == 0 {
-			return nil, fmt.Errorf("refusing to replace non-socket path %q", path)
-		}
-		if err := os.Remove(path); err != nil {
-			return nil, fmt.Errorf("remove stale Unix socket: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("inspect Unix socket path: %w", err)
-	}
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		return nil, fmt.Errorf("listen on Unix socket: %w", err)
-	}
-	if err := os.Chmod(path, 0o660); err != nil {
-		_ = listener.Close()
-		_ = os.Remove(path)
-		return nil, fmt.Errorf("set Unix socket permissions: %w", err)
-	}
-	return listener, nil
-}
-
 func env(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
 		return value
 	}
 	return fallback
-}
-
-func envBool(name string, fallback bool) bool {
-	value := os.Getenv(name)
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return fallback
-	}
-	return parsed
 }
 
 func envDuration(name string, fallback time.Duration) time.Duration {
