@@ -246,6 +246,24 @@ func validateReferences(current *snapshot, resource model.Resource) error {
 	return nil
 }
 
+// validateNewReferenceStates prevents a writer from racing a dependency's
+// deletion/failure transition. Unchanged references are deliberately allowed
+// so existing resources can be reconciled or cleaned up after a parent fails.
+func validateNewReferenceStates(current *snapshot, candidate, previous model.Resource) error {
+	for _, kind := range model.Kinds() {
+		for id, target := range current.resources[kind] {
+			if !references(candidate, kind, id) || (previous != nil && references(previous, kind, id)) {
+				continue
+			}
+			state := target.resource.GetMetadata().State
+			if state == model.ResourceDeleting || state == model.ResourceError {
+				return storeError(controlstore.ErrConflict, "%s cannot add a reference to %s %q in state %q", candidate.ResourceKind(), kind, id, state)
+			}
+		}
+	}
+	return nil
+}
+
 func snapshotHasChassis(current *snapshot, chassisID string) bool {
 	for _, entry := range current.resources[model.KindNode] {
 		if entry.resource.(*model.Node).ChassisID == chassisID {

@@ -794,21 +794,17 @@ func TestStoreReconcileClaimFencesPurgeAndRecoversExpiredLease(t *testing.T) {
 	}
 }
 
-func TestStorePurgeRejectsReferenceCreatedAfterBeginDelete(t *testing.T) {
+func TestStoreRejectsReferenceCreatedAfterBeginDelete(t *testing.T) {
 	store := deterministicStore(newFakeDatabase())
 	provider := mustCreate(t, store, &model.ProviderNetwork{Name: "provider-race"}, "create-race").(*model.ProviderNetwork)
 	tombstone, _, err := store.BeginDelete(context.Background(), model.KindProviderNetwork, provider.ID, provider.Revision, "delete-race")
 	if err != nil {
 		t.Fatal(err)
 	}
-	segment := mustCreate(t, store, &model.ProviderSegment{
+	if _, _, err := store.Create(context.Background(), &model.ProviderSegment{
 		ProviderNetworkID: provider.ID, Name: "late-reference", PhysicalNetwork: "phys-late", NetworkType: model.ProviderFlat,
-	}, "late-reference").(*model.ProviderSegment)
-	if err := store.Purge(context.Background(), model.KindProviderNetwork, provider.ID, tombstone.GetMetadata().Revision); !errors.Is(err, controlstore.ErrConflict) {
-		t.Fatalf("Purge() error=%v want late-reference conflict", err)
-	}
-	if _, err := store.Delete(context.Background(), model.KindProviderSegment, segment.ID, segment.Revision, ""); err != nil {
-		t.Fatal(err)
+	}, "late-reference"); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("Create() error=%v want deleting-reference conflict", err)
 	}
 	if err := store.Purge(context.Background(), model.KindProviderNetwork, provider.ID, tombstone.GetMetadata().Revision); err != nil {
 		t.Fatal(err)

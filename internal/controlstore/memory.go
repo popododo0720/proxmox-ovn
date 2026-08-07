@@ -120,6 +120,9 @@ func (s *Memory) Create(ctx context.Context, resource model.Resource, key string
 	if err := s.validateReferencesLocked(copyResource); err != nil {
 		return nil, false, err
 	}
+	if err := s.validateNewReferenceStatesLocked(copyResource, nil); err != nil {
+		return nil, false, err
+	}
 	if err := s.validateUniqueLocked(copyResource, ""); err != nil {
 		return nil, false, err
 	}
@@ -502,6 +505,9 @@ func (s *Memory) Update(ctx context.Context, resource model.Resource, expectedRe
 		return nil, false, err
 	}
 	if err := s.validateReferencesLocked(copyResource); err != nil {
+		return nil, false, err
+	}
+	if err := s.validateNewReferenceStatesLocked(copyResource, current); err != nil {
 		return nil, false, err
 	}
 	if err := s.validateUniqueLocked(copyResource, id); err != nil {
@@ -1217,6 +1223,25 @@ func (s *Memory) validateReferencesLocked(resource model.Resource) error {
 		if value.RemoteGroupID != "" {
 			if _, err := s.requireLocked(model.KindSecurityGroup, value.RemoteGroupID, "remote_group_id"); err != nil {
 				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateNewReferenceStatesLocked prevents a create or update from adding a
+// dependency after its target has entered a terminal cleanup state. Existing
+// references remain valid so reconciliation can still mark either side as
+// failed and cleanup can make forward progress.
+func (s *Memory) validateNewReferenceStatesLocked(candidate, previous model.Resource) error {
+	for _, kind := range model.Kinds() {
+		for id, target := range s.resources[kind] {
+			if !references(candidate, kind, id) || (previous != nil && references(previous, kind, id)) {
+				continue
+			}
+			state := target.GetMetadata().State
+			if state == model.ResourceDeleting || state == model.ResourceError {
+				return storeError(ErrConflict, "%s cannot add a reference to %s %q in state %q", candidate.ResourceKind(), kind, id, state)
 			}
 		}
 	}

@@ -111,6 +111,44 @@ func TestStoreRejectsPortWithoutSecurityGroup(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsNewReferencesToUnavailableResources(t *testing.T) {
+	ctx := context.Background()
+	store := deterministicStore(newFakeDatabase())
+
+	deletingNetwork := mustCreate(t, store, &model.Network{Name: "deleting-network"}, "deleting-network").(*model.Network)
+	if _, _, err := store.BeginDelete(ctx, model.KindNetwork, deletingNetwork.ID, deletingNetwork.Revision, "delete-network"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Create(ctx, &model.Subnet{
+		NetworkID: deletingNetwork.ID, Name: "late-subnet", CIDR: "10.60.0.0/24",
+	}, "late-subnet"); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("subnet referencing deleting network error=%v, want conflict", err)
+	}
+
+	network := mustCreate(t, store, &model.Network{Name: "reference-network"}, "reference-network").(*model.Network)
+	failedGroup := mustCreate(t, store, &model.SecurityGroup{Name: "failed-group"}, "failed-group").(*model.SecurityGroup)
+	if _, err := store.MarkReconciled(ctx, model.KindSecurityGroup, failedGroup.ID, failedGroup.Revision, errors.New("OVN failure")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Create(ctx, &model.Port{
+		NetworkID: network.ID, Name: "late-port", MACAddress: "02:00:00:00:60:01", SecurityGroupIDs: []string{failedGroup.ID},
+	}, "late-port"); !errors.Is(err, controlstore.ErrConflict) {
+		t.Fatalf("port referencing failed security group error=%v, want conflict", err)
+	}
+
+	healthyGroup := mustCreate(t, store, &model.SecurityGroup{Name: "healthy-group"}, "healthy-group").(*model.SecurityGroup)
+	port := mustCreate(t, store, &model.Port{
+		NetworkID: network.ID, Name: "existing-port", MACAddress: "02:00:00:00:60:02", SecurityGroupIDs: []string{healthyGroup.ID},
+	}, "existing-port").(*model.Port)
+	if _, err := store.MarkReconciled(ctx, model.KindSecurityGroup, healthyGroup.ID, healthyGroup.Revision, errors.New("later failure")); err != nil {
+		t.Fatal(err)
+	}
+	port.Name = "existing-port-updated"
+	if _, _, err := store.Update(ctx, port, port.Revision, "update-existing-reference"); err != nil {
+		t.Fatalf("unchanged existing reference should remain writable: %v", err)
+	}
+}
+
 func buildInvariantTopology(t *testing.T, store controlstore.Store) invariantTopology {
 	t.Helper()
 	ctx := context.Background()

@@ -189,6 +189,9 @@ func (s *Store) Create(ctx context.Context, resource model.Resource, key string)
 		if err := validateReferences(current, candidate); err != nil {
 			return nil, false, err
 		}
+		if err := validateNewReferenceStates(current, candidate, nil); err != nil {
+			return nil, false, err
+		}
 		if err := validateUnique(current, candidate, ""); err != nil {
 			return nil, false, err
 		}
@@ -600,6 +603,9 @@ func (s *Store) Update(ctx context.Context, resource model.Resource, expectedRev
 		meta.CreatedAt = storedMeta.CreatedAt
 		meta.UpdatedAt = now
 		if err := validateReferences(current, candidate); err != nil {
+			return nil, false, err
+		}
+		if err := validateNewReferenceStates(current, candidate, stored.resource); err != nil {
 			return nil, false, err
 		}
 		if err := validateUnique(current, candidate, id); err != nil {

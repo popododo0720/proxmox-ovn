@@ -597,19 +597,17 @@ func TestMemoryDeleteTombstoneMustBePurged(t *testing.T) {
 	}
 }
 
-func TestMemoryPurgeRejectsReferenceCreatedAfterBeginDelete(t *testing.T) {
+func TestMemoryRejectsReferenceCreatedAfterBeginDelete(t *testing.T) {
 	store := deterministicStore()
 	network := mustCreate(t, store, &model.Network{Name: "network-race"}, "create-race").(*model.Network)
 	tombstone, _, err := store.BeginDelete(context.Background(), model.KindNetwork, network.ID, network.Revision, "delete-race")
 	if err != nil {
 		t.Fatal(err)
 	}
-	subnet := mustCreate(t, store, &model.Subnet{NetworkID: network.ID, Name: "late-reference", CIDR: "10.55.0.0/24"}, "late-reference").(*model.Subnet)
-	if err := store.Purge(context.Background(), model.KindNetwork, network.ID, tombstone.GetMetadata().Revision); !errors.Is(err, ErrConflict) {
-		t.Fatalf("Purge() error=%v want late-reference conflict", err)
-	}
-	if _, err := store.Delete(context.Background(), model.KindSubnet, subnet.ID, subnet.Revision, ""); err != nil {
-		t.Fatal(err)
+	if _, _, err := store.Create(context.Background(), &model.Subnet{
+		NetworkID: network.ID, Name: "late-reference", CIDR: "10.55.0.0/24",
+	}, "late-reference"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Create() error=%v want deleting-reference conflict", err)
 	}
 	if err := store.Purge(context.Background(), model.KindNetwork, network.ID, tombstone.GetMetadata().Revision); err != nil {
 		t.Fatal(err)
