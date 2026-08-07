@@ -181,8 +181,14 @@
 
         var writableFields = {
             networks: ['name', 'description', 'mtu', 'external', 'provider_network_id'],
-            subnets: ['name', 'network_id', 'cidr', 'gateway_ip', 'enable_dhcp', 'allocation_pools'],
-            routers: ['name', 'description', 'external_network_id', 'external_subnet_id', 'external_ip_address', 'enable_snat'],
+            subnets: [
+                'name', 'network_id', 'cidr', 'gateway_ip', 'enable_dhcp',
+                'dns_nameservers', 'dns_domain', 'dns_search_domains', 'allocation_pools',
+            ],
+            routers: [
+                'name', 'description', 'external_network_id', 'external_subnet_id',
+                'external_ip_address', 'enable_snat', 'static_routes',
+            ],
             ports: ['name', 'network_id', 'subnet_id', 'fixed_ip_address', 'mac_address', 'security_group_ids'],
             'floating-ips': ['provider_network_id', 'address', 'fixed_ip_address', 'port_id', 'router_id'],
             'security-groups': ['name', 'description', 'stateful'],
@@ -255,7 +261,34 @@
                     payload.allocation_pools = [];
                 }
             }
+            if (collection === 'routers' && fields.some(function (spec) { return spec.name === 'static_routes_text'; })) {
+                var routes = parseStaticRoutes(values.static_routes_text);
+                delete payload.static_routes_text;
+                if (routes.length > 0 || !isCreate) {
+                    payload.static_routes = routes;
+                }
+            }
             return payload;
+        }
+
+        function parseStaticRoutes(value) {
+            var source = Array.isArray(value) ? value.join('\n') : String(value || '');
+            return source.split(/\r?\n/).map(function (line) { return line.trim(); }).filter(Boolean).map(function (line, index) {
+                var match = line.match(/^(\S+)\s+via\s+(\S+)$/i);
+                if (!match) {
+                    throw new Error('Static route line ' + (index + 1) + ' must use "destination via next-hop".');
+                }
+                return { destination: match[1], next_hop: match[2] };
+            });
+        }
+
+        function formatStaticRoutes(routes) {
+            if (!Array.isArray(routes)) return '';
+            return routes.map(function (route) {
+                var destination = text(route && route.destination);
+                var nextHop = text(route && route.next_hop);
+                return destination && nextHop ? destination + ' via ' + nextHop : '';
+            }).filter(Boolean).join('\n');
         }
 
         function formValues(resource, collection) {
@@ -263,6 +296,13 @@
             if (collection === 'subnets' && Array.isArray(values.allocation_pools) && values.allocation_pools.length > 0) {
                 values.allocation_pool_start = values.allocation_pools[0].start || '';
                 values.allocation_pool_end = values.allocation_pools[0].end || '';
+            }
+            if (collection === 'subnets') {
+                values.dns_nameservers = Array.isArray(values.dns_nameservers) ? values.dns_nameservers.join(', ') : '';
+                values.dns_search_domains = Array.isArray(values.dns_search_domains) ? values.dns_search_domains.join(', ') : '';
+            }
+            if (collection === 'routers') {
+                values.static_routes_text = formatStaticRoutes(values.static_routes);
             }
             return values;
         }
@@ -280,6 +320,8 @@
             humanName: humanName,
             idempotencyKey: idempotencyKey,
             listRenderer: listRenderer,
+            parseStaticRoutes: parseStaticRoutes,
+            formatStaticRoutes: formatStaticRoutes,
             removeResource: removeResource,
             request: request,
             resourceURL: resourceURL,
@@ -297,7 +339,8 @@
                 'network_id', 'subnet_id', 'router_id', 'port_id',
                 'security_group_id', 'security_group_ids', 'provider_network_id',
                 'default_segment_id', 'node_id', 'cidr', 'gateway_ip', 'address',
-                'allocation_pools', 'chassis_id', 'ovn_controller', 'gateway_priority',
+                'allocation_pools', 'dns_nameservers', 'dns_domain', 'dns_search_domains', 'static_routes',
+                'chassis_id', 'ovn_controller', 'gateway_priority',
                 'external_network_id', 'external_subnet_id', 'external_ip_address',
                 'fixed_ip_address', 'fixed_ips', 'mac_address', 'management_address',
                 'physical_network', 'network_type', 'vlan_id', 'mtu', 'roles',
@@ -474,6 +517,10 @@
                     config.editable = false;
                     config.hideTrigger = true;
                 }
+            } else if (spec.type === 'textarea') {
+                config.xtype = 'textareafield';
+                config.grow = true;
+                config.height = spec.height || 96;
             } else {
                 config.xtype = 'textfield';
             }
@@ -1386,6 +1433,9 @@
             { name: 'enable_dhcp', label: 'Enable OVN DHCP', type: 'checkbox', defaultValue: true },
             { name: 'allocation_pool_start', label: 'DHCP/IPAM range start', placeholder: '10.42.0.10' },
             { name: 'allocation_pool_end', label: 'DHCP/IPAM range end', placeholder: '10.42.0.200' },
+            { name: 'dns_nameservers', label: 'Guest DNS resolvers', multiple: true, placeholder: '1.1.1.1, 8.8.8.8' },
+            { name: 'dns_domain', label: 'Guest DNS domain', placeholder: 'guest.example' },
+            { name: 'dns_search_domains', label: 'DNS search domains', multiple: true, placeholder: 'guest.example, svc.example' },
         ];
         var routerCreateFields = [
             { name: 'name', label: 'Name', required: true, placeholder: 'edge' },
@@ -1394,6 +1444,7 @@
             { name: 'external_subnet_id', label: 'External subnet', type: 'resource', collection: 'subnets', match: { formField: 'external_network_id', resourceField: 'network_id' } },
             { name: 'external_ip_address', label: 'Router external IPv4', placeholder: '203.0.113.10' },
             { name: 'enable_snat', label: 'Enable SNAT', type: 'checkbox', defaultValue: true },
+            { name: 'static_routes_text', label: 'Additional static routes', type: 'textarea', height: 110, placeholder: '10.60.0.0/16 via 10.42.0.2' },
         ];
         var routerInterfaceFields = [
             { name: 'router_id', label: 'Router', type: 'resource', collection: 'routers', required: true },
@@ -1451,7 +1502,10 @@
             networks: { createFields: networkCreateFields, editFields: networkEditFields },
             subnets: {
                 createFields: subnetCreateFields,
-                editFields: [subnetCreateFields[0], subnetCreateFields[3], subnetCreateFields[4], subnetCreateFields[5], subnetCreateFields[6]],
+                editFields: [
+                    subnetCreateFields[0], subnetCreateFields[3], subnetCreateFields[4], subnetCreateFields[5],
+                    subnetCreateFields[6], subnetCreateFields[7], subnetCreateFields[8], subnetCreateFields[9],
+                ],
             },
             routers: { createFields: routerCreateFields, editFields: routerCreateFields },
             'router-interfaces': { createFields: routerInterfaceFields },
@@ -1794,6 +1848,7 @@
                         { text: 'Gateway', dataIndex: 'gateway_ip', width: 130 },
                         { text: 'DHCP', dataIndex: 'enable_dhcp', width: 70, renderer: booleanRenderer },
                         { text: 'DHCP/IPAM range', dataIndex: 'allocation_pools', flex: 1, minWidth: 190, renderer: allocationPoolRenderer },
+                        { text: 'Guest DNS', dataIndex: 'dns_nameservers', flex: 1, minWidth: 130, renderer: listRenderer },
                         stateColumn(),
                     ],
                 });
@@ -1840,22 +1895,47 @@
                         stateColumn(),
                     ],
                 });
+                var staticRouteStore = Ext.create('Ext.data.Store', {
+                    fields: ['destination', 'next_hop'], data: [],
+                });
+                var staticRouteGrid = Ext.create('Ext.grid.Panel', {
+                    title: 'Static routes owned by selected router', border: false,
+                    store: staticRouteStore,
+                    columns: [
+                        { text: 'Destination', dataIndex: 'destination', flex: 1 },
+                        { text: 'Next hop', dataIndex: 'next_hop', flex: 1 },
+                    ],
+                    viewConfig: {
+                        deferEmptyText: false,
+                        emptyText: '<div class="x-grid-empty">No additional static routes.</div>',
+                        stripeRows: true,
+                    },
+                });
                 var routerGrid = Ext.create('PVN.grid.Resource', {
                     region: 'west', width: '48%', minWidth: 520, split: true,
                     title: 'Routers', collection: 'routers', resourceLabel: 'Router',
                     createFields: routerCreateFields, editFields: routerCreateFields, allowDelete: true,
                     onPVNSelectionChange: function (record) {
                         setRelatedGrid(interfaceGrid, 'router_id', record, null, ['router_id']);
+                        var routes = dataOf(record).static_routes;
+                        staticRouteStore.loadData(Array.isArray(routes) ? routes : []);
                     },
                     columns: [
                         namedColumn('Router', 'Unnamed router'),
                         { text: 'External network', dataIndex: 'external_network_id', flex: 1, renderer: referenceRenderer('networks', 'None') },
                         { text: 'Gateway IP', dataIndex: 'external_ip_address', width: 140 },
                         { text: 'SNAT', dataIndex: 'enable_snat', width: 70, renderer: booleanRenderer },
+                        { text: 'Routes', dataIndex: 'static_routes', width: 70, renderer: function (routes) { return Array.isArray(routes) ? routes.length : 0; } },
                         stateColumn(),
                     ],
                 });
-                Ext.apply(me, { layout: 'border', items: [routerGrid, interfaceGrid] });
+                Ext.apply(me, {
+                    layout: 'border',
+                    items: [routerGrid, {
+                        xtype: 'tabpanel', region: 'center', border: false,
+                        items: [interfaceGrid, staticRouteGrid],
+                    }],
+                });
                 me.callParent();
             },
         });

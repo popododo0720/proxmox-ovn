@@ -173,8 +173,13 @@ test('router and security workspaces use selected-parent detail grids', () => {
   routers.initComponent();
   assert.equal(routers.layout, 'border');
   assert.equal(routers.items[0].collection, 'routers');
-  assert.equal(routers.items[1].collection, 'router-interfaces');
-  assert.equal(routers.items[1].requiredFilter, 'router_id');
+  assert.equal(routers.items[1].xtype, 'tabpanel');
+  assert.equal(routers.items[1].items[0].collection, 'router-interfaces');
+  assert.equal(routers.items[1].items[0].requiredFilter, 'router_id');
+  assert.equal(routers.items[1].items[1].title, 'Static routes owned by selected router');
+  assert.deepEqual(Array.from(routers.items[1].items[1].columns, (column) => column.dataIndex), [
+    'destination', 'next_hop',
+  ]);
 
   const SecurityGroups = classes.get('PVN.panel.SecurityGroups');
   const security = new SecurityGroups();
@@ -345,18 +350,27 @@ test('subnet forms round-trip one explicit DHCP and IPAM allocation range', () =
     name: 'app-v4', network_id: 'network-a', cidr: '10.42.0.0/24',
     gateway_ip: '10.42.0.1', enable_dhcp: true,
     allocation_pool_start: '10.42.0.10', allocation_pool_end: '10.42.0.200',
+    dns_nameservers: '1.1.1.1, 8.8.8.8', dns_domain: 'guest.example',
+    dns_search_domains: 'guest.example, svc.example',
   }, fields, null, true, 'subnets');
   assert.deepEqual(JSON.parse(JSON.stringify(created.allocation_pools)), [
     { start: '10.42.0.10', end: '10.42.0.200' },
   ]);
   assert.equal('allocation_pool_start' in created, false);
   assert.equal('allocation_pool_end' in created, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(created.dns_nameservers)), ['1.1.1.1', '8.8.8.8']);
+  assert.equal(created.dns_domain, 'guest.example');
+  assert.deepEqual(JSON.parse(JSON.stringify(created.dns_search_domains)), ['guest.example', 'svc.example']);
 
   const values = window.PVN.Utils.formValues({
     allocation_pools: [{ start: '10.42.0.20', end: '10.42.0.80' }],
+    dns_nameservers: ['1.1.1.1', '8.8.8.8'],
+    dns_search_domains: ['guest.example', 'svc.example'],
   }, 'subnets');
   assert.equal(values.allocation_pool_start, '10.42.0.20');
   assert.equal(values.allocation_pool_end, '10.42.0.80');
+  assert.equal(values.dns_nameservers, '1.1.1.1, 8.8.8.8');
+  assert.equal(values.dns_search_domains, 'guest.example, svc.example');
 
   const preserved = window.PVN.Utils.formPayload({
     name: 'app-v4', gateway_ip: '10.42.0.1', enable_dhcp: true,
@@ -378,6 +392,33 @@ test('subnet forms round-trip one explicit DHCP and IPAM allocation range', () =
     allocation_pools: [{ start: '10.42.0.20', end: '10.42.0.80' }],
   }, false, 'subnets');
   assert.deepEqual(JSON.parse(JSON.stringify(cleared.allocation_pools)), []);
+});
+
+test('router forms round-trip destination and next-hop static routes', () => {
+  const { window } = harness();
+  const fields = window.PVN.Resources.routers.createFields;
+  const created = window.PVN.Utils.formPayload({
+    name: 'edge', description: '', external_network_id: '', external_subnet_id: '',
+    external_ip_address: '', enable_snat: false,
+    static_routes_text: '10.60.0.0/16 via 10.42.0.2\n203.0.113.0/24 via 192.0.2.2',
+  }, fields, null, true, 'routers');
+  assert.deepEqual(JSON.parse(JSON.stringify(created.static_routes)), [
+    { destination: '10.60.0.0/16', next_hop: '10.42.0.2' },
+    { destination: '203.0.113.0/24', next_hop: '192.0.2.2' },
+  ]);
+  assert.equal('static_routes_text' in created, false);
+
+  const values = window.PVN.Utils.formValues({
+    static_routes: [{ destination: '10.60.0.0/16', next_hop: '10.42.0.2' }],
+  }, 'routers');
+  assert.equal(values.static_routes_text, '10.60.0.0/16 via 10.42.0.2');
+
+  const cleared = window.PVN.Utils.formPayload({
+    name: 'edge', description: '', external_network_id: '', external_subnet_id: '',
+    external_ip_address: '', enable_snat: false, static_routes_text: '',
+  }, fields, { name: 'edge', static_routes: created.static_routes }, false, 'routers');
+  assert.deepEqual(JSON.parse(JSON.stringify(cleared.static_routes)), []);
+  assert.throws(() => window.PVN.Utils.parseStaticRoutes('10.60.0.0/16 10.42.0.2'), /destination via next-hop/);
 });
 
 test('edit payloads never leak fields owned by another collection', () => {
