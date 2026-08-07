@@ -103,11 +103,10 @@ func TestLoadAndEnvironmentOverrides(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 	data := `{
   "cluster": {"id":"lab", "reconcile_every":30000000000, "orphan_grace":300000000000, "require_all_nodes":true, "supported_pve_major":9},
-  "manager": {"listen_address":":8443", "public_port":8443, "pve_url":"https://127.0.0.1:8006", "unix_socket":"/run/pvn/manager.sock", "web_root":"/usr/share/pvn/web"},
+  "manager": {"unix_socket":"/run/pvn/manager.sock", "browser_socket":"/run/pvn-api/manager.sock"},
   "agent": {"poll_every":2000000000, "bridge":"br-int", "manager_url":"unix:///run/pvn/manager.sock", "system_id_file":"/etc/openvswitch/system-id.conf"},
   "ovn": {"control_db":["unix:/run/pvn/control.sock"], "northbound":["unix:/run/ovn/ovnnb_db.sock"], "southbound":["unix:/run/ovn/ovnsb_db.sock"]},
-  "networking": {"encap_type":"geneve", "guest_mtu":1400, "physnet":"provider", "provider_bridge":"br-provider"},
-  "security": {"session_ttl":900000000000}
+  "networking": {"encap_type":"geneve", "guest_mtu":1400, "physnet":"provider", "provider_bridge":"br-provider"}
 }`
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
@@ -141,17 +140,22 @@ func TestValidateAgentManagerTransport(t *testing.T) {
 func TestValidateSeparatesManagerSockets(t *testing.T) {
 	cfg := validConfig()
 	cfg.Manager.BrowserSocket = cfg.Manager.UnixSocket
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must differ") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), DefaultManagerBrowserSocket) {
 		t.Fatalf("shared manager sockets must fail: %v", err)
 	}
 	cfg = validConfig()
 	cfg.Manager.BrowserSocket = "relative.sock"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "browser_socket must be an absolute path") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), DefaultManagerBrowserSocket) {
 		t.Fatalf("relative browser socket must fail: %v", err)
 	}
 	cfg = validConfig()
+	cfg.Manager.UnixSocket = "/run/pvn/custom.sock"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), DefaultManagerRuntimeSocket) {
+		t.Fatalf("custom runtime socket must fail: %v", err)
+	}
+	cfg = validConfig()
 	cfg.Agent.ManagerURL = "unix:///run/pvn-api/manager.sock"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must not use manager.browser_socket") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), DefaultManagerRuntimeSocket) {
 		t.Fatalf("browser socket used by agent must fail: %v", err)
 	}
 }
