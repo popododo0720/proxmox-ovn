@@ -680,6 +680,8 @@ def join_stub_remote(path, required):
         if required:
             fail(f"pending clustered database has an invalid record-0 join log: {path}")
         return None
+    if not remotes and not required:
+        return None
     if len(remotes) != 1:
         fail(f"clustered database record-0 join remote is not singular: {path}")
     remote = re.fullmatch(r"ssl:([^:]+):([0-9]+)", remotes[0])

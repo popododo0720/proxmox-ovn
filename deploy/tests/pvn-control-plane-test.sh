@@ -417,6 +417,18 @@ with tempfile.TemporaryDirectory() as temporary:
     assert info["preactivation_join"] is True
     assert info["remote_addresses"] == ["ssl:192.0.2.11:6646"]
 
+    seed_log = (
+        'record 0:\n name: "PVN_Control\'\n'
+        ' local address: "ssl:192.0.2.12:6646"\n'
+        ' prev_servers: server("ssl:192.0.2.12:6646")\n\n'
+    )
+    info = load_remote_db_info(
+        remote_db_info_runner(known, seed_log)
+    )(str(database), True)
+    assert info["cluster_id"] == "expected-cid"
+    assert info["preactivation_join"] is False
+    assert "remote_addresses" not in info
+
     for rejected in (
         types.SimpleNamespace(
             returncode=1, stdout="", stderr=f"{database}: cluster ID not yet known\n"
