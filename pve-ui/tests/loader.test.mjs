@@ -149,16 +149,48 @@ test('resource stores use only the same-origin PVN API2 path', () => {
 test('overview requests health through Proxmox API2Request', () => {
   const { apiRequests, classes } = harness();
   const Overview = classes.get('PVN.panel.Overview');
-  const updates = [];
+  const loadedRows = [];
+  const metaUpdates = [];
+  const loadingStates = [];
   const panel = new Overview();
-  panel.down = () => ({ update(value) { updates.push(value); } });
+  const store = { loadData(rows) { loadedRows.push(rows); } };
+  panel.down = (selector) => selector === '#pvn-overview-grid'
+    ? { getStore() { return store; } }
+    : { setText(value) { metaUpdates.push(value); } };
+  panel.setLoading = (value) => loadingStates.push(value);
   panel.loadOverview();
   assert.equal(apiRequests.length, 1);
   assert.equal(apiRequests[0].url, '/pvn/health');
   assert.equal(apiRequests[0].method, 'GET');
-  apiRequests[0].success({ result: { data: { cluster: 'lab', status: 'ready', version: 'test' } } });
-  assert.match(updates.at(-1), /lab/);
-  assert.match(updates.at(-1), /Version test/);
+  apiRequests[0].success({ result: { data: {
+    cluster: 'lab', status: 'ready', version: 'test', time: '2026-08-07T01:02:03Z',
+    database: 'ready', ovn_northbound: 'ready', ovn_southbound: 'ready',
+    reconciler: 'ready', default_security_policy: 'ready',
+    capacity: { ready: true, online_nodes: ['prox1', 'prox2', 'prox3'] },
+  } } });
+  assert.equal(loadedRows.at(-1).length, 7);
+  assert.deepEqual(JSON.parse(JSON.stringify(loadedRows.at(-1)[0])), {
+    section: 'Cluster', component: 'lab', status: 'ready', details: 'PVN test',
+  });
+  assert.match(loadedRows.at(-1)[6].details, /3 online: prox1, prox2, prox3/);
+  assert.match(metaUpdates.at(-1), /lab/);
+  assert.match(metaUpdates.at(-1), /Version test/);
+  assert.deepEqual(loadingStates, ['Loading PVN status...', false]);
+});
+
+test('overview is a native striped ExtJS status grid', () => {
+  const { classes } = harness();
+  const Overview = classes.get('PVN.panel.Overview');
+  const panel = new Overview();
+  panel.initComponent();
+  assert.equal(panel.layout, 'fit');
+  assert.equal(panel.items.length, 1);
+  assert.equal(panel.items[0].xtype, 'grid');
+  assert.equal(panel.items[0].itemId, 'pvn-overview-grid');
+  assert.equal(panel.items[0].viewConfig.stripeRows, true);
+  assert.deepEqual(Array.from(panel.items[0].columns, (column) => column.text), [
+    'Area', 'Component', 'Status', 'Details',
+  ]);
 });
 
 test('human labels never fall back to UUIDs in primary cells', () => {

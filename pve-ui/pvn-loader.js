@@ -46,7 +46,7 @@
         function statusRenderer(value) {
             var label = text(value) || 'unknown';
             var normalized = label.toLowerCase();
-            var icon = /^(active|ready|bound|complete|completed|success|connected)$/.test(normalized)
+            var icon = /^(ok|healthy|up|active|ready|bound|complete|completed|success|connected)$/.test(normalized)
                 ? 'check good'
                 : /^(error|failed|degraded|disabled|blocked|unavailable)$/.test(normalized)
                     ? 'times critical'
@@ -1094,51 +1094,147 @@
             extend: 'Ext.panel.Panel',
             alias: 'widget.pvnOverview',
             border: false,
-            bodyPadding: 18,
-            scrollable: true,
+
+            overviewRows: function (health) {
+                var capacity = health.capacity || {};
+                var capacityDetails = [];
+                var onlineNodes = Array.isArray(capacity.online_nodes) ? capacity.online_nodes : [];
+                var missingNodes = Array.isArray(capacity.missing_nodes) ? capacity.missing_nodes : [];
+                var staleNodes = Array.isArray(capacity.stale_nodes) ? capacity.stale_nodes : [];
+
+                if (onlineNodes.length) {
+                    capacityDetails.push(onlineNodes.length + ' online: ' + onlineNodes.join(', '));
+                }
+                if (missingNodes.length) {
+                    capacityDetails.push('Missing: ' + missingNodes.join(', '));
+                }
+                if (staleNodes.length) {
+                    capacityDetails.push('Stale: ' + staleNodes.join(', '));
+                }
+                if (text(capacity.reason)) {
+                    capacityDetails.push(capacity.reason);
+                }
+
+                return [{
+                    section: 'Cluster',
+                    component: health.cluster || 'PVN cluster',
+                    status: health.status || 'unknown',
+                    details: 'PVN ' + (health.version || 'unknown'),
+                }, {
+                    section: 'Control plane',
+                    component: 'Control database',
+                    status: health.database,
+                    details: 'Persistent PVN resource state',
+                }, {
+                    section: 'Control plane',
+                    component: 'OVN Northbound',
+                    status: health.ovn_northbound,
+                    details: 'Logical network intent',
+                }, {
+                    section: 'Control plane',
+                    component: 'OVN Southbound',
+                    status: health.ovn_southbound,
+                    details: 'Chassis and runtime state',
+                }, {
+                    section: 'Control plane',
+                    component: 'Reconciler',
+                    status: health.reconciler,
+                    details: 'Desired-state reconciliation',
+                }, {
+                    section: 'Security',
+                    component: 'Default security policy',
+                    status: health.default_security_policy,
+                    details: 'Managed baseline port policy',
+                }, {
+                    section: 'Capacity',
+                    component: 'PVE node readiness',
+                    status: capacity.ready === true ? 'ready' : capacity.ready === false ? 'degraded' : 'unknown',
+                    details: capacityDetails.join(' \u00b7 ') || 'All required PVE nodes are available',
+                }];
+            },
 
             loadOverview: function () {
                 var me = this;
-                var body = me.down('#pvn-overview-body');
-                body.update('<p><i class="fa fa-spinner fa-pulse"></i> Loading PVN status...</p>');
+                var grid = me.down('#pvn-overview-grid');
+                var store = grid && grid.getStore ? grid.getStore() : me.overviewStore;
+                var meta = me.down('#pvn-overview-meta');
+                if (me.setLoading) {
+                    me.setLoading('Loading PVN status...');
+                }
                 request({
                     url: '/pvn/health',
                     method: 'GET',
                     success: function (response) {
                         var health = response && response.result && response.result.data || {};
-                        var capacity = health.capacity || {};
-                        var components = [
-                            ['Control database', health.database],
-                            ['OVN Northbound', health.ovn_northbound],
-                            ['OVN Southbound', health.ovn_southbound],
-                            ['Reconciler', health.reconciler],
-                            ['Default security policy', health.default_security_policy],
-                            ['Cluster capacity', capacity.ready === true ? 'ready' : capacity.ready === false ? 'degraded' : 'unknown'],
-                        ];
-                        var rows = components.map(function (component) {
-                            return '<tr><td>' + html(component[0]) + '</td><td>' + statusRenderer(component[1]) + '</td></tr>';
-                        }).join('');
-                        body.update(
-                            '<h2 style="margin-top:0">' + html(health.cluster || 'PVN') + '</h2>' +
-                            '<p>Version ' + html(health.version || 'unknown') + ' &middot; ' + statusRenderer(health.status) + '</p>' +
-                            '<table class="x-grid-item" style="width:100%;max-width:720px"><tbody>' + rows + '</tbody></table>'
-                        );
+                        if (store && store.loadData) {
+                            store.loadData(me.overviewRows(health));
+                        }
+                        if (meta && meta.setText) {
+                            meta.setText(
+                                '<b>' + html(health.cluster || 'PVN') + '</b>' +
+                                ' &middot; Version ' + html(health.version || 'unknown') +
+                                (health.time ? ' &middot; Checked ' + html(health.time) : '')
+                            );
+                        }
+                        if (me.setLoading) {
+                            me.setLoading(false);
+                        }
                     },
                     failure: function (response) {
-                        body.update('<div class="x-form-invalid-under"><b>PVN status unavailable</b><br>' + html(apiError(response)) + '</div>');
+                        if (store && store.loadData) {
+                            store.loadData([{
+                                section: 'Manager', component: 'PVN API', status: 'unavailable',
+                                details: apiError(response),
+                            }]);
+                        }
+                        if (meta && meta.setText) {
+                            meta.setText('<b>PVN status unavailable</b>');
+                        }
+                        if (me.setLoading) {
+                            me.setLoading(false);
+                        }
                     },
                 });
             },
 
             initComponent: function () {
                 var me = this;
+                me.overviewStore = Ext.create('Ext.data.Store', {
+                    fields: ['section', 'component', 'status', 'details'],
+                    data: [],
+                });
                 Ext.apply(me, {
+                    layout: 'fit',
                     tbar: [{
                         text: 'Refresh',
                         iconCls: 'fa fa-refresh',
                         handler: function () { me.loadOverview(); },
+                    }, '->', {
+                        xtype: 'tbtext',
+                        itemId: 'pvn-overview-meta',
+                        text: 'PVN status has not been loaded',
                     }],
-                    items: [{ xtype: 'component', itemId: 'pvn-overview-body' }],
+                    items: [{
+                        xtype: 'grid',
+                        itemId: 'pvn-overview-grid',
+                        border: false,
+                        store: me.overviewStore,
+                        columns: [{
+                            text: 'Area', dataIndex: 'section', width: 145,
+                        }, {
+                            text: 'Component', dataIndex: 'component', minWidth: 190, flex: 1,
+                            renderer: function (value) { return '<b>' + html(value) + '</b>'; },
+                        }, {
+                            text: 'Status', dataIndex: 'status', width: 135, renderer: statusRenderer,
+                        }, {
+                            text: 'Details', dataIndex: 'details', minWidth: 260, flex: 2, renderer: html,
+                        }],
+                        viewConfig: {
+                            deferEmptyText: false,
+                            emptyText: '<div class="x-grid-empty">No PVN status available.</div>',
+                            stripeRows: true,
+                        },
+                    }],
                     listeners: { activate: function () { me.loadOverview(); } },
                 });
                 me.callParent();
