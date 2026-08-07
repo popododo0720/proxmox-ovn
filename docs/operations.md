@@ -299,16 +299,9 @@ or convergence timeout fails closed and no automatic delete or leave occurs.
 The OVN units use clustered NB/SB database ports 6643/6644 and publish
 mutual-TLS client listeners on 6641/6642. PVN Control uses client port 6645 and
 Raft port 6646. Allow 6643, 6644, and 6646 only among voters; allow 6641, 6642,
-and 6645 only from PVN nodes. Port 8443 is the same-node PVN web/API endpoint.
-No insecure TCP listener is created.
-
-On first use, a browser may trust the PVE UI on port 8006 but still reject the
-embedded manager on port 8443. The PVN panel toolbar provides **Trust local PVN
-certificate**, which opens only the current node's manager origin in a new
-`noopener,noreferrer` tab. Review and accept the certificate warning, return to
-the panel, and select **Reload PVN**. Production clients should trust the PVE CA
-or use a publicly trusted node certificate so this onboarding step is not
-required.
+and 6645 only from PVN nodes. Browser management remains on the existing PVE
+port 8006. The local manager exposes Unix sockets only; no PVN management TCP
+listener or second browser certificate is created.
 
 NB/SB client listeners are process-local `ovsdb-server` remotes, applied again
 after every database-process restart. PVN removes only the packaged replicated
@@ -439,25 +432,18 @@ systemctl restart pvn-ovn-host-config ovn-controller \
   pvn-manager pvn-agent pvn-node-ready
 ```
 
-## Default security policy and legacy backfill
+## Default security policy
 
-Each project owns a reserved `default` security group. New ports that omit an
+The cluster owns one reserved `default` security group. New ports that omit an
 explicit security-group selection receive it automatically. Its baseline
 allows IPv4 egress and ingress from other ports in the same default group;
 other IPv4 ingress is dropped. The group and its two managed rules are visible
 by name in the Proxmox PVN page, but cannot be edited or deleted independently.
-Authorized tenants may add separate rules to extend the group without changing
-the managed baseline.
 
-Ports created by older PVN releases with no security-group assignment remain
-unrestricted until an administrator migrates them. Open **Datacenter → PVN →
-Ports → Legacy security policy backfill**, refresh the plan, and run the dry
-run. The page lists projects, ports, nodes, and attached VM NICs by human name.
-Applying requires typing the exact PVE cluster name and changes policy for
-attached traffic immediately. Review any required external ingress rules
-before applying. On a standalone host, the exact confirmation is
-`standalone-NODENAME`. The manager reads this name from a protected systemd
-credential copy of `/etc/pve/.members`, not from the PVN installation UUID.
+Because PVN 0.3 has no projects, every port using this default group belongs to
+one routed self-ingress trust domain. Create explicit security groups before
+attach when workloads need narrower trust. The 0.2 to 0.3 cutover recreates
+the control databases, so there is no legacy unrestricted-port backfill path.
 
 The same display rule applies throughout the PVN page: normal tables,
 selectors, confirmations, diagnostics, and bounded errors resolve references
@@ -465,18 +451,15 @@ to human names when the referenced object is visible. Unknown UUIDs are
 redacted instead of becoming an operator-facing label. Open **Details** for the
 raw, copyable UUIDs needed to correlate API or database records.
 
-The dry run issues an opaque plan token covering the exact candidate ports and
-their revisions. Apply accepts only that preview: if a port is added or changes
-first, PVN rejects the whole request and the page refreshes the plan for a new
-review and dry run. The token is intentionally not displayed in the normal UI.
-The operation remains revision-fenced and rerunnable. It repairs the reserved
-baseline first, migrates only ports whose security-group list is still empty,
-and reports concurrent or blocked ports separately for a later retry. Planning
-requires global `SDN.Audit`; applying requires global `SDN.Allocate` and
-`Sys.Modify`. The normal Proxmox session and PVN CSRF protection apply, with no
-second login.
-
 ## Upgrades
+
+Do not run the normal rolling updater for the PVN 0.2 to 0.3 transition.
+`PVN_Control` 2.0 removes Project columns and is intentionally incompatible.
+Use the breaking-cutover procedure shipped with 0.3; it stops every writer,
+installs the package inert, discards only PVN/OVN database state, preserves the
+cluster identity and PKI, and then bootstraps all voters again.
+
+The rolling updater below is only for schema-compatible releases.
 
 Run the hosted rolling updater on any online PVE node. With no arguments it
 downloads the release package, updater, and native PVE lease helper, verifies
