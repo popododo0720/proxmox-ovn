@@ -29,6 +29,8 @@ type Controller struct {
 	lease             time.Duration
 	heartbeat         time.Duration
 	completionTimeout time.Duration
+	forcedClaimWait   time.Duration
+	forcedClaimPoll   time.Duration
 	now               func() time.Time
 	newOwner          func() string
 	retention         operationRetention
@@ -42,6 +44,8 @@ var ErrReconcileLeaseActive = errors.New("target has an active reconcile lease")
 const (
 	operationLease             = 5 * time.Minute
 	operationCompletionTimeout = 5 * time.Second
+	forcedClaimWaitTimeout     = 5 * time.Second
+	forcedClaimPollInterval    = 20 * time.Millisecond
 	maxConvergencePasses       = 8
 	maxHeartbeatInterval       = 30 * time.Second
 	defaultOperationKeep       = 1000
@@ -81,6 +85,7 @@ func NewController(store controlstore.Store, renderer Renderer, options ...Optio
 	controller := &Controller{
 		store: store, renderer: renderer, locks: make(map[string]*sync.Mutex),
 		lease: operationLease, heartbeat: heartbeatInterval(operationLease), completionTimeout: operationCompletionTimeout,
+		forcedClaimWait: forcedClaimWaitTimeout, forcedClaimPoll: forcedClaimPollInterval,
 		now: time.Now, newOwner: randomLeaseOwner,
 		retention: operationRetention{keep: defaultOperationKeep, age: defaultOperationAge},
 	}
@@ -98,10 +103,26 @@ func (c *Controller) Reconcile(ctx context.Context, kind model.Kind, id string) 
 // already marked ready. Root-only VM start checks use this to repair or reject
 // external OVN drift immediately before QEMU is allowed to start.
 func (c *Controller) ReconcileForced(ctx context.Context, kind model.Kind, id string) error {
-	return c.reconcile(ctx, kind, id, true, time.Time{})
+	wait := forcedClaimWaitTimeout
+	if c != nil && c.forcedClaimWait > 0 {
+		wait = c.forcedClaimWait
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		err := c.reconcileAttempt(ctx, kind, id, true, time.Time{}, true, deadline)
+		if !errors.Is(err, errRetryForcedReconcile) {
+			return err
+		}
+	}
 }
 
 func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, force bool, freshSince time.Time) error {
+	return c.reconcileAttempt(ctx, kind, id, force, freshSince, false, time.Time{})
+}
+
+var errRetryForcedReconcile = errors.New("retry forced reconcile")
+
+func (c *Controller) reconcileAttempt(ctx context.Context, kind model.Kind, id string, force bool, freshSince time.Time, waitForClaim bool, claimDeadline time.Time) error {
 	if c == nil || c.store == nil || c.renderer == nil {
 		return errors.New("reconciler is not configured")
 	}
@@ -115,6 +136,10 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 	}
 	meta := resource.GetMetadata()
 	if meta.State == model.ResourceDeleting {
+		if waitForClaim {
+			lock.Unlock()
+			return fmt.Errorf("forced reconcile %s %q revision %d: %w: resource is deleting", kind, id, meta.Revision, controlstore.ErrPrecondition)
+		}
 		// A manager may have died after persisting the tombstone but before
 		// removing the OVN rows. Release the local lock because Delete takes
 		// the same lock, then finish the durable delete workflow. This also
@@ -169,6 +194,12 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 	now := c.now().UTC()
 	claimed, claimErr := c.store.ClaimReconcile(ctx, op.ID, op.Revision, c.newOwner(), now, now.Add(-c.lease))
 	if claimErr != nil {
+		if waitForClaim {
+			if errors.Is(claimErr, controlstore.ErrConflict) {
+				return c.waitForForcedClaim(ctx, op.ID, kind, id, meta.Revision, claimDeadline)
+			}
+			return fmt.Errorf("claim forced reconcile operation: %w", claimErr)
+		}
 		if errors.Is(claimErr, controlstore.ErrPrecondition) || errors.Is(claimErr, controlstore.ErrConflict) || errors.Is(claimErr, controlstore.ErrNotFound) {
 			// Another manager won the claim, or the exact desired revision
 			// stopped being active before this manager could start writing.
@@ -205,6 +236,68 @@ func (c *Controller) reconcile(ctx context.Context, kind model.Kind, id string, 
 		resultErr = errors.Join(resultErr, fmt.Errorf("complete reconcile operation: %w", operationErr))
 	}
 	return resultErr
+}
+
+// waitForForcedClaim follows the exact durable operation that defeated a
+// root-only forced audit. It may accept the winner only after that operation
+// succeeded and the same desired revision is durably ready. Failed, expired,
+// or superseded winners force a fresh claim/audit instead of letting a VM start
+// on state that this manager did not verify.
+func (c *Controller) waitForForcedClaim(ctx context.Context, operationID string, kind model.Kind, id string, revision int64, deadline time.Time) error {
+	for {
+		resource, err := c.store.Get(ctx, model.KindOperation, operationID)
+		if err != nil {
+			return fmt.Errorf("load competing reconcile operation: %w", err)
+		}
+		operation := resource.(*model.Operation)
+		if operation.Action != "reconcile" || operation.TargetKind != kind || operation.TargetID != id || operation.TargetRevision != revision {
+			return fmt.Errorf("competing reconcile operation %q no longer targets exact %s %q revision %d: %w", operationID, kind, id, revision, controlstore.ErrConflict)
+		}
+		switch operation.OperationStatus {
+		case model.OperationSucceeded:
+			current, getErr := c.store.Get(ctx, kind, id)
+			if getErr != nil {
+				return fmt.Errorf("confirm competing reconcile target: %w", getErr)
+			}
+			meta := current.GetMetadata()
+			if meta.Revision == revision && meta.AppliedRevision == revision && meta.State == model.ResourceReady {
+				return nil
+			}
+			return errRetryForcedReconcile
+		case model.OperationRunning:
+			if operation.StartedAt == nil || !operation.UpdatedAt.UTC().After(c.now().UTC().Add(-c.lease)) {
+				return errRetryForcedReconcile
+			}
+		case model.OperationQueued, model.OperationFailed:
+			return errRetryForcedReconcile
+		default:
+			return fmt.Errorf("competing reconcile operation %q has invalid status %q: %w", operationID, operation.OperationStatus, controlstore.ErrConflict)
+		}
+
+		poll := c.forcedClaimPoll
+		if poll <= 0 {
+			poll = forcedClaimPollInterval
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("wait for competing reconcile operation %q: %w", operationID, context.DeadlineExceeded)
+		}
+		if poll > remaining {
+			poll = remaining
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // ReconcileAll is an explicit forced drift audit. Manager startup uses the

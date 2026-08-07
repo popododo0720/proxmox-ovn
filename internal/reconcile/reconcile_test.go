@@ -98,6 +98,47 @@ type snapshotObservingStore struct {
 	kinds         [][]model.Kind
 }
 
+type claimObservingStore struct {
+	controlstore.Store
+	conflicted chan struct{}
+	once       sync.Once
+}
+
+type claimErrorStore struct {
+	controlstore.Store
+	err error
+}
+
+type invalidateReadyOnTerminalStore struct {
+	controlstore.Store
+	once sync.Once
+	err  error
+}
+
+func (store *claimObservingStore) ClaimReconcile(ctx context.Context, operationID string, expectedRevision int64, leaseOwner string, startedAt, leaseCutoff time.Time) (*model.Operation, error) {
+	operation, err := store.Store.ClaimReconcile(ctx, operationID, expectedRevision, leaseOwner, startedAt, leaseCutoff)
+	if errors.Is(err, controlstore.ErrConflict) {
+		store.once.Do(func() { close(store.conflicted) })
+	}
+	return operation, err
+}
+
+func (store *claimErrorStore) ClaimReconcile(context.Context, string, int64, string, time.Time, time.Time) (*model.Operation, error) {
+	return nil, store.err
+}
+
+func (store *invalidateReadyOnTerminalStore) Get(ctx context.Context, kind model.Kind, id string) (model.Resource, error) {
+	resource, err := store.Store.Get(ctx, kind, id)
+	if err != nil || kind != model.KindOperation || resource.(*model.Operation).OperationStatus != model.OperationSucceeded {
+		return resource, err
+	}
+	operation := resource.(*model.Operation)
+	store.once.Do(func() {
+		_, store.err = store.Store.MarkReconciled(context.Background(), operation.TargetKind, operation.TargetID, operation.TargetRevision, errors.New("realized state lost after winner completion"))
+	})
+	return resource, nil
+}
+
 func (store *snapshotObservingStore) List(ctx context.Context, kind model.Kind, options controlstore.ListOptions) ([]model.Resource, error) {
 	store.mu.Lock()
 	store.listCalls++
@@ -1054,6 +1095,182 @@ func TestControllersShareRunningOperationLease(t *testing.T) {
 	}
 	if _, calls := renderer.state(); calls != 1 {
 		t.Fatalf("renderer calls=%d, want one durable operation owner", calls)
+	}
+}
+
+func TestReconcileForcedWaitsForForeignClaimAndAcceptsExactSuccess(t *testing.T) {
+	base := controlstore.NewMemory()
+	subject := createSubject(t, base)
+	delegate := NewFakeRenderer()
+	renderer := &blockingRenderer{delegate: delegate, started: make(chan struct{}), release: make(chan struct{})}
+	winner := NewController(base, renderer)
+	observed := &claimObservingStore{Store: base, conflicted: make(chan struct{})}
+	waiter := NewController(observed, renderer)
+
+	winnerDone := make(chan error, 1)
+	go func() { winnerDone <- winner.Reconcile(context.Background(), model.KindProviderNetwork, subject.ID) }()
+	<-renderer.started
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- waiter.ReconcileForced(context.Background(), model.KindProviderNetwork, subject.ID)
+	}()
+	<-observed.conflicted
+	select {
+	case err := <-waiterDone:
+		t.Fatalf("ReconcileForced() returned while the foreign claim was live: %v", err)
+	default:
+	}
+
+	close(renderer.release)
+	if err := <-winnerDone; err != nil {
+		t.Fatalf("winning Reconcile(): %v", err)
+	}
+	if err := <-waiterDone; err != nil {
+		t.Fatalf("ReconcileForced(): %v", err)
+	}
+	if calls := delegate.Calls(model.KindProviderNetwork, subject.ID); calls != 1 {
+		t.Fatalf("renderer calls=%d, want the exact successful winner accepted", calls)
+	}
+}
+
+func TestReconcileForcedRetriesAfterForeignClaimFails(t *testing.T) {
+	base := controlstore.NewMemory()
+	subject := createSubject(t, base)
+	failing := NewFakeRenderer()
+	failing.SetFailure(model.KindProviderNetwork, subject.ID, errors.New("winner render failed"))
+	winnerRenderer := &blockingRenderer{delegate: failing, started: make(chan struct{}), release: make(chan struct{})}
+	winner := NewController(base, winnerRenderer)
+	observed := &claimObservingStore{Store: base, conflicted: make(chan struct{})}
+	repairRenderer := NewFakeRenderer()
+	waiter := NewController(observed, repairRenderer)
+
+	winnerDone := make(chan error, 1)
+	go func() { winnerDone <- winner.Reconcile(context.Background(), model.KindProviderNetwork, subject.ID) }()
+	<-winnerRenderer.started
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- waiter.ReconcileForced(context.Background(), model.KindProviderNetwork, subject.ID)
+	}()
+	<-observed.conflicted
+	close(winnerRenderer.release)
+	if err := <-winnerDone; err == nil {
+		t.Fatal("winning Reconcile() unexpectedly succeeded")
+	}
+	if err := <-waiterDone; err != nil {
+		t.Fatalf("ReconcileForced(): %v", err)
+	}
+	if calls := repairRenderer.Calls(model.KindProviderNetwork, subject.ID); calls != 1 {
+		t.Fatalf("repair renderer calls=%d, want one fresh forced audit", calls)
+	}
+	ready, err := base.Get(context.Background(), model.KindProviderNetwork, subject.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta := ready.GetMetadata(); meta.State != model.ResourceReady || meta.AppliedRevision != meta.Revision {
+		t.Fatalf("repaired metadata=%#v", meta)
+	}
+}
+
+func TestReconcileForcedReauditsWinnerWhoseExactReadyStateWasLost(t *testing.T) {
+	base := controlstore.NewMemory()
+	subject := createSubject(t, base)
+	winnerRenderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
+	winner := NewController(base, winnerRenderer)
+	invalidating := &invalidateReadyOnTerminalStore{Store: base}
+	observed := &claimObservingStore{Store: invalidating, conflicted: make(chan struct{})}
+	repairRenderer := NewFakeRenderer()
+	waiter := NewController(observed, repairRenderer)
+
+	winnerDone := make(chan error, 1)
+	go func() { winnerDone <- winner.Reconcile(context.Background(), model.KindProviderNetwork, subject.ID) }()
+	<-winnerRenderer.started
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- waiter.ReconcileForced(context.Background(), model.KindProviderNetwork, subject.ID)
+	}()
+	<-observed.conflicted
+	close(winnerRenderer.release)
+	if err := <-winnerDone; err != nil {
+		t.Fatalf("winning Reconcile(): %v", err)
+	}
+	if err := <-waiterDone; err != nil {
+		t.Fatalf("ReconcileForced(): %v", err)
+	}
+	if invalidating.err != nil {
+		t.Fatalf("invalidate exact ready state: %v", invalidating.err)
+	}
+	if calls := repairRenderer.Calls(model.KindProviderNetwork, subject.ID); calls != 1 {
+		t.Fatalf("repair renderer calls=%d, want winner result re-audited", calls)
+	}
+}
+
+func TestReconcileForcedWaitForForeignClaimRespectsCancellation(t *testing.T) {
+	base := controlstore.NewMemory()
+	subject := createSubject(t, base)
+	renderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
+	winner := NewController(base, renderer)
+	observed := &claimObservingStore{Store: base, conflicted: make(chan struct{})}
+	waiterRenderer := NewFakeRenderer()
+	waiter := NewController(observed, waiterRenderer)
+
+	winnerDone := make(chan error, 1)
+	go func() { winnerDone <- winner.Reconcile(context.Background(), model.KindProviderNetwork, subject.ID) }()
+	<-renderer.started
+	ctx, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- waiter.ReconcileForced(ctx, model.KindProviderNetwork, subject.ID) }()
+	<-observed.conflicted
+	cancel()
+	if err := <-waiterDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReconcileForced() error=%v, want context canceled", err)
+	}
+	if calls := waiterRenderer.Calls(model.KindProviderNetwork, subject.ID); calls != 0 {
+		t.Fatalf("canceled waiter renderer calls=%d, want 0", calls)
+	}
+	close(renderer.release)
+	if err := <-winnerDone; err != nil {
+		t.Fatalf("winning Reconcile(): %v", err)
+	}
+}
+
+func TestReconcileForcedWaitForForeignClaimIsBounded(t *testing.T) {
+	base := controlstore.NewMemory()
+	subject := createSubject(t, base)
+	renderer := &blockingRenderer{delegate: NewFakeRenderer(), started: make(chan struct{}), release: make(chan struct{})}
+	winner := NewController(base, renderer)
+	observed := &claimObservingStore{Store: base, conflicted: make(chan struct{})}
+	waiter := NewController(observed, NewFakeRenderer())
+	waiter.forcedClaimWait = 40 * time.Millisecond
+	waiter.forcedClaimPoll = 5 * time.Millisecond
+
+	winnerDone := make(chan error, 1)
+	go func() { winnerDone <- winner.Reconcile(context.Background(), model.KindProviderNetwork, subject.ID) }()
+	<-renderer.started
+	started := time.Now()
+	err := waiter.ReconcileForced(context.Background(), model.KindProviderNetwork, subject.ID)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReconcileForced() error=%v, want bounded deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("ReconcileForced() wait=%v, want bounded return", elapsed)
+	}
+	close(renderer.release)
+	if err := <-winnerDone; err != nil {
+		t.Fatalf("winning Reconcile(): %v", err)
+	}
+}
+
+func TestReconcileForcedDoesNotSwallowClaimPreconditionOrNotFound(t *testing.T) {
+	for _, want := range []error{controlstore.ErrPrecondition, controlstore.ErrNotFound} {
+		t.Run(want.Error(), func(t *testing.T) {
+			base := controlstore.NewMemory()
+			subject := createSubject(t, base)
+			store := &claimErrorStore{Store: base, err: want}
+			controller := NewController(store, NewFakeRenderer())
+			if err := controller.ReconcileForced(context.Background(), model.KindProviderNetwork, subject.ID); !errors.Is(err, want) {
+				t.Fatalf("ReconcileForced() error=%v, want %v", err, want)
+			}
+		})
 	}
 }
 
