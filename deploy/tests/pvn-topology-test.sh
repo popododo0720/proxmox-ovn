@@ -4,6 +4,158 @@ set -eu
 TEST_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
 REPO=$(CDPATH= cd -P "$TEST_DIR/../.." && pwd)
 TOPOLOGY=$REPO/deploy/scripts/pvn-topology
+SELF=$TEST_DIR/pvn-topology-test.sh
+TEST_SCENARIO=${PVN_TOPOLOGY_TEST_SCENARIO:-}
+
+now_ns() {
+    date +%s%N
+}
+
+format_elapsed_ns() {
+    elapsed_ms=$(($1 / 1000000))
+    printf '%d.%03d' "$((elapsed_ms / 1000))" "$((elapsed_ms % 1000))"
+}
+
+if [ -n "${PVN_TOPOLOGY_TEST_RUN_SCENARIO:-}" ]; then
+    run_scenario=$PVN_TOPOLOGY_TEST_RUN_SCENARIO
+    run_log=$PVN_TOPOLOGY_TEST_RUN_LOG
+    run_status_file=$PVN_TOPOLOGY_TEST_RUN_STATUS
+    run_elapsed_file=$PVN_TOPOLOGY_TEST_RUN_ELAPSED
+    unset PVN_TOPOLOGY_TEST_RUN_SCENARIO
+    run_started_ns=$(now_ns)
+    run_status=0
+    if PVN_TOPOLOGY_TEST_SCENARIO=$run_scenario "$SELF" > "$run_log" 2>&1; then
+        :
+    else
+        run_status=$?
+    fi
+    run_finished_ns=$(now_ns)
+    printf '%s\n' "$run_status" > "$run_status_file"
+    printf '%s\n' "$((run_finished_ns - run_started_ns))" > "$run_elapsed_file"
+    exit 0
+fi
+
+parallel_root=
+parallel_pids=
+
+parallel_cleanup() {
+    parallel_status=$?
+    trap - 0 HUP INT TERM
+    if [ -n "$parallel_pids" ]; then
+        for parallel_pid in $parallel_pids; do
+            kill -TERM "-$parallel_pid" 2>/dev/null ||
+                kill -TERM "$parallel_pid" 2>/dev/null || :
+        done
+        sleep 1
+        for parallel_pid in $parallel_pids; do
+            kill -KILL "-$parallel_pid" 2>/dev/null ||
+                kill -KILL "$parallel_pid" 2>/dev/null || :
+        done
+        for parallel_pid in $parallel_pids; do
+            wait "$parallel_pid" 2>/dev/null || :
+        done
+    fi
+    [ -z "$parallel_root" ] || rm -rf "$parallel_root"
+    exit "$parallel_status"
+}
+
+parallel_signal() {
+    exit "$1"
+}
+
+run_parallel_scenarios() {
+    command -v setsid >/dev/null 2>&1 || {
+        echo "pvn-topology test failed: setsid is required for isolated scenario workers" >&2
+        return 1
+    }
+    parallel_root=$(mktemp -d)
+    parallel_pids=
+    trap parallel_cleanup 0
+    trap 'parallel_signal 129' HUP
+    trap 'parallel_signal 130' INT
+    trap 'parallel_signal 143' TERM
+
+    scenario_names='validation lifecycle corosync-restart corosync-crash-resume corosync-stale-cas'
+    if [ "${PVN_TOPOLOGY_CLUSTERED_ONLY:-0}" != 1 ]; then
+        scenario_names="$scenario_names network-staging network-rollback-guards"
+    fi
+    parallel_started_ns=$(now_ns)
+    for scenario_name in $scenario_names; do
+        PVN_TOPOLOGY_TEST_RUN_SCENARIO=$scenario_name \
+        PVN_TOPOLOGY_TEST_RUN_LOG=$parallel_root/$scenario_name.log \
+        PVN_TOPOLOGY_TEST_RUN_STATUS=$parallel_root/$scenario_name.status \
+        PVN_TOPOLOGY_TEST_RUN_ELAPSED=$parallel_root/$scenario_name.elapsed \
+            setsid "$SELF" &
+        parallel_pids="$parallel_pids $!"
+    done
+
+    parallel_wait_failed=0
+    for parallel_pid in $parallel_pids; do
+        if wait "$parallel_pid"; then
+            :
+        else
+            parallel_wait_failed=1
+        fi
+    done
+    parallel_pids=
+
+    parallel_failed=$parallel_wait_failed
+    for scenario_name in $scenario_names; do
+        scenario_log=$parallel_root/$scenario_name.log
+        scenario_status_file=$parallel_root/$scenario_name.status
+        scenario_elapsed_file=$parallel_root/$scenario_name.elapsed
+        [ ! -f "$scenario_log" ] || cat "$scenario_log"
+        if [ ! -s "$scenario_status_file" ] || [ ! -s "$scenario_elapsed_file" ]; then
+            echo "pvn-topology scenario=$scenario_name missing worker result" >&2
+            parallel_failed=1
+            continue
+        fi
+        scenario_status=$(sed -n '1p' "$scenario_status_file")
+        scenario_elapsed_ns=$(sed -n '1p' "$scenario_elapsed_file")
+        if [ "$scenario_status" -eq 0 ]; then
+            scenario_result=passed
+        else
+            scenario_result=failed
+            parallel_failed=1
+        fi
+        printf 'pvn-topology scenario=%s elapsed=%ss status=%s\n' \
+            "$scenario_name" "$(format_elapsed_ns "$scenario_elapsed_ns")" \
+            "$scenario_result"
+    done
+    parallel_finished_ns=$(now_ns)
+    printf 'pvn-topology scenarios elapsed=%ss\n' \
+        "$(format_elapsed_ns "$((parallel_finished_ns - parallel_started_ns))")"
+
+    rm -rf "$parallel_root"
+    parallel_root=
+    trap - 0 HUP INT TERM
+    if [ "$parallel_failed" -ne 0 ]; then
+        return 1
+    fi
+    echo "pvn-topology tests passed"
+}
+
+if [ -z "$TEST_SCENARIO" ]; then
+    run_parallel_scenarios
+    exit $?
+fi
+
+case "$TEST_SCENARIO" in
+    validation|lifecycle|corosync-restart|corosync-crash-resume|corosync-stale-cas|network-staging|network-rollback-guards) ;;
+    *)
+        echo "pvn-topology test failed: unknown scenario $TEST_SCENARIO" >&2
+        exit 2
+        ;;
+esac
+case "$TEST_SCENARIO" in
+    network-staging|network-rollback-guards)
+        if [ "${PVN_TOPOLOGY_CLUSTERED_ONLY:-0}" = 1 ]; then
+            echo "pvn-topology scenario=$TEST_SCENARIO skipped for clustered-only run"
+            exit 0
+        fi
+        ;;
+esac
+
 WORK=$(mktemp -d)
 
 cleanup() {
@@ -1052,6 +1204,7 @@ PY
 PYTHONDONTWRITEBYTECODE=1 python3 -c \
     "compile(open('$TOPOLOGY', encoding='utf-8').read(), '$TOPOLOGY', 'exec')"
 
+if [ "$TEST_SCENARIO" = validation ]; then
 reset_state
 "$TOPOLOGY" --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" > "$WORK/plan.out"
 [ ! -e "$LOCK" ] || fail "read-only plan created a lock/journal artifact"
@@ -1232,7 +1385,9 @@ for mtu_role in geneve provider; do
     [ ! -e "$GLOBAL_LOCK" ] ||
         fail "$mtu_role unrestorable MTU preflight left the cluster-global lock behind"
 done
+fi
 
+if [ "$TEST_SCENARIO" = lifecycle ]; then
 reset_state
 PVN_TEST_MEMBERSHIP_DRIFT_KIND=members-version PVN_TEST_DRIFT_AFTER_STAGE_HOST=prox2 \
     "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
@@ -1675,7 +1830,9 @@ if grep -Eq 'action=(validate-corosync|apply-corosync|reload-corosync|restart-co
 fi
 [ "$(grep -c 'exact network state already present; no-op' "$WORK/rerun.out")" -eq 3 ] ||
     fail "exact-state rerun did not report all no-ops"
+fi
 
+if [ "$TEST_SCENARIO" = corosync-restart ]; then
 reset_state
 PVN_TEST_PARTIAL_RELOAD_HOSTS=prox1,prox2,prox3 "$TOPOLOGY" apply \
     --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
@@ -1728,7 +1885,9 @@ fi
 if grep -Eq 'action=(stage-network|apply-network|write-ledger)' "$LOG"; then
     fail "network/ledger mutation ran after Corosync safety-ring loss"
 fi
+fi
 
+if [ "$TEST_SCENARIO" = corosync-crash-resume ]; then
 reset_state
 if PVN_TEST_CRASH_BEFORE_COROSYNC_WRITE_NUMBER=2 "$TOPOLOGY" apply \
     --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
@@ -1772,7 +1931,9 @@ PY
 "$TOPOLOGY" apply --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
     --provider-port-ready "$ACK" --confirm lab-cluster > "$WORK/final-resume.out"
 grep -q 'action=write-ledger' "$LOG" || fail "final-boundary rerun did not resume to completion"
+fi
 
+if [ "$TEST_SCENARIO" = corosync-stale-cas ]; then
 reset_state
 python3 - "$COROSYNC" "$STATE" <<'PY'
 import json
@@ -1928,7 +2089,9 @@ if [ "${PVN_TOPOLOGY_CLUSTERED_ONLY:-0}" = 1 ]; then
     echo "pvn-topology clustered Corosync tests passed"
     exit 0
 fi
+fi
 
+if [ "$TEST_SCENARIO" = network-staging ]; then
 reset_state
 if PVN_TEST_FAIL_STAGE_RESPONSE_HOST=prox2 "$TOPOLOGY" apply \
     --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
@@ -2027,7 +2190,9 @@ state = json.load(open(sys.argv[1], encoding="utf-8"))
 assert all(value["network"] == "initial" for value in state["nodes"].values())
 assert state["ledger"] is None
 PY
+fi
 
+if [ "$TEST_SCENARIO" = network-rollback-guards ]; then
 reset_state
 if PVN_TEST_FAIL_VERIFY_HOST=prox1 "$TOPOLOGY" apply \
     --geneve-cidr "$GENEVE" --provider-cidr "$PROVIDER" \
@@ -2130,5 +2295,6 @@ grep -q 'STATE_FILE.*state.json' "$TOPOLOGY" || fail "persistent topology journa
 grep -q '0o600' "$TOPOLOGY" || fail "root-private journal/backup mode is missing"
 grep -q 'expected_sha256' "$TOPOLOGY" || fail "Corosync compare-and-swap guard is missing"
 grep -q 'before_interfaces_sha256' "$TOPOLOGY" || fail "network compare-and-swap guard is missing"
+fi
 
-echo "pvn-topology tests passed"
+echo "pvn-topology scenario=$TEST_SCENARIO passed"
