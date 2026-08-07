@@ -83,16 +83,16 @@ jobs:
               "$remote_commit" "$PVN_RELEASE_COMMIT_SHA" >&2
             exit 1
           fi
-          if ! gh api \
-              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-              >/dev/null 2>&1; then
+          if ! gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes \
               --title "PVN $GITHUB_REF_NAME"
           fi
-          release_state=$(gh api \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            --jq '[.author.login, .draft, .prerelease, .tag_name] | @tsv')
+          release_state=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json author,isDraft,isPrerelease,tagName \
+            --jq '[.author.login, .isDraft, .isPrerelease, .tagName] | @tsv')
           IFS=$'\t' read -r release_author release_is_draft \
             release_is_prerelease release_tag_name <<< "$release_state"
           if [[ $release_author != 'github-actions[bot]' ]]; then
@@ -110,8 +110,8 @@ jobs:
             printf 'existing release has invalid tag or prerelease state\n' >&2
             exit 1
           fi
-          unexpected_uploaders=$(gh api \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+          unexpected_uploaders=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[] | select(.uploader.login != "github-actions[bot]") | .name')
           if [[ -n $unexpected_uploaders ]]; then
             printf 'release contains assets from a noncanonical publisher:\n%s\n' \
@@ -229,16 +229,16 @@ jobs:
           }
           verify_release_provenance() {
             local release_author unexpected_uploaders
-            release_author=$(gh api \
-              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            release_author=$(gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --json author \
               --jq '.author.login')
             if [[ $release_author != 'github-actions[bot]' ]]; then
               printf 'release was not created by the canonical publisher: %s\n' \
                 "$release_author" >&2
               exit 1
             fi
-            unexpected_uploaders=$(gh api \
-              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            unexpected_uploaders=$(gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --json assets \
               --jq '.assets[] | select(.uploader.login != "github-actions[bot]") | .name')
             if [[ -n $unexpected_uploaders ]]; then
               printf 'release contains assets from a noncanonical publisher:\n%s\n' \

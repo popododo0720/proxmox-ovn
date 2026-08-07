@@ -73,4 +73,14 @@ TEST_BUILD_DATE=1970-01-01T00:00:01Z \
     expect_failure 'wrong build date' run_check
 TEST_GITHUB_ACTIONS=false expect_failure 'a non-Actions publisher' run_check
 
+release_workflow=$repo_root/.github/workflows/release.yml
+if grep -Fq 'releases/tags/$GITHUB_REF_NAME' "$release_workflow"; then
+    printf 'release workflow uses an API endpoint that cannot resolve drafts\n' >&2
+    exit 1
+fi
+grep -Fq 'gh release view "$GITHUB_REF_NAME"' "$release_workflow" || {
+    printf 'release workflow does not resolve releases through draft-aware gh lookup\n' >&2
+    exit 1
+}
+
 printf 'release-check tests passed\n'
