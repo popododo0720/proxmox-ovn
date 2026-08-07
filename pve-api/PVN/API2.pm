@@ -23,21 +23,12 @@ my $MAX_REQUEST = 1 << 20;
 my $MAX_RESPONSE = 8 << 20;
 my $TIMEOUT = 10;
 my $ID_PATTERN = '[A-Za-z0-9][A-Za-z0-9._:-]{0,127}';
-my $ITEM_ID_PATTERN = '(?!provision$)' . $ID_PATTERN;
-my $READ_COLLECTION_PATTERN = join(
-    '|',
-    qw(
-        networks subnets ports ip-allocations routers router-interfaces floating-ips
-        provider-networks provider-segments security-groups security-group-rules nodes operations
-    ),
+my $ITEM_ID_PATTERN = $ID_PATTERN;
+my @READ_COLLECTIONS = qw(
+    networks subnets ports ip-allocations routers router-interfaces floating-ips
+    provider-networks provider-segments security-groups security-group-rules nodes operations
 );
-my $WRITE_COLLECTION_PATTERN = join(
-    '|',
-    qw(
-        networks subnets ports ip-allocations routers router-interfaces floating-ips
-        provider-networks provider-segments security-groups security-group-rules nodes
-    ),
-);
+my %WRITE_COLLECTIONS = map { $_ => 1 } grep { $_ ne 'operations' } @READ_COLLECTIONS;
 
 my $auth_permissions = { user => 'all' };
 my $empty_parameters = { additionalProperties => 0, properties => {} };
@@ -45,14 +36,6 @@ my $object_return = { type => 'object' };
 my $array_return = { type => 'array', items => { type => 'object' } };
 my $null_return = { type => 'null' };
 
-my $collection_property = {
-    type => 'string',
-    pattern => "(?:$READ_COLLECTION_PATTERN)",
-};
-my $write_collection_property = {
-    type => 'string',
-    pattern => "(?:$WRITE_COLLECTION_PATTERN)",
-};
 my $id_property = {
     type => 'string',
     pattern => $ITEM_ID_PATTERN,
@@ -273,19 +256,25 @@ __PACKAGE__->register_method({
 
 __PACKAGE__->register_method({
     name => 'port_provision',
-    path => 'ports/provision',
+    path => "ports/{id:$ITEM_ID_PATTERN}",
     method => 'POST',
     permissions => $auth_permissions,
     description => 'Provision a PVN port.',
     parameters => {
         additionalProperties => 0,
         properties => {
+            id => { type => 'string', enum => ['provision'] },
             payload => $payload_property,
             idempotency_key => $idempotency_property,
         },
     },
     returns => $object_return,
-    code => sub { return forward_request('POST', '/api/v1/ports/provision', $_[0]); },
+    code => sub {
+        my ($param) = @_;
+        raise_param_exc({ id => 'only the provision action is accepted here' })
+            if $param->{id} ne 'provision';
+        return forward_request('POST', '/api/v1/ports/provision', $param);
+    },
 });
 
 for my $action (qw(attach detach)) {
@@ -337,120 +326,119 @@ __PACKAGE__->register_method({
     },
 });
 
-__PACKAGE__->register_method({
-    name => 'list_resources',
-    path => "{collection:(?:$READ_COLLECTION_PATTERN)}",
-    method => 'GET',
-    permissions => $auth_permissions,
-    description => 'List PVN resources.',
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            collection => $collection_property,
-            network_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
-            node_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
-            vmid => { type => 'integer', minimum => 1, optional => 1 },
-            nic => { type => 'string', pattern => 'net[0-9]+', optional => 1 },
-            limit => { type => 'integer', minimum => 1, maximum => 500, optional => 1 },
-        },
-    },
-    returns => $array_return,
-    code => sub {
-        my ($param) = @_;
-        return forward_request(
-            'GET', '/api/v1/' . $param->{collection}, $param,
-            [qw(network_id node_id vmid nic limit)],
-        );
-    },
-});
+for my $collection (@READ_COLLECTIONS) {
+    (my $method_suffix = $collection) =~ tr/-/_/;
 
-__PACKAGE__->register_method({
-    name => 'create_resource',
-    path => "{collection:(?:$WRITE_COLLECTION_PATTERN)}",
-    method => 'POST',
-    permissions => $auth_permissions,
-    description => 'Create a PVN resource.',
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            collection => $write_collection_property,
-            payload => $payload_property,
-            idempotency_key => $idempotency_property,
+    __PACKAGE__->register_method({
+        name => "list_$method_suffix",
+        path => $collection,
+        method => 'GET',
+        permissions => $auth_permissions,
+        description => "List PVN $collection.",
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                network_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
+                node_id => { type => 'string', pattern => $ID_PATTERN, optional => 1 },
+                vmid => { type => 'integer', minimum => 1, optional => 1 },
+                nic => { type => 'string', pattern => 'net[0-9]+', optional => 1 },
+                limit => { type => 'integer', minimum => 1, maximum => 500, optional => 1 },
+            },
         },
-    },
-    returns => $object_return,
-    code => sub {
-        my ($param) = @_;
-        return forward_request('POST', '/api/v1/' . $param->{collection}, $param);
-    },
-});
-
-__PACKAGE__->register_method({
-    name => 'get_resource',
-    path => "{collection:(?:$READ_COLLECTION_PATTERN)}/{id:$ITEM_ID_PATTERN}",
-    method => 'GET',
-    permissions => $auth_permissions,
-    description => 'Read a PVN resource.',
-    parameters => {
-        additionalProperties => 0,
-        properties => { collection => $collection_property, id => $id_property },
-    },
-    returns => $object_return,
-    code => sub {
-        my ($param) = @_;
-        return forward_request(
-            'GET', '/api/v1/' . $param->{collection} . '/' . uri_escape_utf8($param->{id}), $param,
-        );
-    },
-});
-
-__PACKAGE__->register_method({
-    name => 'update_resource',
-    path => "{collection:(?:$WRITE_COLLECTION_PATTERN)}/{id:$ITEM_ID_PATTERN}",
-    method => 'PUT',
-    permissions => $auth_permissions,
-    description => 'Update a PVN resource.',
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            collection => $write_collection_property,
-            id => $id_property,
-            payload => $payload_property,
-            revision => { %$revision_property, optional => 1 },
-            idempotency_key => $idempotency_property,
+        returns => $array_return,
+        code => sub {
+            return forward_request(
+                'GET', "/api/v1/$collection", $_[0], [qw(network_id node_id vmid nic limit)],
+            );
         },
-    },
-    returns => $object_return,
-    code => sub {
-        my ($param) = @_;
-        return forward_request(
-            'PUT', '/api/v1/' . $param->{collection} . '/' . uri_escape_utf8($param->{id}), $param,
-        );
-    },
-});
+    });
 
-__PACKAGE__->register_method({
-    name => 'delete_resource',
-    path => "{collection:(?:$WRITE_COLLECTION_PATTERN)}/{id:$ITEM_ID_PATTERN}",
-    method => 'DELETE',
-    permissions => $auth_permissions,
-    description => 'Delete a PVN resource.',
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            collection => $write_collection_property,
-            id => $id_property,
-            revision => $revision_property,
-            idempotency_key => $idempotency_property,
+    if ($WRITE_COLLECTIONS{$collection}) {
+        __PACKAGE__->register_method({
+            name => "create_$method_suffix",
+            path => $collection,
+            method => 'POST',
+            permissions => $auth_permissions,
+            description => "Create a PVN $collection resource.",
+            parameters => {
+                additionalProperties => 0,
+                properties => {
+                    payload => $payload_property,
+                    idempotency_key => $idempotency_property,
+                },
+            },
+            returns => $object_return,
+            code => sub { return forward_request('POST', "/api/v1/$collection", $_[0]); },
+        });
+    }
+
+    __PACKAGE__->register_method({
+        name => "get_$method_suffix",
+        path => "$collection/{id:$ITEM_ID_PATTERN}",
+        method => 'GET',
+        permissions => $auth_permissions,
+        description => "Read a PVN $collection resource.",
+        parameters => {
+            additionalProperties => 0,
+            properties => { id => $id_property },
         },
-    },
-    returns => $null_return,
-    code => sub {
-        my ($param) = @_;
-        return forward_request(
-            'DELETE', '/api/v1/' . $param->{collection} . '/' . uri_escape_utf8($param->{id}), $param,
-        );
-    },
-});
+        returns => $object_return,
+        code => sub {
+            my ($param) = @_;
+            return forward_request(
+                'GET', "/api/v1/$collection/" . uri_escape_utf8($param->{id}), $param,
+            );
+        },
+    });
+
+    next if !$WRITE_COLLECTIONS{$collection};
+
+    __PACKAGE__->register_method({
+        name => "update_$method_suffix",
+        path => "$collection/{id:$ITEM_ID_PATTERN}",
+        method => 'PUT',
+        permissions => $auth_permissions,
+        description => "Update a PVN $collection resource.",
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                id => $id_property,
+                payload => $payload_property,
+                revision => { %$revision_property, optional => 1 },
+                idempotency_key => $idempotency_property,
+            },
+        },
+        returns => $object_return,
+        code => sub {
+            my ($param) = @_;
+            return forward_request(
+                'PUT', "/api/v1/$collection/" . uri_escape_utf8($param->{id}), $param,
+            );
+        },
+    });
+
+    __PACKAGE__->register_method({
+        name => "delete_$method_suffix",
+        path => "$collection/{id:$ITEM_ID_PATTERN}",
+        method => 'DELETE',
+        permissions => $auth_permissions,
+        description => "Delete a PVN $collection resource.",
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                id => $id_property,
+                revision => $revision_property,
+                idempotency_key => $idempotency_property,
+            },
+        },
+        returns => $null_return,
+        code => sub {
+            my ($param) = @_;
+            return forward_request(
+                'DELETE', "/api/v1/$collection/" . uri_escape_utf8($param->{id}), $param,
+            );
+        },
+    });
+}
 
 1;
