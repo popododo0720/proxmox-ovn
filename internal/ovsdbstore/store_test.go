@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -319,7 +320,14 @@ func TestStorePersistsEveryResourceKindAndFiltersInternalRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	floating = realizedFloating.(*model.FloatingIP)
-	operation := mustCreate(t, store, &model.Operation{Action: "bind", TargetKind: model.KindPort, TargetID: port.ID, TargetRevision: port.Revision}, "operation")
+	operationPayload, err := model.MarshalOperationPayload(struct {
+		Generation int64 `json:"generation"`
+		VMID       int   `json:"vmid"`
+	}{Generation: port.Generation, VMID: port.VMID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := mustCreate(t, store, &model.Operation{Action: "bind", TargetKind: model.KindPort, TargetID: port.ID, TargetRevision: port.Revision, Payload: operationPayload}, "operation")
 	if operation.(*model.Operation).IdempotencyKey != "operation" {
 		t.Fatalf("operation idempotency key=%q", operation.(*model.Operation).IdempotencyKey)
 	}
@@ -364,9 +372,66 @@ func TestStorePersistsEveryResourceKindAndFiltersInternalRows(t *testing.T) {
 	if len(operations) != 1 || operations[0].GetMetadata().ID != operation.GetMetadata().ID {
 		t.Fatalf("internal lock/idempotency rows leaked into Operation list: %#v", operations)
 	}
+	if operations[0].(*model.Operation).Payload != operationPayload {
+		t.Fatalf("decoded operation payload=%q", operations[0].(*model.Operation).Payload)
+	}
+	database.mu.Lock()
+	operationRow := database.rows[kindTables[model.KindOperation]][findRow(database.rows[kindTables[model.KindOperation]], operation.GetMetadata().ID)]
+	storedExternalIDs, externalErr := rowStringMap(operationRow, "external_ids")
+	database.mu.Unlock()
+	if externalErr != nil || len(storedExternalIDs) != 1 || storedExternalIDs[operationComputePayloadKey] != operationPayload {
+		t.Fatalf("stored operation external_ids=%#v err=%v", storedExternalIDs, externalErr)
+	}
+	replayedOperation, replayed, err := store.Create(context.Background(), &model.Operation{
+		Action: "bind", TargetKind: model.KindPort, TargetID: port.ID, TargetRevision: port.Revision, Payload: operationPayload,
+	}, "operation")
+	if err != nil || !replayed {
+		t.Fatalf("operation replay resource=%#v replayed=%v err=%v", replayedOperation, replayed, err)
+	}
+	if replayedOperation.(*model.Operation).Payload != operationPayload {
+		t.Fatalf("operation replay payload=%q", replayedOperation.(*model.Operation).Payload)
+	}
 	ports, err := store.List(context.Background(), model.KindPort, controlstore.ListOptions{NetworkID: network.ID, NodeID: node.ID, VMID: 100, NIC: "net0"})
 	if err != nil || len(ports) != 1 || ports[0].GetMetadata().ID != port.ID {
 		t.Fatalf("filtered ports=%#v err=%v", ports, err)
+	}
+}
+
+func TestStoreRejectsInvalidOperationPayloadExternalIDs(t *testing.T) {
+	validPayload, err := model.MarshalOperationPayload(struct {
+		VMID int `json:"vmid"`
+	}{VMID: 101})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name        string
+		externalIDs map[string]string
+		want        string
+	}{
+		{name: "unknown key", externalIDs: map[string]string{operationComputePayloadKey: validPayload, "pvn:unexpected": "value"}, want: "unknown key"},
+		{name: "malformed", externalIDs: map[string]string{operationComputePayloadKey: `{"vmid":`}, want: "valid JSON"},
+		{name: "noncanonical", externalIDs: map[string]string{operationComputePayloadKey: `{ "vmid":101}`}, want: "canonical JSON object"},
+		{name: "oversize", externalIDs: map[string]string{operationComputePayloadKey: `{"data":"` + strings.Repeat("x", model.MaxOperationPayloadBytes) + `"}`}, want: "must not exceed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database := newFakeDatabase()
+			store := deterministicStore(database)
+			operation := mustCreate(t, store, &model.Operation{
+				Action: "compute-clone", TargetKind: model.KindPort, TargetID: "port-id", TargetRevision: 1,
+				Payload: validPayload,
+			}, "compute-clone:101")
+			database.mu.Lock()
+			rows := database.rows[kindTables[model.KindOperation]]
+			index := findRow(rows, operation.GetMetadata().ID)
+			rows[index]["external_ids"] = encodeStringMap(test.externalIDs)
+			database.mu.Unlock()
+			_, err := store.Get(context.Background(), model.KindOperation, operation.GetMetadata().ID)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("invalid external_ids error=%v", err)
+			}
+		})
 	}
 }
 

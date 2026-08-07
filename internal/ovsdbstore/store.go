@@ -1088,6 +1088,12 @@ func resourceFingerprint(resource model.Resource, qualifier string) ([sha256.Siz
 		return [sha256.Size]byte{}, err
 	}
 	encoded = append(encoded, qualifier...)
+	if operation, ok := resource.(*model.Operation); ok && operation.Payload != "" {
+		// Operation payloads are private API state but remain part of the
+		// idempotent write identity.
+		encoded = append(encoded, 0)
+		encoded = append(encoded, operation.Payload...)
+	}
 	return sha256.Sum256(encoded), nil
 }
 

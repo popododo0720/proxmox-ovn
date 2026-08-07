@@ -1,6 +1,8 @@
 package model
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -67,6 +69,10 @@ func TestResourceValidation(t *testing.T) {
 		{"node", &Node{Name: "pve01", ChassisID: "chassis-1", Roles: []NodeRole{NodeRoleCompute, NodeRoleGateway}}, true},
 		{"node duplicate role", &Node{Name: "pve01", ChassisID: "chassis-1", Roles: []NodeRole{NodeRoleCompute, NodeRoleCompute}}, false},
 		{"operation", &Operation{Action: "reconcile", TargetKind: KindNetwork, TargetID: "network-id", TargetRevision: 1, IdempotencyKey: "reconcile:network:network-id:1", OperationStatus: OperationQueued}, true},
+		{"operation with payload", &Operation{Action: "compute-clone", TargetKind: KindPort, TargetID: "port-id", TargetRevision: 1, IdempotencyKey: "clone:port-id:1", OperationStatus: OperationQueued, Payload: `{"generation":1,"vmid":101}`}, true},
+		{"operation with non-object payload", &Operation{Action: "compute-clone", TargetKind: KindPort, TargetID: "port-id", TargetRevision: 1, IdempotencyKey: "clone:port-id:1", OperationStatus: OperationQueued, Payload: `[]`}, false},
+		{"operation with noncanonical payload", &Operation{Action: "compute-clone", TargetKind: KindPort, TargetID: "port-id", TargetRevision: 1, IdempotencyKey: "clone:port-id:1", OperationStatus: OperationQueued, Payload: `{ "vmid": 101 }`}, false},
+		{"operation with oversized payload", &Operation{Action: "compute-clone", TargetKind: KindPort, TargetID: "port-id", TargetRevision: 1, IdempotencyKey: "clone:port-id:1", OperationStatus: OperationQueued, Payload: `{"data":"` + strings.Repeat("x", MaxOperationPayloadBytes) + `"}`}, false},
 		{"running operation", &Operation{Action: "reconcile", TargetKind: KindNetwork, TargetID: "network-id", TargetRevision: 1, IdempotencyKey: "reconcile:network:network-id:1", OperationStatus: OperationRunning, LeaseOwner: "lease-manager-1"}, true},
 		{"running operation without owner", &Operation{Action: "reconcile", TargetKind: KindNetwork, TargetID: "network-id", TargetRevision: 1, IdempotencyKey: "reconcile:network:network-id:1", OperationStatus: OperationRunning}, false},
 		{"operation without idempotency", &Operation{Action: "reconcile", TargetKind: KindNetwork, TargetID: "network-id", TargetRevision: 1, OperationStatus: OperationQueued}, false},
@@ -118,5 +124,62 @@ func TestCloneIsIndependent(t *testing.T) {
 	cloned.FixedIPs[0].Address = "10.0.0.3"
 	if original.Name != "before" || original.FixedIPs[0].Address != "10.0.0.2" {
 		t.Fatal("clone mutated original")
+	}
+}
+
+func TestOperationPayloadHelpersAreCanonicalStrictAndPrivate(t *testing.T) {
+	type manifest struct {
+		VMID       int    `json:"vmid"`
+		Generation int64  `json:"generation"`
+		Mode       string `json:"mode,omitempty"`
+	}
+	payload, err := MarshalOperationPayload(manifest{VMID: 101, Generation: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload != `{"generation":7,"vmid":101}` {
+		t.Fatalf("canonical payload=%q", payload)
+	}
+	var decoded manifest
+	if err := UnmarshalOperationPayload(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.VMID != 101 || decoded.Generation != 7 {
+		t.Fatalf("decoded payload=%#v", decoded)
+	}
+	for name, invalidPayload := range map[string]string{
+		"malformed":      `{"vmid":`,
+		"trailing":       `{"vmid":101}{}`,
+		"array":          `[{"vmid":101}]`,
+		"whitespace":     `{ "vmid":101}`,
+		"unsorted":       `{"vmid":101,"generation":7}`,
+		"duplicate keys": `{"vmid":101,"vmid":101}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateOperationPayload(invalidPayload); err == nil {
+				t.Fatalf("ValidateOperationPayload(%q) unexpectedly succeeded", invalidPayload)
+			}
+		})
+	}
+	if err := UnmarshalOperationPayload(`{"generation":7,"unknown":true,"vmid":101}`, &decoded); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("unknown field error=%v", err)
+	}
+	if _, err := MarshalOperationPayload([]int{1, 2}); err == nil {
+		t.Fatal("array payload unexpectedly marshaled")
+	}
+	operation := &Operation{Payload: payload}
+	clonedResource, err := Clone(operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clonedResource.(*Operation).Payload != payload {
+		t.Fatalf("clone lost payload: %#v", clonedResource)
+	}
+	publicJSON, err := json.Marshal(operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(publicJSON), "payload") || strings.Contains(string(publicJSON), "generation") {
+		t.Fatalf("internal payload leaked into public JSON: %s", publicJSON)
 	}
 }

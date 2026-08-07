@@ -848,6 +848,13 @@ func fingerprint(resource model.Resource, qualifier string) ([32]byte, error) {
 		return [32]byte{}, err
 	}
 	encoded = append(encoded, qualifier...)
+	if operation, ok := resource.(*model.Operation); ok && operation.Payload != "" {
+		// Payload is intentionally omitted from public JSON. Keep it in the
+		// request identity behind an unambiguous separator so reusing a key for
+		// different internal compute state still conflicts.
+		encoded = append(encoded, 0)
+		encoded = append(encoded, operation.Payload...)
+	}
 	return sha256.Sum256(encoded), nil
 }
 

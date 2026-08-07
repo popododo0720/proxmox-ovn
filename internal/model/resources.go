@@ -276,6 +276,10 @@ type Operation struct {
 	LeaseOwner      string          `json:"lease_owner,omitempty"`
 	StartedAt       *time.Time      `json:"started_at,omitempty"`
 	CompletedAt     *time.Time      `json:"completed_at,omitempty"`
+	// Payload is durable, manager-internal operation state. It is deliberately
+	// excluded from the public resource JSON so compute manifests and rollback
+	// state cannot leak through the browser-facing Operations API.
+	Payload string `json:"-"`
 }
 
 func (*Operation) ResourceKind() Kind { return KindOperation }

@@ -373,6 +373,9 @@ func validateOperation(o *Operation) error {
 			return err
 		}
 	}
+	if err := ValidateOperationPayload(o.Payload); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -423,6 +426,11 @@ func Clone(resource Resource) (Resource, error) {
 	}
 	if err := json.Unmarshal(encoded, copyResource); err != nil {
 		return nil, err
+	}
+	// Operation.Payload is intentionally hidden from public JSON, so preserve
+	// it explicitly while retaining JSON-based deep-copy semantics elsewhere.
+	if source, ok := resource.(*Operation); ok {
+		copyResource.(*Operation).Payload = source.Payload
 	}
 	return copyResource, nil
 }

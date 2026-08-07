@@ -522,6 +522,52 @@ func TestMemoryOperationUsesRequestIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestMemoryOperationPayloadSurvivesCloneUpdateAndScopesIdempotency(t *testing.T) {
+	store := deterministicStore()
+	firstPayload, err := model.MarshalOperationPayload(struct {
+		VMID int `json:"vmid"`
+	}{VMID: 101})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPayload, err := model.MarshalOperationPayload(struct {
+		VMID int `json:"vmid"`
+	}{VMID: 102})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &model.Operation{
+		Action: "compute-clone", TargetKind: model.KindPort, TargetID: "port-id", TargetRevision: 1,
+		Payload: firstPayload,
+	}
+	created := mustCreate(t, store, request, "compute-clone:101").(*model.Operation)
+	if created.Payload != firstPayload {
+		t.Fatalf("created payload=%q", created.Payload)
+	}
+	created.Payload = secondPayload
+	loadedResource, err := store.Get(context.Background(), model.KindOperation, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := loadedResource.(*model.Operation)
+	if loaded.Payload != firstPayload {
+		t.Fatalf("caller mutation changed stored payload=%q", loaded.Payload)
+	}
+	loaded.Payload = secondPayload
+	updatedResource, replayed, err := store.Update(context.Background(), loaded, loaded.Revision, "compute-clone:101:update")
+	if err != nil || replayed {
+		t.Fatalf("Update replayed=%v err=%v", replayed, err)
+	}
+	if updatedResource.(*model.Operation).Payload != secondPayload {
+		t.Fatalf("updated payload=%q", updatedResource.(*model.Operation).Payload)
+	}
+	conflicting := *request
+	conflicting.Payload = secondPayload
+	if _, _, err := store.Create(context.Background(), &conflicting, "compute-clone:101"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("different payload reused idempotency key: %v", err)
+	}
+}
+
 func TestMemoryDeleteTombstoneMustBePurged(t *testing.T) {
 	store := deterministicStore()
 	subject := mustCreate(t, store, &model.ProviderNetwork{Name: "tenant"}, "create").(*model.ProviderNetwork)

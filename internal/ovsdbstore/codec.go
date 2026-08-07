@@ -30,6 +30,7 @@ const (
 	subnetDNSDomainKey         = "pvn:dns-domain"
 	subnetDNSSearchDomainsKey  = "pvn:dns-search-domains"
 	routerStaticRoutesKey      = "pvn:static-routes"
+	operationComputePayloadKey = "pvn:compute-payload"
 	maxStoredErrorLen          = 16 * 1024
 	maxResourceExternalJSONLen = 64 * 1024
 )
@@ -247,6 +248,12 @@ func decodeInternalOperation(row ovsdb.Row, result *snapshot) (bool, error) {
 		if err := json.Unmarshal([]byte(external[idemResource]), resource); err != nil {
 			return false, fmt.Errorf("decode idempotency result for %q: %w", scope, err)
 		}
+		if operation, ok := resource.(*model.Operation); ok {
+			operation.Payload = external[operationComputePayloadKey]
+			if err := model.ValidateOperationPayload(operation.Payload); err != nil {
+				return false, fmt.Errorf("idempotency result for %q has invalid compute payload: %w", scope, err)
+			}
+		}
 		meta := resource.GetMetadata()
 		if meta.ID == "" || meta.Revision < 1 || meta.AppliedRevision < 0 || meta.AppliedRevision > meta.Revision || meta.CreatedAt.IsZero() || meta.UpdatedAt.IsZero() {
 			return false, fmt.Errorf("idempotency result for %q has invalid metadata", scope)
@@ -411,7 +418,9 @@ func decodeResource(kind model.Kind, row ovsdb.Row, refs *snapshot) (model.Resou
 		leaseOwner, e8 := stringValue("lease_owner")
 		started, e9 := rowOptionalTime(row, "started_at")
 		completed, e10 := rowOptionalTime(row, "completed_at")
-		return &model.Operation{Metadata: meta, Action: action, TargetKind: model.Kind(targetKind), TargetID: targetID, TargetRevision: targetRevision, OperationStatus: model.OperationStatus(status), IdempotencyKey: key, Error: errorText, LeaseOwner: leaseOwner, StartedAt: started, CompletedAt: completed}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10)
+		external, e11 := rowStringMap(row, "external_ids")
+		payload, e12 := decodeOperationPayload(external)
+		return &model.Operation{Metadata: meta, Action: action, TargetKind: model.Kind(targetKind), TargetID: targetID, TargetRevision: targetRevision, OperationStatus: model.OperationStatus(status), IdempotencyKey: key, Error: errorText, LeaseOwner: leaseOwner, StartedAt: started, CompletedAt: completed, Payload: payload}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12)
 	default:
 		return nil, fmt.Errorf("unsupported resource kind %q", kind)
 	}
@@ -527,6 +536,9 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 		row["action"], row["target_kind"], row["target_id"], row["target_revision"] = value.Action, string(value.TargetKind), value.TargetID, value.TargetRevision
 		row["operation_status"], row["idempotency_key"], row["error"], row["lease_owner"] = string(value.OperationStatus), value.IdempotencyKey, value.Error, value.LeaseOwner
 		row["started_at"], row["completed_at"] = encodeOptionalTime(value.StartedAt), encodeOptionalTime(value.CompletedAt)
+		if err == nil {
+			err = encodeOperationPayload(externalIDs, value.Payload)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported resource type %T", resource)
 	}
@@ -562,6 +574,30 @@ func decodeExternalJSON[T any](externalIDs map[string]string, key string) (T, er
 		return result, fmt.Errorf("external_ids %s contains malformed JSON: %w", key, err)
 	}
 	return result, nil
+}
+
+func encodeOperationPayload(externalIDs map[string]string, payload string) error {
+	if payload == "" {
+		return nil
+	}
+	if err := model.ValidateOperationPayload(payload); err != nil {
+		return fmt.Errorf("encode external_ids %s: %w", operationComputePayloadKey, err)
+	}
+	externalIDs[operationComputePayloadKey] = payload
+	return nil
+}
+
+func decodeOperationPayload(externalIDs map[string]string) (string, error) {
+	for key := range externalIDs {
+		if key != operationComputePayloadKey {
+			return "", fmt.Errorf("operation external_ids contains unknown key %q", key)
+		}
+	}
+	payload := externalIDs[operationComputePayloadKey]
+	if err := model.ValidateOperationPayload(payload); err != nil {
+		return "", fmt.Errorf("external_ids %s is invalid: %w", operationComputePayloadKey, err)
+	}
+	return payload, nil
 }
 
 func encodeMetadata(meta *model.Metadata) (ovsdb.Row, error) {
@@ -617,6 +653,18 @@ func encodeIdempotencyRow(scope string, fingerprint [sha256.Size]byte, resource 
 	if err != nil {
 		return nil, err
 	}
+	externalIDs := map[string]string{
+		internalTypeKey:  internalIdemType,
+		idemFingerprint:  hex.EncodeToString(fingerprint[:]),
+		idemResource:     string(encoded),
+		idemResourceKind: string(resource.ResourceKind()),
+		idemDeleted:      strconv.FormatBool(deleted),
+	}
+	if operation, ok := resource.(*model.Operation); ok && operation.Payload != "" {
+		if err := encodeOperationPayload(externalIDs, operation.Payload); err != nil {
+			return nil, err
+		}
+	}
 	id := idempotencyRowID(scope)
 	timestamp := formatTime(now)
 	return ovsdb.Row{
@@ -625,13 +673,7 @@ func encodeIdempotencyRow(scope string, fingerprint [sha256.Size]byte, resource 
 		"idempotency_key": internalScopeKey + scope, "error": "", "started_at": "", "completed_at": timestamp,
 		"revision": int64(1), "applied_revision": int64(1), "state": string(model.ResourceReady),
 		"last_error": "", "created_at": timestamp, "updated_at": timestamp,
-		"external_ids": encodeStringMap(map[string]string{
-			internalTypeKey:  internalIdemType,
-			idemFingerprint:  hex.EncodeToString(fingerprint[:]),
-			idemResource:     string(encoded),
-			idemResourceKind: string(resource.ResourceKind()),
-			idemDeleted:      strconv.FormatBool(deleted),
-		}),
+		"external_ids": encodeStringMap(externalIDs),
 	}, nil
 }
 
