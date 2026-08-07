@@ -27,8 +27,9 @@ func invalid(field, format string, args ...any) error {
 }
 
 var (
-	namePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,126}$`)
-	nicPattern  = regexp.MustCompile(`^net[0-9]+$`)
+	namePattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,126}$`)
+	nicPattern      = regexp.MustCompile(`^net[0-9]+$`)
+	dnsLabelPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 )
 
 func validateName(field, value string) error {
@@ -78,6 +79,23 @@ func validateSubnet(s *Subnet) error {
 		if parseErr != nil || !addr.Is4() {
 			return invalid(fmt.Sprintf("dns_nameservers[%d]", i), "must be an IPv4 address")
 		}
+	}
+	if s.DNSDomain != "" {
+		if err := validateDNSDomain("dns_domain", s.DNSDomain); err != nil {
+			return err
+		}
+	}
+	seenSearchDomains := make(map[string]struct{}, len(s.DNSSearchDomains))
+	for i, domain := range s.DNSSearchDomains {
+		field := fmt.Sprintf("dns_search_domains[%d]", i)
+		if err := validateDNSDomain(field, domain); err != nil {
+			return err
+		}
+		key := strings.ToLower(strings.TrimSuffix(domain, "."))
+		if _, duplicate := seenSearchDomains[key]; duplicate {
+			return invalid(field, "duplicates another search domain")
+		}
+		seenSearchDomains[key] = struct{}{}
 	}
 	for i, pool := range s.AllocationPools {
 		start, startErr := netip.ParseAddr(pool.Start)
@@ -150,6 +168,24 @@ func validateRouter(r *Router) error {
 	if err := validateName("name", r.Name); err != nil {
 		return err
 	}
+	for i, route := range r.StaticRoutes {
+		prefix, err := netip.ParsePrefix(route.Destination)
+		if err != nil || !prefix.Addr().Is4() {
+			return invalid(fmt.Sprintf("static_routes[%d].destination", i), "must be a valid IPv4 prefix")
+		}
+		if prefix != prefix.Masked() {
+			return invalid(fmt.Sprintf("static_routes[%d].destination", i), "must be a canonical IPv4 prefix")
+		}
+		nextHop, err := netip.ParseAddr(route.NextHop)
+		if err != nil || !nextHop.Is4() || nextHop.IsUnspecified() || nextHop.IsMulticast() {
+			return invalid(fmt.Sprintf("static_routes[%d].next_hop", i), "must be a unicast IPv4 address")
+		}
+		for previous := 0; previous < i; previous++ {
+			if r.StaticRoutes[previous].Destination == route.Destination && r.StaticRoutes[previous].NextHop == route.NextHop {
+				return invalid(fmt.Sprintf("static_routes[%d]", i), "duplicates another static route")
+			}
+		}
+	}
 	if r.ExternalNetworkID == "" {
 		if r.ExternalSubnetID != "" || r.ExternalIPAddress != "" {
 			return invalid("external_network_id", "is required when an external subnet or IP is configured")
@@ -162,6 +198,19 @@ func validateRouter(r *Router) error {
 	address, err := netip.ParseAddr(r.ExternalIPAddress)
 	if err != nil || !address.Is4() {
 		return invalid("external_ip_address", "must be a valid IPv4 address")
+	}
+	return nil
+}
+
+func validateDNSDomain(field, value string) error {
+	domain := strings.TrimSuffix(value, ".")
+	if domain == "" || len(domain) > 253 {
+		return invalid(field, "must be a DNS name no longer than 253 characters")
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if !dnsLabelPattern.MatchString(label) {
+			return invalid(field, "must contain valid DNS labels")
+		}
 	}
 	return nil
 }

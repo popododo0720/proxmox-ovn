@@ -22,13 +22,15 @@ type IPRange struct {
 
 type Subnet struct {
 	Metadata
-	NetworkID       string    `json:"network_id"`
-	Name            string    `json:"name"`
-	CIDR            string    `json:"cidr"`
-	GatewayIP       string    `json:"gateway_ip,omitempty"`
-	EnableDHCP      bool      `json:"enable_dhcp"`
-	DNSNameservers  []string  `json:"dns_nameservers,omitempty"`
-	AllocationPools []IPRange `json:"allocation_pools,omitempty"`
+	NetworkID        string    `json:"network_id"`
+	Name             string    `json:"name"`
+	CIDR             string    `json:"cidr"`
+	GatewayIP        string    `json:"gateway_ip,omitempty"`
+	EnableDHCP       bool      `json:"enable_dhcp"`
+	DNSNameservers   []string  `json:"dns_nameservers,omitempty"`
+	DNSDomain        string    `json:"dns_domain,omitempty"`
+	DNSSearchDomains []string  `json:"dns_search_domains,omitempty"`
+	AllocationPools  []IPRange `json:"allocation_pools,omitempty"`
 }
 
 func (*Subnet) ResourceKind() Kind     { return KindSubnet }
@@ -89,14 +91,20 @@ type IPAllocation struct {
 func (*IPAllocation) ResourceKind() Kind { return KindIPAllocation }
 func (a *IPAllocation) Validate() error  { return validateIPAllocation(a) }
 
+type StaticRoute struct {
+	Destination string `json:"destination"`
+	NextHop     string `json:"next_hop"`
+}
+
 type Router struct {
 	Metadata
-	Name              string `json:"name"`
-	Description       string `json:"description,omitempty"`
-	ExternalNetworkID string `json:"external_network_id,omitempty"`
-	ExternalSubnetID  string `json:"external_subnet_id,omitempty"`
-	ExternalIPAddress string `json:"external_ip_address,omitempty"`
-	EnableSNAT        bool   `json:"enable_snat"`
+	Name              string        `json:"name"`
+	Description       string        `json:"description,omitempty"`
+	ExternalNetworkID string        `json:"external_network_id,omitempty"`
+	ExternalSubnetID  string        `json:"external_subnet_id,omitempty"`
+	ExternalIPAddress string        `json:"external_ip_address,omitempty"`
+	EnableSNAT        bool          `json:"enable_snat"`
+	StaticRoutes      []StaticRoute `json:"static_routes,omitempty"`
 }
 
 func (*Router) ResourceKind() Kind     { return KindRouter }
