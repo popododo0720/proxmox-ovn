@@ -357,7 +357,7 @@ func (s *Server) get(writer http.ResponseWriter, request *http.Request, kind mod
 	}
 	if err := s.authorizeRead(request.Context(), resource); err != nil {
 		// Use a consistent not-found response so callers cannot use object GETs
-		// to enumerate resources outside their PVE pools.
+		// to enumerate resources outside their effective PVE permissions.
 		writeError(writer, http.StatusNotFound, "not_found", "resource was not found", nil)
 		return
 	}

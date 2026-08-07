@@ -2812,7 +2812,7 @@ class ControlPlane:
     def _render_node_files(self, discovery: Discovery, node: Node, seed: Node) -> list[dict[str, str]]:
         node_env = (
             f"PVN_NODE_NAME={node.name}\nPVN_ENCAP_IP={node.geneve_ip}\n"
-            "PVN_PVE_URL=https://127.0.0.1:8006\nPVN_NODE_ROLES=compute,gateway,central\n"
+            "PVN_NODE_ROLES=compute,gateway,central\n"
             "PVN_HEALTH_LISTEN=127.0.0.1:9476\n"
             "PVN_AGENT_HEALTH_URL=http://127.0.0.1:9476/healthz\n"
         )

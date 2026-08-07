@@ -162,7 +162,7 @@ func readNodeEnv(path string) (map[string]string, error) {
 	defer file.Close()
 
 	allowed := map[string]bool{
-		"PVN_NODE_NAME": true, "PVN_ENCAP_IP": true, "PVN_PVE_URL": true,
+		"PVN_NODE_NAME": true, "PVN_ENCAP_IP": true,
 		"PVN_NODE_ROLES": true, "PVN_HEALTH_LISTEN": true,
 		"PVN_AGENT_HEALTH_URL": true,
 	}
