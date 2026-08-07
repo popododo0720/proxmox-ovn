@@ -28,6 +28,10 @@ safe_activation_marker() {
 }
 safe_activation_marker /etc/pvn/node-enabled node || exit 2
 
+if ! api_output=$(/usr/lib/pvn/pvn-api-verify 2>&1); then
+    printf '%s\n' "$api_output" >&2
+    exit 1
+fi
 if ! ui_output=$(/usr/lib/pvn/pvn-ui-verify 2>&1); then
     printf '%s\n' "$ui_output" >&2
     exit 1
@@ -58,6 +62,8 @@ central_northd_is_ready() {
 while [ "$attempt" -le "$max_attempts" ]; do
     if [ ! -S /run/pvn/manager.sock ]; then
         last_output='PVN manager runtime socket is not ready'
+    elif [ ! -S /run/pvn-api/manager.sock ]; then
+        last_output='PVN manager browser socket is not ready'
     elif ! required_units_active; then
         last_output='one or more required PVN node services are not active'
     elif ! controller_is_connected; then
@@ -73,7 +79,8 @@ while [ "$attempt" -le "$max_attempts" ]; do
         # Avoid accepting a process that only appeared active between restart
         # attempts. Manager socket creation also proves its DB probes passed.
         /usr/bin/sleep 2
-        if [ -S /run/pvn/manager.sock ] && required_units_active && \
+        if [ -S /run/pvn/manager.sock ] && [ -S /run/pvn-api/manager.sock ] && \
+            required_units_active && \
             controller_is_connected && central_northd_is_ready >/dev/null 2>&1 && \
             /usr/bin/curl --fail --silent --show-error --noproxy '*' \
                 --proto '=http' --connect-timeout 1 --max-time 2 \

@@ -35,7 +35,9 @@ with tempfile.TemporaryDirectory() as temporary:
     transformed = SOURCE.replace("max_attempts=30", "max_attempts=1")
     transformed = transformed.replace(
         "[ ! -S /run/pvn/manager.sock ]", "false"
-    ).replace("[ -S /run/pvn/manager.sock ]", "true")
+    ).replace("[ -S /run/pvn/manager.sock ]", "true").replace(
+        "[ ! -S /run/pvn-api/manager.sock ]", "false"
+    ).replace("[ -S /run/pvn-api/manager.sock ]", "true")
     transformed = transformed.replace(
         "/etc/pvn/central/enabled", str(marker)
     ).replace("/etc/pvn/node-enabled", str(node_marker)).replace(
@@ -46,6 +48,7 @@ with tempfile.TemporaryDirectory() as temporary:
         "/usr/bin/curl": commands / "curl",
         "/usr/bin/ovn-appctl": commands / "ovn-appctl",
         "/usr/sbin/pvnctl": commands / "pvnctl",
+        "/usr/lib/pvn/pvn-api-verify": commands / "api-verify",
         "/usr/lib/pvn/pvn-ui-verify": commands / "ui-verify",
         "/usr/lib/pvn/pvn-ovn-northd": commands / "pvn-ovn-northd",
         "/usr/bin/sleep": commands / "sleep",
@@ -55,7 +58,7 @@ with tempfile.TemporaryDirectory() as temporary:
     script.write_text(transformed, encoding="utf-8")
     script.chmod(0o755)
 
-    for name in ("systemctl", "curl", "pvnctl", "ui-verify", "sleep"):
+    for name in ("systemctl", "curl", "pvnctl", "api-verify", "ui-verify", "sleep"):
         executable(commands / name, "exit 0\n")
     executable(commands / "ovn-appctl", "printf 'connected\\n'\n")
     executable(

@@ -25,6 +25,9 @@ override_dh_auto_install:
 	mkdir -p debian/pvn-node/usr/share/pve-manager/js debian/pvn-node/usr/lib/pvn
 	install -m 0644 pve-ui/pvn-loader.js debian/pvn-node/usr/lib/pvn/
 	install -m 0755 pve-ui/inject.sh debian/pvn-node/usr/lib/pvn/pvn-ui-inject
+	install -m 0755 pve-api/inject.sh debian/pvn-node/usr/lib/pvn/pvn-api-inject
+	mkdir -p debian/pvn-node/usr/share/perl5/PVN
+	install -m 0644 pve-api/PVN/API2.pm debian/pvn-node/usr/share/perl5/PVN/
 	find deploy/scripts -mindepth 1 -maxdepth 1 -type f -name 'pvn-*' \
 		-exec install -m 0755 -t debian/pvn-node/usr/lib/pvn/ -- {} +
 	install -m 0755 deploy/scripts/pvn-db-backup debian/pvn-node/usr/sbin/pvn-db-backup

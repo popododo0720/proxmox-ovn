@@ -21,10 +21,13 @@ PY
     esac
 done
 for script in packaging/debian/pvn-node.postinst packaging/debian/pvn-node.prerm \
-    packaging/debian/pvn-node.postrm pve-ui/inject.sh
+    packaging/debian/pvn-node.postrm pve-ui/inject.sh pve-api/inject.sh
 do
     sh -n "$script"
 done
+
+perl pve-api/tests/api2-test.pl >/dev/null
+pve-api/tests/injector-test.sh
 
 deploy/tests/pvn-cluster-install-test.sh
 deploy/tests/pvn-install-test.sh
@@ -63,6 +66,14 @@ if grep -n '/usr/lib/pvn/pvn-ui-inject install || true' packaging/debian/pvn-nod
 fi
 grep -q '/usr/lib/pvn/pvn-ui-verify' packaging/debian/pvn-node.postinst || {
     echo "package configuration must verify the installed PVE UI hook" >&2
+    exit 1
+}
+grep -q '/usr/lib/pvn/pvn-api-verify' packaging/debian/pvn-node.postinst || {
+    echo "package configuration must verify the installed PVE API hook" >&2
+    exit 1
+}
+grep -q '^interest-noawait /usr/share/perl5/PVE/API2.pm$' packaging/debian/triggers || {
+    echo "the package must reapply the PVN API hook after PVE dispatcher updates" >&2
     exit 1
 }
 if grep -n 'systemctl restart.*|| true' packaging/debian/pvn-node.postinst; then
@@ -130,14 +141,18 @@ grep -q '^LoadCredential=pvn-pve-members:/etc/pve/.members$' deploy/systemd/pvn-
     echo "the unprivileged manager must receive PVE membership as a credential" >&2
     exit 1
 }
-grep -q '^LoadCredential=pvn-pve-ca:/etc/pve/pve-root-ca.pem$' deploy/systemd/pvn-manager.service || {
-    echo "the unprivileged manager must receive the PVE CA as a credential" >&2
+grep -q '^RuntimeDirectory=pvn pvn-api$' deploy/systemd/pvn-manager.service || {
+    echo "the manager must own separate runtime and browser socket directories" >&2
     exit 1
 }
-grep -q '^Environment=PVN_PVE_CA_FILE=%d/pvn-pve-ca$' deploy/systemd/pvn-manager.service || {
-    echo "the manager must validate PVE with its credential CA copy" >&2
+grep -q '^SupplementaryGroups=www-data$' deploy/systemd/pvn-manager.service || {
+    echo "the manager must share only its browser socket with pveproxy" >&2
     exit 1
 }
+if grep -Eq 'pvn-(pve-ca|tls-cert|tls-key)|PVN_(PVE_CA_FILE|TLS_CERT|TLS_KEY)' deploy/systemd/pvn-manager.service; then
+    echo "the Unix-only manager must not receive browser TLS credentials" >&2
+    exit 1
+fi
 grep -q '^Environment=PVN_PVE_MEMBERS_FILE=%d/pvn-pve-members$' deploy/systemd/pvn-manager.service || {
     echo "the manager must derive its human deployment name from the membership credential" >&2
     exit 1
@@ -229,17 +244,20 @@ install -d "$readiness_bin"
 sed \
     -e 's#\[ ! -S /run/pvn/manager.sock \]#false#g' \
     -e 's#\[ -S /run/pvn/manager.sock \]#true#g' \
+    -e 's#\[ ! -S /run/pvn-api/manager.sock \]#false#g' \
+    -e 's#\[ -S /run/pvn-api/manager.sock \]#true#g' \
     -e 's#safe_activation_marker /etc/pvn/node-enabled node || exit 2#true#' \
     -e "s#/usr/bin/systemctl#$readiness_bin/systemctl#g" \
     -e "s#/usr/bin/curl#$readiness_bin/curl#g" \
     -e "s#/usr/bin/ovn-appctl#$readiness_bin/ovn-appctl#g" \
     -e "s#/usr/sbin/pvnctl#$readiness_bin/pvnctl#g" \
+    -e "s#/usr/lib/pvn/pvn-api-verify#$readiness_bin/api-verify#g" \
     -e "s#/usr/lib/pvn/pvn-ui-verify#$readiness_bin/ui-verify#g" \
     -e "s#/usr/lib/pvn/pvn-ovn-northd#$readiness_bin/pvn-ovn-northd#g" \
     -e "s#/usr/bin/sleep#$readiness_bin/sleep#g" \
     deploy/scripts/pvn-node-ready > "$readiness_test"
 chmod 0755 "$readiness_test"
-for command in systemctl pvnctl ui-verify pvn-ovn-northd sleep; do
+for command in systemctl pvnctl api-verify ui-verify pvn-ovn-northd sleep; do
     printf '#!/bin/sh\nexit 0\n' > "$readiness_bin/$command"
     chmod 0755 "$readiness_bin/$command"
 done
@@ -336,6 +354,7 @@ for executable in \
     /usr/lib/pvn/pvn-ovn-northd \
     /usr/lib/pvn/pvn-node-ready \
     /usr/lib/pvn/pvn-guest-gate \
+    /usr/lib/pvn/pvn-api-verify \
     /usr/lib/pvn/pvn-ui-verify \
     /usr/bin/ovs-appctl \
     /usr/bin/test \
@@ -365,6 +384,8 @@ for path in \
     usr/sbin/pvn-agent \
     usr/sbin/pvnctl \
     usr/sbin/pvn-db-backup \
+    usr/lib/pvn/pvn-api-inject \
+    usr/lib/pvn/pvn-api-verify \
     usr/lib/pvn/pvn-ui-inject \
     usr/lib/pvn/pvn-control-db-run \
     usr/lib/pvn/pvn-central-preflight \
@@ -379,6 +400,7 @@ for path in \
     usr/lib/pvn/pvn-update.sh \
     usr/lib/pvn/pvn-topology \
     usr/lib/pvn/pvn-control-plane \
+    usr/share/perl5/PVN/API2.pm \
     usr/lib/systemd/system/pvn-node.target \
     usr/lib/systemd/system/pvn-node-ready.service \
     usr/lib/systemd/system/pvn-guest-gate.service \
@@ -422,6 +444,12 @@ dpkg-deb -f "$deb" Depends | grep -Eq '(^|, )python3([ ,]|$)' || {
     echo "built package does not depend on Python for cluster orchestration" >&2
     exit 1
 }
+for dependency in liburi-perl libwww-perl; do
+    dpkg-deb -f "$deb" Depends | grep -Eq "(^|, )$dependency([ ,]|$)" || {
+        echo "built package does not depend on $dependency for the PVE API gateway" >&2
+        exit 1
+    }
+done
 "$package_root/usr/sbin/pvn-manager" --version | grep -Fq "pvn-manager $package_version (" || {
     echo "pvn-manager build version does not match the package" >&2
     exit 1
