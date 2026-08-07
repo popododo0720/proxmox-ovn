@@ -410,7 +410,6 @@ for path in \
     usr/lib/systemd/system/ovn-ovsdb-server-nb.service.d/90-pvn.conf \
     usr/lib/systemd/system/ovn-ovsdb-server-sb.service.d/90-pvn.conf \
     usr/lib/systemd/system/ovn-northd.service.d/90-pvn.conf \
-    usr/share/pvn/web/index.html \
     usr/share/pvn/schema/PVN_Control.ovsschema \
     usr/share/doc/pvn-node/examples/config.json \
     usr/share/doc/pvn-node/inventory/pve-cluster.example

@@ -11,9 +11,9 @@ prioritized backlog. Update this file when items ship or scope changes.
 
 ## PVN 0.3 cutover (active goal)
 
-- [ ] Remove Project/PVE pool mapping and make names cluster-global
-- [ ] Replace React/iframe with native ExtJS on the PVE :8006 origin
-- [ ] Replace :8443 with the authenticated PVE API and split Unix sockets
+- [x] Remove Project/PVE pool mapping and make names cluster-global
+- [x] Replace React/iframe with native ExtJS on the PVE :8006 origin
+- [x] Replace :8443 with the authenticated PVE API and split Unix sockets
 - [ ] Recreate PVN_Control/OVN state and verify the live three-node cluster
 
 ## Retained foundations (verify on real PVE)
@@ -81,10 +81,10 @@ PVN does **not** auto-wire physical networking. Confirm every node has:
 ### Current product work
 
 - [x] Show human names in tables/selectors and keep full UUIDs in Details only
-- [ ] Remove Project/PVE pool mapping and make names cluster-global
-- [ ] Use only the PVE :8006 origin; remove iframe, :8443, and second certificate trust
+- [x] Remove Project/PVE pool mapping and make names cluster-global
+- [x] Use only the PVE :8006 origin; remove iframe, :8443, and second certificate trust
 - [x] Keep the stateful-only security-group UI honest (no ineffective toggle)
-- [ ] Auto-provision and continuously repair one cluster-global default security policy
+- [x] Auto-provision and continuously repair one cluster-global default security policy
 - [x] Fence Corosync Geneve-to-management migration through an N/N dual-ring
       safety path, exact persisted/runtime gates, resumable stage boundaries,
       and strict recovery of the uniform v0.2.13 stale-runtime shape before any

@@ -1,15 +1,15 @@
 # Proxmox UI adapter
 
 `pvn-loader.js` adds a PVN item to the Datacenter configuration panel and
-embeds the local manager at `https://<node>:8443`. It does not implement a
-second login. The manager receives the existing PVE cookie and validates it
-through the local PVE API.
+eight grouped child panels. The screens are native ExtJS components mounted
+inside Proxmox; there is no iframe, second browser origin, or second login.
 
-The iframe bridge exposes only `GET` and narrowly constrained `PUT` requests
-for `/nodes/<node>/qemu/<vmid>/config`. A PUT must carry a PVE digest plus one
-PVN `netN` value, or `delete=netN`; unrelated VM settings are rejected. Every
-message must match the generated nonce, the manager origin, and the exact
-iframe window.
+PVN resource requests use the authenticated Proxmox origin at
+`/api2/json/pvn`. The PVE API extension checks the existing PVE ticket, CSRF,
+and RBAC context before forwarding a credential-free request through the
+local `/run/pvn-api/manager.sock`. VM NIC writes continue through the normal
+PVE API and are limited to a digest-bound PVN `netN` add, link-state change,
+or delete.
 
 Install or remove the template marker with:
 
@@ -18,7 +18,7 @@ Install or remove the template marker with:
 ./inject.sh remove
 ```
 
-Package scripts should run the patch again after a supported `pve-manager`
-9.x upgrade. The injector patches only the known PVE 9 template signature,
+Package scripts run the patch again after a supported `pve-manager` 9.x
+upgrade. The injector patches only the known PVE 9 template signature,
 directly after `pvemanagerlib.js`. An unknown signature or a missing Ext/PVE
 class leaves the normal Proxmox UI untouched.
