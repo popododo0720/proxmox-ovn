@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/popododo0720/proxmox-ovn/internal/auth"
-	pveclient "github.com/popododo0720/proxmox-ovn/internal/pve"
 )
 
 const PVNCSRFHeader = "X-PVN-CSRF-Token"
@@ -148,28 +147,6 @@ func (p *PVESessionProvider) Authorize(ctx context.Context, incoming *http.Reque
 		}
 	}
 	return sessionResponse(stored, p.clusterName), nil
-}
-
-// PoolExists checks an exact resource-pool ID with the caller's PVE ticket.
-// It deliberately reuses the provider's CA-verifying HTTP client.
-func (p *PVESessionProvider) PoolExists(ctx context.Context, incoming *http.Request, poolID string) (bool, error) {
-	ticket, err := auth.TicketFromRequest(incoming)
-	if err != nil {
-		return false, ErrUnauthenticated
-	}
-	client, err := pveclient.NewClient(pveclient.ClientConfig{
-		BaseURL:    p.baseURL,
-		HTTPClient: p.client,
-		Auth:       pveclient.TicketAuth{Ticket: ticket},
-	})
-	if err != nil {
-		return false, fmt.Errorf("configure PVE pool client: %w", err)
-	}
-	exists, err := client.PoolExists(ctx, poolID)
-	if err != nil {
-		return false, fmt.Errorf("look up PVE pool %q: %w", poolID, err)
-	}
-	return exists, nil
 }
 
 func sessionResponse(stored auth.Session, cluster string) Session {

@@ -175,7 +175,6 @@ func run(arguments []string) error {
 	}
 	controller := reconcile.NewController(store, renderer, reconcile.WithLeaseDuration(defaults.orphanGrace))
 	var sessionProvider api.SessionProvider
-	var poolValidator api.PoolValidator
 	if defaults.insecureNoAuth {
 		logger.Warn("PVE authentication is disabled; do not use this mode in production")
 	} else {
@@ -184,11 +183,10 @@ func run(arguments []string) error {
 			return err
 		}
 		sessionProvider = provider
-		poolValidator = provider
 	}
 	reconcilerHealth := newReconcilerHealth(defaults.reconcileEvery, time.Now)
 	handler, err := api.New(api.Options{
-		Store: store, Reconciler: controller, SessionProvider: sessionProvider, PoolValidator: poolValidator, Logger: logger,
+		Store: store, Reconciler: controller, SessionProvider: sessionProvider, Logger: logger,
 		RequireAllNodes: defaults.requireAllNodes, NodeHeartbeatTTL: 2 * time.Minute,
 		GuestMTU: defaults.guestMTU, Physnet: defaults.physnet,
 		ClusterName: defaults.clusterName, NorthboundProbe: ovnClient,
