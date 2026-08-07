@@ -19,7 +19,6 @@ func FullDatabaseModel() (model.ClientDBModel, error) {
 		"Node":              &Node{},
 		"Operation":         &Operation{},
 		"Port":              &Port{},
-		"Project":           &Project{},
 		"ProviderNetwork":   &ProviderNetwork{},
 		"ProviderSegment":   &ProviderSegment{},
 		"Router":            &Router{},
@@ -32,7 +31,7 @@ func FullDatabaseModel() (model.ClientDBModel, error) {
 
 var schema = `{
   "name": "PVN_Control",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "tables": {
     "FloatingIP": {
       "columns": {
@@ -95,15 +94,6 @@ var schema = `{
             },
             "min": 0,
             "max": 1
-          }
-        },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
-              "refType": "strong"
-            }
           }
         },
         "provider_network": {
@@ -224,15 +214,6 @@ var schema = `{
             "max": 1
           }
         },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
-              "refType": "strong"
-            }
-          }
-        },
         "revision": {
           "type": {
             "key": {
@@ -330,15 +311,6 @@ var schema = `{
         "name": {
           "type": "string"
         },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
-              "refType": "strong"
-            }
-          }
-        },
         "provider_network": {
           "type": {
             "key": {
@@ -383,7 +355,6 @@ var schema = `{
           "id"
         ],
         [
-          "project",
           "name"
         ]
       ],
@@ -720,15 +691,6 @@ var schema = `{
             "max": 1
           }
         },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
-              "refType": "strong"
-            }
-          }
-        },
         "requested_chassis": {
           "type": "string"
         },
@@ -792,87 +754,6 @@ var schema = `{
       ],
       "isRoot": true
     },
-    "Project": {
-      "columns": {
-        "applied_revision": {
-          "type": {
-            "key": {
-              "type": "integer",
-              "minInteger": 0
-            }
-          }
-        },
-        "created_at": {
-          "type": "string"
-        },
-        "description": {
-          "type": "string"
-        },
-        "external_ids": {
-          "type": {
-            "key": {
-              "type": "string"
-            },
-            "value": {
-              "type": "string"
-            },
-            "min": 0,
-            "max": "unlimited"
-          }
-        },
-        "id": {
-          "type": "string"
-        },
-        "last_error": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "pool_id": {
-          "type": "string"
-        },
-        "revision": {
-          "type": {
-            "key": {
-              "type": "integer",
-              "minInteger": 1
-            }
-          }
-        },
-        "state": {
-          "type": {
-            "key": {
-              "type": "string",
-              "enum": [
-                "set",
-                [
-                  "pending",
-                  "ready",
-                  "error",
-                  "deleting"
-                ]
-              ]
-            }
-          }
-        },
-        "updated_at": {
-          "type": "string"
-        }
-      },
-      "indexes": [
-        [
-          "id"
-        ],
-        [
-          "pool_id"
-        ],
-        [
-          "name"
-        ]
-      ],
-      "isRoot": true
-    },
     "ProviderNetwork": {
       "columns": {
         "applied_revision": {
@@ -928,9 +809,6 @@ var schema = `{
               "minInteger": 1
             }
           }
-        },
-        "shared": {
-          "type": "boolean"
         },
         "state": {
           "type": {
@@ -1140,15 +1018,6 @@ var schema = `{
         "name": {
           "type": "string"
         },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
-              "refType": "strong"
-            }
-          }
-        },
         "revision": {
           "type": {
             "key": {
@@ -1182,7 +1051,6 @@ var schema = `{
           "id"
         ],
         [
-          "project",
           "name"
         ]
       ],
@@ -1228,15 +1096,6 @@ var schema = `{
             },
             "min": 0,
             "max": 1
-          }
-        },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
-              "refType": "strong"
-            }
           }
         },
         "revision": {
@@ -1333,15 +1192,6 @@ var schema = `{
         "name": {
           "type": "string"
         },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
-              "refType": "strong"
-            }
-          }
-        },
         "revision": {
           "type": {
             "key": {
@@ -1378,7 +1228,6 @@ var schema = `{
           "id"
         ],
         [
-          "project",
           "name"
         ]
       ],
@@ -1469,15 +1318,6 @@ var schema = `{
               "type": "integer",
               "minInteger": 0,
               "maxInteger": 65535
-            }
-          }
-        },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
-              "refType": "strong"
             }
           }
         },
@@ -1608,15 +1448,6 @@ var schema = `{
             "key": {
               "type": "uuid",
               "refTable": "Network",
-              "refType": "strong"
-            }
-          }
-        },
-        "project": {
-          "type": {
-            "key": {
-              "type": "uuid",
-              "refTable": "Project",
               "refType": "strong"
             }
           }

@@ -10,7 +10,6 @@ import (
 type Kind string
 
 const (
-	KindProject           Kind = "project"
 	KindNetwork           Kind = "network"
 	KindSubnet            Kind = "subnet"
 	KindPort              Kind = "port"
@@ -27,7 +26,6 @@ const (
 )
 
 var kindToCollection = map[Kind]string{
-	KindProject:           "projects",
 	KindNetwork:           "networks",
 	KindSubnet:            "subnets",
 	KindPort:              "ports",

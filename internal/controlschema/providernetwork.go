@@ -28,7 +28,6 @@ type ProviderNetwork struct {
 	LastError       string               `ovsdb:"last_error"`
 	Name            string               `ovsdb:"name"`
 	Revision        int                  `ovsdb:"revision"`
-	Shared          bool                 `ovsdb:"shared"`
 	State           ProviderNetworkState `ovsdb:"state"`
 	UpdatedAt       string               `ovsdb:"updated_at"`
 }

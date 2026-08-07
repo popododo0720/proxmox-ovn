@@ -26,7 +26,6 @@ type SecurityGroup struct {
 	ID              string             `ovsdb:"id"`
 	LastError       string             `ovsdb:"last_error"`
 	Name            string             `ovsdb:"name"`
-	Project         string             `ovsdb:"project"`
 	Revision        int                `ovsdb:"revision"`
 	State           SecurityGroupState `ovsdb:"state"`
 	Stateful        bool               `ovsdb:"stateful"`

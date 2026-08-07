@@ -30,7 +30,6 @@ type IPAllocation struct {
 	ID              string                      `ovsdb:"id"`
 	LastError       string                      `ovsdb:"last_error"`
 	Port            *string                     `ovsdb:"port"`
-	Project         string                      `ovsdb:"project"`
 	Revision        int                         `ovsdb:"revision"`
 	State           IPAllocationState           `ovsdb:"state"`
 	Subnet          string                      `ovsdb:"subnet"`

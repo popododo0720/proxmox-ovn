@@ -40,7 +40,6 @@ type Port struct {
 	Network          string            `ovsdb:"network"`
 	Nic              string            `ovsdb:"nic"`
 	Node             *string           `ovsdb:"node"`
-	Project          string            `ovsdb:"project"`
 	RequestedChassis string            `ovsdb:"requested_chassis"`
 	Revision         int               `ovsdb:"revision"`
 	SecurityGroups   []string          `ovsdb:"security_groups"`

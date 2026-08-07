@@ -31,7 +31,6 @@ type Subnet struct {
 	LastError       string            `ovsdb:"last_error"`
 	Name            string            `ovsdb:"name"`
 	Network         string            `ovsdb:"network"`
-	Project         string            `ovsdb:"project"`
 	Revision        int               `ovsdb:"revision"`
 	State           SubnetState       `ovsdb:"state"`
 	UpdatedAt       string            `ovsdb:"updated_at"`

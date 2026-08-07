@@ -45,20 +45,7 @@ func required(field, value string) error {
 	return nil
 }
 
-func validateProject(p *Project) error {
-	if err := validateName("name", p.Name); err != nil {
-		return err
-	}
-	if err := required("pool_id", p.PoolID); err != nil {
-		return err
-	}
-	return nil
-}
-
 func validateNetwork(n *Network) error {
-	if err := required("project_id", n.ProjectID); err != nil {
-		return err
-	}
 	if err := validateName("name", n.Name); err != nil {
 		return err
 	}
@@ -72,9 +59,6 @@ func validateNetwork(n *Network) error {
 }
 
 func validateSubnet(s *Subnet) error {
-	if err := required("project_id", s.ProjectID); err != nil {
-		return err
-	}
 	if err := required("network_id", s.NetworkID); err != nil {
 		return err
 	}
@@ -106,9 +90,6 @@ func validateSubnet(s *Subnet) error {
 }
 
 func validatePort(p *Port) error {
-	if err := required("project_id", p.ProjectID); err != nil {
-		return err
-	}
 	if err := required("network_id", p.NetworkID); err != nil {
 		return err
 	}
@@ -149,9 +130,6 @@ func validatePort(p *Port) error {
 }
 
 func validateIPAllocation(a *IPAllocation) error {
-	if err := required("project_id", a.ProjectID); err != nil {
-		return err
-	}
 	if err := required("subnet_id", a.SubnetID); err != nil {
 		return err
 	}
@@ -169,9 +147,6 @@ func validateIPAllocation(a *IPAllocation) error {
 }
 
 func validateRouter(r *Router) error {
-	if err := required("project_id", r.ProjectID); err != nil {
-		return err
-	}
 	if err := validateName("name", r.Name); err != nil {
 		return err
 	}
@@ -192,9 +167,6 @@ func validateRouter(r *Router) error {
 }
 
 func validateRouterInterface(r *RouterInterface) error {
-	if err := required("project_id", r.ProjectID); err != nil {
-		return err
-	}
 	if err := required("router_id", r.RouterID); err != nil {
 		return err
 	}
@@ -202,9 +174,6 @@ func validateRouterInterface(r *RouterInterface) error {
 }
 
 func validateFloatingIP(f *FloatingIP) error {
-	if err := required("project_id", f.ProjectID); err != nil {
-		return err
-	}
 	if err := required("provider_network_id", f.ProviderNetworkID); err != nil {
 		return err
 	}
@@ -249,16 +218,10 @@ func validateProviderSegment(p *ProviderSegment) error {
 }
 
 func validateSecurityGroup(s *SecurityGroup) error {
-	if err := required("project_id", s.ProjectID); err != nil {
-		return err
-	}
 	return validateName("name", s.Name)
 }
 
 func validateSecurityGroupRule(r *SecurityGroupRule) error {
-	if err := required("project_id", r.ProjectID); err != nil {
-		return err
-	}
 	if err := required("security_group_id", r.SecurityGroupID); err != nil {
 		return err
 	}
@@ -343,8 +306,6 @@ func validateOperation(o *Operation) error {
 
 func New(kind Kind) (Resource, error) {
 	switch kind {
-	case KindProject:
-		return &Project{}, nil
 	case KindNetwork:
 		return &Network{}, nil
 	case KindSubnet:

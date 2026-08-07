@@ -38,7 +38,6 @@ type SecurityGroupRule struct {
 	LastError       string                     `ovsdb:"last_error"`
 	PortRangeMax    int                        `ovsdb:"port_range_max"`
 	PortRangeMin    int                        `ovsdb:"port_range_min"`
-	Project         string                     `ovsdb:"project"`
 	Protocol        string                     `ovsdb:"protocol"`
 	RemoteCidr      string                     `ovsdb:"remote_cidr"`
 	RemoteGroup     *string                    `ovsdb:"remote_group"`
