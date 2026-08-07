@@ -451,6 +451,18 @@ apt_line=$(grep -n 'apt-get install -y' "$REMOTE_SCRIPT" | cut -d: -f1)
 [ -n "$mask_line" ] && [ -n "$apt_line" ] && [ "$mask_line" -lt "$apt_line" ] ||
     fail "remote install does not mask OVN aggregate units before apt"
 
+transition_line=$(grep -n 'check_pve_extensions "$pvn_package_state" transition' \
+    "$REMOTE_SCRIPT" | cut -d: -f1)
+strict_line=$(grep -n 'check_pve_extensions installed strict' \
+    "$REMOTE_SCRIPT" | cut -d: -f1)
+[ -n "$transition_line" ] && [ -n "$strict_line" ] && \
+    [ "$transition_line" -lt "$apt_line" ] && [ "$apt_line" -lt "$strict_line" ] ||
+    fail "API hook verification does not straddle the package transition"
+grep -q '/usr/lib/pvn/pvn-api-verify' "$REMOTE_SCRIPT" ||
+    fail "remote install does not verify the installed PVE API hook"
+grep -q '^check_clean_api_dispatcher() {' "$REMOTE_SCRIPT" ||
+    fail "remote install does not validate a clean PVE API dispatcher"
+
 if grep -Eq 'ovs-vsctl[^#]*(add-br|add-port|set|create|destroy)|br-provider|/etc/network/interfaces|ip (link|address|route)' \
     "$INSTALLER"
 then
