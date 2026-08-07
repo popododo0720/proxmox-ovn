@@ -1,5 +1,5 @@
 [Unit]
-Description=PVN manager API and web interface
+Description=PVN manager control and Proxmox browser APIs
 Documentation=file:/usr/share/doc/pvn-node/architecture.md
 After=network-online.target pve-cluster.service
 Wants=network-online.target
@@ -11,22 +11,16 @@ ConditionPathExists=/etc/pve/pvn/config.json
 Type=simple
 User=pvn
 Group=pvn
-RuntimeDirectory=pvn
+RuntimeDirectory=pvn pvn-api
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
+SupplementaryGroups=www-data
 EnvironmentFile=/etc/pvn/node.env
 LoadCredential=pvn-config:/etc/pve/pvn/config.json
 LoadCredential=pvn-pve-members:/etc/pve/.members
-LoadCredential=pvn-pve-ca:/etc/pve/pve-root-ca.pem
-LoadCredential=pvn-tls-cert:/etc/pve/local/pve-ssl.pem
-LoadCredential=pvn-tls-key:/etc/pve/local/pve-ssl.key
-Environment=PVN_PVE_CA_FILE=%d/pvn-pve-ca
 Environment=PVN_PVE_MEMBERS_FILE=%d/pvn-pve-members
-Environment=PVN_TLS_CERT=%d/pvn-tls-cert
-Environment=PVN_TLS_KEY=%d/pvn-tls-key
 ExecStartPre=/usr/bin/test -r %d/pvn-config
 ExecStartPre=/usr/bin/test -r %d/pvn-pve-members
-ExecStartPre=/usr/bin/test -r %d/pvn-pve-ca
 ExecStart=/usr/sbin/pvn-manager --config %d/pvn-config --pve-members-file %d/pvn-pve-members
 Restart=on-failure
 RestartSec=3s
@@ -34,7 +28,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/run/pvn
+ReadWritePaths=/run/pvn /run/pvn-api
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

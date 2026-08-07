@@ -2787,12 +2787,8 @@ class ControlPlane:
             "cluster": {"id": cluster_id, "reconcile_every": 30000000000,
                         "orphan_grace": 300000000000, "require_all_nodes": True,
                         "supported_pve_major": 9},
-            "manager": {"listen_address": ":8443", "public_port": 8443,
-                        "pve_url": "https://127.0.0.1:8006",
-                        "unix_socket": "/run/pvn/manager.sock",
-                        "web_root": "/usr/share/pvn/web",
-                        "tls_cert": "/etc/pve/local/pve-ssl.pem",
-                        "tls_key": "/etc/pve/local/pve-ssl.key"},
+            "manager": {"unix_socket": "/run/pvn/manager.sock",
+                        "browser_socket": "/run/pvn-api/manager.sock"},
             "agent": {"poll_every": 2000000000, "bridge": "br-int",
                       "manager_url": "unix:///run/pvn/manager.sock",
                       "system_id_file": "/etc/openvswitch/system-id.conf"},
@@ -2806,7 +2802,6 @@ class ControlPlane:
                            "guest_mtu": discovery.guest_mtu,
                            "physnet": discovery.physnet,
                            "provider_bridge": discovery.nodes[0].provider_bridge},
-            "security": {"session_ttl": 900000000000},
         }
 
     @staticmethod

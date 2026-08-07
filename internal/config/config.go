@@ -17,6 +17,8 @@ import (
 
 const DefaultPath = "/etc/pve/pvn/config.json"
 const DefaultNodeEnvPath = "/etc/pvn/node.env"
+const DefaultManagerRuntimeSocket = "/run/pvn/manager.sock"
+const DefaultManagerBrowserSocket = "/run/pvn-api/manager.sock"
 
 type Config struct {
 	Cluster    ClusterConfig    `json:"cluster"`
@@ -74,8 +76,8 @@ func Default() Config {
 			SupportedPVEMajor: 9,
 		},
 		Manager: ManagerConfig{
-			UnixSocket:    "/run/pvn/manager.sock",
-			BrowserSocket: "/run/pvn-api/manager.sock",
+			UnixSocket:    DefaultManagerRuntimeSocket,
+			BrowserSocket: DefaultManagerBrowserSocket,
 		},
 		Agent: AgentConfig{
 			PollEvery:    2 * time.Second,
@@ -233,14 +235,11 @@ func (c Config) Validate() error {
 	if c.Agent.PollEvery <= 0 {
 		problems = append(problems, "agent.poll_every must be positive")
 	}
-	if !filepath.IsAbs(c.Manager.UnixSocket) {
-		problems = append(problems, "manager.unix_socket must be an absolute path")
+	if filepath.Clean(c.Manager.UnixSocket) != DefaultManagerRuntimeSocket {
+		problems = append(problems, "manager.unix_socket must be "+DefaultManagerRuntimeSocket)
 	}
-	if !filepath.IsAbs(c.Manager.BrowserSocket) {
-		problems = append(problems, "manager.browser_socket must be an absolute path")
-	}
-	if filepath.Clean(c.Manager.UnixSocket) == filepath.Clean(c.Manager.BrowserSocket) {
-		problems = append(problems, "manager.browser_socket must differ from manager.unix_socket")
+	if filepath.Clean(c.Manager.BrowserSocket) != DefaultManagerBrowserSocket {
+		problems = append(problems, "manager.browser_socket must be "+DefaultManagerBrowserSocket)
 	}
 	if c.Agent.Bridge == "" {
 		problems = append(problems, "agent.bridge is required")
@@ -271,8 +270,8 @@ func (c Config) Validate() error {
 		problems = append(problems, "agent.manager_url must use a Unix socket URL")
 	} else if !filepath.IsAbs(parsedManager.Path) || parsedManager.Host != "" {
 		problems = append(problems, "agent.manager_url Unix address must be an absolute socket path")
-	} else if filepath.Clean(parsedManager.Path) == filepath.Clean(c.Manager.BrowserSocket) {
-		problems = append(problems, "agent.manager_url must not use manager.browser_socket")
+	} else if filepath.Clean(parsedManager.Path) != DefaultManagerRuntimeSocket {
+		problems = append(problems, "agent.manager_url must use "+DefaultManagerRuntimeSocket)
 	}
 	usesOVNTLS := false
 	for label, endpoints := range map[string][]string{

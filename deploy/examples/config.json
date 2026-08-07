@@ -7,13 +7,8 @@
     "supported_pve_major": 9
   },
   "manager": {
-    "listen_address": ":8443",
-    "public_port": 8443,
-    "pve_url": "https://127.0.0.1:8006",
     "unix_socket": "/run/pvn/manager.sock",
-    "web_root": "/usr/share/pvn/web",
-    "tls_cert": "/etc/pve/local/pve-ssl.pem",
-    "tls_key": "/etc/pve/local/pve-ssl.key"
+    "browser_socket": "/run/pvn-api/manager.sock"
   },
   "agent": {
     "poll_every": 2000000000,
@@ -47,8 +42,5 @@
     "guest_mtu": 1400,
     "physnet": "provider",
     "provider_bridge": "br-provider"
-  },
-  "security": {
-    "session_ttl": 900000000000
   }
 }
