@@ -40,6 +40,17 @@ func listenBrowserUnix(path string, peerUsers []string, socketGroup string) (net
 	return &peerUIDListener{Listener: listener, allowedUIDs: allowedUIDs}, nil
 }
 
+func listenRootUnix(path string) (net.Listener, error) {
+	listener, err := listenUnixForGroup(path, "")
+	if err != nil {
+		return nil, err
+	}
+	return &peerUIDListener{
+		Listener:    listener,
+		allowedUIDs: map[uint32]struct{}{0: {}},
+	}, nil
+}
+
 func listenUnixForGroup(path, groupName string) (net.Listener, error) {
 	directory := filepath.Dir(path)
 	if err := prepareSocketDirectory(directory, groupName); err != nil {

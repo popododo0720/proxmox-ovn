@@ -27,6 +27,8 @@ import (
 type managerConfig struct {
 	runtimeSocket   string
 	browserSocket   string
+	computeSocket   string
+	nodeName        string
 	pveMembersFile  string
 	clusterName     string
 	controlDB       []string
@@ -43,6 +45,8 @@ type managerConfig struct {
 	shutdownWait    time.Duration
 }
 
+const defaultManagerComputeSocket = "/run/pvn-compute/manager.sock"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		slog.Error("pvn-manager stopped", "error", err)
@@ -54,6 +58,7 @@ func run(arguments []string) error {
 	defaults := managerConfig{
 		runtimeSocket:  pvnconfig.DefaultManagerRuntimeSocket,
 		browserSocket:  pvnconfig.DefaultManagerBrowserSocket,
+		computeSocket:  defaultManagerComputeSocket,
 		pveMembersFile: os.Getenv("PVN_PVE_MEMBERS_FILE"),
 		clusterName:    os.Getenv("PVN_CLUSTER_NAME"),
 		shutdownWait:   envDuration("PVN_SHUTDOWN_TIMEOUT", 15*time.Second),
@@ -88,11 +93,16 @@ func run(arguments []string) error {
 	if defaults.shutdownWait <= 0 {
 		return errors.New("shutdown-timeout must be positive")
 	}
-	if defaults.runtimeSocket == "" || defaults.browserSocket == "" || defaults.runtimeSocket == defaults.browserSocket {
-		return errors.New("distinct runtime and browser Unix sockets are required")
+	if defaults.runtimeSocket == "" || defaults.browserSocket == "" || defaults.computeSocket == "" ||
+		defaults.runtimeSocket == defaults.browserSocket || defaults.runtimeSocket == defaults.computeSocket ||
+		defaults.browserSocket == defaults.computeSocket {
+		return errors.New("distinct runtime, browser, and compute Unix sockets are required")
 	}
 	if defaults.reconcileEvery <= 0 {
 		return errors.New("reconcile interval must be positive")
+	}
+	if strings.TrimSpace(defaults.nodeName) == "" {
+		return errors.New("local PVE node name is required for the privileged compute API")
 	}
 	if defaults.orphanGrace <= 0 {
 		return errors.New("orphan grace must be positive")
@@ -140,12 +150,17 @@ func run(arguments []string) error {
 	}
 	controller := reconcile.NewController(store, renderer, reconcile.WithLeaseDuration(defaults.orphanGrace))
 	reconcilerHealth := newReconcilerHealth(defaults.reconcileEvery, time.Now)
+	agentHealthClient := newAgentHealthClient()
 	handler, err := api.New(api.Options{
 		Store: store, Reconciler: controller, Logger: logger,
 		RequireAllNodes: defaults.requireAllNodes, NodeHeartbeatTTL: 2 * time.Minute,
 		GuestMTU: defaults.guestMTU, Physnet: defaults.physnet,
 		ClusterName: defaults.clusterName, NorthboundProbe: ovnClient,
 		SouthboundProbe: southboundProbe, ReconcilerProbe: reconcilerHealth,
+		ComputeNode: defaults.nodeName,
+		ComputeProbe: api.HealthProbeFunc(func(ctx context.Context) error {
+			return probeAgentHealth(ctx, agentHealthClient)
+		}),
 	})
 	if err != nil {
 		return err
@@ -163,6 +178,13 @@ func run(arguments []string) error {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+	computeServer := &http.Server{
+		Handler:           handler.ComputeHandler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
 	runtimeListener, err := listenUnix(defaults.runtimeSocket)
@@ -183,10 +205,21 @@ func run(arguments []string) error {
 		_ = browserListener.Close()
 		_ = os.Remove(defaults.browserSocket)
 	}()
+	// QEMU lifecycle calls can mutate desired networking state. Keep them off
+	// both the pvn-agent runtime socket and the www-data browser socket, and
+	// authenticate the local PVE worker by its kernel-supplied peer UID.
+	computeListener, err := listenRootUnix(defaults.computeSocket)
+	if err != nil {
+		return fmt.Errorf("listen for privileged PVN compute API: %w", err)
+	}
+	defer func() {
+		_ = computeListener.Close()
+		_ = os.Remove(defaults.computeSocket)
+	}()
 	reconcileContext, stopReconciler := context.WithCancel(context.Background())
 	defer stopReconciler()
 
-	serverErrors := make(chan error, 2)
+	serverErrors := make(chan error, 3)
 	go func() {
 		logger.Info("pvn-manager browser API listening", "socket", defaults.browserSocket, "version", buildinfo.Version)
 		serverErrors <- browserServer.Serve(browserListener)
@@ -194,6 +227,10 @@ func run(arguments []string) error {
 	go func() {
 		logger.Info("pvn-manager runtime API listening", "socket", defaults.runtimeSocket)
 		serverErrors <- runtimeServer.Serve(runtimeListener)
+	}()
+	go func() {
+		logger.Info("pvn-manager privileged compute API listening", "socket", defaults.computeSocket)
+		serverErrors <- computeServer.Serve(computeListener)
 	}()
 	go reconcilePeriodically(reconcileContext, managerPeriodicReconciler{controller: controller, defaultSecurity: handler}, defaults.reconcileEvery, reconcilerHealth, logger)
 
@@ -219,12 +256,17 @@ func run(arguments []string) error {
 		_ = runtimeServer.Close()
 		runError = errors.Join(runError, fmt.Errorf("runtime API graceful shutdown: %w", err))
 	}
+	if err := computeServer.Shutdown(shutdownContext); err != nil {
+		_ = computeServer.Close()
+		runError = errors.Join(runError, fmt.Errorf("compute API graceful shutdown: %w", err))
+	}
 	return runError
 }
 
 func applyClusterConfig(target *managerConfig, clusterConfig pvnconfig.Config, explicit map[string]bool) {
 	target.runtimeSocket = clusterConfig.Manager.UnixSocket
 	target.browserSocket = clusterConfig.Manager.BrowserSocket
+	target.nodeName = clusterConfig.Cluster.NodeName
 	if !explicit["cluster-name"] {
 		target.clusterName = clusterConfig.Cluster.ID
 	}

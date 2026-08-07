@@ -18,9 +18,10 @@ import (
 )
 
 func TestApplyClusterConfigPinsManagerSockets(t *testing.T) {
-	target := managerConfig{runtimeSocket: "flag-runtime", browserSocket: "old-browser", clusterName: "old-cluster"}
+	target := managerConfig{runtimeSocket: "flag-runtime", browserSocket: "old-browser", computeSocket: defaultManagerComputeSocket, clusterName: "old-cluster"}
 	cluster := pvnconfig.Default()
 	cluster.Cluster.ID = "cluster-a"
+	cluster.Cluster.NodeName = "prox1"
 	cluster.Manager.UnixSocket = "/run/pvn/manager.sock"
 	cluster.Manager.BrowserSocket = "/run/pvn-api/manager.sock"
 	cluster.OVN.ControlDB = []string{"ssl:192.0.2.10:6645"}
@@ -35,6 +36,12 @@ func TestApplyClusterConfigPinsManagerSockets(t *testing.T) {
 	}
 	if target.browserSocket != cluster.Manager.BrowserSocket || target.clusterName != "cluster-a" {
 		t.Fatalf("cluster config not applied: %#v", target)
+	}
+	if target.computeSocket != defaultManagerComputeSocket {
+		t.Fatalf("fixed privileged compute socket changed: %q", target.computeSocket)
+	}
+	if target.nodeName != "prox1" {
+		t.Fatalf("local compute node not applied: %q", target.nodeName)
 	}
 	if len(target.controlDB) != 1 || len(target.northbound) != 1 || len(target.southbound) != 1 || target.southbound[0] != cluster.OVN.Southbound[0] || target.ovnTLSCA != cluster.OVN.TLSCA || target.reconcileEvery != cluster.Cluster.ReconcileEvery {
 		t.Fatalf("OVN settings not applied: %#v", target)
@@ -362,6 +369,58 @@ func TestBrowserUnixListenerAllowsOnlyConfiguredUIDs(t *testing.T) {
 	}
 	if listener.allowsUID(1) || listener.allowsUID(65534) {
 		t.Fatal("unconfigured browser peer UID was accepted")
+	}
+}
+
+func TestRootUnixListenerRejectsNonRootUIDs(t *testing.T) {
+	listener := &peerUIDListener{allowedUIDs: map[uint32]struct{}{0: {}}}
+	if !listener.allowsUID(0) {
+		t.Fatal("root peer UID was rejected")
+	}
+	for _, uid := range []uint32{1, 33, 65534} {
+		if listener.allowsUID(uid) {
+			t.Fatalf("non-root peer UID %d was accepted", uid)
+		}
+	}
+}
+
+func TestListenRootUnixAcceptsRootPeer(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root peer credential test requires root")
+	}
+	path := filepath.Join(t.TempDir(), "compute", "manager.sock")
+	listener, err := listenRootUnix(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	errors := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			errors <- acceptErr
+			return
+		}
+		accepted <- connection
+	}()
+	client, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	select {
+	case connection := <-accepted:
+		defer connection.Close()
+		uid, err := unixPeerUID(connection)
+		if err != nil || uid != 0 {
+			t.Fatalf("accepted peer UID=%d err=%v", uid, err)
+		}
+	case err := <-errors:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("root-only listener did not accept root peer")
 	}
 }
 
