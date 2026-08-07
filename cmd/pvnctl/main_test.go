@@ -356,17 +356,17 @@ func TestRecoveryReconcileOVNRequiresManagedGraphAuditorBeforeWriting(t *testing
 
 func TestVerifiedRecoveryReconcilerRequiresACompletedOperationFromThisPass(t *testing.T) {
 	completed := time.Now().UTC()
-	project := &model.Project{Metadata: model.Metadata{
+	project := &model.ProviderNetwork{Metadata: model.Metadata{
 		ID: "project-a", Revision: 3, AppliedRevision: 3, State: model.ResourceReady,
 	}}
 	operation := &model.Operation{
 		Metadata: model.Metadata{ID: "operation-a", Revision: 8},
-		Action:   "reconcile", TargetKind: model.KindProject, TargetID: project.ID, TargetRevision: project.Revision,
+		Action:   "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID, TargetRevision: project.Revision,
 		OperationStatus: model.OperationSucceeded, CompletedAt: &completed,
 	}
 	store := &recoverySnapshotterStub{snapshots: []controlstore.ResourceSnapshot{
 		{model.KindOperation: {operation}},
-		{model.KindProject: {project}, model.KindOperation: {operation}},
+		{model.KindProviderNetwork: {project}, model.KindOperation: {operation}},
 	}}
 	forced := &recoveryReconcilerStub{}
 	err := (verifiedRecoveryReconciler{reconciler: forced, store: store}).ReconcileAll(context.Background())
@@ -380,22 +380,22 @@ func TestVerifiedRecoveryReconcilerRequiresACompletedOperationFromThisPass(t *te
 
 func TestVerifiedRecoveryReconcilerAcceptsNewlyCompletedDesiredRevision(t *testing.T) {
 	completed := time.Now().UTC()
-	project := &model.Project{Metadata: model.Metadata{
+	project := &model.ProviderNetwork{Metadata: model.Metadata{
 		ID: "project-a", Revision: 3, AppliedRevision: 3, State: model.ResourceReady,
 	}}
 	before := &model.Operation{
 		Metadata: model.Metadata{ID: "operation-a", Revision: 8},
-		Action:   "reconcile", TargetKind: model.KindProject, TargetID: project.ID, TargetRevision: project.Revision,
+		Action:   "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID, TargetRevision: project.Revision,
 		OperationStatus: model.OperationRunning,
 	}
 	after := &model.Operation{
 		Metadata: model.Metadata{ID: before.ID, Revision: 10},
-		Action:   "reconcile", TargetKind: model.KindProject, TargetID: project.ID, TargetRevision: project.Revision,
+		Action:   "reconcile", TargetKind: model.KindProviderNetwork, TargetID: project.ID, TargetRevision: project.Revision,
 		OperationStatus: model.OperationSucceeded, CompletedAt: &completed,
 	}
 	store := &recoverySnapshotterStub{snapshots: []controlstore.ResourceSnapshot{
 		{model.KindOperation: {before}},
-		{model.KindProject: {project}, model.KindOperation: {after}},
+		{model.KindProviderNetwork: {project}, model.KindOperation: {after}},
 	}}
 	forced := &recoveryReconcilerStub{}
 	if err := (verifiedRecoveryReconciler{reconciler: forced, store: store}).ReconcileAll(context.Background()); err != nil {
@@ -407,12 +407,12 @@ func TestVerifiedRecoveryReconcilerAcceptsNewlyCompletedDesiredRevision(t *testi
 }
 
 func TestVerifiedRecoveryReconcilerFailsClosedOnIncompleteControlState(t *testing.T) {
-	project := &model.Project{Metadata: model.Metadata{
+	project := &model.ProviderNetwork{Metadata: model.Metadata{
 		ID: "project-a", Revision: 3, AppliedRevision: 2, State: model.ResourcePending,
 	}}
 	store := &recoverySnapshotterStub{snapshots: []controlstore.ResourceSnapshot{
 		{model.KindOperation: nil},
-		{model.KindProject: {project}, model.KindOperation: nil},
+		{model.KindProviderNetwork: {project}, model.KindOperation: nil},
 	}}
 	err := (verifiedRecoveryReconciler{reconciler: &recoveryReconcilerStub{}, store: store}).ReconcileAll(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "is pending at applied revision 2") {

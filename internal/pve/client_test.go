@@ -3,7 +3,6 @@ package pve
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,76 +11,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestClientChecksExactPoolExistence(t *testing.T) {
-	t.Parallel()
-
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodGet || request.URL.Path != "/api2/json/pools" {
-			t.Errorf("request = %s %s", request.Method, request.URL.Path)
-		}
-		if cookie, err := request.Cookie("PVEAuthCookie"); err != nil || cookie.Value != "ticket-value" {
-			t.Errorf("ticket cookie = %#v, %v", cookie, err)
-		}
-		switch request.URL.Query().Get("poolid") {
-		case "parent/tenant":
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": []map[string]any{{"poolid": "parent/tenant"}}})
-		case "missing":
-			writer.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": nil, "message": "pool 'missing' does not exist\n"})
-		case "broken":
-			writer.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": nil, "message": "database unavailable"})
-		default:
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": []map[string]any{{"poolid": "different"}}})
-		}
-	}))
-	defer server.Close()
-
-	client, err := NewClient(ClientConfig{BaseURL: server.URL, Auth: TicketAuth{Ticket: "ticket-value"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	exists, err := client.PoolExists(context.Background(), "parent/tenant")
-	if err != nil || !exists {
-		t.Fatalf("existing pool: exists=%v err=%v", exists, err)
-	}
-	exists, err = client.PoolExists(context.Background(), "missing")
-	if err != nil || exists {
-		t.Fatalf("missing pool: exists=%v err=%v", exists, err)
-	}
-	exists, err = client.PoolExists(context.Background(), "broken")
-	if err == nil || exists {
-		t.Fatalf("failed lookup: exists=%v err=%v", exists, err)
-	}
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError || apiErr.Message != "database unavailable" {
-		t.Fatalf("unexpected API error: %#v", err)
-	}
-	if _, err := client.PoolExists(context.Background(), "mismatched"); err == nil {
-		t.Fatal("mismatched pool response unexpectedly succeeded")
-	}
-}
-
-func TestClientRejectsInvalidPoolIDBeforeRequest(t *testing.T) {
-	t.Parallel()
-
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		requests.Add(1)
-	}))
-	defer server.Close()
-	client, err := NewClient(ClientConfig{BaseURL: server.URL})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.PoolExists(context.Background(), "bad\npool"); err == nil {
-		t.Fatal("control character in pool ID was accepted")
-	}
-	if requests.Load() != 0 {
-		t.Fatalf("requests = %d, want 0", requests.Load())
-	}
-}
 
 func TestClientReadsAndUpdatesVMNetworkWithTicket(t *testing.T) {
 	t.Parallel()

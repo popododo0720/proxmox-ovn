@@ -25,7 +25,7 @@ func TestPVNControlSchemaHasRequiredTablesAndIndexes(t *testing.T) {
 	if document.Name != "PVN_Control" || document.Version == "" {
 		t.Fatalf("schema identity=%q version=%q", document.Name, document.Version)
 	}
-	required := []string{"Project", "Network", "Subnet", "Port", "IPAllocation", "Router", "RouterInterface", "FloatingIP", "ProviderNetwork", "ProviderSegment", "SecurityGroup", "SecurityGroupRule", "Node", "Operation"}
+	required := []string{"Network", "Subnet", "Port", "IPAllocation", "Router", "RouterInterface", "FloatingIP", "ProviderNetwork", "ProviderSegment", "SecurityGroup", "SecurityGroupRule", "Node", "Operation"}
 	for _, name := range required {
 		table, ok := document.Tables[name]
 		if !ok {
@@ -49,5 +49,16 @@ func TestPVNControlSchemaHasRequiredTablesAndIndexes(t *testing.T) {
 	}
 	if _, ok := document.Tables["Operation"].Columns["lease_owner"]; !ok {
 		t.Error("Operation table missing lease_owner")
+	}
+	if _, ok := document.Tables["Project"]; ok {
+		t.Error("Project table must not exist in the cluster-global schema")
+	}
+	for name, table := range document.Tables {
+		if _, ok := table.Columns["project"]; ok {
+			t.Errorf("table %s still has a project column", name)
+		}
+		if _, ok := table.Columns["shared"]; ok {
+			t.Errorf("table %s still has a shared column", name)
+		}
 	}
 }
