@@ -38,8 +38,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.18.0'
-          cache: npm
-          cache-dependency-path: web/package-lock.json
 
       - name: Validate release version
         shell: bash
@@ -146,7 +144,7 @@ jobs:
           verify_asset_uploaders
 
       - name: Run release source gates
-        run: make fmt-check vet test test-race web-test ui-test package-check release-check-test
+        run: make fmt-check vet test test-race ui-test package-check release-check-test
 
       - name: Build and verify release
         run: >-

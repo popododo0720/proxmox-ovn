@@ -2,7 +2,7 @@ Source: proxmox-ovn
 Section: admin
 Priority: optional
 Maintainer: PVN Project <root@localhost>
-Build-Depends: debhelper-compat (= 13), golang-any, npm, python3
+Build-Depends: debhelper-compat (= 13), golang-any, python3
 Standards-Version: 4.7.2
 Rules-Requires-Root: no
 

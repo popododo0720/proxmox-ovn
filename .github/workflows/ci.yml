@@ -22,21 +22,6 @@ jobs:
           go-version: '1.24.13'
           cache: true
       - run: make fmt-check vet test build package-check
-  web:
-    runs-on: ubuntu-latest
-    container: debian:13@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
-    steps:
-      - name: Install Debian 13 prerequisites
-        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git make
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Trust checked-out workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '24.18.0'
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: make web-test web-build ui-test
   package:
     runs-on: ubuntu-latest
     container: debian:13@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
@@ -53,8 +38,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.18.0'
-          cache: npm
-          cache-dependency-path: web/package-lock.json
       - run: make deb release-check-test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

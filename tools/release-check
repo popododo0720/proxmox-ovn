@@ -30,25 +30,6 @@ head -n 1 packaging/debian/changelog | \
 grep -Fx "RELEASE_VERSION=$version" deploy/tests/pvn-install-test.sh
 grep -Fx "RELEASE_VERSION=$version" deploy/tests/pvn-update-test.sh
 
-node --input-type=commonjs - "$version" <<'NODE'
-const fs = require("node:fs");
-
-const expected = process.argv[2];
-const packageJson = JSON.parse(fs.readFileSync("web/package.json", "utf8"));
-const packageLock = JSON.parse(fs.readFileSync("web/package-lock.json", "utf8"));
-const versions = [
-  ["web/package.json version", packageJson.version],
-  ["web/package-lock.json root version", packageLock.version],
-  ["web/package-lock.json package root version", packageLock.packages?.[""]?.version],
-];
-for (const [location, actual] of versions) {
-  if (actual !== expected) {
-    console.error(`${location} is ${JSON.stringify(actual)}, expected ${expected}`);
-    process.exit(1);
-  }
-}
-NODE
-
 head_commit=$(git rev-parse --verify HEAD)
 tag_commit=$(git rev-parse --verify "v$version^{commit}" 2>/dev/null || true)
 if [[ $tag_commit != "$head_commit" ]]; then

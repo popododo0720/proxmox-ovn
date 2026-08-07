@@ -5,17 +5,14 @@
 
 override_dh_auto_build:
 	$(MAKE) build VERSION=$$(dpkg-parsechangelog -SVersion)
-	if [ -f web/package-lock.json ]; then npm --prefix web ci && npm --prefix web run build; fi
 
 override_dh_auto_test:
 	$(MAKE) test
-	if [ -f web/package-lock.json ]; then npm --prefix web test -- --run; fi
 
 override_dh_auto_install:
 	mkdir -p debian/pvn-node/usr/sbin
 	install -m 0755 bin/pvn-manager bin/pvn-agent bin/pvnctl debian/pvn-node/usr/sbin/
 	mkdir -p debian/pvn-node/usr/share/pvn
-	if [ -d web/dist ]; then cp -a web/dist debian/pvn-node/usr/share/pvn/web; fi
 	mkdir -p debian/pvn-node/usr/share/pvn/schema
 	install -m 0644 schema/*.ovsschema debian/pvn-node/usr/share/pvn/schema/
 	mkdir -p debian/pvn-node/usr/lib/systemd/system

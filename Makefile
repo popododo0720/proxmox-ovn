@@ -7,7 +7,6 @@ COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
 BUILD_DATE ?= $(shell date -u -d '@$(SOURCE_DATE_EPOCH)' +%Y-%m-%dT%H:%M:%SZ)
 override RELEASE_GO_VERSION := go1.24.13
 override RELEASE_NODE_VERSION := v24.18.0
-override RELEASE_NPM_VERSION := 11.16.0
 override RELEASE_DPKG_VERSION := 1.22.22
 export SOURCE_DATE_EPOCH COMMIT BUILD_DATE
 LDFLAGS := -s -w \
@@ -16,7 +15,7 @@ LDFLAGS := -s -w \
 	-X github.com/popododo0720/proxmox-ovn/internal/buildinfo.Date=$(BUILD_DATE)
 GO_BUILD_FLAGS := -trimpath -buildvcs=false
 
-.PHONY: all build web-build test test-race web-test ui-test vet fmt-check package-check deb release-check-test release-source-check release-env-check release clean
+.PHONY: all build test test-race ui-test vet fmt-check package-check deb release-check-test release-source-check release-env-check release clean
 
 all: test build
 
@@ -26,19 +25,11 @@ build:
 	CGO_ENABLED=0 go build $(GO_BUILD_FLAGS) -ldflags '$(LDFLAGS)' -o bin/pvn-agent ./cmd/pvn-agent
 	CGO_ENABLED=0 go build $(GO_BUILD_FLAGS) -ldflags '$(LDFLAGS)' -o bin/pvnctl ./cmd/pvnctl
 
-web-build:
-	npm --prefix web ci
-	npm --prefix web run build
-
 test:
 	go test ./...
 
 test-race:
 	go test -race ./...
-
-web-test:
-	npm --prefix web ci
-	npm --prefix web test -- --run
 
 ui-test:
 	node --test pve-ui/tests/loader.test.mjs
@@ -66,13 +57,8 @@ release-env-check: release-source-check
 		exit 1; \
 	}
 	@test "$$(node --version)" = "$(RELEASE_NODE_VERSION)" || { \
-		printf 'release requires Node %s (found %s)\n' \
+		printf 'release requires Node %s for native UI tests (found %s)\n' \
 			'$(RELEASE_NODE_VERSION)' "$$(node --version)" >&2; \
-		exit 1; \
-	}
-	@test "$$(npm --version)" = "$(RELEASE_NPM_VERSION)" || { \
-		printf 'release requires npm %s (found %s)\n' \
-			'$(RELEASE_NPM_VERSION)' "$$(npm --version)" >&2; \
 		exit 1; \
 	}
 	@test "$$(dpkg-query -W -f='$${Version}' dpkg)" = "$(RELEASE_DPKG_VERSION)" || { \
@@ -81,7 +67,7 @@ release-env-check: release-source-check
 		exit 1; \
 	}
 
-deb: package-check web-build ui-test
+deb: package-check ui-test
 	$(MAKE) build VERSION=$(DEB_VERSION)
 	@set -eu; \
 	pvn_pkg_tmp=$$(mktemp -d); \
@@ -101,7 +87,6 @@ deb: package-check web-build ui-test
 	install -m 0755 pve-ui/inject.sh "$$pvn_root/usr/lib/pvn/pvn-ui-inject"; \
 	install -m 0644 pve-ui/pvn-loader.js "$$pvn_root/usr/lib/pvn/"; \
 	install -d "$$pvn_root/usr/share/pvn" "$$pvn_root/usr/share/doc/pvn-node/examples" "$$pvn_root/usr/share/doc/pvn-node/inventory"; \
-	cp -a web/dist "$$pvn_root/usr/share/pvn/web"; \
 	install -d "$$pvn_root/usr/share/pvn/schema"; \
 	install -m 0644 schema/*.ovsschema "$$pvn_root/usr/share/pvn/schema/"; \
 	install -m 0644 README.md docs/*.md "$$pvn_root/usr/share/doc/pvn-node/"; \
