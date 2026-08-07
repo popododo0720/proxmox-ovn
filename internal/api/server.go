@@ -53,20 +53,6 @@ func (f SessionProviderFunc) Session(ctx context.Context, request *http.Request)
 	return f(ctx, request)
 }
 
-// PoolValidator verifies project pool references against the Proxmox API.
-// The incoming request is provided so production implementations can forward
-// the already authenticated PVE browser ticket without introducing a second
-// credential store.
-type PoolValidator interface {
-	PoolExists(context.Context, *http.Request, string) (bool, error)
-}
-
-type PoolValidatorFunc func(context.Context, *http.Request, string) (bool, error)
-
-func (f PoolValidatorFunc) PoolExists(ctx context.Context, request *http.Request, poolID string) (bool, error) {
-	return f(ctx, request, poolID)
-}
-
 type Reconciler interface {
 	Reconcile(context.Context, model.Kind, string) error
 }
@@ -90,7 +76,6 @@ type Options struct {
 	Store            controlstore.Store
 	Reconciler       Reconciler
 	SessionProvider  SessionProvider
-	PoolValidator    PoolValidator
 	Logger           *slog.Logger
 	RequireAllNodes  bool
 	NodeHeartbeatTTL time.Duration
@@ -109,7 +94,6 @@ type Server struct {
 	reconciler      Reconciler
 	defaultSecurity *defaultsecurity.Manager
 	sessionProvider SessionProvider
-	poolValidator   PoolValidator
 	logger          *slog.Logger
 	clusterGate     *clusterCapacityGate
 	guestMTU        int
@@ -146,7 +130,7 @@ func New(options Options) (*Server, error) {
 		options.HealthTimeout = defaultHealthTimeout
 	}
 	return &Server{
-		store: options.Store, reconciler: options.Reconciler, defaultSecurity: defaultsecurity.New(options.Store, options.Reconciler), sessionProvider: options.SessionProvider, poolValidator: options.PoolValidator,
+		store: options.Store, reconciler: options.Reconciler, defaultSecurity: defaultsecurity.New(options.Store, options.Reconciler), sessionProvider: options.SessionProvider,
 		logger: options.Logger, clusterGate: newClusterCapacityGate(options.RequireAllNodes, options.NodeHeartbeatTTL, options.Clock),
 		guestMTU: options.GuestMTU, physnet: strings.TrimSpace(options.Physnet), clusterName: strings.TrimSpace(options.ClusterName),
 		northboundProbe: options.NorthboundProbe, southboundProbe: options.SouthboundProbe,
@@ -185,14 +169,6 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	if request.URL.Path == "/api/v1/health" {
 		s.health(writer, request)
-		return
-	}
-	if request.URL.Path == defaultSecurityGroupBackfillPlanPath {
-		s.defaultSecurityGroupBackfillPlan(writer, request)
-		return
-	}
-	if request.URL.Path == defaultSecurityGroupBackfillApplyPath {
-		s.defaultSecurityGroupBackfillApply(writer, request)
 		return
 	}
 	if request.URL.Path == "/api/v1/runtime/ports/resolve" {
@@ -381,8 +357,21 @@ func (s *Server) resource(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) list(writer http.ResponseWriter, request *http.Request, kind model.Kind) {
+	allowedQuery := map[string]bool{"network_id": true, "node_id": true, "vmid": true, "nic": true}
+	if kind == model.KindOperation {
+		allowedQuery["limit"] = true
+	}
+	for key, values := range request.URL.Query() {
+		if !allowedQuery[key] {
+			writeError(writer, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unsupported list query parameter %q", key), nil)
+			return
+		}
+		if len(values) != 1 {
+			writeError(writer, http.StatusBadRequest, "invalid_request", fmt.Sprintf("query parameter %q must be supplied at most once", key), nil)
+			return
+		}
+	}
 	options := controlstore.ListOptions{
-		ProjectID: request.URL.Query().Get("project_id"),
 		NetworkID: request.URL.Query().Get("network_id"),
 		NodeID:    request.URL.Query().Get("node_id"),
 		NIC:       request.URL.Query().Get("nic"),
@@ -476,9 +465,6 @@ func (s *Server) create(writer http.ResponseWriter, request *http.Request, kind 
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error(), nil)
 		return
 	}
-	if !s.requireExistingProjectPool(writer, request, resource) {
-		return
-	}
 	if kind == model.KindPort && !s.requireClusterCapacity(writer, request) {
 		return
 	}
@@ -489,11 +475,6 @@ func (s *Server) create(writer http.ResponseWriter, request *http.Request, kind 
 	if err != nil {
 		s.storeError(writer, err)
 		return
-	}
-	if project, ok := created.(*model.Project); ok {
-		if _, ensured := s.ensureDefaultSecurityGroup(writer, request.Context(), project.ID); !ensured {
-			return
-		}
 	}
 	created = s.reconcileAndReload(request.Context(), created)
 	setETag(writer, created.GetMetadata().Revision)
@@ -563,9 +544,6 @@ func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind 
 			}
 		}
 	}
-	if !s.requireExistingProjectPool(writer, request, resource) {
-		return
-	}
 	if port, ok := resource.(*model.Port); ok && len(port.SecurityGroupIDs) == 0 {
 		currentPort := current.(*model.Port)
 		if expected == current.GetMetadata().Revision {
@@ -576,7 +554,7 @@ func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind 
 			// Canonicalize stale/replayed bodies without performing repair side
 			// effects. Store.Update will decide replay versus precondition using
 			// the same fingerprint recorded by the original successful request.
-			port.SecurityGroupIDs = []string{defaultsecurity.DefaultSecurityGroupID(port.ProjectID)}
+			port.SecurityGroupIDs = []string{defaultsecurity.DefaultSecurityGroupID()}
 		}
 	}
 	updated, replayed, err := s.store.Update(request.Context(), resource, expected, key)
@@ -590,24 +568,6 @@ func (s *Server) update(writer http.ResponseWriter, request *http.Request, kind 
 		writer.Header().Set("Idempotency-Replayed", "true")
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"data": resourceAPIView(updated)})
-}
-
-func (s *Server) requireExistingProjectPool(writer http.ResponseWriter, request *http.Request, resource model.Resource) bool {
-	project, ok := resource.(*model.Project)
-	if !ok || s.poolValidator == nil {
-		return true
-	}
-	exists, err := s.poolValidator.PoolExists(request.Context(), request, project.PoolID)
-	if err != nil {
-		s.logger.Error("Proxmox pool validation failed", "pool_id", project.PoolID, "error", err)
-		writeError(writer, http.StatusBadGateway, "pve_pool_validation_failed", "failed to verify the Proxmox pool", nil)
-		return false
-	}
-	if !exists {
-		s.storeError(writer, &model.ValidationError{Field: "pool_id", Message: fmt.Sprintf("Proxmox pool %q does not exist", project.PoolID)})
-		return false
-	}
-	return true
 }
 
 func (s *Server) delete(writer http.ResponseWriter, request *http.Request, kind model.Kind, id string) {
@@ -633,16 +593,6 @@ func (s *Server) delete(writer http.ResponseWriter, request *http.Request, kind 
 		if defaultsecurity.IsReserved(current) {
 			writeError(writer, http.StatusConflict, "reserved_default_security_policy", "PVN managed default security policy resources cannot be deleted", nil)
 			return
-		}
-		if kind == model.KindProject {
-			if current.GetMetadata().State != model.ResourceDeleting && expected != current.GetMetadata().Revision {
-				s.storeError(writer, &controlstore.Error{Kind: controlstore.ErrPrecondition, Message: fmt.Sprintf("expected revision %d but current revision is %d", expected, current.GetMetadata().Revision)})
-				return
-			}
-			if err := s.cleanupProjectDefaultSecurity(request.Context(), id); err != nil {
-				s.writeDefaultSecurityError(writer, err)
-				return
-			}
 		}
 	}
 	tombstone, replayed, err := s.store.BeginDelete(request.Context(), kind, id, expected, key)

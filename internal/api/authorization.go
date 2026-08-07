@@ -10,7 +10,6 @@ import (
 
 const (
 	globalPath        = "/"
-	projectPoolPrefix = "/pool/"
 	networkPathPrefix = "/sdn/zones/pvn/"
 )
 
@@ -28,8 +27,8 @@ func (s *Server) authorizeWrite(ctx context.Context, resource, previous model.Re
 		return nil
 	}
 
-	// Authorize both sides of a project/pool move. Checking only the proposed
-	// resource would let a user with access to pool B take an object from pool A.
+	// Authorize both the stored and proposed representations so a caller cannot
+	// bypass policy by changing fields used by resource-specific checks.
 	if previous != nil {
 		if err := s.requireResourcePrivilege(ctx, session, previous, "SDN.Allocate"); err != nil {
 			return err
@@ -51,7 +50,7 @@ func (s *Server) authorizeWrite(ctx context.Context, resource, previous model.Re
 		if !ok || !portAttached(port) {
 			continue
 		}
-		key := fmt.Sprintf("%s/%s/%d/%s", port.ProjectID, port.NetworkID, port.VMID, port.NIC)
+		key := fmt.Sprintf("%s/%d/%s", port.NetworkID, port.VMID, port.NIC)
 		if _, done := checkedPorts[key]; done {
 			continue
 		}
@@ -73,90 +72,19 @@ func (s *Server) requireResourcePrivilege(ctx context.Context, session Session, 
 	if systemResource(resource.ResourceKind()) {
 		return fmt.Errorf("global %s is required", privilege)
 	}
-	poolPath, err := s.resourcePoolPath(ctx, resource)
-	if err != nil {
-		return err
-	}
-	if poolPath != "" && hasPrivilege(session, poolPath, privilege) {
-		return nil
-	}
-	return fmt.Errorf("%s is required on the resource project", privilege)
-}
-
-func (s *Server) resourcePoolPath(ctx context.Context, resource model.Resource) (string, error) {
-	if project, ok := resource.(*model.Project); ok {
-		if project.PoolID == "" {
-			return "", errors.New("the resource project is unavailable for permission evaluation")
-		}
-		return projectPoolPrefix + project.PoolID, nil
-	}
-
-	if operation, ok := resource.(*model.Operation); ok {
-		target, err := s.store.Get(ctx, operation.TargetKind, operation.TargetID)
-		if err != nil {
-			return "", errors.New("the operation target is unavailable for permission evaluation")
-		}
-		if systemResource(target.ResourceKind()) {
-			return "", nil
-		}
-		return s.resourcePoolPath(ctx, target)
-	}
-
-	projectID := resourceProjectID(resource)
-	if projectID == "" {
-		return "", errors.New("the resource project is unavailable for permission evaluation")
-	}
-	projectResource, err := s.store.Get(ctx, model.KindProject, projectID)
-	if err != nil {
-		return "", errors.New("the resource project is unavailable for permission evaluation")
-	}
-	project, ok := projectResource.(*model.Project)
-	if !ok || project.PoolID == "" {
-		return "", errors.New("the resource project is unavailable for permission evaluation")
-	}
-	return projectPoolPrefix + project.PoolID, nil
+	return fmt.Errorf("global %s is required", privilege)
 }
 
 func (s *Server) requirePortUse(ctx context.Context, session Session, port *model.Port) error {
-	poolPath, err := s.resourcePoolPath(ctx, port)
-	if err != nil {
-		return err
-	}
 	if !hasPrivilege(session, globalPath, "SDN.Use") &&
-		!hasPrivilege(session, poolPath, "SDN.Use") &&
 		!hasPrivilege(session, networkPathPrefix+port.NetworkID, "SDN.Use") {
-		return errors.New("SDN.Use is required on the network project")
+		return errors.New("SDN.Use is required globally or on the network")
 	}
 	if port.VMID < 1 || (!hasPrivilege(session, globalPath, "VM.Config.Network") &&
 		!hasPrivilege(session, fmt.Sprintf("/vms/%d", port.VMID), "VM.Config.Network")) {
 		return errors.New("VM.Config.Network is required on the target VM")
 	}
 	return nil
-}
-
-func resourceProjectID(resource model.Resource) string {
-	switch value := resource.(type) {
-	case *model.Network:
-		return value.ProjectID
-	case *model.Subnet:
-		return value.ProjectID
-	case *model.Port:
-		return value.ProjectID
-	case *model.IPAllocation:
-		return value.ProjectID
-	case *model.Router:
-		return value.ProjectID
-	case *model.RouterInterface:
-		return value.ProjectID
-	case *model.FloatingIP:
-		return value.ProjectID
-	case *model.SecurityGroup:
-		return value.ProjectID
-	case *model.SecurityGroupRule:
-		return value.ProjectID
-	default:
-		return ""
-	}
 }
 
 func systemResource(kind model.Kind) bool {

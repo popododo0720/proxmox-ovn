@@ -1,6 +1,7 @@
-// Package defaultsecurity owns the system-managed security policy that every
-// PVN project receives. The policy uses deterministic UUIDs so every manager
-// can safely ensure the same resources without an additional coordination row.
+// Package defaultsecurity owns the cluster-global system-managed security
+// policy. Every port that uses the default security group is part of one routed
+// self-ingress trust domain: the baseline allows all IPv4 egress and IPv4
+// ingress from every other port attached to that same global group.
 package defaultsecurity
 
 import (
@@ -9,7 +10,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
@@ -17,9 +17,9 @@ import (
 
 const (
 	DefaultSecurityGroupName        = "default"
-	DefaultSecurityGroupDescription = "PVN managed default security group"
+	DefaultSecurityGroupDescription = "PVN managed cluster default security group"
 	DefaultEgressDescription        = "Allow all IPv4 egress"
-	DefaultIngressDescription       = "Allow IPv4 ingress from this security group"
+	DefaultIngressDescription       = "Allow IPv4 ingress from all ports in the cluster default trust domain"
 )
 
 // Reconciler realizes one desired resource in OVN.
@@ -27,7 +27,7 @@ type Reconciler interface {
 	Reconcile(context.Context, model.Kind, string) error
 }
 
-// Manager creates and repairs the deterministic default policy for projects.
+// Manager creates and repairs the deterministic cluster-global default policy.
 type Manager struct {
 	store      controlstore.Store
 	reconciler Reconciler
@@ -37,17 +37,15 @@ type Manager struct {
 type BlockedReason string
 
 const (
-	BlockedNone            BlockedReason = ""
-	BlockedNameCollision   BlockedReason = "default_name_collision"
-	BlockedMalformedGroup  BlockedReason = "deterministic_group_malformed"
-	BlockedMalformedRule   BlockedReason = "deterministic_rule_malformed"
-	BlockedProjectDeleting BlockedReason = "project_deleting"
+	BlockedNone           BlockedReason = ""
+	BlockedNameCollision  BlockedReason = "default_name_collision"
+	BlockedMalformedGroup BlockedReason = "deterministic_group_malformed"
+	BlockedMalformedRule  BlockedReason = "deterministic_rule_malformed"
 )
 
-// Inspection is a read-only assessment of one project's baseline. Missing
+// Inspection is a read-only assessment of the cluster baseline. Missing
 // resources are repairable; BlockedReason requires operator intervention.
 type Inspection struct {
-	ProjectID          string        `json:"project_id"`
 	GroupID            string        `json:"group_id"`
 	MissingResourceIDs []string      `json:"missing_resource_ids,omitempty"`
 	Ready              bool          `json:"ready"`
@@ -60,22 +58,22 @@ func New(store controlstore.Store, reconciler Reconciler) *Manager {
 }
 
 // DefaultSecurityGroupID is stable across all managers and installations.
-func DefaultSecurityGroupID(projectID string) string {
-	return deterministicUUID("pvn/default-security-group/v1", projectID)
+func DefaultSecurityGroupID() string {
+	return deterministicUUID("pvn/default-security-group/cluster/v1")
 }
 
 // DefaultEgressRuleID identifies the system-managed IPv4 egress rule.
-func DefaultEgressRuleID(projectID string) string {
-	return deterministicUUID("pvn/default-security-group-rule/egress-ipv4/v1", projectID)
+func DefaultEgressRuleID() string {
+	return deterministicUUID("pvn/default-security-group-rule/cluster-egress-ipv4/v1")
 }
 
 // DefaultIngressRuleID identifies the system-managed IPv4 self-ingress rule.
-func DefaultIngressRuleID(projectID string) string {
-	return deterministicUUID("pvn/default-security-group-rule/ingress-self-ipv4/v1", projectID)
+func DefaultIngressRuleID() string {
+	return deterministicUUID("pvn/default-security-group-rule/cluster-ingress-self-ipv4/v1")
 }
 
-func deterministicUUID(domain, projectID string) string {
-	digest := sha256.Sum256([]byte(domain + ":" + strings.TrimSpace(projectID)))
+func deterministicUUID(domain string) string {
+	digest := sha256.Sum256([]byte(domain))
 	digest[6] = (digest[6] & 0x0f) | 0x50
 	digest[8] = (digest[8] & 0x3f) | 0x80
 	encoded := hex.EncodeToString(digest[:16])
@@ -86,11 +84,15 @@ func deterministicUUID(domain, projectID string) string {
 // objects. API mutation paths use this to prevent the baseline from being
 // renamed, weakened, or deleted.
 func IsReserved(resource model.Resource) bool {
-	switch value := resource.(type) {
-	case *model.SecurityGroup:
-		return value.ID != "" && value.ID == DefaultSecurityGroupID(value.ProjectID)
-	case *model.SecurityGroupRule:
-		return value.ID != "" && (value.ID == DefaultEgressRuleID(value.ProjectID) || value.ID == DefaultIngressRuleID(value.ProjectID))
+	if resource == nil {
+		return false
+	}
+	switch resource.ResourceKind() {
+	case model.KindSecurityGroup:
+		return resource.GetMetadata().ID == DefaultSecurityGroupID()
+	case model.KindSecurityGroupRule:
+		id := resource.GetMetadata().ID
+		return id == DefaultEgressRuleID() || id == DefaultIngressRuleID()
 	default:
 		return false
 	}
@@ -98,28 +100,14 @@ func IsReserved(resource model.Resource) bool {
 
 // Inspect assesses the deterministic baseline without creating, updating, or
 // reconciling any resource.
-func (m *Manager) Inspect(ctx context.Context, projectID string) (Inspection, error) {
-	inspection := Inspection{ProjectID: strings.TrimSpace(projectID), Ready: true}
-	inspection.GroupID = DefaultSecurityGroupID(inspection.ProjectID)
+func (m *Manager) Inspect(ctx context.Context) (Inspection, error) {
+	inspection := Inspection{GroupID: DefaultSecurityGroupID(), Ready: true}
 	if m == nil || m.store == nil {
 		return inspection, errors.New("default security policy store is not configured")
 	}
-	if inspection.ProjectID == "" {
-		return inspection, &model.ValidationError{Field: "project_id", Message: "is required"}
-	}
-	project, err := m.store.Get(ctx, model.KindProject, inspection.ProjectID)
-	if err != nil {
-		return inspection, err
-	}
-	if project.GetMetadata().State == model.ResourceDeleting {
-		inspection.Ready = false
-		inspection.BlockedReason = BlockedProjectDeleting
-		inspection.Detail = "project is being deleted"
-		return inspection, nil
-	}
 
-	desiredGroup := desiredGroup(inspection.ProjectID)
-	groups, err := m.store.List(ctx, model.KindSecurityGroup, controlstore.ListOptions{ProjectID: inspection.ProjectID})
+	desiredGroup := desiredGroup()
+	groups, err := m.store.List(ctx, model.KindSecurityGroup, controlstore.ListOptions{})
 	if err != nil {
 		return inspection, err
 	}
@@ -133,7 +121,7 @@ func (m *Manager) Inspect(ctx context.Context, projectID string) (Inspection, er
 		}
 	}
 
-	resources := []model.Resource{desiredGroup, desiredEgressRule(inspection.ProjectID), desiredIngressRule(inspection.ProjectID)}
+	resources := []model.Resource{desiredGroup, desiredEgressRule(), desiredIngressRule()}
 	for _, desired := range resources {
 		current, getErr := m.store.Get(ctx, desired.ResourceKind(), desired.GetMetadata().ID)
 		if errors.Is(getErr, controlstore.ErrNotFound) {
@@ -161,35 +149,21 @@ func (m *Manager) Inspect(ctx context.Context, projectID string) (Inspection, er
 			inspection.Detail = verifyErr.Error()
 			return inspection, nil
 		}
-		meta := current.GetMetadata()
-		if meta.State != model.ResourceReady || meta.AppliedRevision != meta.Revision {
+		if !resourceReady(current) {
 			inspection.Ready = false
 		}
 	}
 	return inspection, nil
 }
 
-// Ensure creates any missing deterministic policy rows, verifies that existing
-// rows contain exactly the baseline policy, and realizes each row before it is
-// returned for attachment to a new port. Creation order is deliberately
-// restrictive: the default-drop security group is realized before allow rules.
-func (m *Manager) Ensure(ctx context.Context, projectID string) (*model.SecurityGroup, error) {
+// Ensure creates missing deterministic policy rows, verifies existing rows,
+// and realizes each row before returning the group for port attachment. The
+// restrictive group is realized before either allow rule.
+func (m *Manager) Ensure(ctx context.Context) (*model.SecurityGroup, error) {
 	if m == nil || m.store == nil {
 		return nil, errors.New("default security policy store is not configured")
 	}
-	projectID = strings.TrimSpace(projectID)
-	if projectID == "" {
-		return nil, &model.ValidationError{Field: "project_id", Message: "is required"}
-	}
-	projectResource, err := m.store.Get(ctx, model.KindProject, projectID)
-	if err != nil {
-		return nil, err
-	}
-	if projectResource.GetMetadata().State == model.ResourceDeleting {
-		return nil, conflict("project is being deleted; its default security policy cannot be ensured")
-	}
-
-	group := desiredGroup(projectID)
+	group := desiredGroup()
 	if err := m.rejectNameCollision(ctx, group); err != nil {
 		return nil, err
 	}
@@ -205,7 +179,7 @@ func (m *Manager) Ensure(ctx context.Context, projectID string) (*model.Security
 		return nil, err
 	}
 
-	for _, desired := range []*model.SecurityGroupRule{desiredEgressRule(projectID), desiredIngressRule(projectID)} {
+	for _, desired := range []*model.SecurityGroupRule{desiredEgressRule(), desiredIngressRule()} {
 		ensured, ensureErr := m.ensureResource(ctx, desired)
 		if ensureErr != nil {
 			return nil, ensureErr
@@ -225,111 +199,25 @@ func (m *Manager) Ensure(ctx context.Context, projectID string) (*model.Security
 	return latest.(*model.SecurityGroup), nil
 }
 
-// EnsureAll repairs default policies for every non-deleting project. It never
-// reads or changes Port rows, so legacy ports with an explicit empty SG list
-// remain untouched.
+// EnsureAll retains the manager repair-loop contract while ensuring the one
+// cluster-global default policy.
 func (m *Manager) EnsureAll(ctx context.Context) error {
-	if m == nil || m.store == nil {
-		return errors.New("default security policy store is not configured")
-	}
-	index, err := m.loadPolicyIndex(ctx)
-	if err != nil {
-		return err
-	}
-	var failures []error
-	for _, resource := range index.projects {
-		if resource.GetMetadata().State == model.ResourceDeleting {
-			continue
-		}
-		if index.issue(resource.GetMetadata().ID) == nil {
-			continue
-		}
-		if _, ensureErr := m.Ensure(ctx, resource.GetMetadata().ID); ensureErr != nil {
-			failures = append(failures, fmt.Errorf("ensure project %q default security policy: %w", resource.GetMetadata().ID, ensureErr))
-		}
-	}
-	return errors.Join(failures...)
+	_, err := m.Ensure(ctx)
+	return err
 }
 
-// Probe reports whether every active project has a complete, realized default
-// policy. It is read-only and suitable for the manager health endpoint.
+// Probe reports whether the cluster-global default policy is complete and
+// realized. It is read-only and suitable for the manager health endpoint.
 func (m *Manager) Probe(ctx context.Context) error {
-	if m == nil || m.store == nil {
-		return errors.New("default security policy store is not configured")
-	}
-	index, err := m.loadPolicyIndex(ctx)
+	inspection, err := m.Inspect(ctx)
 	if err != nil {
 		return err
 	}
-	var failures []error
-	for _, resource := range index.projects {
-		if resource.GetMetadata().State == model.ResourceDeleting {
-			continue
-		}
-		if issue := index.issue(resource.GetMetadata().ID); issue != nil {
-			failures = append(failures, issue)
-		}
+	if inspection.BlockedReason != BlockedNone {
+		return fmt.Errorf("default security policy is blocked: %s", inspection.BlockedReason)
 	}
-	return errors.Join(failures...)
-}
-
-type policyIndex struct {
-	projects             []model.Resource
-	groupsByID           map[string]*model.SecurityGroup
-	rulesByID            map[string]*model.SecurityGroupRule
-	defaultNameCollision map[string]bool
-}
-
-func (m *Manager) loadPolicyIndex(ctx context.Context) (*policyIndex, error) {
-	snapshot, err := m.store.Snapshot(ctx, []model.Kind{model.KindProject, model.KindSecurityGroup, model.KindSecurityGroupRule}, controlstore.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	index := &policyIndex{
-		projects:             snapshot[model.KindProject],
-		groupsByID:           make(map[string]*model.SecurityGroup, len(snapshot[model.KindSecurityGroup])),
-		rulesByID:            make(map[string]*model.SecurityGroupRule, len(snapshot[model.KindSecurityGroupRule])),
-		defaultNameCollision: make(map[string]bool),
-	}
-	for _, resource := range snapshot[model.KindSecurityGroup] {
-		group := resource.(*model.SecurityGroup)
-		index.groupsByID[group.ID] = group
-		if group.Name == DefaultSecurityGroupName && group.ID != DefaultSecurityGroupID(group.ProjectID) {
-			index.defaultNameCollision[group.ProjectID] = true
-		}
-	}
-	for _, resource := range snapshot[model.KindSecurityGroupRule] {
-		rule := resource.(*model.SecurityGroupRule)
-		index.rulesByID[rule.ID] = rule
-	}
-	return index, nil
-}
-
-func (index *policyIndex) issue(projectID string) error {
-	if index.defaultNameCollision[projectID] {
-		return fmt.Errorf("default security policy is blocked: %s", BlockedNameCollision)
-	}
-	desiredGroup := desiredGroup(projectID)
-	group := index.groupsByID[desiredGroup.ID]
-	if group == nil {
-		return errors.New("default security policy is incomplete")
-	}
-	if verifyErr := sameGroup(group, desiredGroup); verifyErr != nil {
-		return fmt.Errorf("default security policy is blocked: %s", BlockedMalformedGroup)
-	}
-	ready := resourceReady(group)
-	for _, desired := range []*model.SecurityGroupRule{desiredEgressRule(projectID), desiredIngressRule(projectID)} {
-		rule := index.rulesByID[desired.ID]
-		if rule == nil {
-			return errors.New("default security policy is incomplete")
-		}
-		if verifyErr := sameRule(rule, desired); verifyErr != nil {
-			return fmt.Errorf("default security policy is blocked: %s", BlockedMalformedRule)
-		}
-		ready = ready && resourceReady(rule)
-	}
-	if !ready {
-		return errors.New("default security policy is not realized")
+	if !inspection.Ready {
+		return errors.New("default security policy is incomplete or not realized")
 	}
 	return nil
 }
@@ -339,21 +227,19 @@ func resourceReady(resource model.Resource) bool {
 	return meta.State == model.ResourceReady && meta.AppliedRevision == meta.Revision
 }
 
-func desiredGroup(projectID string) *model.SecurityGroup {
+func desiredGroup() *model.SecurityGroup {
 	return &model.SecurityGroup{
-		Metadata:    model.Metadata{ID: DefaultSecurityGroupID(projectID)},
-		ProjectID:   projectID,
+		Metadata:    model.Metadata{ID: DefaultSecurityGroupID()},
 		Name:        DefaultSecurityGroupName,
 		Description: DefaultSecurityGroupDescription,
 		Stateful:    true,
 	}
 }
 
-func desiredEgressRule(projectID string) *model.SecurityGroupRule {
+func desiredEgressRule() *model.SecurityGroupRule {
 	return &model.SecurityGroupRule{
-		Metadata:        model.Metadata{ID: DefaultEgressRuleID(projectID)},
-		ProjectID:       projectID,
-		SecurityGroupID: DefaultSecurityGroupID(projectID),
+		Metadata:        model.Metadata{ID: DefaultEgressRuleID()},
+		SecurityGroupID: DefaultSecurityGroupID(),
 		Direction:       model.DirectionEgress,
 		EtherType:       model.EtherTypeIPv4,
 		Action:          model.ActionAllow,
@@ -361,11 +247,13 @@ func desiredEgressRule(projectID string) *model.SecurityGroupRule {
 	}
 }
 
-func desiredIngressRule(projectID string) *model.SecurityGroupRule {
-	groupID := DefaultSecurityGroupID(projectID)
+// desiredIngressRule is intentionally self-referential. Because every default
+// port uses this one cluster-global group, all such ports form one routed
+// self-ingress trust domain across all logical networks.
+func desiredIngressRule() *model.SecurityGroupRule {
+	groupID := DefaultSecurityGroupID()
 	return &model.SecurityGroupRule{
-		Metadata:        model.Metadata{ID: DefaultIngressRuleID(projectID)},
-		ProjectID:       projectID,
+		Metadata:        model.Metadata{ID: DefaultIngressRuleID()},
 		SecurityGroupID: groupID,
 		Direction:       model.DirectionIngress,
 		EtherType:       model.EtherTypeIPv4,
@@ -376,14 +264,14 @@ func desiredIngressRule(projectID string) *model.SecurityGroupRule {
 }
 
 func (m *Manager) rejectNameCollision(ctx context.Context, desired *model.SecurityGroup) error {
-	groups, err := m.store.List(ctx, model.KindSecurityGroup, controlstore.ListOptions{ProjectID: desired.ProjectID})
+	groups, err := m.store.List(ctx, model.KindSecurityGroup, controlstore.ListOptions{})
 	if err != nil {
 		return err
 	}
 	for _, resource := range groups {
 		group := resource.(*model.SecurityGroup)
 		if group.Name == DefaultSecurityGroupName && group.ID != desired.ID {
-			return conflict("project already has a non-PVN security group named %q; rename or remove it before creating ports", DefaultSecurityGroupName)
+			return conflict("a non-PVN security group already uses the cluster-reserved name %q", DefaultSecurityGroupName)
 		}
 	}
 	return nil
@@ -405,9 +293,8 @@ func (m *Manager) ensureResource(ctx context.Context, desired model.Resource) (m
 	if !errors.Is(err, controlstore.ErrAlreadyExists) && !errors.Is(err, controlstore.ErrConflict) {
 		return nil, err
 	}
-	// Another manager may have committed the same deterministic row between
-	// our read and write. Only adopt that exact ID; unique-name collisions are
-	// diagnosed by the caller and never treated as the default policy.
+	// Another manager may have committed the deterministic row between the read
+	// and write. Only adopt that exact ID; unique-name collisions remain errors.
 	existing, getErr := m.store.Get(ctx, kind, id)
 	if getErr == nil {
 		return existing, nil
@@ -446,7 +333,7 @@ func sameGroup(current, desired *model.SecurityGroup) error {
 	if current.State == model.ResourceDeleting {
 		return conflict("the default security group is being deleted")
 	}
-	if current.ProjectID != desired.ProjectID || current.Name != desired.Name || current.Description != desired.Description || !current.Stateful {
+	if current.Name != desired.Name || current.Description != desired.Description || !current.Stateful {
 		return conflict("the deterministic default security group contains non-baseline policy")
 	}
 	return nil
@@ -456,11 +343,11 @@ func sameRule(current, desired *model.SecurityGroupRule) error {
 	if current.State == model.ResourceDeleting {
 		return conflict("a default security group rule is being deleted")
 	}
-	if current.ProjectID != desired.ProjectID || current.SecurityGroupID != desired.SecurityGroupID ||
-		current.Direction != desired.Direction || current.EtherType != desired.EtherType ||
-		current.Protocol != "" || current.PortRangeMin != 0 || current.PortRangeMax != 0 ||
-		current.RemoteCIDR != "" || current.RemoteGroupID != desired.RemoteGroupID ||
-		current.Action != desired.Action || current.Description != desired.Description {
+	if current.SecurityGroupID != desired.SecurityGroupID || current.Direction != desired.Direction ||
+		current.EtherType != desired.EtherType || current.Protocol != "" ||
+		current.PortRangeMin != 0 || current.PortRangeMax != 0 || current.RemoteCIDR != "" ||
+		current.RemoteGroupID != desired.RemoteGroupID || current.Action != desired.Action ||
+		current.Description != desired.Description {
 		return conflict("a deterministic default security group rule contains non-baseline policy")
 	}
 	return nil

@@ -22,7 +22,6 @@ import (
 )
 
 type portProvisionRequest struct {
-	ProjectID        string   `json:"project_id"`
 	NetworkID        string   `json:"network_id"`
 	SubnetID         string   `json:"subnet_id,omitempty"`
 	Name             string   `json:"name,omitempty"`
@@ -95,7 +94,7 @@ func (s *Server) provisionPort(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusForbidden, "forbidden", err.Error(), nil)
 		return
 	}
-	_, network, subnet, err := s.loadProvisionTopology(request.Context(), input)
+	network, subnet, err := s.loadProvisionTopology(request.Context(), input)
 	if err != nil {
 		s.storeError(writer, err)
 		return
@@ -122,7 +121,7 @@ func (s *Server) provisionPort(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	if len(port.SecurityGroupIDs) == 0 {
-		group, ensureErr := s.defaultSecurity.Ensure(request.Context(), port.ProjectID)
+		group, ensureErr := s.defaultSecurity.Ensure(request.Context())
 		if ensureErr != nil {
 			s.failPortProvision(request.Context(), operation, ensureErr)
 			s.writeDefaultSecurityError(writer, ensureErr)
@@ -174,15 +173,11 @@ func (s *Server) provisionPort(writer http.ResponseWriter, request *http.Request
 }
 
 func normalizeProvisionRequest(input *portProvisionRequest) error {
-	input.ProjectID = strings.TrimSpace(input.ProjectID)
 	input.NetworkID = strings.TrimSpace(input.NetworkID)
 	input.SubnetID = strings.TrimSpace(input.SubnetID)
 	input.Name = strings.TrimSpace(input.Name)
 	input.MACAddress = strings.TrimSpace(input.MACAddress)
 	input.FixedIPAddress = strings.TrimSpace(input.FixedIPAddress)
-	if input.ProjectID == "" {
-		return &model.ValidationError{Field: "project_id", Message: "is required"}
-	}
 	if input.NetworkID == "" {
 		return &model.ValidationError{Field: "network_id", Message: "is required"}
 	}
@@ -260,7 +255,6 @@ func provisionPortResource(identity provisionIdentity, input portProvisionReques
 	}
 	port := &model.Port{
 		Metadata:         model.Metadata{ID: identity.portID},
-		ProjectID:        input.ProjectID,
 		NetworkID:        input.NetworkID,
 		Name:             name,
 		MACAddress:       mac,
@@ -273,32 +267,24 @@ func provisionPortResource(identity provisionIdentity, input portProvisionReques
 	return port
 }
 
-func (s *Server) loadProvisionTopology(ctx context.Context, input portProvisionRequest) (*model.Project, *model.Network, *model.Subnet, error) {
-	projectResource, err := s.store.Get(ctx, model.KindProject, input.ProjectID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+func (s *Server) loadProvisionTopology(ctx context.Context, input portProvisionRequest) (*model.Network, *model.Subnet, error) {
 	networkResource, err := s.store.Get(ctx, model.KindNetwork, input.NetworkID)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	project := projectResource.(*model.Project)
 	network := networkResource.(*model.Network)
-	if network.ProjectID != project.ID {
-		return nil, nil, nil, &controlstore.Error{Kind: controlstore.ErrConflict, Message: "network belongs to a different project"}
-	}
 	if input.SubnetID == "" {
-		return project, network, nil, nil
+		return network, nil, nil
 	}
 	subnetResource, err := s.store.Get(ctx, model.KindSubnet, input.SubnetID)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	subnet := subnetResource.(*model.Subnet)
-	if subnet.ProjectID != project.ID || subnet.NetworkID != network.ID {
-		return nil, nil, nil, &controlstore.Error{Kind: controlstore.ErrConflict, Message: "subnet belongs to a different project or network"}
+	if subnet.NetworkID != network.ID {
+		return nil, nil, &controlstore.Error{Kind: controlstore.ErrConflict, Message: "subnet belongs to a different network"}
 	}
-	return project, network, subnet, nil
+	return network, subnet, nil
 }
 
 func (s *Server) beginPortProvision(ctx context.Context, key string, identity provisionIdentity, portID string) (*model.Operation, bool, error) {
@@ -351,11 +337,10 @@ func (s *Server) reserveProvisionAddress(ctx context.Context, input portProvisio
 			continue
 		}
 		allocation := &model.IPAllocation{
-			Metadata:  model.Metadata{ID: identity.allocationID},
-			ProjectID: input.ProjectID,
-			SubnetID:  subnet.ID,
-			Address:   address,
-			State:     model.IPReserved,
+			Metadata: model.Metadata{ID: identity.allocationID},
+			SubnetID: subnet.ID,
+			Address:  address,
+			State:    model.IPReserved,
 		}
 		created, _, createErr := s.store.Create(ctx, allocation, "")
 		if createErr == nil {
@@ -377,7 +362,7 @@ func (s *Server) reserveProvisionAddress(ctx context.Context, input portProvisio
 }
 
 func validateProvisionAllocation(allocation *model.IPAllocation, input portProvisionRequest, subnet *model.Subnet, portID string) (*model.IPAllocation, error) {
-	if allocation.ProjectID != input.ProjectID || allocation.SubnetID != subnet.ID {
+	if allocation.SubnetID != subnet.ID {
 		return nil, &controlstore.Error{Kind: controlstore.ErrConflict, Message: "the provisioning reservation does not match this request"}
 	}
 	if input.FixedIPAddress != "" && allocation.Address != input.FixedIPAddress {
@@ -595,7 +580,7 @@ func (s *Server) adoptDefaultSecurityForInterruptedProvision(ctx context.Context
 
 func interruptedProvisionCanAdoptDefault(current, desired *model.Port) bool {
 	return len(current.SecurityGroupIDs) == 0 && len(desired.SecurityGroupIDs) == 1 &&
-		desired.SecurityGroupIDs[0] == defaultsecurity.DefaultSecurityGroupID(desired.ProjectID) &&
+		desired.SecurityGroupIDs[0] == defaultsecurity.DefaultSecurityGroupID() &&
 		current.BindingStatus == model.PortUnbound && current.NodeID == "" && current.VMID == 0 && current.NIC == "" &&
 		current.RequestedChassis == "" && sameProvisionedPortIgnoringSecurityGroups(current, desired)
 }
@@ -613,7 +598,7 @@ func sameProvisionedPort(current, desired *model.Port) bool {
 }
 
 func sameProvisionedPortIgnoringSecurityGroups(current, desired *model.Port) bool {
-	if current.ID != desired.ID || current.ProjectID != desired.ProjectID || current.NetworkID != desired.NetworkID ||
+	if current.ID != desired.ID || current.NetworkID != desired.NetworkID ||
 		current.Name != desired.Name || !strings.EqualFold(current.MACAddress, desired.MACAddress) ||
 		!current.AdminStateUp || len(current.FixedIPs) != len(desired.FixedIPs) {
 		return false
