@@ -8,6 +8,19 @@ make deb
 make release-check-test
 ```
 
+The long package gate can also be run as four independent suites:
+
+```sh
+make package-check-fast
+make package-check-topology
+make package-check-control-plane
+make package-check-backup
+```
+
+`make package-check` remains the sequential aggregate for local use. GitHub
+Actions runs the four suites on separate workers, then builds the DEB only
+after every suite succeeds.
+
 The unit tests use in-memory control state and fake PVE/OVS command runners.
 Host integration tests require a disposable PVE 9 cluster; do not run them on
 a node carrying unmanaged production networking.
@@ -30,16 +43,18 @@ performs these builds in a Debian 13 container. Static unit verification is not
 a substitute for a staged PVE 9 host test.
 
 After the source and UI gates have already passed for the current commit,
-`make deb-artifact` rebuilds and checks only the DEB artifact. Do not use that
-shortcut as a replacement for the full `make deb` gate in CI or a canonical
-release.
+`make deb-artifact` rebuilds and checks only the DEB artifact. Main-branch CI
+uses it only after the parallel package suites and source job succeed. Do not
+use that shortcut by itself as a replacement for the full gates.
 
 ## Canonical releases
 
 `make deb` builds a local development/test package. It may be used for staged
 PVE validation, but it is not a canonical public artifact and must not be
-uploaded to GitHub Releases. `make release` is reserved for the tag-triggered
-GitHub Actions workflow and fails outside GitHub Actions.
+uploaded to GitHub Releases. `make release` is the full canonical aggregate;
+the tag workflow runs its package suites in parallel and invokes
+`make release-artifact` only after they all pass. Both release targets fail
+outside GitHub Actions.
 
 The canonical publisher uses the pinned Debian image
 `docker.io/library/debian@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958`,
