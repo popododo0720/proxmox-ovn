@@ -30,7 +30,6 @@ func storeError(kind error, format string, args ...any) error {
 }
 
 type ListOptions struct {
-	ProjectID string
 	NetworkID string
 	NodeID    string
 	VMID      int
@@ -51,7 +50,7 @@ type ResourceSnapshot map[model.Kind][]model.Resource
 // runtime port resolver. Implementations must resolve node ID, name, and chassis
 // aliases from the same store view used to select the matching VM NIC ports.
 // Returned ports may be runtime-only projections rather than complete resources;
-// they must populate ID, revision/applied revision/state, project ID, MAC address,
+// they must populate ID, revision/applied revision/state, MAC address,
 // admin/binding state, node ID, VMID/NIC, LSP name, generation, and requested
 // chassis. Callers must not rely on other Port fields.
 type RuntimePortLookup interface {

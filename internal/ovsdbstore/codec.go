@@ -63,7 +63,6 @@ func newSnapshot() *snapshot {
 }
 
 var kindTables = map[model.Kind]string{
-	model.KindProject:           controlschema.ProjectTable,
 	model.KindNetwork:           controlschema.NetworkTable,
 	model.KindSubnet:            controlschema.SubnetTable,
 	model.KindPort:              controlschema.PortTable,
@@ -199,13 +198,15 @@ func decodeInternalOperation(row ovsdb.Row, result *snapshot) (bool, error) {
 			return false, fmt.Errorf("invalid or duplicate PVN store lock row %q", id)
 		}
 		action, actionErr := rowString(row, "action")
+		targetKind, targetKindErr := rowString(row, "target_kind")
+		targetID, targetIDErr := rowString(row, "target_id")
 		key, keyErr := rowString(row, "idempotency_key")
 		status, statusErr := rowString(row, "operation_status")
 		state, stateErr := rowString(row, "state")
-		if err := firstError(actionErr, keyErr, statusErr, stateErr); err != nil {
+		if err := firstError(actionErr, targetKindErr, targetIDErr, keyErr, statusErr, stateErr); err != nil {
 			return false, fmt.Errorf("invalid PVN store lock: %w", err)
 		}
-		if action != "internal-lock" || key != storeLockID || status != string(model.OperationSucceeded) || state != string(model.ResourceReady) {
+		if action != "internal-lock" || targetKind != "internal" || targetID != storeLockID || key != storeLockID || status != string(model.OperationSucceeded) || state != string(model.ResourceReady) {
 			return false, fmt.Errorf("PVN store lock has invalid identity or state")
 		}
 		epoch, err := rowInt64(row, "revision")
@@ -292,82 +293,69 @@ func decodeResource(kind model.Kind, row ovsdb.Row, refs *snapshot) (model.Resou
 	}
 
 	switch kind {
-	case model.KindProject:
+	case model.KindNetwork:
 		name, e1 := stringValue("name")
 		description, e2 := stringValue("description")
-		poolID, e3 := stringValue("pool_id")
-		return &model.Project{Metadata: meta, Name: name, Description: description, PoolID: poolID}, firstError(e1, e2, e3)
-	case model.KindNetwork:
-		projectID, e1 := ref(model.KindProject, "project", false)
-		name, e2 := stringValue("name")
-		description, e3 := stringValue("description")
-		mtu, e4 := intValue("mtu")
-		external, e5 := boolValue("external")
-		providerID, e6 := ref(model.KindProviderNetwork, "provider_network", true)
-		return &model.Network{Metadata: meta, ProjectID: projectID, Name: name, Description: description, MTU: mtu, External: external, ProviderNetworkID: providerID}, firstError(e1, e2, e3, e4, e5, e6)
+		mtu, e3 := intValue("mtu")
+		external, e4 := boolValue("external")
+		providerID, e5 := ref(model.KindProviderNetwork, "provider_network", true)
+		return &model.Network{Metadata: meta, Name: name, Description: description, MTU: mtu, External: external, ProviderNetworkID: providerID}, firstError(e1, e2, e3, e4, e5)
 	case model.KindSubnet:
-		projectID, e1 := ref(model.KindProject, "project", false)
-		networkID, e2 := ref(model.KindNetwork, "network", false)
-		name, e3 := stringValue("name")
-		cidr, e4 := stringValue("cidr")
-		gateway, e5 := stringValue("gateway_ip")
-		dhcp, e6 := boolValue("enable_dhcp")
-		dns, e7 := rowStringSet(row, "dns_nameservers")
-		pools, e8 := decodeIPRanges(row, "allocation_pools")
-		return &model.Subnet{Metadata: meta, ProjectID: projectID, NetworkID: networkID, Name: name, CIDR: cidr, GatewayIP: gateway, EnableDHCP: dhcp, DNSNameservers: dns, AllocationPools: pools}, firstError(e1, e2, e3, e4, e5, e6, e7, e8)
+		networkID, e1 := ref(model.KindNetwork, "network", false)
+		name, e2 := stringValue("name")
+		cidr, e3 := stringValue("cidr")
+		gateway, e4 := stringValue("gateway_ip")
+		dhcp, e5 := boolValue("enable_dhcp")
+		dns, e6 := rowStringSet(row, "dns_nameservers")
+		pools, e7 := decodeIPRanges(row, "allocation_pools")
+		return &model.Subnet{Metadata: meta, NetworkID: networkID, Name: name, CIDR: cidr, GatewayIP: gateway, EnableDHCP: dhcp, DNSNameservers: dns, AllocationPools: pools}, firstError(e1, e2, e3, e4, e5, e6, e7)
 	case model.KindPort:
-		projectID, e1 := ref(model.KindProject, "project", false)
-		networkID, e2 := ref(model.KindNetwork, "network", false)
-		name, e3 := stringValue("name")
-		mac, e4 := stringValue("mac_address")
-		fixed, e5 := decodeFixedIPs(row, refs)
-		groups, e6 := decodeReferenceSet(row, "security_groups", model.KindSecurityGroup, refs)
-		adminUp, e7 := boolValue("admin_state_up")
-		binding, e8 := stringValue("binding_status")
-		nodeID, e9 := ref(model.KindNode, "node", true)
-		vmid, e10 := intValue("vmid")
-		nic, e11 := stringValue("nic")
-		lsp, e12 := stringValue("lsp_name")
-		generation, e13 := rowInt64(row, "generation")
-		requested, e14 := stringValue("requested_chassis")
-		return &model.Port{Metadata: meta, ProjectID: projectID, NetworkID: networkID, Name: name, MACAddress: mac, FixedIPs: fixed, SecurityGroupIDs: groups, AdminStateUp: adminUp, BindingStatus: model.PortBindingStatus(binding), NodeID: nodeID, VMID: vmid, NIC: nic, LSPName: lsp, Generation: generation, RequestedChassis: requested}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14)
+		networkID, e1 := ref(model.KindNetwork, "network", false)
+		name, e2 := stringValue("name")
+		mac, e3 := stringValue("mac_address")
+		fixed, e4 := decodeFixedIPs(row, refs)
+		groups, e5 := decodeReferenceSet(row, "security_groups", model.KindSecurityGroup, refs)
+		adminUp, e6 := boolValue("admin_state_up")
+		binding, e7 := stringValue("binding_status")
+		nodeID, e8 := ref(model.KindNode, "node", true)
+		vmid, e9 := intValue("vmid")
+		nic, e10 := stringValue("nic")
+		lsp, e11 := stringValue("lsp_name")
+		generation, e12 := rowInt64(row, "generation")
+		requested, e13 := stringValue("requested_chassis")
+		return &model.Port{Metadata: meta, NetworkID: networkID, Name: name, MACAddress: mac, FixedIPs: fixed, SecurityGroupIDs: groups, AdminStateUp: adminUp, BindingStatus: model.PortBindingStatus(binding), NodeID: nodeID, VMID: vmid, NIC: nic, LSPName: lsp, Generation: generation, RequestedChassis: requested}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13)
 	case model.KindIPAllocation:
-		projectID, e1 := ref(model.KindProject, "project", false)
+		subnetID, e1 := ref(model.KindSubnet, "subnet", false)
+		portID, e2 := ref(model.KindPort, "port", true)
+		address, e3 := stringValue("address")
+		state, e4 := stringValue("allocation_state")
+		return &model.IPAllocation{Metadata: meta, SubnetID: subnetID, PortID: portID, Address: address, State: model.IPAllocationState(state)}, firstError(e1, e2, e3, e4)
+	case model.KindRouter:
+		name, e1 := stringValue("name")
+		description, e2 := stringValue("description")
+		externalID, e3 := ref(model.KindNetwork, "external_network", true)
+		externalSubnetID, e4 := ref(model.KindSubnet, "external_subnet", true)
+		externalIPAddress, e5 := stringValue("external_ip_address")
+		snat, e6 := boolValue("enable_snat")
+		return &model.Router{Metadata: meta, Name: name, Description: description, ExternalNetworkID: externalID, ExternalSubnetID: externalSubnetID, ExternalIPAddress: externalIPAddress, EnableSNAT: snat}, firstError(e1, e2, e3, e4, e5, e6)
+	case model.KindRouterInterface:
+		routerID, e1 := ref(model.KindRouter, "router", false)
 		subnetID, e2 := ref(model.KindSubnet, "subnet", false)
 		portID, e3 := ref(model.KindPort, "port", true)
-		address, e4 := stringValue("address")
-		state, e5 := stringValue("allocation_state")
-		return &model.IPAllocation{Metadata: meta, ProjectID: projectID, SubnetID: subnetID, PortID: portID, Address: address, State: model.IPAllocationState(state)}, firstError(e1, e2, e3, e4, e5)
-	case model.KindRouter:
-		projectID, e1 := ref(model.KindProject, "project", false)
-		name, e2 := stringValue("name")
-		description, e3 := stringValue("description")
-		externalID, e4 := ref(model.KindNetwork, "external_network", true)
-		externalSubnetID, e5 := ref(model.KindSubnet, "external_subnet", true)
-		externalIPAddress, e6 := stringValue("external_ip_address")
-		snat, e7 := boolValue("enable_snat")
-		return &model.Router{Metadata: meta, ProjectID: projectID, Name: name, Description: description, ExternalNetworkID: externalID, ExternalSubnetID: externalSubnetID, ExternalIPAddress: externalIPAddress, EnableSNAT: snat}, firstError(e1, e2, e3, e4, e5, e6, e7)
-	case model.KindRouterInterface:
-		projectID, e1 := ref(model.KindProject, "project", false)
-		routerID, e2 := ref(model.KindRouter, "router", false)
-		subnetID, e3 := ref(model.KindSubnet, "subnet", false)
-		portID, e4 := ref(model.KindPort, "port", true)
-		return &model.RouterInterface{Metadata: meta, ProjectID: projectID, RouterID: routerID, SubnetID: subnetID, PortID: portID}, firstError(e1, e2, e3, e4)
+		return &model.RouterInterface{Metadata: meta, RouterID: routerID, SubnetID: subnetID, PortID: portID}, firstError(e1, e2, e3)
 	case model.KindFloatingIP:
-		projectID, e1 := ref(model.KindProject, "project", false)
-		providerID, e2 := ref(model.KindProviderNetwork, "provider_network", false)
-		address, e3 := stringValue("address")
-		portID, e4 := ref(model.KindPort, "port", true)
-		fixed, e5 := stringValue("fixed_ip_address")
-		routerID, e6 := ref(model.KindRouter, "router", true)
-		status, e7 := stringValue("floating_status")
-		return &model.FloatingIP{Metadata: meta, ProjectID: projectID, ProviderNetworkID: providerID, Address: address, PortID: portID, FixedIPAddress: fixed, RouterID: routerID, FloatingStatus: model.FloatingIPStatus(status)}, firstError(e1, e2, e3, e4, e5, e6, e7)
+		providerID, e1 := ref(model.KindProviderNetwork, "provider_network", false)
+		address, e2 := stringValue("address")
+		portID, e3 := ref(model.KindPort, "port", true)
+		fixed, e4 := stringValue("fixed_ip_address")
+		routerID, e5 := ref(model.KindRouter, "router", true)
+		status, e6 := stringValue("floating_status")
+		return &model.FloatingIP{Metadata: meta, ProviderNetworkID: providerID, Address: address, PortID: portID, FixedIPAddress: fixed, RouterID: routerID, FloatingStatus: model.FloatingIPStatus(status)}, firstError(e1, e2, e3, e4, e5, e6)
 	case model.KindProviderNetwork:
 		name, e1 := stringValue("name")
 		description, e2 := stringValue("description")
-		shared, e3 := boolValue("shared")
-		segmentID, e4 := ref(model.KindProviderSegment, "default_segment", true)
-		return &model.ProviderNetwork{Metadata: meta, Name: name, Description: description, Shared: shared, DefaultSegmentID: segmentID}, firstError(e1, e2, e3, e4)
+		segmentID, e3 := ref(model.KindProviderSegment, "default_segment", true)
+		return &model.ProviderNetwork{Metadata: meta, Name: name, Description: description, DefaultSegmentID: segmentID}, firstError(e1, e2, e3)
 	case model.KindProviderSegment:
 		providerID, e1 := ref(model.KindProviderNetwork, "provider_network", false)
 		name, e2 := stringValue("name")
@@ -376,24 +364,22 @@ func decodeResource(kind model.Kind, row ovsdb.Row, refs *snapshot) (model.Resou
 		vlanID, e5 := intValue("vlan_id")
 		return &model.ProviderSegment{Metadata: meta, ProviderNetworkID: providerID, Name: name, PhysicalNetwork: physical, NetworkType: model.ProviderNetworkType(networkType), VLANID: vlanID}, firstError(e1, e2, e3, e4, e5)
 	case model.KindSecurityGroup:
-		projectID, e1 := ref(model.KindProject, "project", false)
-		name, e2 := stringValue("name")
-		description, e3 := stringValue("description")
-		stateful, e4 := boolValue("stateful")
-		return &model.SecurityGroup{Metadata: meta, ProjectID: projectID, Name: name, Description: description, Stateful: stateful}, firstError(e1, e2, e3, e4)
+		name, e1 := stringValue("name")
+		description, e2 := stringValue("description")
+		stateful, e3 := boolValue("stateful")
+		return &model.SecurityGroup{Metadata: meta, Name: name, Description: description, Stateful: stateful}, firstError(e1, e2, e3)
 	case model.KindSecurityGroupRule:
-		projectID, e1 := ref(model.KindProject, "project", false)
-		groupID, e2 := ref(model.KindSecurityGroup, "security_group", false)
-		direction, e3 := stringValue("direction")
-		ethertype, e4 := stringValue("ethertype")
-		protocol, e5 := stringValue("protocol")
-		minPort, e6 := intValue("port_range_min")
-		maxPort, e7 := intValue("port_range_max")
-		remoteCIDR, e8 := stringValue("remote_cidr")
-		remoteGroup, e9 := ref(model.KindSecurityGroup, "remote_group", true)
-		action, e10 := stringValue("action")
-		description, e11 := stringValue("description")
-		return &model.SecurityGroupRule{Metadata: meta, ProjectID: projectID, SecurityGroupID: groupID, Direction: model.RuleDirection(direction), EtherType: model.EtherType(ethertype), Protocol: protocol, PortRangeMin: minPort, PortRangeMax: maxPort, RemoteCIDR: remoteCIDR, RemoteGroupID: remoteGroup, Action: model.RuleAction(action), Description: description}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11)
+		groupID, e1 := ref(model.KindSecurityGroup, "security_group", false)
+		direction, e2 := stringValue("direction")
+		ethertype, e3 := stringValue("ethertype")
+		protocol, e4 := stringValue("protocol")
+		minPort, e5 := intValue("port_range_min")
+		maxPort, e6 := intValue("port_range_max")
+		remoteCIDR, e7 := stringValue("remote_cidr")
+		remoteGroup, e8 := ref(model.KindSecurityGroup, "remote_group", true)
+		action, e9 := stringValue("action")
+		description, e10 := stringValue("description")
+		return &model.SecurityGroupRule{Metadata: meta, SecurityGroupID: groupID, Direction: model.RuleDirection(direction), EtherType: model.EtherType(ethertype), Protocol: protocol, PortRangeMin: minPort, PortRangeMax: maxPort, RemoteCIDR: remoteCIDR, RemoteGroupID: remoteGroup, Action: model.RuleAction(action), Description: description}, firstError(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10)
 	case model.KindNode:
 		name, e1 := stringValue("name")
 		chassis, e2 := stringValue("chassis_id")
@@ -453,14 +439,10 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 	}
 
 	switch value := resource.(type) {
-	case *model.Project:
-		row["name"], row["description"], row["pool_id"] = value.Name, value.Description, value.PoolID
 	case *model.Network:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		row["name"], row["description"], row["mtu"], row["external"] = value.Name, value.Description, value.MTU, value.External
 		setRef("provider_network", model.KindProviderNetwork, value.ProviderNetworkID, "provider_network_id", true)
 	case *model.Subnet:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		setRef("network", model.KindNetwork, value.NetworkID, "network_id", false)
 		row["name"], row["cidr"], row["gateway_ip"], row["enable_dhcp"] = value.Name, value.CIDR, value.GatewayIP, value.EnableDHCP
 		if err == nil {
@@ -470,7 +452,6 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 			row["allocation_pools"], err = encodeIPRanges(value.AllocationPools)
 		}
 	case *model.Port:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		setRef("network", model.KindNetwork, value.NetworkID, "network_id", false)
 		row["name"], row["mac_address"] = value.Name, value.MACAddress
 		if err == nil {
@@ -483,24 +464,20 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 		setRef("node", model.KindNode, value.NodeID, "node_id", true)
 		row["vmid"], row["nic"], row["lsp_name"], row["generation"], row["requested_chassis"] = value.VMID, value.NIC, value.LSPName, value.Generation, value.RequestedChassis
 	case *model.IPAllocation:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		setRef("subnet", model.KindSubnet, value.SubnetID, "subnet_id", false)
 		setRef("port", model.KindPort, value.PortID, "port_id", true)
 		row["address"], row["allocation_state"] = value.Address, string(value.State)
 	case *model.Router:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		row["name"], row["description"] = value.Name, value.Description
 		setRef("external_network", model.KindNetwork, value.ExternalNetworkID, "external_network_id", true)
 		setRef("external_subnet", model.KindSubnet, value.ExternalSubnetID, "external_subnet_id", true)
 		row["external_ip_address"] = value.ExternalIPAddress
 		row["enable_snat"] = value.EnableSNAT
 	case *model.RouterInterface:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		setRef("router", model.KindRouter, value.RouterID, "router_id", false)
 		setRef("subnet", model.KindSubnet, value.SubnetID, "subnet_id", false)
 		setRef("port", model.KindPort, value.PortID, "port_id", true)
 	case *model.FloatingIP:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		setRef("provider_network", model.KindProviderNetwork, value.ProviderNetworkID, "provider_network_id", false)
 		row["address"] = value.Address
 		setRef("port", model.KindPort, value.PortID, "port_id", true)
@@ -508,16 +485,14 @@ func encodeResource(resource model.Resource, refs *snapshot) (ovsdb.Row, error) 
 		setRef("router", model.KindRouter, value.RouterID, "router_id", true)
 		row["floating_status"] = string(value.FloatingStatus)
 	case *model.ProviderNetwork:
-		row["name"], row["description"], row["shared"] = value.Name, value.Description, value.Shared
+		row["name"], row["description"] = value.Name, value.Description
 		setRef("default_segment", model.KindProviderSegment, value.DefaultSegmentID, "default_segment_id", true)
 	case *model.ProviderSegment:
 		setRef("provider_network", model.KindProviderNetwork, value.ProviderNetworkID, "provider_network_id", false)
 		row["name"], row["physical_network"], row["network_type"], row["vlan_id"] = value.Name, value.PhysicalNetwork, string(value.NetworkType), value.VLANID
 	case *model.SecurityGroup:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		row["name"], row["description"], row["stateful"] = value.Name, value.Description, value.Stateful
 	case *model.SecurityGroupRule:
-		setRef("project", model.KindProject, value.ProjectID, "project_id", false)
 		setRef("security_group", model.KindSecurityGroup, value.SecurityGroupID, "security_group_id", false)
 		row["direction"], row["ethertype"], row["protocol"] = string(value.Direction), string(value.EtherType), value.Protocol
 		row["port_range_min"], row["port_range_max"], row["remote_cidr"] = value.PortRangeMin, value.PortRangeMax, value.RemoteCIDR
@@ -583,7 +558,7 @@ func decodeMetadata(row ovsdb.Row) (model.Metadata, error) {
 func encodeLockRow(now time.Time) ovsdb.Row {
 	timestamp := formatTime(now)
 	return ovsdb.Row{
-		"id": storeLockID, "action": "internal-lock", "target_kind": string(model.KindProject),
+		"id": storeLockID, "action": "internal-lock", "target_kind": "internal",
 		"target_id": storeLockID, "target_revision": int64(1), "operation_status": string(model.OperationSucceeded),
 		"idempotency_key": storeLockID, "error": "", "started_at": "", "completed_at": "",
 		"revision": int64(1), "applied_revision": int64(1), "state": string(model.ResourceReady),

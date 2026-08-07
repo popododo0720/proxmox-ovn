@@ -27,9 +27,8 @@ const (
 type rawDatabase map[string][]ovsdb.Row
 
 type rawRuntimePortLookup struct {
-	nodes    []ovsdb.Row
-	projects []ovsdb.Row
-	ports    []ovsdb.Row
+	nodes []ovsdb.Row
+	ports []ovsdb.Row
 }
 
 type changeType uint8
@@ -181,7 +180,7 @@ func (d *ovsDatabase) lookupRuntimePorts(ctx context.Context, vmid int, nic stri
 	if len(results) != len(operations) {
 		return rawRuntimePortLookup{}, fmt.Errorf("lookup runtime ports in PVN control database: expected %d results, got %d", len(operations), len(results))
 	}
-	return rawRuntimePortLookup{nodes: results[0].Rows, projects: results[1].Rows, ports: results[2].Rows}, nil
+	return rawRuntimePortLookup{nodes: results[0].Rows, ports: results[1].Rows}, nil
 }
 
 func runtimePortLookupOperations(vmid int, nic string) []ovsdb.Operation {
@@ -192,11 +191,6 @@ func runtimePortLookupOperations(vmid int, nic string) []ovsdb.Operation {
 			Columns: []string{"_uuid", "id", "name", "chassis_id"},
 		},
 		{
-			Op:      ovsdb.OperationSelect,
-			Table:   controlschema.ProjectTable,
-			Columns: []string{"_uuid", "id"},
-		},
-		{
 			Op:    ovsdb.OperationSelect,
 			Table: controlschema.PortTable,
 			Where: []ovsdb.Condition{
@@ -204,7 +198,7 @@ func runtimePortLookupOperations(vmid int, nic string) []ovsdb.Operation {
 				ovsdb.NewCondition("nic", ovsdb.ConditionEqual, nic),
 			},
 			Columns: []string{
-				"id", "revision", "applied_revision", "state", "project", "node",
+				"id", "revision", "applied_revision", "state", "node",
 				"vmid", "nic", "lsp_name", "generation", "requested_chassis",
 				"mac_address", "admin_state_up", "binding_status",
 			},
