@@ -1,3 +1,14 @@
+proxmox-ovn (0.3.2) unstable; urgency=medium
+
+  * Split package and release validation into parallel, timed CI gates and
+    build the Debian artifact only after every gate succeeds.
+  * Add relationship filters for subnet ports, router interfaces, security
+    group rules, provider segments, external networks, and floating IPs.
+  * Present native Proxmox master-detail network workspaces and editable
+    subnet DHCP/IPAM allocation ranges.
+
+ -- PVN Project <root@localhost>  Fri, 07 Aug 2026 09:16:02 +0000
+
 proxmox-ovn (0.3.1) unstable; urgency=medium
 
   * Preserve authenticated same-origin API request context and return native
