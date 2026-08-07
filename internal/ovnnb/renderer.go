@@ -164,7 +164,7 @@ func ovnBackedResource(resource model.Resource) (bool, error) {
 		*model.RouterInterface, *model.FloatingIP, *model.ProviderSegment,
 		*model.SecurityGroup, *model.SecurityGroupRule:
 		return true, nil
-	case *model.Project, *model.ProviderNetwork, *model.IPAllocation,
+	case *model.ProviderNetwork, *model.IPAllocation,
 		*model.Node, *model.Operation:
 		return false, nil
 	default:
@@ -277,12 +277,9 @@ func (renderer *Renderer) deleteACL(ctx context.Context, owner string) error {
 }
 
 func (renderer *Renderer) network(ctx context.Context, network *model.Network) error {
-	if err := safeID(network.ProjectID); err != nil {
-		return fmt.Errorf("invalid project ID: %w", err)
-	}
 	name := logicalSwitch(network.ID)
 	assignments := []string{stringAssignment("name", name)}
-	assignments = append(assignments, metadataAssignments(network, map[string]string{"pvn-project": network.ProjectID})...)
+	assignments = append(assignments, metadataAssignments(network, nil)...)
 	switchUUID, err := renderer.ensureOwnedRow(ctx, logicalSwitchOwnedRow(network.ID), assignments)
 	if err != nil {
 		return wrapRender("network", network.ID, err)
@@ -298,7 +295,7 @@ func (renderer *Renderer) network(ctx context.Context, network *model.Network) e
 }
 
 func (renderer *Renderer) subnet(ctx context.Context, subnet *model.Subnet) error {
-	if err := validateReferencedIDs(subnet.ProjectID, subnet.NetworkID); err != nil {
+	if err := validateReferencedIDs(subnet.NetworkID); err != nil {
 		return err
 	}
 	if !subnet.EnableDHCP {
@@ -307,9 +304,6 @@ func (renderer *Renderer) subnet(ctx context.Context, subnet *model.Subnet) erro
 	network, err := getResource[*model.Network](ctx, renderer.store, model.KindNetwork, subnet.NetworkID)
 	if err != nil {
 		return err
-	}
-	if network.ProjectID != subnet.ProjectID {
-		return fmt.Errorf("subnet %q and network %q belong to different projects", subnet.ID, network.ID)
 	}
 	gateway, err := subnetGateway(subnet)
 	if err != nil {
@@ -320,7 +314,6 @@ func (renderer *Renderer) subnet(ctx context.Context, subnet *model.Subnet) erro
 		mapAssignment("external_ids", "pvn-managed", "true"),
 		mapAssignment("external_ids", "pvn-kind", subnet.ResourceKind().String()),
 		mapAssignment("external_ids", "pvn-id", subnet.ID),
-		mapAssignment("external_ids", "pvn-project", subnet.ProjectID),
 		mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(subnet.Revision, 10)),
 	}
 	uuid, err := renderer.ensureOwnedRow(ctx, dhcpOptionsOwnedRow(subnet.ID), assignments)
@@ -402,19 +395,12 @@ func (renderer *Renderer) attachDHCPToPorts(ctx context.Context, subnet *model.S
 }
 
 func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
-	if err := validateReferencedIDs(port.ProjectID, port.NetworkID); err != nil {
+	if err := validateReferencedIDs(port.NetworkID); err != nil {
 		return err
 	}
 	network, err := getResource[*model.Network](ctx, renderer.store, model.KindNetwork, port.NetworkID)
 	if err != nil {
 		return err
-	}
-	if network.ProjectID != port.ProjectID {
-		return fmt.Errorf("port %q and network %q belong to different projects", port.ID, network.ID)
-	}
-	switchUUID, err := renderer.requireOwnedRow(ctx, logicalSwitchOwnedRow(network.ID))
-	if err != nil {
-		return wrapRender("port network", port.ID, err)
 	}
 	if err := safeID(port.LSPName); err != nil {
 		return fmt.Errorf("invalid LSP name: %w", err)
@@ -431,8 +417,8 @@ func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
 		if getErr != nil {
 			return getErr
 		}
-		if subnet.ProjectID != port.ProjectID || subnet.NetworkID != port.NetworkID {
-			return fmt.Errorf("fixed-IP subnet %q does not belong to port %q's project and network", subnet.ID, port.ID)
+		if subnet.NetworkID != port.NetworkID {
+			return fmt.Errorf("fixed-IP subnet %q does not belong to port %q's network", subnet.ID, port.ID)
 		}
 		if fixed.Address != "" {
 			prefix, _ := netip.ParsePrefix(subnet.CIDR)
@@ -444,6 +430,10 @@ func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
 		if fixed.Address != "" {
 			addresses = append(addresses, fixed.Address)
 		}
+	}
+	switchUUID, err := renderer.requireOwnedRow(ctx, logicalSwitchOwnedRow(network.ID))
+	if err != nil {
+		return wrapRender("port network", port.ID, err)
 	}
 	enabledState := "disabled"
 	if port.AdminStateUp && port.BindingStatus != model.PortUnbound && port.BindingStatus != model.PortDetaching && port.BindingStatus != model.PortBindingError {
@@ -465,7 +455,7 @@ func (renderer *Renderer) port(ctx context.Context, port *model.Port) error {
 		"--", "lsp-set-enabled", target, enabledState,
 		"--", "set", "Logical_Switch_Port", target,
 	)
-	arguments = append(arguments, metadataAssignments(port, map[string]string{"pvn-project": port.ProjectID, "pvn-network": port.NetworkID})...)
+	arguments = append(arguments, metadataAssignments(port, map[string]string{"pvn-network": port.NetworkID})...)
 	if _, err := renderer.client.run(ctx, arguments...); err != nil {
 		return wrapRender("port", port.ID, err)
 	}
@@ -519,9 +509,6 @@ func (renderer *Renderer) portDHCP(ctx context.Context, port *model.Port, portUU
 }
 
 func (renderer *Renderer) router(ctx context.Context, router *model.Router) error {
-	if err := safeID(router.ProjectID); err != nil {
-		return fmt.Errorf("invalid project ID: %w", err)
-	}
 	var external *routerExternal
 	var gatewayChassis []string
 	if router.ExternalNetworkID != "" {
@@ -540,7 +527,7 @@ func (renderer *Renderer) router(ctx context.Context, router *model.Router) erro
 	}
 	name := logicalRouter(router.ID)
 	assignments := []string{stringAssignment("name", name)}
-	assignments = append(assignments, metadataAssignments(router, map[string]string{"pvn-project": router.ProjectID})...)
+	assignments = append(assignments, metadataAssignments(router, nil)...)
 	routerUUID, err := renderer.ensureOwnedRow(ctx, logicalRouterOwnedRow(router.ID), assignments)
 	if err != nil {
 		return wrapRender("router", router.ID, err)
@@ -584,9 +571,6 @@ func (renderer *Renderer) validateRouterExternal(ctx context.Context, router *mo
 	if err != nil {
 		return nil, err
 	}
-	if network.ProjectID != router.ProjectID && !provider.Shared {
-		return nil, fmt.Errorf("router %q cannot use non-shared external network %q from another project", router.ID, network.ID)
-	}
 	segment, err := renderer.defaultProviderSegment(ctx, provider.ID)
 	if err != nil {
 		return nil, err
@@ -601,7 +585,7 @@ func (renderer *Renderer) validateRouterExternal(ctx context.Context, router *mo
 	if err != nil {
 		return nil, err
 	}
-	if subnet.NetworkID != network.ID || subnet.ProjectID != network.ProjectID {
+	if subnet.NetworkID != network.ID {
 		return nil, fmt.Errorf("router %q external subnet %q does not belong to external network %q", router.ID, subnet.ID, network.ID)
 	}
 	prefix, err := netip.ParsePrefix(subnet.CIDR)
@@ -702,7 +686,7 @@ func (renderer *Renderer) routerGatewayArgs(router *model.Router, routerUUID, sw
 		"--", "--may-exist", "lrp-add", routerUUID, routerPort, mac, network,
 		"--", "set", "Logical_Router_Port", routerPort, stringAssignment("mac", mac), stringAssignment("networks", network),
 	)
-	args = append(args, metadataAssignments(router, map[string]string{"pvn-project": router.ProjectID, "pvn-role": "external-gateway"})...)
+	args = append(args, metadataAssignments(router, map[string]string{"pvn-role": "external-gateway"})...)
 	args = append(args,
 		"--", "--may-exist", "lsp-add", switchUUID, switchPort,
 		"--", "lsp-set-type", switchPort, "router",
@@ -710,7 +694,7 @@ func (renderer *Renderer) routerGatewayArgs(router *model.Router, routerUUID, sw
 		"--", "lsp-set-options", switchPort, "router-port="+routerPort, "nat-addresses=router",
 		"--", "set", "Logical_Switch_Port", switchPort,
 	)
-	return append(args, metadataAssignments(router, map[string]string{"pvn-network": networkID, "pvn-project": router.ProjectID, "pvn-role": "external-gateway"})...)
+	return append(args, metadataAssignments(router, map[string]string{"pvn-network": networkID, "pvn-role": "external-gateway"})...)
 }
 
 func (renderer *Renderer) renderRouterDefaultRoute(ctx context.Context, router *model.Router, routerUUID string, gateway netip.Addr, routerPort string) error {
@@ -802,7 +786,7 @@ func containsString(values []string, expected string) bool {
 }
 
 func (renderer *Renderer) routerInterface(ctx context.Context, routerInterface *model.RouterInterface) error {
-	if err := validateReferencedIDs(routerInterface.ProjectID, routerInterface.RouterID, routerInterface.SubnetID); err != nil {
+	if err := validateReferencedIDs(routerInterface.RouterID, routerInterface.SubnetID); err != nil {
 		return err
 	}
 	router, err := getResource[*model.Router](ctx, renderer.store, model.KindRouter, routerInterface.RouterID)
@@ -812,9 +796,6 @@ func (renderer *Renderer) routerInterface(ctx context.Context, routerInterface *
 	subnet, err := getResource[*model.Subnet](ctx, renderer.store, model.KindSubnet, routerInterface.SubnetID)
 	if err != nil {
 		return err
-	}
-	if router.ProjectID != routerInterface.ProjectID || subnet.ProjectID != routerInterface.ProjectID {
-		return fmt.Errorf("router interface %q crosses project boundaries", routerInterface.ID)
 	}
 	network, err := getResource[*model.Network](ctx, renderer.store, model.KindNetwork, subnet.NetworkID)
 	if err != nil {
@@ -875,7 +856,7 @@ func (renderer *Renderer) routerInterfaceArgs(routerInterface *model.RouterInter
 		"--", "lsp-set-options", switchPort, "router-port="+routerPort,
 		"--", "set", "Logical_Router_Port", routerPort,
 	)
-	args = append(args, metadataAssignments(routerInterface, map[string]string{"pvn-project": routerInterface.ProjectID})...)
+	args = append(args, metadataAssignments(routerInterface, nil)...)
 	return args
 }
 
@@ -905,9 +886,6 @@ func (renderer *Renderer) reconcileRouterSNAT(ctx context.Context, router *model
 			if routerInterface.RouterID != router.ID || routerInterface.State == model.ResourceDeleting {
 				continue
 			}
-			if routerInterface.ProjectID != router.ProjectID {
-				return fmt.Errorf("router interface %q crosses router %q project boundary", routerInterface.ID, router.ID)
-			}
 			subnet, err := getResource[*model.Subnet](ctx, renderer.store, model.KindSubnet, routerInterface.SubnetID)
 			if err != nil {
 				return err
@@ -916,8 +894,8 @@ func (renderer *Renderer) reconcileRouterSNAT(ctx context.Context, router *model
 			if err != nil {
 				return err
 			}
-			if subnet.ProjectID != router.ProjectID || network.ProjectID != router.ProjectID || network.External {
-				return fmt.Errorf("router interface %q is not an internal subnet of router %q's project", routerInterface.ID, router.ID)
+			if network.External {
+				return fmt.Errorf("router interface %q is not an internal subnet of router %q", routerInterface.ID, router.ID)
 			}
 			prefix, err := netip.ParsePrefix(subnet.CIDR)
 			if err != nil || !prefix.Addr().Is4() {
@@ -1080,7 +1058,7 @@ func (renderer *Renderer) deleteRouter(ctx context.Context, router *model.Router
 }
 
 func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.FloatingIP) error {
-	if err := validateReferencedIDs(floatingIP.ProjectID, floatingIP.ProviderNetworkID); err != nil {
+	if err := validateReferencedIDs(floatingIP.ProviderNetworkID); err != nil {
 		return err
 	}
 	row := floatingIPOwnedRow(floatingIP.ID)
@@ -1118,9 +1096,6 @@ func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.Floa
 	if err != nil {
 		return err
 	}
-	if router.ProjectID != floatingIP.ProjectID {
-		return fmt.Errorf("floating IP %q and router %q belong to different projects", floatingIP.ID, router.ID)
-	}
 	external, err := renderer.validateRouterExternal(ctx, router)
 	if err != nil {
 		return fmt.Errorf("floating IP %q router has no usable external gateway: %w", floatingIP.ID, err)
@@ -1140,9 +1115,6 @@ func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.Floa
 		if getErr != nil {
 			return getErr
 		}
-		if port.ProjectID != floatingIP.ProjectID {
-			return fmt.Errorf("floating IP %q and port %q belong to different projects", floatingIP.ID, port.ID)
-		}
 		foundAddress := false
 		for _, fixed := range port.FixedIPs {
 			foundAddress = foundAddress || fixed.Address == floatingIP.FixedIPAddress
@@ -1158,7 +1130,6 @@ func (renderer *Renderer) floatingIP(ctx context.Context, floatingIP *model.Floa
 		mapAssignment("external_ids", "pvn-managed", "true"),
 		mapAssignment("external_ids", "pvn-kind", floatingIP.ResourceKind().String()),
 		mapAssignment("external_ids", "pvn-id", floatingIP.ID),
-		mapAssignment("external_ids", "pvn-project", floatingIP.ProjectID),
 		mapAssignment("external_ids", "pvn-revision", strconv.FormatInt(floatingIP.Revision, 10)),
 	}
 	existing, findErr := renderer.lookupOwnedRow(ctx, row)
@@ -1383,11 +1354,8 @@ func (renderer *Renderer) ownedProviderPort(ctx context.Context, networkID, port
 }
 
 func (renderer *Renderer) securityGroup(ctx context.Context, group *model.SecurityGroup) error {
-	if err := safeID(group.ProjectID); err != nil {
-		return fmt.Errorf("invalid project ID: %w", err)
-	}
 	name := portGroup(group.ID)
-	metadata := metadataAssignments(group, map[string]string{"pvn-project": group.ProjectID})
+	metadata := metadataAssignments(group, nil)
 	assignments := append([]string{stringAssignment("name", name)}, metadata...)
 	if _, err := renderer.ensureOwnedRow(ctx, portGroupOwnedRow(group.ID), assignments); err != nil {
 		return wrapRender("security group", group.ID, err)
@@ -1414,26 +1382,19 @@ func (renderer *Renderer) securityGroup(ctx context.Context, group *model.Securi
 }
 
 func (renderer *Renderer) securityGroupRule(ctx context.Context, rule *model.SecurityGroupRule) error {
-	if err := validateReferencedIDs(rule.ProjectID, rule.SecurityGroupID); err != nil {
+	if err := validateReferencedIDs(rule.SecurityGroupID); err != nil {
 		return err
 	}
 	group, err := getResource[*model.SecurityGroup](ctx, renderer.store, model.KindSecurityGroup, rule.SecurityGroupID)
 	if err != nil {
 		return err
 	}
-	if group.ProjectID != rule.ProjectID {
-		return fmt.Errorf("security group rule %q crosses project boundaries", rule.ID)
-	}
 	if rule.RemoteGroupID != "" {
 		if err := safeID(rule.RemoteGroupID); err != nil {
 			return fmt.Errorf("invalid remote group ID: %w", err)
 		}
-		remote, getErr := getResource[*model.SecurityGroup](ctx, renderer.store, model.KindSecurityGroup, rule.RemoteGroupID)
-		if getErr != nil {
+		if _, getErr := getResource[*model.SecurityGroup](ctx, renderer.store, model.KindSecurityGroup, rule.RemoteGroupID); getErr != nil {
 			return getErr
-		}
-		if remote.ProjectID != rule.ProjectID {
-			return fmt.Errorf("security group rule %q references a remote group in another project", rule.ID)
 		}
 	}
 	spec, err := securityGroupRuleACLSpec(rule)
@@ -1604,9 +1565,6 @@ func (renderer *Renderer) portGroups(ctx context.Context, port *model.Port, port
 		}
 		command := "remove"
 		if desired[group.ID] {
-			if group.ProjectID != port.ProjectID {
-				return fmt.Errorf("port %q references security group %q from another project", port.ID, group.ID)
-			}
 			command = "add"
 			delete(desired, group.ID)
 		}

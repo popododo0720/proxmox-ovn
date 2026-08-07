@@ -206,21 +206,21 @@ func comprehensiveManagedAuditFixture(t *testing.T) (*controlstore.Memory, contr
 	}
 	fixture.internalSubnet = updatedSubnet.(*model.Subnet)
 	group := mustCreate(t, store, &model.SecurityGroup{
-		Metadata: model.Metadata{ID: "sg-audit"}, ProjectID: fixture.project.ID, Name: "audit",
+		Metadata: model.Metadata{ID: "sg-audit"}, Name: "audit",
 	}).(*model.SecurityGroup)
 	_ = mustCreate(t, store, &model.SecurityGroupRule{
-		Metadata: model.Metadata{ID: "rule-audit"}, ProjectID: fixture.project.ID, SecurityGroupID: group.ID,
+		Metadata: model.Metadata{ID: "rule-audit"}, SecurityGroupID: group.ID,
 		Direction: model.DirectionIngress, EtherType: model.EtherTypeIPv4, Protocol: "tcp",
 		PortRangeMin: 443, PortRangeMax: 443, RemoteCIDR: "0.0.0.0/0", Action: model.ActionAllow,
 	})
 	port := mustCreate(t, store, &model.Port{
-		Metadata: model.Metadata{ID: "port-audit"}, ProjectID: fixture.project.ID, NetworkID: fixture.internalNetwork.ID,
+		Metadata: model.Metadata{ID: "port-audit"}, NetworkID: fixture.internalNetwork.ID,
 		Name: "vm-audit-net0", LSPName: "pvn-port-audit", MACAddress: "02:00:00:00:00:55",
 		FixedIPs:         []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.55"}},
 		SecurityGroupIDs: []string{group.ID}, AdminStateUp: true, BindingStatus: model.PortBound,
 	}).(*model.Port)
 	_ = mustCreate(t, store, &model.FloatingIP{
-		Metadata: model.Metadata{ID: "fip-audit"}, ProjectID: fixture.project.ID,
+		Metadata:          model.Metadata{ID: "fip-audit"},
 		ProviderNetworkID: fixture.provider.ID, Address: "192.0.2.55", RouterID: fixture.router.ID,
 		PortID: port.ID, FixedIPAddress: "10.42.0.55", FloatingStatus: model.FloatingIPActive,
 	})
@@ -235,7 +235,13 @@ func comprehensiveManagedAuditFixture(t *testing.T) (*controlstore.Memory, contr
 func TestAuditManagedGraphAcceptsCompleteRestoredGraphReadOnly(t *testing.T) {
 	store, snapshot := comprehensiveManagedAuditFixture(t)
 	runner := newManagedAuditRunner()
-	_, _ = seedManagedAuditPlan(t, runner, snapshot)
+	plan, _ := seedManagedAuditPlan(t, runner, snapshot)
+	legacyKey := "pvn-" + "project"
+	for key, row := range plan.rows {
+		if _, present := row.requiredExternal[legacyKey]; present {
+			t.Fatalf("managed row %q requires legacy scope metadata", key)
+		}
+	}
 	// Router-interface peer LSPs are currently unmarked renderer glue. They are
 	// deliberately outside managed-row ownership until PVN gives them identity.
 	runner.put(&managedAuditRow{
@@ -266,6 +272,23 @@ func TestAuditManagedGraphAcceptsCompleteRestoredGraphReadOnly(t *testing.T) {
 		if !seen[table.name] {
 			t.Errorf("audit did not scan %s", table.name)
 		}
+	}
+}
+
+func TestBuildManagedAuditPlanRequiresExistingRemoteGroup(t *testing.T) {
+	group := &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-audit"}, Name: "audit"}
+	rule := &model.SecurityGroupRule{
+		Metadata: model.Metadata{ID: "rule-audit"}, SecurityGroupID: group.ID,
+		Direction: model.DirectionIngress, EtherType: model.EtherTypeIPv4,
+		RemoteGroupID: "missing-group", Action: model.ActionAllow,
+	}
+	snapshot := controlstore.ResourceSnapshot{
+		model.KindSecurityGroup:     []model.Resource{group},
+		model.KindSecurityGroupRule: []model.Resource{rule},
+	}
+
+	if _, err := buildManagedAuditPlan(snapshot); err == nil || !strings.Contains(err.Error(), "references absent remote group") {
+		t.Fatalf("absent remote-group audit error = %v", err)
 	}
 }
 

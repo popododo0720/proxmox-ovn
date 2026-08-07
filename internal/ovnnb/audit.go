@@ -448,7 +448,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if err := plan.add(managedExpectedRow{
 			key: key, label: "network " + network.ID, table: "Logical_Switch", preferredUUID: logicalSwitchUUID(network.ID), name: logicalSwitch(network.ID),
 			identity:         auditIdentity(model.KindNetwork.String(), "pvn-id", network.ID),
-			requiredExternal: auditResourceExternal(network, map[string]string{"pvn-project": network.ProjectID}),
+			requiredExternal: auditResourceExternal(network, nil),
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -481,7 +481,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if err := plan.add(managedExpectedRow{
 			key: "dhcp/" + subnet.ID, label: "DHCP options " + subnet.ID, table: "DHCP_Options", preferredUUID: deterministicUUID("dhcp-options:" + subnet.ID),
 			identity:         auditIdentity(model.KindSubnet.String(), "pvn-id", subnet.ID),
-			requiredExternal: auditResourceExternal(subnet, map[string]string{"pvn-project": subnet.ProjectID}),
+			requiredExternal: auditResourceExternal(subnet, nil),
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -493,7 +493,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if err := plan.add(managedExpectedRow{
 			key: groupKey, label: "security group " + group.ID, table: "Port_Group", preferredUUID: deterministicUUID("port-group:" + group.ID), name: portGroup(group.ID),
 			identity:         auditIdentity(model.KindSecurityGroup.String(), "pvn-id", group.ID),
-			requiredExternal: auditResourceExternal(group, map[string]string{"pvn-project": group.ProjectID}),
+			requiredExternal: auditResourceExternal(group, nil),
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -531,13 +531,10 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if group == nil {
 			return managedAuditPlan{}, fmt.Errorf("security group rule %q references absent group %q", rule.ID, rule.SecurityGroupID)
 		}
-		if group.ProjectID != rule.ProjectID {
-			return managedAuditPlan{}, fmt.Errorf("security group rule %q crosses project boundaries", rule.ID)
-		}
 		if rule.RemoteGroupID != "" {
 			remote := index.groups[rule.RemoteGroupID]
-			if remote == nil || remote.ProjectID != rule.ProjectID {
-				return managedAuditPlan{}, fmt.Errorf("security group rule %q references an absent or cross-project remote group", rule.ID)
+			if remote == nil {
+				return managedAuditPlan{}, fmt.Errorf("security group rule %q references absent remote group %q", rule.ID, rule.RemoteGroupID)
 			}
 		}
 		spec, err := securityGroupRuleACLSpec(rule)
@@ -568,7 +565,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if err := plan.add(managedExpectedRow{
 			key: routerKey, label: "router " + router.ID, table: "Logical_Router", preferredUUID: logicalRouterUUID(router.ID), name: logicalRouter(router.ID),
 			identity:         auditIdentity(model.KindRouter.String(), "pvn-id", router.ID),
-			requiredExternal: auditResourceExternal(router, map[string]string{"pvn-project": router.ProjectID}),
+			requiredExternal: auditResourceExternal(router, nil),
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -580,7 +577,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		}
 		lrpKey := "gateway-lrp/" + router.ID
 		lrpName := gatewayRouterPort(router.ID)
-		lrpExtra := map[string]string{"pvn-project": router.ProjectID, "pvn-role": "external-gateway"}
+		lrpExtra := map[string]string{"pvn-role": "external-gateway"}
 		if err := plan.add(managedExpectedRow{
 			key: lrpKey, label: "router gateway LRP " + router.ID, table: "Logical_Router_Port", name: lrpName,
 			identity:         map[string]string{"pvn-managed": "true", "pvn-kind": model.KindRouter.String(), "pvn-id": router.ID, "pvn-role": "external-gateway"},
@@ -591,7 +588,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		plan.expectParents("router gateway LRP parent", lrpKey, "Logical_Router", "ports", routerKey)
 
 		lspKey := "gateway-lsp/" + router.ID
-		lspExtra := map[string]string{"pvn-network": router.ExternalNetworkID, "pvn-project": router.ProjectID, "pvn-role": "external-gateway"}
+		lspExtra := map[string]string{"pvn-network": router.ExternalNetworkID, "pvn-role": "external-gateway"}
 		if err := plan.add(managedExpectedRow{
 			key: lspKey, label: "router gateway LSP " + router.ID, table: "Logical_Switch_Port", name: gatewaySwitchPort(router.ID), rowType: "router",
 			identity:         map[string]string{"pvn-managed": "true", "pvn-kind": model.KindRouter.String(), "pvn-id": router.ID, "pvn-network": router.ExternalNetworkID, "pvn-role": "external-gateway"},
@@ -622,7 +619,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if err := plan.add(managedExpectedRow{
 			key: lrpKey, label: "router interface LRP " + routerInterface.ID, table: "Logical_Router_Port", name: "pvn-lrp-" + compact(routerInterface.ID),
 			identity:         auditIdentity(model.KindRouterInterface.String(), "pvn-id", routerInterface.ID),
-			requiredExternal: auditResourceExternal(routerInterface, map[string]string{"pvn-project": routerInterface.ProjectID}),
+			requiredExternal: auditResourceExternal(routerInterface, nil),
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -669,7 +666,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if err := plan.add(managedExpectedRow{
 			key: portKey, label: "port " + port.ID, table: "Logical_Switch_Port", preferredUUID: deterministicUUID("logical-switch-port:" + port.ID), name: port.LSPName,
 			identity:         auditIdentity(model.KindPort.String(), "pvn-id", port.ID),
-			requiredExternal: auditResourceExternal(port, map[string]string{"pvn-project": port.ProjectID, "pvn-network": port.NetworkID}),
+			requiredExternal: auditResourceExternal(port, map[string]string{"pvn-network": port.NetworkID}),
 		}); err != nil {
 			return managedAuditPlan{}, err
 		}
@@ -713,7 +710,7 @@ func buildManagedAuditPlan(snapshot controlstore.ResourceSnapshot) (managedAudit
 		if err := plan.add(managedExpectedRow{
 			key: key, label: "floating IP NAT " + floatingIP.ID, table: "NAT", preferredUUID: deterministicUUID("floating-ip-nat:" + floatingIP.ID), rowType: "dnat_and_snat",
 			identity:         auditIdentity(model.KindFloatingIP.String(), "pvn-id", floatingIP.ID),
-			requiredExternal: auditResourceExternal(floatingIP, map[string]string{"pvn-project": floatingIP.ProjectID}),
+			requiredExternal: auditResourceExternal(floatingIP, nil),
 			requiredAttrs: map[string]string{
 				"external_ip": floatingIP.Address, "logical_ip": floatingIP.FixedIPAddress,
 				"external_port_range": "", "priority": "0", "match": "",
@@ -778,7 +775,7 @@ func indexManagedDesired(snapshot controlstore.ResourceSnapshot) managedDesiredI
 			case *model.SecurityGroupRule:
 				_, duplicate = index.rules[id]
 				index.rules[id] = value
-			case *model.Project, *model.IPAllocation, *model.Node:
+			case *model.IPAllocation, *model.Node:
 				continue
 			default:
 				index.resourceErrors = append(index.resourceErrors, fmt.Errorf("snapshot kind %s contains unexpected resource %T", kind, resource))

@@ -510,23 +510,22 @@ func TestEnsureAttachedRowRecoversDeterministicUUIDRace(t *testing.T) {
 	}
 }
 
-func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
+func TestRendererBuildsNetworkPortAndSecurityGroup(t *testing.T) {
 	ctx := context.Background()
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
-	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private", MTU: 1400}).(*model.Network)
+	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, Name: "private", MTU: 1400}).(*model.Network)
 	subnet := mustCreate(t, store, &model.Subnet{
-		Metadata: model.Metadata{ID: "subnet-1"}, ProjectID: project.ID, NetworkID: network.ID,
+		Metadata: model.Metadata{ID: "subnet-1"}, NetworkID: network.ID,
 		Name: "private-v4", CIDR: "10.42.0.0/24", GatewayIP: "10.42.0.1", EnableDHCP: true,
 		DNSNameservers: []string{"1.1.1.1"},
 	}).(*model.Subnet)
-	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "web"}).(*model.SecurityGroup)
+	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, Name: "web"}).(*model.SecurityGroup)
 	mustCreate(t, store, &model.Node{
 		Metadata: model.Metadata{ID: "pve-a"}, Name: "pve-a", ChassisID: "chassis-a",
 		Roles: []model.NodeRole{model.NodeRoleCompute}, Enabled: true,
 	})
 	port := mustCreate(t, store, &model.Port{
-		Metadata: model.Metadata{ID: "port-1"}, ProjectID: project.ID, NetworkID: network.ID, Name: "vm100-net0",
+		Metadata: model.Metadata{ID: "port-1"}, NetworkID: network.ID, Name: "vm100-net0",
 		MACAddress: "02:00:00:00:00:10", FixedIPs: []model.FixedIP{{SubnetID: subnet.ID, Address: "10.42.0.10"}},
 		SecurityGroupIDs: []string{group.ID}, AdminStateUp: true, BindingStatus: model.PortBinding,
 		NodeID: "pve-a", VMID: 100, NIC: "net0", RequestedChassis: "chassis-a",
@@ -562,28 +561,30 @@ func TestRendererBuildsTenantNetworkPortAndSecurityGroup(t *testing.T) {
 			t.Errorf("no OVN command contains %v; calls=%v", expected, runner.calls)
 		}
 	}
+	assertNoLegacyScopeMetadata(t, runner.calls)
 }
 
 func TestRendererDisablesUnboundPortWithOVNState(t *testing.T) {
 	ctx := context.Background()
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{
-		Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1",
-	}).(*model.Project)
 	network := mustCreate(t, store, &model.Network{
-		Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private", MTU: 1400,
+		Metadata: model.Metadata{ID: "network-1"}, Name: "private", MTU: 1400,
 	}).(*model.Network)
 	subnet := mustCreate(t, store, &model.Subnet{
-		Metadata: model.Metadata{ID: "subnet-1"}, ProjectID: project.ID, NetworkID: network.ID,
+		Metadata: model.Metadata{ID: "subnet-1"}, NetworkID: network.ID,
 		Name: "private-v4", CIDR: "10.42.0.0/24", GatewayIP: "10.42.0.1",
 	}).(*model.Subnet)
+	group := mustCreate(t, store, &model.SecurityGroup{
+		Metadata: model.Metadata{ID: "sg-1"}, Name: "default",
+	}).(*model.SecurityGroup)
 	port := mustCreate(t, store, &model.Port{
-		Metadata: model.Metadata{ID: "port-1"}, ProjectID: project.ID, NetworkID: network.ID, Name: "vm100-net0",
+		Metadata: model.Metadata{ID: "port-1"}, NetworkID: network.ID, Name: "vm100-net0",
 		MACAddress: "02:00:00:00:00:10", FixedIPs: []model.FixedIP{{SubnetID: subnet.ID, Address: "10.42.0.10"}},
-		AdminStateUp: true, BindingStatus: model.PortUnbound,
+		SecurityGroupIDs: []string{group.ID}, AdminStateUp: true, BindingStatus: model.PortUnbound,
 	}).(*model.Port)
 	runner := &recordingRunner{}
 	runner.seedOwnedRow(logicalSwitchOwnedRow(network.ID), logicalSwitchUUID(network.ID))
+	runner.seedOwnedRow(portGroupOwnedRow(group.ID), deterministicUUID("test-port-group:"+group.ID))
 	renderer := newTestRenderer(t, runner, store)
 
 	if err := renderer.Render(ctx, port); err != nil {
@@ -597,14 +598,13 @@ func TestRendererDisablesUnboundPortWithOVNState(t *testing.T) {
 func TestExternalNetworkCreatesItsLocalnetPortImmediately(t *testing.T) {
 	ctx := context.Background()
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
 	provider := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-1"}, Name: "uplink"}).(*model.ProviderNetwork)
 	segment := mustCreate(t, store, &model.ProviderSegment{
 		Metadata: model.Metadata{ID: "segment-1"}, ProviderNetworkID: provider.ID,
 		Name: "vlan-100", PhysicalNetwork: "provider", NetworkType: model.ProviderVLAN, VLANID: 100,
 	}).(*model.ProviderSegment)
 	network := mustCreate(t, store, &model.Network{
-		Metadata: model.Metadata{ID: "external-1"}, ProjectID: project.ID, Name: "external",
+		Metadata: model.Metadata{ID: "external-1"}, Name: "external",
 		External: true, ProviderNetworkID: provider.ID,
 	}).(*model.Network)
 
@@ -629,7 +629,6 @@ func TestExternalNetworkCreatesItsLocalnetPortImmediately(t *testing.T) {
 func TestNetworkProviderChangeUpdatesOwnedLocalnetMapping(t *testing.T) {
 	ctx := context.Background()
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
 	providerA := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-a"}, Name: "uplink-a"}).(*model.ProviderNetwork)
 	providerB := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-b"}, Name: "uplink-b"}).(*model.ProviderNetwork)
 	_ = mustCreate(t, store, &model.ProviderSegment{
@@ -641,7 +640,7 @@ func TestNetworkProviderChangeUpdatesOwnedLocalnetMapping(t *testing.T) {
 		Name: "vlan-b", PhysicalNetwork: "phys-b", NetworkType: model.ProviderVLAN, VLANID: 222,
 	}).(*model.ProviderSegment)
 	network := &model.Network{
-		Metadata: model.Metadata{ID: "network-1", Revision: 1}, ProjectID: project.ID, Name: "provider",
+		Metadata: model.Metadata{ID: "network-1", Revision: 1}, Name: "provider",
 		ProviderNetworkID: providerA.ID,
 	}
 	runner := &providerPortRunner{uuid: deterministicUUID("localnet-row:" + network.ID)}
@@ -684,14 +683,13 @@ func TestNetworkProviderChangeUpdatesOwnedLocalnetMapping(t *testing.T) {
 func TestNetworkProviderRemovalDeletesOnlyOwnedLocalnetPort(t *testing.T) {
 	ctx := context.Background()
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
 	provider := mustCreate(t, store, &model.ProviderNetwork{Metadata: model.Metadata{ID: "provider-1"}, Name: "uplink"}).(*model.ProviderNetwork)
 	_ = mustCreate(t, store, &model.ProviderSegment{
 		Metadata: model.Metadata{ID: "segment-1"}, ProviderNetworkID: provider.ID,
 		Name: "flat", PhysicalNetwork: "provider", NetworkType: model.ProviderFlat,
 	})
 	network := &model.Network{
-		Metadata: model.Metadata{ID: "network-1", Revision: 1}, ProjectID: project.ID, Name: "provider",
+		Metadata: model.Metadata{ID: "network-1", Revision: 1}, Name: "provider",
 		ProviderNetworkID: provider.ID,
 	}
 	runner := &providerPortRunner{uuid: deterministicUUID("localnet-row:" + network.ID)}
@@ -716,8 +714,7 @@ func TestNetworkProviderRemovalDeletesOnlyOwnedLocalnetPort(t *testing.T) {
 
 func TestNetworkProviderRemovalRefusesUnownedNameCollision(t *testing.T) {
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
-	network := &model.Network{Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "overlay"}
+	network := &model.Network{Metadata: model.Metadata{ID: "network-1"}, Name: "overlay"}
 	runner := &providerPortRunner{
 		uuid: deterministicUUID("foreign-localnet-row:" + network.ID), exists: true, owned: false,
 	}
@@ -734,8 +731,7 @@ func TestNetworkProviderRemovalRefusesUnownedNameCollision(t *testing.T) {
 
 func TestSecurityGroupDefaultDropHasOwnedDHCPv4Exceptions(t *testing.T) {
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
-	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "default"}).(*model.SecurityGroup)
+	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, Name: "default"}).(*model.SecurityGroup)
 	runner := &recordingRunner{}
 	renderer := newTestRenderer(t, runner, store)
 
@@ -769,11 +765,8 @@ func TestSecurityGroupDefaultDropHasOwnedDHCPv4Exceptions(t *testing.T) {
 
 func TestSecurityGroupExplicitDropDeterministicallyPrecedesAllow(t *testing.T) {
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{
-		Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1",
-	}).(*model.Project)
 	group := mustCreate(t, store, &model.SecurityGroup{
-		Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "policy",
+		Metadata: model.Metadata{ID: "sg-1"}, Name: "policy",
 	}).(*model.SecurityGroup)
 	runner := &recordingRunner{}
 	renderer := newTestRenderer(t, runner, store)
@@ -783,13 +776,13 @@ func TestSecurityGroupExplicitDropDeterministicallyPrecedesAllow(t *testing.T) {
 
 	for _, rule := range []*model.SecurityGroupRule{
 		{
-			Metadata: model.Metadata{ID: "allow-rule"}, ProjectID: project.ID,
+			Metadata:        model.Metadata{ID: "allow-rule"},
 			SecurityGroupID: group.ID, Direction: model.DirectionIngress,
 			EtherType: model.EtherTypeIPv4, Protocol: "tcp", PortRangeMin: 443,
 			PortRangeMax: 443, RemoteCIDR: "192.0.2.0/24", Action: model.ActionAllow,
 		},
 		{
-			Metadata: model.Metadata{ID: "drop-rule"}, ProjectID: project.ID,
+			Metadata:        model.Metadata{ID: "drop-rule"},
 			SecurityGroupID: group.ID, Direction: model.DirectionIngress,
 			EtherType: model.EtherTypeIPv4, Protocol: "tcp", PortRangeMin: 443,
 			PortRangeMax: 443, RemoteCIDR: "192.0.2.0/24", Action: model.ActionDrop,
@@ -807,13 +800,31 @@ func TestSecurityGroupExplicitDropDeterministicallyPrecedesAllow(t *testing.T) {
 	}
 }
 
+func TestSecurityGroupRuleRequiresExistingRemoteGroup(t *testing.T) {
+	store := controlstore.NewMemory()
+	group := mustCreate(t, store, &model.SecurityGroup{
+		Metadata: model.Metadata{ID: "sg-1"}, Name: "policy",
+	}).(*model.SecurityGroup)
+	rule := &model.SecurityGroupRule{
+		Metadata: model.Metadata{ID: "remote-rule"}, SecurityGroupID: group.ID,
+		Direction: model.DirectionIngress, EtherType: model.EtherTypeIPv4,
+		RemoteGroupID: "missing-group", Action: model.ActionAllow,
+	}
+	runner := &recordingRunner{}
+	renderer := newTestRenderer(t, runner, store)
+
+	if err := renderer.Render(context.Background(), rule); err == nil {
+		t.Fatal("security group rule with an absent remote group unexpectedly rendered")
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("OVN was called before remote-group validation completed: %v", runner.calls)
+	}
+}
+
 func TestRendererExplicitSyncFencesIdempotentRetryAndDelete(t *testing.T) {
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{
-		Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1",
-	}).(*model.Project)
 	network := mustCreate(t, store, &model.Network{
-		Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private",
+		Metadata: model.Metadata{ID: "network-1"}, Name: "private",
 	}).(*model.Network)
 	runner := &syncFailRunner{failSync: true}
 	client, err := NewClient(ClientConfig{
@@ -861,9 +872,8 @@ func TestRendererExplicitSyncFencesIdempotentRetryAndDelete(t *testing.T) {
 func TestRendererUsesOVNNBCTL2503CommandBoundaries(t *testing.T) {
 	ctx := context.Background()
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
-	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private"}).(*model.Network)
-	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, ProjectID: project.ID, Name: "default"}).(*model.SecurityGroup)
+	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, Name: "private"}).(*model.Network)
+	group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-1"}, Name: "default"}).(*model.SecurityGroup)
 	runner := &recordingRunner{}
 	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
 	if err != nil {
@@ -892,7 +902,7 @@ func TestRendererUsesOVNNBCTL2503CommandBoundaries(t *testing.T) {
 	}
 }
 
-func TestRendererRejectsTypedNilAndCrossProjectPort(t *testing.T) {
+func TestRendererRejectsTypedNilAndCrossNetworkFixedIP(t *testing.T) {
 	store := controlstore.NewMemory()
 	runner := &recordingRunner{}
 	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
@@ -908,15 +918,19 @@ func TestRendererRejectsTypedNilAndCrossProjectPort(t *testing.T) {
 		t.Fatal("typed nil resource unexpectedly rendered")
 	}
 
-	first := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-a"}, Name: "a", PoolID: "pool-a"}).(*model.Project)
-	second := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-b"}, Name: "b", PoolID: "pool-b"}).(*model.Project)
-	otherNetwork := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-b"}, ProjectID: second.ID, Name: "private"}).(*model.Network)
+	firstNetwork := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-a"}, Name: "private-a"}).(*model.Network)
+	otherNetwork := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-b"}, Name: "private-b"}).(*model.Network)
+	firstSubnet := mustCreate(t, store, &model.Subnet{
+		Metadata: model.Metadata{ID: "subnet-a"}, NetworkID: firstNetwork.ID,
+		Name: "private-a-v4", CIDR: "10.42.0.0/24", GatewayIP: "10.42.0.1",
+	}).(*model.Subnet)
 	port := &model.Port{
-		Metadata: model.Metadata{ID: "port-a"}, ProjectID: first.ID, NetworkID: otherNetwork.ID, Name: "vm100-net0",
+		Metadata: model.Metadata{ID: "port-a"}, NetworkID: otherNetwork.ID, Name: "vm100-net0",
 		MACAddress: "02:00:00:00:00:01", LSPName: "pvn-port-a",
+		FixedIPs: []model.FixedIP{{SubnetID: firstSubnet.ID, Address: "10.42.0.10"}},
 	}
-	if err := renderer.Render(context.Background(), port); err == nil || !strings.Contains(err.Error(), "different projects") {
-		t.Fatalf("cross-project port error = %v", err)
+	if err := renderer.Render(context.Background(), port); err == nil || !strings.Contains(err.Error(), "does not belong to port") {
+		t.Fatalf("cross-network fixed-IP error = %v", err)
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("OVN called for rejected resources: %v", runner.calls)
@@ -963,6 +977,7 @@ func TestRouterRendersCentralizedGatewayDefaultRouteAndSNAT(t *testing.T) {
 	if runner.contains("chassis-disabled") {
 		t.Fatalf("disabled gateway chassis was selected: %v", runner.calls)
 	}
+	assertNoLegacyScopeMetadata(t, runner.calls)
 }
 
 func TestRouterInterfaceReconcilesRouterSNAT(t *testing.T) {
@@ -1204,7 +1219,6 @@ func TestRouterRejectsInvalidExternalNetworkRelationBeforeOVNMutation(t *testing
 	renderer := newTestRenderer(t, runner, store)
 	router := &model.Router{
 		Metadata:          model.Metadata{ID: "router-invalid"},
-		ProjectID:         fixture.project.ID,
 		Name:              "invalid",
 		ExternalNetworkID: fixture.internalNetwork.ID,
 		ExternalSubnetID:  fixture.internalSubnet.ID,
@@ -1216,11 +1230,11 @@ func TestRouterRejectsInvalidExternalNetworkRelationBeforeOVNMutation(t *testing
 		t.Fatalf("invalid external relation error = %v", err)
 	}
 	otherExternal := mustCreate(t, store, &model.Network{
-		Metadata: model.Metadata{ID: "external-2"}, ProjectID: fixture.project.ID, Name: "external-other",
+		Metadata: model.Metadata{ID: "external-2"}, Name: "external-other",
 		External: true, ProviderNetworkID: fixture.provider.ID,
 	}).(*model.Network)
 	otherSubnet := mustCreate(t, store, &model.Subnet{
-		Metadata: model.Metadata{ID: "external-subnet-2"}, ProjectID: fixture.project.ID, NetworkID: otherExternal.ID,
+		Metadata: model.Metadata{ID: "external-subnet-2"}, NetworkID: otherExternal.ID,
 		Name: "external-other-v4", CIDR: "198.51.100.0/24", GatewayIP: "198.51.100.1",
 	}).(*model.Subnet)
 	router.ExternalNetworkID = fixture.externalNetwork.ID
@@ -1245,7 +1259,7 @@ func TestFloatingIPMustMatchRouterExternalProviderAndSubnet(t *testing.T) {
 	renderer := newTestRenderer(t, runner, store)
 
 	mismatch := &model.FloatingIP{
-		Metadata: model.Metadata{ID: "fip-mismatch"}, ProjectID: fixture.project.ID,
+		Metadata:          model.Metadata{ID: "fip-mismatch"},
 		ProviderNetworkID: secondProvider.ID, Address: "192.0.2.20", RouterID: fixture.router.ID,
 		FixedIPAddress: "10.42.0.10",
 	}
@@ -1267,13 +1281,13 @@ func TestFloatingIPMustMatchRouterExternalProviderAndSubnet(t *testing.T) {
 func TestFloatingIPOnRouterExternalProviderRendersNAT(t *testing.T) {
 	store, fixture := newNorthSouthFixture(t)
 	port := mustCreate(t, store, &model.Port{
-		Metadata: model.Metadata{ID: "port-1"}, ProjectID: fixture.project.ID, NetworkID: fixture.internalNetwork.ID,
+		Metadata: model.Metadata{ID: "port-1"}, NetworkID: fixture.internalNetwork.ID,
 		Name: "vm100-net0", MACAddress: "02:00:00:00:00:10",
-		FixedIPs:     []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.10"}},
-		AdminStateUp: true, BindingStatus: model.PortUnbound,
+		FixedIPs:         []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.10"}},
+		SecurityGroupIDs: []string{fixture.securityGroup.ID}, AdminStateUp: true, BindingStatus: model.PortUnbound,
 	}).(*model.Port)
 	floatingIP := &model.FloatingIP{
-		Metadata: model.Metadata{ID: "fip-1"}, ProjectID: fixture.project.ID,
+		Metadata:          model.Metadata{ID: "fip-1"},
 		ProviderNetworkID: fixture.provider.ID, Address: "192.0.2.20", RouterID: fixture.router.ID,
 		PortID: port.ID, FixedIPAddress: "10.42.0.10", FloatingStatus: model.FloatingIPActive,
 	}
@@ -1287,6 +1301,7 @@ func TestFloatingIPOnRouterExternalProviderRendersNAT(t *testing.T) {
 	if !runner.contains("create NAT", `type="dnat_and_snat"`, `external_ip="192.0.2.20"`, `logical_ip="10.42.0.10"`, "add Logical_Router "+logicalRouterUUID(fixture.router.ID)) {
 		t.Fatalf("valid floating IP NAT was not rendered: %v", runner.calls)
 	}
+	assertNoLegacyScopeMetadata(t, runner.calls)
 }
 
 func TestRendererAdoptsAndDeletesCompleteRestoredUUIDGraph(t *testing.T) {
@@ -1301,21 +1316,21 @@ func TestRendererAdoptsAndDeletesCompleteRestoredUUIDGraph(t *testing.T) {
 	}
 	fixture.internalSubnet = updatedSubnet.(*model.Subnet)
 	group := mustCreate(t, store, &model.SecurityGroup{
-		Metadata: model.Metadata{ID: "sg-restored"}, ProjectID: fixture.project.ID, Name: "restored",
+		Metadata: model.Metadata{ID: "sg-restored"}, Name: "restored",
 	}).(*model.SecurityGroup)
 	rule := mustCreate(t, store, &model.SecurityGroupRule{
-		Metadata: model.Metadata{ID: "rule-restored"}, ProjectID: fixture.project.ID, SecurityGroupID: group.ID,
+		Metadata: model.Metadata{ID: "rule-restored"}, SecurityGroupID: group.ID,
 		Direction: model.DirectionIngress, EtherType: model.EtherTypeIPv4, Protocol: "tcp",
 		PortRangeMin: 443, PortRangeMax: 443, RemoteCIDR: "0.0.0.0/0", Action: model.ActionAllow,
 	}).(*model.SecurityGroupRule)
 	port := mustCreate(t, store, &model.Port{
-		Metadata: model.Metadata{ID: "port-restored"}, ProjectID: fixture.project.ID, NetworkID: fixture.internalNetwork.ID,
+		Metadata: model.Metadata{ID: "port-restored"}, NetworkID: fixture.internalNetwork.ID,
 		Name: "vm-restored-net0", MACAddress: "02:00:00:00:00:44",
 		FixedIPs:         []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.44"}},
 		SecurityGroupIDs: []string{group.ID}, AdminStateUp: true, BindingStatus: model.PortBound,
 	}).(*model.Port)
 	floatingIP := mustCreate(t, store, &model.FloatingIP{
-		Metadata: model.Metadata{ID: "fip-restored"}, ProjectID: fixture.project.ID,
+		Metadata:          model.Metadata{ID: "fip-restored"},
 		ProviderNetworkID: fixture.provider.ID, Address: "192.0.2.44", RouterID: fixture.router.ID,
 		PortID: port.ID, FixedIPAddress: "10.42.0.44", FloatingStatus: model.FloatingIPActive,
 	}).(*model.FloatingIP)
@@ -1439,8 +1454,7 @@ func TestRendererRejectsRestoredDuplicateAndForeignNonRootRows(t *testing.T) {
 
 	t.Run("foreign-port-group-name", func(t *testing.T) {
 		store := controlstore.NewMemory()
-		project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
-		group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-foreign"}, ProjectID: project.ID, Name: "foreign"}).(*model.SecurityGroup)
+		group := mustCreate(t, store, &model.SecurityGroup{Metadata: model.Metadata{ID: "sg-foreign"}, Name: "foreign"}).(*model.SecurityGroup)
 		runner := &recordingRunner{}
 		foreign := managedRow(
 			"Port_Group",
@@ -1477,9 +1491,10 @@ func TestSubnetDHCPRemovalPreflightsRestoredDuplicateBeforeClearingPorts(t *test
 		t.Run(test.name, func(t *testing.T) {
 			store, fixture := newNorthSouthFixture(t)
 			port := mustCreate(t, store, &model.Port{
-				Metadata: model.Metadata{ID: "port-dhcp-preflight"}, ProjectID: fixture.project.ID,
+				Metadata:  model.Metadata{ID: "port-dhcp-preflight"},
 				NetworkID: fixture.internalNetwork.ID, Name: "vm-preflight-net0", MACAddress: "02:00:00:00:00:55",
-				FixedIPs: []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.55"}},
+				FixedIPs:         []model.FixedIP{{SubnetID: fixture.internalSubnet.ID, Address: "10.42.0.55"}},
+				SecurityGroupIDs: []string{fixture.securityGroup.ID},
 			}).(*model.Port)
 			runner := &recordingRunner{}
 			runner.seedOwnedRow(logicalSwitchPortOwnedRow(port.ID, port.LSPName), deterministicUUID("restored:preflight-port"))
@@ -1507,8 +1522,7 @@ func TestDerivedNamesDoNotAliasPunctuation(t *testing.T) {
 
 func TestActiveActiveNetworkCreateUsesOneDeterministicRow(t *testing.T) {
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1"}).(*model.Project)
-	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, ProjectID: project.ID, Name: "private"}).(*model.Network)
+	network := mustCreate(t, store, &model.Network{Metadata: model.Metadata{ID: "network-1"}, Name: "private"}).(*model.Network)
 	runner := &activeActiveRunner{barrier: make(chan struct{}), uuid: logicalSwitchUUID(network.ID)}
 	client, err := NewClient(ClientConfig{Runner: runner, Database: []string{"unix:/run/ovn/ovnnb_db.sock"}})
 	if err != nil {
@@ -1564,7 +1578,7 @@ func TestRendererRejectsUnsafeResourceIDBeforeExecuting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resource := &model.Network{Metadata: model.Metadata{ID: "../../bad"}, ProjectID: "project-1", Name: "bad", MTU: 1400}
+	resource := &model.Network{Metadata: model.Metadata{ID: "../../bad"}, Name: "bad", MTU: 1400}
 	if err := renderer.Render(context.Background(), resource); err == nil {
 		t.Fatal("unsafe ID unexpectedly rendered")
 	}
@@ -1582,9 +1596,19 @@ func mustCreate(t *testing.T, store controlstore.Store, resource model.Resource)
 	return created
 }
 
+func assertNoLegacyScopeMetadata(t *testing.T, calls [][]string) {
+	t.Helper()
+	legacyKey := "pvn-" + "project"
+	for _, call := range calls {
+		if strings.Contains(strings.Join(call, " "), legacyKey) {
+			t.Fatalf("cluster-global resource emitted legacy scope metadata: %v", call)
+		}
+	}
+}
+
 type northSouthFixture struct {
-	project         *model.Project
 	provider        *model.ProviderNetwork
+	securityGroup   *model.SecurityGroup
 	externalNetwork *model.Network
 	externalSubnet  *model.Subnet
 	internalNetwork *model.Network
@@ -1596,29 +1620,29 @@ type northSouthFixture struct {
 func newNorthSouthFixture(t *testing.T) (*controlstore.Memory, northSouthFixture) {
 	t.Helper()
 	store := controlstore.NewMemory()
-	project := mustCreate(t, store, &model.Project{
-		Metadata: model.Metadata{ID: "project-1"}, Name: "tenant", PoolID: "pool-1",
-	}).(*model.Project)
 	provider := mustCreate(t, store, &model.ProviderNetwork{
-		Metadata: model.Metadata{ID: "provider-1"}, Name: "uplink", Shared: true,
+		Metadata: model.Metadata{ID: "provider-1"}, Name: "uplink",
 	}).(*model.ProviderNetwork)
+	securityGroup := mustCreate(t, store, &model.SecurityGroup{
+		Metadata: model.Metadata{ID: "default-sg"}, Name: "default",
+	}).(*model.SecurityGroup)
 	_ = mustCreate(t, store, &model.ProviderSegment{
 		Metadata: model.Metadata{ID: "segment-1"}, ProviderNetworkID: provider.ID,
 		Name: "flat-provider", PhysicalNetwork: "provider", NetworkType: model.ProviderFlat,
 	})
 	externalNetwork := mustCreate(t, store, &model.Network{
-		Metadata: model.Metadata{ID: "external-1"}, ProjectID: project.ID, Name: "external",
+		Metadata: model.Metadata{ID: "external-1"}, Name: "external",
 		External: true, ProviderNetworkID: provider.ID,
 	}).(*model.Network)
 	externalSubnet := mustCreate(t, store, &model.Subnet{
-		Metadata: model.Metadata{ID: "external-subnet-1"}, ProjectID: project.ID, NetworkID: externalNetwork.ID,
+		Metadata: model.Metadata{ID: "external-subnet-1"}, NetworkID: externalNetwork.ID,
 		Name: "external-v4", CIDR: "192.0.2.0/24", GatewayIP: "192.0.2.1",
 	}).(*model.Subnet)
 	internalNetwork := mustCreate(t, store, &model.Network{
-		Metadata: model.Metadata{ID: "internal-1"}, ProjectID: project.ID, Name: "private",
+		Metadata: model.Metadata{ID: "internal-1"}, Name: "private",
 	}).(*model.Network)
 	internalSubnet := mustCreate(t, store, &model.Subnet{
-		Metadata: model.Metadata{ID: "internal-subnet-1"}, ProjectID: project.ID, NetworkID: internalNetwork.ID,
+		Metadata: model.Metadata{ID: "internal-subnet-1"}, NetworkID: internalNetwork.ID,
 		Name: "private-v4", CIDR: "10.42.0.0/24", GatewayIP: "10.42.0.1",
 	}).(*model.Subnet)
 	for _, node := range []*model.Node{
@@ -1629,16 +1653,16 @@ func newNorthSouthFixture(t *testing.T) (*controlstore.Memory, northSouthFixture
 		_ = mustCreate(t, store, node)
 	}
 	router := mustCreate(t, store, &model.Router{
-		Metadata: model.Metadata{ID: "router-1"}, ProjectID: project.ID, Name: "edge",
+		Metadata: model.Metadata{ID: "router-1"}, Name: "edge",
 		ExternalNetworkID: externalNetwork.ID, ExternalSubnetID: externalSubnet.ID,
 		ExternalIPAddress: "192.0.2.10", EnableSNAT: true,
 	}).(*model.Router)
 	routerInterface := mustCreate(t, store, &model.RouterInterface{
-		Metadata: model.Metadata{ID: "router-interface-1"}, ProjectID: project.ID,
+		Metadata: model.Metadata{ID: "router-interface-1"},
 		RouterID: router.ID, SubnetID: internalSubnet.ID,
 	}).(*model.RouterInterface)
 	return store, northSouthFixture{
-		project: project, provider: provider, externalNetwork: externalNetwork, externalSubnet: externalSubnet,
+		provider: provider, securityGroup: securityGroup, externalNetwork: externalNetwork, externalSubnet: externalSubnet,
 		internalNetwork: internalNetwork, internalSubnet: internalSubnet, router: router, routerInterface: routerInterface,
 	}
 }
