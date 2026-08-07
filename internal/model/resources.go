@@ -2,20 +2,8 @@ package model
 
 import "time"
 
-type Project struct {
-	Metadata
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	PoolID      string `json:"pool_id"`
-}
-
-func (*Project) ResourceKind() Kind     { return KindProject }
-func (p *Project) ResourceName() string { return p.Name }
-func (p *Project) Validate() error      { return validateProject(p) }
-
 type Network struct {
 	Metadata
-	ProjectID         string `json:"project_id"`
 	Name              string `json:"name"`
 	Description       string `json:"description,omitempty"`
 	MTU               int    `json:"mtu"`
@@ -34,7 +22,6 @@ type IPRange struct {
 
 type Subnet struct {
 	Metadata
-	ProjectID       string    `json:"project_id"`
 	NetworkID       string    `json:"network_id"`
 	Name            string    `json:"name"`
 	CIDR            string    `json:"cidr"`
@@ -65,7 +52,6 @@ const (
 
 type Port struct {
 	Metadata
-	ProjectID        string            `json:"project_id"`
 	NetworkID        string            `json:"network_id"`
 	Name             string            `json:"name"`
 	MACAddress       string            `json:"mac_address"`
@@ -94,7 +80,6 @@ const (
 
 type IPAllocation struct {
 	Metadata
-	ProjectID string            `json:"project_id"`
 	SubnetID  string            `json:"subnet_id"`
 	PortID    string            `json:"port_id,omitempty"`
 	Address   string            `json:"address"`
@@ -106,7 +91,6 @@ func (a *IPAllocation) Validate() error  { return validateIPAllocation(a) }
 
 type Router struct {
 	Metadata
-	ProjectID         string `json:"project_id"`
 	Name              string `json:"name"`
 	Description       string `json:"description,omitempty"`
 	ExternalNetworkID string `json:"external_network_id,omitempty"`
@@ -121,7 +105,6 @@ func (r *Router) Validate() error      { return validateRouter(r) }
 
 type RouterInterface struct {
 	Metadata
-	ProjectID string `json:"project_id"`
 	RouterID  string `json:"router_id"`
 	SubnetID  string `json:"subnet_id"`
 	PortID    string `json:"port_id,omitempty"`
@@ -140,7 +123,6 @@ const (
 
 type FloatingIP struct {
 	Metadata
-	ProjectID         string           `json:"project_id"`
 	ProviderNetworkID string           `json:"provider_network_id"`
 	Address           string           `json:"address"`
 	PortID            string           `json:"port_id,omitempty"`
@@ -176,7 +158,6 @@ type ProviderNetwork struct {
 	Metadata
 	Name             string `json:"name"`
 	Description      string `json:"description,omitempty"`
-	Shared           bool   `json:"shared"`
 	DefaultSegmentID string `json:"default_segment_id,omitempty"`
 }
 
@@ -206,7 +187,6 @@ func (p *ProviderSegment) Validate() error      { return validateProviderSegment
 
 type SecurityGroup struct {
 	Metadata
-	ProjectID   string `json:"project_id"`
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Stateful    bool   `json:"stateful"`
@@ -230,7 +210,6 @@ const (
 
 type SecurityGroupRule struct {
 	Metadata
-	ProjectID       string        `json:"project_id"`
 	SecurityGroupID string        `json:"security_group_id"`
 	Direction       RuleDirection `json:"direction"`
 	EtherType       EtherType     `json:"ethertype"`

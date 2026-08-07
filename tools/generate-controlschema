@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(git -C "$script_dir/.." rev-parse --show-toplevel)
+generator_version=v0.7.0
+generation_root=$(mktemp -d)
+trap 'rm -rf "$generation_root"' EXIT HUP INT TERM
+
+(
+    cd "$generation_root"
+    go mod init pvn-controlschema-generator >/dev/null
+    GOWORK=off go run "github.com/ovn-org/libovsdb/cmd/modelgen@$generator_version" \
+        -p controlschema \
+        -o "$repo_root/internal/controlschema" \
+        "$repo_root/schema/PVN_Control.ovsschema"
+)
+
+# modelgen only creates or overwrites tables; it does not remove code for a
+# table deleted from the schema.
+rm -f "$repo_root/internal/controlschema/project.go"

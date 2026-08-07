@@ -28,7 +28,6 @@ type Network struct {
 	LastError       string            `ovsdb:"last_error"`
 	MTU             int               `ovsdb:"mtu"`
 	Name            string            `ovsdb:"name"`
-	Project         string            `ovsdb:"project"`
 	ProviderNetwork *string           `ovsdb:"provider_network"`
 	Revision        int               `ovsdb:"revision"`
 	State           NetworkState      `ovsdb:"state"`

@@ -25,7 +25,6 @@ type RouterInterface struct {
 	ID              string               `ovsdb:"id"`
 	LastError       string               `ovsdb:"last_error"`
 	Port            *string              `ovsdb:"port"`
-	Project         string               `ovsdb:"project"`
 	Revision        int                  `ovsdb:"revision"`
 	Router          string               `ovsdb:"router"`
 	State           RouterInterfaceState `ovsdb:"state"`

@@ -32,7 +32,6 @@ type FloatingIP struct {
 	ID              string                   `ovsdb:"id"`
 	LastError       string                   `ovsdb:"last_error"`
 	Port            *string                  `ovsdb:"port"`
-	Project         string                   `ovsdb:"project"`
 	ProviderNetwork string                   `ovsdb:"provider_network"`
 	Revision        int                      `ovsdb:"revision"`
 	Router          *string                  `ovsdb:"router"`
