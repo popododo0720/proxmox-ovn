@@ -55,9 +55,16 @@ if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
     [ -z "$managed_interfaces" ] ||
         fail_removal "managed OVS interfaces remain: $managed_interfaces"
 
+    if [ -x /usr/lib/pvn/pvn-compute-inject ] || \
+        [ -x /usr/lib/pvn/pvn-api-inject ] || [ -x /usr/lib/pvn/pvn-ui-inject ]; then
+        [ -x /usr/lib/pvn/pvn-pve-refresh ] || \
+            fail_removal "PVE daemon refresh helper is unavailable"
+        /usr/lib/pvn/pvn-pve-refresh --check
+    fi
+    [ ! -x /usr/lib/pvn/pvn-compute-inject ] || /usr/lib/pvn/pvn-compute-inject remove
     [ ! -x /usr/lib/pvn/pvn-api-inject ] || /usr/lib/pvn/pvn-api-inject remove
     [ ! -x /usr/lib/pvn/pvn-ui-inject ] || /usr/lib/pvn/pvn-ui-inject remove
-    systemctl reload pveproxy.service
+    [ ! -x /usr/lib/pvn/pvn-pve-refresh ] || /usr/lib/pvn/pvn-pve-refresh
     systemctl disable --now pvn-central.target pvn-node.target >/dev/null 2>&1 || true
     systemctl stop pvn-node-ready.service pvn-agent.service pvn-manager.service pvn-ovn-host-config.service pvn-control-db.service pvn-ovn-db-listeners.service pvn-ovn-northd-ready.service ovn-controller.service >/dev/null 2>&1 || true
 fi

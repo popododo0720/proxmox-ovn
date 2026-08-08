@@ -106,7 +106,9 @@ deb-artifact:
 		-exec install -m 0755 -t "$$pvn_root/usr/lib/pvn/" -- {} +; \
 	install -m 0755 deploy/scripts/pvn-db-backup "$$pvn_root/usr/sbin/pvn-db-backup"; \
 	install -m 0755 pve-api/inject.sh "$$pvn_root/usr/lib/pvn/pvn-api-inject"; \
+	install -m 0755 pve-api/compute-inject.py "$$pvn_root/usr/lib/pvn/pvn-compute-inject"; \
 	install -m 0644 pve-api/PVN/API2.pm "$$pvn_root/usr/share/perl5/PVN/"; \
+	install -m 0644 pve-api/PVN/ComputeLifecycle.pm "$$pvn_root/usr/share/perl5/PVN/"; \
 	install -m 0755 pve-ui/inject.sh "$$pvn_root/usr/lib/pvn/pvn-ui-inject"; \
 	install -m 0644 pve-ui/pvn-loader.js "$$pvn_root/usr/lib/pvn/"; \
 	install -d "$$pvn_root/usr/share/pvn" "$$pvn_root/usr/share/doc/pvn-node/examples" "$$pvn_root/usr/share/doc/pvn-node/inventory"; \

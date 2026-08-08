@@ -46,13 +46,33 @@ install_api() {
     /usr/lib/pvn/pvn-api-verify
 }
 
-install_pve_extensions() {
-    install_api
-    install_ui
-    systemctl reload pveproxy.service || {
-        echo "pveproxy could not reload the installed PVN API extension" >&2
+install_compute() {
+    [ -x /usr/lib/pvn/pvn-compute-inject ] || {
+        echo "PVN compute lifecycle injector is missing" >&2
         return 1
     }
+    [ -x /usr/lib/pvn/pvn-compute-verify ] || {
+        echo "PVN compute lifecycle verifier is missing" >&2
+        return 1
+    }
+    /usr/lib/pvn/pvn-compute-inject install
+    /usr/lib/pvn/pvn-compute-verify
+}
+
+install_pve_extensions() {
+    [ -x /usr/lib/pvn/pvn-pve-refresh ] || {
+        echo "PVN PVE daemon refresh helper is missing" >&2
+        return 1
+    }
+    # Prove every affected daemon can enter a fresh generation before changing
+    # any live PVE source file.
+    /usr/lib/pvn/pvn-pve-refresh --check
+    # This exact-version/signature preflight is first: an unsupported
+    # qemu-server must fail package configuration before any PVE file changes.
+    install_compute
+    install_api
+    install_ui
+    /usr/lib/pvn/pvn-pve-refresh
 }
 
 verify_corosync_runtime() {

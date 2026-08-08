@@ -54,9 +54,14 @@ for script in packaging/debian/pvn-node.postinst packaging/debian/pvn-node.prerm
 do
     sh -n "$script"
 done
+python3 -m py_compile pve-api/compute-inject.py pve-api/tests/compute-injector-test.py \
+    pve-api/tests/compute-contract-test.py
 
 perl pve-api/tests/api2-test.pl >/dev/null
+perl pve-api/tests/compute-lifecycle-test.pl >/dev/null
 pve-api/tests/injector-test.sh
+pve-api/tests/compute-injector-test.py
+pve-api/tests/compute-contract-test.py
 
 deploy/tests/pvn-cluster-install-test.sh
 deploy/tests/pvn-install-test.sh
@@ -66,7 +71,10 @@ deploy/tests/pvn-cluster-lease-test.sh
 deploy/tests/pvn-ovn-db-listeners-test.sh
 python3 -B deploy/tests/pvn-ovn-northd-test.py
 python3 -B deploy/tests/pvn-node-ready-test.py
+python3 -B deploy/tests/pvn-pve-refresh-test.py
 python3 -B packaging/tests/pvn-postinst-test.py
+python3 -B packaging/tests/pvn-prerm-test.py
+python3 -B packaging/tests/pvn-postrm-test.py
 fast_finished_ns=$(now_ns)
 fast_elapsed_ns=$((fast_elapsed_ns + fast_finished_ns - fast_started_ns))
 fi
@@ -125,8 +133,63 @@ grep -q '/usr/lib/pvn/pvn-api-verify' packaging/debian/pvn-node.postinst || {
     echo "package configuration must verify the installed PVE API hook" >&2
     exit 1
 }
+grep -q '/usr/lib/pvn/pvn-compute-verify' packaging/debian/pvn-node.postinst || {
+    echo "package configuration must verify the installed PVE compute hooks" >&2
+    exit 1
+}
+python3 - <<'PY'
+from pathlib import Path
+
+source = Path("packaging/debian/pvn-node.postinst").read_text()
+body = source[source.index("install_pve_extensions() {") : source.index("\n}\n", source.index("install_pve_extensions() {"))]
+refresh = "/usr/lib/pvn/pvn-pve-refresh"
+refresh_positions = [index for index in range(len(body)) if body.startswith(refresh, index)]
+if len(refresh_positions) != 3:
+    raise SystemExit("PVE refresh helper must be checked, preflighted, and executed exactly once")
+order = [refresh_positions[1], body.index("install_compute"), body.index("install_api"), body.index("install_ui"), refresh_positions[2]]
+if order != sorted(order):
+    raise SystemExit("daemon preflight and unsupported qemu-server must fail before API/UI PVE mutations")
+PY
+grep -Eq 'abort-install\|abort-upgrade\|failed-upgrade' packaging/debian/pvn-node.postrm || {
+    echo "failed package configuration must remove or recover compute hooks" >&2
+    exit 1
+}
+grep -q '/usr/lib/pvn/pvn-compute-inject remove' packaging/debian/pvn-node.postrm || {
+    echo "postrm must invoke the journal-aware compute hook remover" >&2
+    exit 1
+}
+grep -q '/usr/lib/pvn/pvn-pve-refresh --check' packaging/debian/pvn-node.postinst || {
+    echo "postinst must preflight daemon generations before PVE file mutation" >&2
+    exit 1
+}
+grep -q '/usr/lib/pvn/pvn-pve-refresh --check' packaging/debian/pvn-node.prerm || {
+    echo "prerm must preflight daemon generations before removing PVE hooks" >&2
+    exit 1
+}
+grep -q '^Wants=pvn-node-ready.service$' deploy/systemd/pve-ha-lrm.service.d/90-pvn.conf || {
+    echo "pve-ha-lrm must pull in initial PVN node readiness" >&2
+    exit 1
+}
+grep -q '^After=pvn-node-ready.service$' deploy/systemd/pve-ha-lrm.service.d/90-pvn.conf || {
+    echo "pve-ha-lrm must start after initial PVN node readiness" >&2
+    exit 1
+}
 grep -q '^interest-noawait /usr/share/perl5/PVE/API2.pm$' packaging/debian/triggers || {
     echo "the package must reapply the PVN API hook after PVE dispatcher updates" >&2
+    exit 1
+}
+for pvn_compute_trigger in \
+    /usr/share/perl5/PVE/QemuServer.pm \
+    /usr/share/perl5/PVE/QemuMigrate.pm \
+    /usr/share/perl5/PVE/API2/Qemu.pm
+do
+    grep -q "^interest-noawait $pvn_compute_trigger$" packaging/debian/triggers || {
+        echo "the package must reapply compute hooks after $pvn_compute_trigger changes" >&2
+        exit 1
+    }
+done
+grep -Eq 'qemu-server \(= 9\.1\.15\)' packaging/debian/control packaging/pvn-node.control || {
+    echo "runtime metadata must pin the exact supported qemu-server build" >&2
     exit 1
 }
 if grep -n 'systemctl restart.*|| true' packaging/debian/pvn-node.postinst; then
@@ -194,8 +257,8 @@ grep -q '^LoadCredential=pvn-pve-members:/etc/pve/.members$' deploy/systemd/pvn-
     echo "the unprivileged manager must receive PVE membership as a credential" >&2
     exit 1
 }
-grep -q '^RuntimeDirectory=pvn pvn-api$' deploy/systemd/pvn-manager.service || {
-    echo "the manager must own separate runtime and browser socket directories" >&2
+grep -q '^RuntimeDirectory=pvn pvn-api pvn-compute$' deploy/systemd/pvn-manager.service || {
+    echo "the manager must own separate runtime, browser, and compute socket directories" >&2
     exit 1
 }
 grep -q '^SupplementaryGroups=www-data$' deploy/systemd/pvn-manager.service || {
@@ -383,7 +446,7 @@ for source in deploy/systemd/*.service.d; do
     install -m 0644 "$source"/*.conf "$unit_root/$unit/"
 done
 
-for unit in sysinit.target basic.target network.target network-online.target shutdown.target sockets.target timers.target paths.target multi-user.target pve-cluster.service openvswitch-switch.service pve-guests.service ovn-host.service ovn-central.service ovn-controller.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service ovn-northd.service; do
+for unit in sysinit.target basic.target network.target network-online.target shutdown.target sockets.target timers.target paths.target multi-user.target pve-cluster.service openvswitch-switch.service pve-guests.service pve-ha-lrm.service ovn-host.service ovn-central.service ovn-controller.service ovn-ovsdb-server-nb.service ovn-ovsdb-server-sb.service ovn-northd.service; do
     case "$unit" in
         *.target)
             printf '[Unit]\nDescription=package check stub\n' > "$unit_root/$unit"
@@ -408,6 +471,9 @@ for executable in \
     /usr/lib/pvn/pvn-node-ready \
     /usr/lib/pvn/pvn-guest-gate \
     /usr/lib/pvn/pvn-api-verify \
+    /usr/lib/pvn/pvn-compute-verify \
+    /usr/lib/pvn/pvn-compute-inject \
+    /usr/lib/pvn/pvn-pve-refresh \
     /usr/lib/pvn/pvn-ui-verify \
     /usr/bin/ovs-appctl \
     /usr/bin/test \
@@ -417,7 +483,7 @@ do
     install -D -m 0755 /dev/null "$verify_root$executable"
 done
 
-systemd-analyze verify --root="$verify_root" pvn-node.target pvn-central.target pve-guests.service
+systemd-analyze verify --root="$verify_root" pvn-node.target pvn-central.target pve-guests.service pve-ha-lrm.service
 fast_finished_ns=$(now_ns)
 fast_elapsed_ns=$((fast_elapsed_ns + fast_finished_ns - fast_started_ns))
 report_elapsed fast "$fast_elapsed_ns"

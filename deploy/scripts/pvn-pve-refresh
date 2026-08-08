@@ -1,0 +1,123 @@
+#!/bin/sh
+set -eu
+
+case "$#:${1:-}" in
+    0:) check_only=false ;;
+    1:--check) check_only=true ;;
+    *) echo "usage: pvn-pve-refresh [--check]" >&2; exit 2 ;;
+esac
+
+capture_active_generation() {
+    unit=$1
+    label=$2
+    state=$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null || true)
+    [ "$state" = active ] || {
+        echo "$label is not active and cannot be safely refreshed: ${state:-unknown}" >&2
+        return 1
+    }
+    pid=$(systemctl show --property=MainPID --value "$unit") || return 1
+    generation=$(systemctl show --property=ExecMainStartTimestampMonotonic --value \
+        "$unit") || return 1
+    case "$pid:$generation" in
+        *[!0-9:]*|0:*|*:0|'':*)
+            echo "$label has no stable process generation" >&2
+            return 1
+            ;;
+    esac
+    printf '%s:%s\n' "$pid" "$generation"
+}
+
+split_generation() {
+    value=$1
+    old_ifs=$IFS
+    IFS=:
+    set -- $value
+    IFS=$old_ifs
+    [ "$#" -eq 2 ] || return 1
+    printf '%s\n%s\n' "$1" "$2"
+}
+
+verify_new_generation() {
+    unit=$1
+    label=$2
+    before_pid=$3
+    before_generation=$4
+    attempt=1
+    while [ "$attempt" -le 20 ]; do
+        state=$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null || true)
+        if [ "$state" = active ]; then
+            after_pid=$(systemctl show --property=MainPID --value "$unit" 2>/dev/null || true)
+            after_generation=$(systemctl show \
+                --property=ExecMainStartTimestampMonotonic --value "$unit" 2>/dev/null || true)
+            case "$after_pid:$after_generation" in
+                *[!0-9:]*|0:*|*:0|'':*) ;;
+                *)
+                    if [ "$after_pid" != "$before_pid" ] && \
+                        [ "$after_generation" -gt "$before_generation" ]; then
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+        attempt=$((attempt + 1))
+        [ "$attempt" -le 20 ] && sleep 0.25
+    done
+    echo "$label did not enter a new active process generation" >&2
+    return 1
+}
+
+# Finish every read-only safety check before changing even one daemon
+# generation. This prevents an inquorate or transitional HA node from ending
+# with only part of the PVE worker set using the new lifecycle hooks.
+pvedaemon_before=$(capture_active_generation pvedaemon.service pvedaemon)
+pveproxy_before=$(capture_active_generation pveproxy.service pveproxy)
+
+lrm_state=$(systemctl show --property=ActiveState --value pve-ha-lrm.service 2>/dev/null || true)
+lrm_refresh=false
+lrm_before=
+case "$lrm_state" in
+    inactive) ;;
+    active)
+        pvecm_status=$(pvecm status 2>&1) || {
+            echo "cannot prove PVE quorum before refreshing pve-ha-lrm: $pvecm_status" >&2
+            exit 1
+        }
+        printf '%s\n' "$pvecm_status" | grep -Eq '^Quorate:[[:space:]]+Yes$' || {
+            echo "refusing to refresh pve-ha-lrm without quorum" >&2
+            exit 1
+        }
+        lrm_before=$(capture_active_generation pve-ha-lrm.service pve-ha-lrm)
+        lrm_refresh=true
+        ;;
+    *)
+        echo "pve-ha-lrm is not in a safely restartable state: ${lrm_state:-unknown}" >&2
+        exit 1
+        ;;
+esac
+
+[ "$check_only" = false ] || exit 0
+
+if [ "$lrm_refresh" = true ]; then
+    # HA is the start authority, so put it on the new fail-closed hook
+    # generation before exposing the new API/UI workers.
+    set -- $(split_generation "$lrm_before")
+    lrm_pid_before=$1
+    lrm_generation_before=$2
+    systemctl restart pve-ha-lrm.service
+    verify_new_generation pve-ha-lrm.service pve-ha-lrm \
+        "$lrm_pid_before" "$lrm_generation_before"
+fi
+
+set -- $(split_generation "$pvedaemon_before")
+pvedaemon_pid_before=$1
+pvedaemon_generation_before=$2
+systemctl reload pvedaemon.service
+verify_new_generation pvedaemon.service pvedaemon \
+    "$pvedaemon_pid_before" "$pvedaemon_generation_before"
+
+set -- $(split_generation "$pveproxy_before")
+pveproxy_pid_before=$1
+pveproxy_generation_before=$2
+systemctl reload pveproxy.service
+verify_new_generation pveproxy.service pveproxy \
+    "$pveproxy_pid_before" "$pveproxy_generation_before"

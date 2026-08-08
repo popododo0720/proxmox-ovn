@@ -1,2 +1,5 @@
 interest-noawait /usr/share/pve-manager/index.html.tpl
 interest-noawait /usr/share/perl5/PVE/API2.pm
+interest-noawait /usr/share/perl5/PVE/QemuServer.pm
+interest-noawait /usr/share/perl5/PVE/QemuMigrate.pm
+interest-noawait /usr/share/perl5/PVE/API2/Qemu.pm

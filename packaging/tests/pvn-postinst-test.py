@@ -44,6 +44,7 @@ def run_scenario(
     late_marker_unsafe: bool = False,
     late_pid_query_failure: bool = False,
     consume_failure: bool = False,
+    compute_install_failure: bool = False,
     pid_base: int = 0,
     work_root: pathlib.Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]], bool, bool]:
@@ -91,6 +92,9 @@ def run_scenario(
         ("/usr/share/doc/pvn-node/examples/ovn-host.env", str(example)),
         ("/usr/lib/pvn/pvn-api-inject", str(commands / "pvn-api-inject")),
         ("/usr/lib/pvn/pvn-api-verify", str(commands / "pvn-api-verify")),
+        ("/usr/lib/pvn/pvn-compute-inject", str(commands / "pvn-compute-inject")),
+        ("/usr/lib/pvn/pvn-compute-verify", str(commands / "pvn-compute-verify")),
+        ("/usr/lib/pvn/pvn-pve-refresh", str(commands / "pvn-pve-refresh")),
         ("/usr/lib/pvn/pvn-ui-inject", str(commands / "pvn-ui-inject")),
         ("/usr/lib/pvn/pvn-ui-verify", str(commands / "pvn-ui-verify")),
         ("/usr/lib/pvn/pvn-ovn-northd", str(commands / "pvn-ovn-northd")),
@@ -109,65 +113,90 @@ def run_scenario(
     for name in (
         "pvn-api-inject",
         "pvn-api-verify",
+        "pvn-compute-inject",
+        "pvn-compute-verify",
+        "pvn-pve-refresh",
         "pvn-ui-inject",
         "pvn-ui-verify",
         "pvnctl",
         "pvn-ovn-northd",
     ):
-        write_executable(commands / name, "#!/bin/sh\nexit 0\n")
+        write_executable(
+            commands / name,
+            """#!/bin/sh
+set -eu
+name=${0##*/}
+{
+    printf '{"action":"helper","arguments":["%s"' "$name"
+    for argument in "$@"; do
+        case "$argument" in
+            *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:=+,-]*)
+                echo "unsafe fake-helper argument: $argument" >&2
+                exit 70
+                ;;
+        esac
+        printf ',"%s"' "$argument"
+    done
+    printf ']}\\n'
+} >>"$FAKE_EVENTS"
+if [ "$name" = pvn-compute-inject ] && \
+    [ "${FAKE_COMPUTE_INSTALL_FAILURE:-no}" = yes ]; then
+    exit 72
+fi
+""",
+        )
     write_executable(
         commands / "dpkg-query",
-        """#!/usr/bin/python3
-import os, sys
-if "-f=${Version}" in sys.argv:
-    print(os.environ["FAKE_VERSION"])
-    raise SystemExit(0)
-raise SystemExit(2)
+        """#!/bin/sh
+set -eu
+for argument in "$@"; do
+    if [ "$argument" = '-f=${Version}' ]; then
+        printf '%s\\n' "$FAKE_VERSION"
+        exit 0
+    fi
+done
+exit 2
 """,
     )
     write_executable(
         commands / "install",
-        """#!/usr/bin/python3
-import os, pathlib, shutil, sys
-arguments = sys.argv[1:]
-directory = "-d" in arguments
-mode = None
-paths = []
-index = 0
-while index < len(arguments):
-    value = arguments[index]
-    if value in {"-m", "-o", "-g"}:
-        if value == "-m":
-            mode = int(arguments[index + 1], 8)
-        index += 2
-    elif value == "-d":
-        index += 1
-    else:
-        paths.append(value)
-        index += 1
-if directory:
-    for value in paths:
-        pathlib.Path(value).mkdir(parents=True, exist_ok=True)
-        if mode is not None:
-            os.chmod(value, mode)
-else:
-    source, destination = map(pathlib.Path, paths)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, destination)
-    if mode is not None:
-        destination.chmod(mode)
+        """#!/bin/sh
+set -eu
+directory=false
+mode=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -d) directory=true; shift ;;
+        -m) mode=$2; shift 2 ;;
+        -o|-g) shift 2 ;;
+        *) break ;;
+    esac
+done
+if [ "$directory" = true ]; then
+    mkdir -p -- "$@"
+    [ -z "$mode" ] || chmod "$mode" -- "$@"
+else
+    [ "$#" -eq 2 ] || exit 2
+    cp -- "$1" "$2"
+    [ -z "$mode" ] || chmod "$mode" -- "$2"
+fi
 """,
     )
     write_executable(
         commands / "systemctl",
-        """#!/usr/bin/python3
-import fcntl, json, os, pathlib, stat, sys
+        """#!/usr/bin/python3 -S
+import fcntl, os, stat, sys
 
 arguments = sys.argv[1:]
 action = arguments[0] if arguments else ""
-event = {"action": action, "arguments": arguments[1:]}
-with pathlib.Path(os.environ["FAKE_EVENTS"]).open("a", encoding="utf-8") as stream:
-    stream.write(json.dumps(event) + "\\n")
+def quote(value):
+    if any(ord(character) < 32 for character in value):
+        raise SystemExit(70)
+    return '"' + value.replace('\\\\', '\\\\\\\\').replace('"', '\\\\"') + '"'
+event = '{"action":' + quote(action) + ',"arguments":[' \
+    + ','.join(quote(value) for value in arguments[1:]) + ']}\\n'
+with open(os.environ["FAKE_EVENTS"], "a", encoding="utf-8") as stream:
+    stream.write(event)
 
 def yes(name):
     return os.environ.get(name) == "yes"
@@ -175,18 +204,22 @@ def yes(name):
 def verify_transition():
     if not yes("FAKE_CENTRAL_ACTIVE"):
         return
-    marker = pathlib.Path(os.environ["FAKE_RESTART_MARKER"])
-    auth = pathlib.Path(os.environ["FAKE_PACKAGE_AUTH"])
-    if marker.read_text(encoding="ascii") != os.environ["FAKE_VERSION"] + "\\n":
+    marker = os.environ["FAKE_RESTART_MARKER"]
+    auth = os.environ["FAKE_PACKAGE_AUTH"]
+    with open(marker, encoding="ascii") as stream:
+        marker_content = stream.read()
+    if marker_content != os.environ["FAKE_VERSION"] + "\\n":
         raise SystemExit(81)
-    metadata = auth.stat()
+    metadata = os.stat(auth)
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
         raise SystemExit(82)
-    if auth.read_text(encoding="ascii") != os.environ["FAKE_VERSION"] + "\\n":
+    with open(auth, encoding="ascii") as stream:
+        auth_content = stream.read()
+    if auth_content != os.environ["FAKE_VERSION"] + "\\n":
         raise SystemExit(83)
     descriptor = os.open(auth, os.O_RDONLY)
     try:
-        if pathlib.Path("/proc/self/fd/9").exists():
+        if os.path.exists("/proc/self/fd/9"):
             raise SystemExit(85)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -199,13 +232,13 @@ def verify_transition():
 if action == "is-active":
     unit = arguments[-1]
     if unit == "pvn-node.target":
-        raise SystemExit(0 if pathlib.Path(os.environ["FAKE_ACTIVE_STATE"]).exists() else 3)
+        raise SystemExit(0 if os.path.exists(os.environ["FAKE_ACTIVE_STATE"]) else 3)
     if unit == "pvn-central.target":
         raise SystemExit(0 if yes("FAKE_CENTRAL_ACTIVE") else 3)
     if unit == "pvn-node-ready.service":
-        raise SystemExit(0 if pathlib.Path(os.environ["FAKE_READY_STATE"]).exists() else 3)
+        raise SystemExit(0 if os.path.exists(os.environ["FAKE_READY_STATE"]) else 3)
     if unit in {"pvn-manager.service", "pvn-agent.service", "pvn-ovn-host-config.service", "ovn-controller.service"}:
-        raise SystemExit(0 if pathlib.Path(os.environ["FAKE_RESTARTED"]).exists() else 3)
+        raise SystemExit(0 if os.path.exists(os.environ["FAKE_RESTARTED"]) else 3)
     raise SystemExit(3)
 if action == "is-enabled":
     raise SystemExit(0 if yes("FAKE_NODE_ENABLED") else 1)
@@ -222,37 +255,40 @@ if action == "show":
         "ovn-ovsdb-server-sb.service": 103,
         "ovn-northd.service": 104,
     }
-    if yes("FAKE_LATE_PID_QUERY_FAILURE") and pathlib.Path(os.environ["FAKE_FINAL_STARTED"]).exists():
+    if yes("FAKE_LATE_PID_QUERY_FAILURE") and os.path.exists(os.environ["FAKE_FINAL_STARTED"]):
         raise SystemExit(1)
     value = pids[unit] + int(os.environ["FAKE_PID_BASE"])
-    if yes("FAKE_PID_DRIFT") and pathlib.Path(os.environ["FAKE_RESTARTED"]).exists():
+    if yes("FAKE_PID_DRIFT") and os.path.exists(os.environ["FAKE_RESTARTED"]):
         value += 1000
-    if yes("FAKE_LATE_PID_DRIFT") and pathlib.Path(os.environ["FAKE_FINAL_STARTED"]).exists():
+    if yes("FAKE_LATE_PID_DRIFT") and os.path.exists(os.environ["FAKE_FINAL_STARTED"]):
         value += 2000
     print(value)
     raise SystemExit(0)
 if action == "restart" and "pvn-manager.service" in arguments:
     verify_transition()
-    pathlib.Path(os.environ["FAKE_RESTARTED"]).touch()
+    open(os.environ["FAKE_RESTARTED"], "a").close()
     raise SystemExit(1 if yes("FAKE_COMPONENT_FAILURE") else 0)
 if action == "stop" and "pvn-node.target" in arguments:
-    pathlib.Path(os.environ["FAKE_ACTIVE_STATE"]).unlink(missing_ok=True)
-    pathlib.Path(os.environ["FAKE_READY_STATE"]).unlink(missing_ok=True)
+    for path in (os.environ["FAKE_ACTIVE_STATE"], os.environ["FAKE_READY_STATE"]):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
     raise SystemExit(0)
 if action == "start" and arguments[1:] == ["pvn-node.target"]:
     verify_transition()
     if yes("FAKE_FINAL_FAILURE"):
-        pathlib.Path(os.environ["FAKE_ACTIVE_STATE"]).touch()
-        pathlib.Path(os.environ["FAKE_READY_STATE"]).touch()
+        open(os.environ["FAKE_ACTIVE_STATE"], "a").close()
+        open(os.environ["FAKE_READY_STATE"], "a").close()
         raise SystemExit(1)
     if not yes("FAKE_CONDITION_SKIP"):
-        pathlib.Path(os.environ["FAKE_ACTIVE_STATE"]).touch()
-        pathlib.Path(os.environ["FAKE_READY_STATE"]).touch()
-    pathlib.Path(os.environ["FAKE_FINAL_STARTED"]).touch()
+        open(os.environ["FAKE_ACTIVE_STATE"], "a").close()
+        open(os.environ["FAKE_READY_STATE"], "a").close()
+    open(os.environ["FAKE_FINAL_STARTED"], "a").close()
     if yes("FAKE_LATE_MARKER_UNSAFE"):
-        pathlib.Path(os.environ["FAKE_CENTRAL_ACTIVATION_MARKER"]).chmod(0o666)
+        os.chmod(os.environ["FAKE_CENTRAL_ACTIVATION_MARKER"], 0o666)
     if yes("FAKE_CONSUME_FAILURE"):
-        pathlib.Path(os.environ["FAKE_NODE_RESTART_INTENT"]).chmod(0o666)
+        os.chmod(os.environ["FAKE_NODE_RESTART_INTENT"], 0o666)
     raise SystemExit(0)
 raise SystemExit(0)
 """,
@@ -278,6 +314,7 @@ raise SystemExit(0)
             "FAKE_LATE_MARKER_UNSAFE": "yes" if late_marker_unsafe else "no",
             "FAKE_LATE_PID_QUERY_FAILURE": "yes" if late_pid_query_failure else "no",
             "FAKE_CONSUME_FAILURE": "yes" if consume_failure else "no",
+            "FAKE_COMPUTE_INSTALL_FAILURE": "yes" if compute_install_failure else "no",
             "FAKE_EVENTS": str(event_log),
             "FAKE_RESTARTED": str(restarted),
             "FAKE_ACTIVE_STATE": str(active_state),
@@ -382,6 +419,33 @@ transport, transport_events, _, _ = run_scenario(
 )
 check(transport.returncode == 0, f"clean transport stop failed: {transport.stderr}")
 check(not any(event["action"] == "start" for event in transport_events), "transport-only stop was activated")
+
+unsupported, unsupported_events, unsupported_auth, unsupported_intent = run_scenario(
+    node_active=False,
+    central_active=False,
+    compute_install_failure=True,
+)
+unsupported_helpers = [
+    event["arguments"][0]
+    for event in unsupported_events
+    if event["action"] == "helper"
+    and event["arguments"][0]
+    in {
+        "pvn-compute-inject",
+        "pvn-compute-verify",
+        "pvn-api-inject",
+        "pvn-api-verify",
+        "pvn-ui-inject",
+        "pvn-ui-verify",
+        "pvn-pve-refresh",
+    }
+]
+check(unsupported.returncode != 0, "unsupported qemu-server compute preflight was accepted")
+check(
+    unsupported_helpers == ["pvn-pve-refresh", "pvn-compute-inject"],
+    "compute preflight failure allowed later API/UI PVE mutations",
+)
+check(not unsupported_auth and not unsupported_intent, "compute preflight failure created restart authorization")
 
 for label, options in (
     ("clean stop", {}),

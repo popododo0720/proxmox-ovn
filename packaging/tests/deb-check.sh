@@ -41,6 +41,9 @@ for path in \
     usr/sbin/pvn-db-backup \
     usr/lib/pvn/pvn-api-inject \
     usr/lib/pvn/pvn-api-verify \
+    usr/lib/pvn/pvn-compute-inject \
+    usr/lib/pvn/pvn-compute-verify \
+    usr/lib/pvn/pvn-pve-refresh \
     usr/lib/pvn/pvn-ui-inject \
     usr/lib/pvn/pvn-loader.js \
     usr/lib/pvn/pvn-control-db-run \
@@ -57,9 +60,11 @@ for path in \
     usr/lib/pvn/pvn-topology \
     usr/lib/pvn/pvn-control-plane \
     usr/share/perl5/PVN/API2.pm \
+    usr/share/perl5/PVN/ComputeLifecycle.pm \
     usr/lib/systemd/system/pvn-node.target \
     usr/lib/systemd/system/pvn-node-ready.service \
     usr/lib/systemd/system/pvn-guest-gate.service \
+    usr/lib/systemd/system/pve-ha-lrm.service.d/90-pvn.conf \
     usr/lib/systemd/system/pvn-central.target \
     usr/lib/systemd/system/pvn-ovn-northd-ready.service \
     usr/lib/systemd/system/ovn-controller.service.d/90-pvn.conf \
@@ -98,6 +103,16 @@ check_packaged_payload pve-api/inject.sh \
     "$package_root/usr/lib/pvn/pvn-api-inject" 755
 check_packaged_payload pve-api/PVN/API2.pm \
     "$package_root/usr/share/perl5/PVN/API2.pm" 644
+check_packaged_payload pve-api/compute-inject.py \
+    "$package_root/usr/lib/pvn/pvn-compute-inject" 755
+check_packaged_payload pve-api/PVN/ComputeLifecycle.pm \
+    "$package_root/usr/share/perl5/PVN/ComputeLifecycle.pm" 644
+check_packaged_payload deploy/scripts/pvn-compute-verify \
+    "$package_root/usr/lib/pvn/pvn-compute-verify" 755
+check_packaged_payload deploy/scripts/pvn-pve-refresh \
+    "$package_root/usr/lib/pvn/pvn-pve-refresh" 755
+check_packaged_payload deploy/systemd/pve-ha-lrm.service.d/90-pvn.conf \
+    "$package_root/usr/lib/systemd/system/pve-ha-lrm.service.d/90-pvn.conf" 644
 check_packaged_payload pve-ui/inject.sh \
     "$package_root/usr/lib/pvn/pvn-ui-inject" 755
 check_packaged_payload pve-ui/pvn-loader.js \
@@ -136,6 +151,10 @@ for dependency in liburi-perl libwww-perl; do
         exit 1
     }
 done
+dpkg-deb -f "$deb" Depends | grep -Eq '(^|, )qemu-server \(= 9\.1\.15\)(,|$)' || {
+    echo "built package does not pin the exact supported qemu-server" >&2
+    exit 1
+}
 "$package_root/usr/sbin/pvn-manager" --version | grep -Fq "pvn-manager $package_version (" || {
     echo "pvn-manager build version does not match the package" >&2
     exit 1

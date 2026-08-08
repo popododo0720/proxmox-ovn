@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+injector=${PVN_COMPUTE_INJECTOR:-/usr/lib/pvn/pvn-compute-inject}
+[ -x "$injector" ] || {
+    echo "PVN compute lifecycle injector is missing" >&2
+    exit 1
+}
+exec "$injector" verify

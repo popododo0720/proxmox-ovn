@@ -1,12 +1,27 @@
 #!/bin/sh
 set -eu
 
-if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+case "$1" in
+remove|purge|abort-install|abort-upgrade|failed-upgrade|disappear)
+    pvn_pve_changed=false
+    if [ -x /usr/lib/pvn/pvn-compute-inject ]; then
+        /usr/lib/pvn/pvn-compute-inject remove
+        pvn_pve_changed=true
+    fi
+    if [ -x /usr/lib/pvn/pvn-api-inject ]; then
+        /usr/lib/pvn/pvn-api-inject remove
+        pvn_pve_changed=true
+    fi
     if [ -x /usr/lib/pvn/pvn-ui-inject ]; then
-        /usr/lib/pvn/pvn-ui-inject remove || true
+        /usr/lib/pvn/pvn-ui-inject remove
+        pvn_pve_changed=true
+    fi
+    if [ "$pvn_pve_changed" = true ] && [ -x /usr/lib/pvn/pvn-pve-refresh ]; then
+        /usr/lib/pvn/pvn-pve-refresh
     fi
     systemctl unmask ovn-host.service ovn-central.service >/dev/null 2>&1 || true
     systemctl daemon-reload >/dev/null 2>&1 || true
-fi
+    ;;
+esac
 
 exit 0
