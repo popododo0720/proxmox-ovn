@@ -1,3 +1,10 @@
+proxmox-ovn (0.4.2) unstable; urgency=medium
+
+  * Give privileged VM lifecycle requests per-resource response budgets,
+    preserve outer PVE deadlines, and allow bounded compensation to finish.
+
+ -- PVN Project <root@localhost>  Sat, 08 Aug 2026 02:52:04 +0000
+
 proxmox-ovn (0.4.1) unstable; urgency=medium
 
   * Verify graceful pvedaemon and pveproxy reloads by their replacement
