@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 VERSION ?= dev
-DEB_VERSION ?= 0.3.2
+DEB_VERSION ?= 0.4.0
 SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD 2>/dev/null || date +%s)
 ifeq ($(strip $(SOURCE_DATE_EPOCH)),)
 override SOURCE_DATE_EPOCH := $(shell git show -s --format=%ct HEAD 2>/dev/null || date +%s)

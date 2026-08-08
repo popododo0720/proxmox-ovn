@@ -1,3 +1,17 @@
+proxmox-ovn (0.4.0) unstable; urgency=medium
+
+  * Integrate fail-closed Proxmox VM start, clone, template, snapshot, and
+    destroy hooks with durable PVN port and IP allocation transactions.
+  * Coordinate online and offline migration, authoritative PVE HA recovery,
+    and fenced migration-to-HA takeover without releasing the VM lifecycle
+    slot.
+  * Add subnet DNS options, router static routes, and atomic reference guards
+    for deleting or failed network resources.
+  * Package signature-gated PVE 9.2 lifecycle injection and verified daemon
+    refresh and removal paths.
+
+ -- PVN Project <root@localhost>  Sat, 08 Aug 2026 01:25:00 +0000
+
 proxmox-ovn (0.3.2) unstable; urgency=medium
 
   * Split package and release validation into parallel, timed CI gates and
