@@ -8,6 +8,7 @@ use FindBin qw($Bin);
 use Digest::SHA qw(sha256_hex);
 use POSIX qw(strftime);
 use Test::More;
+use Time::HiRes ();
 
 use lib "$Bin/..";
 require PVN::ComputeLifecycle;
@@ -36,6 +37,85 @@ sub with_defaults {
     local $PVN::ComputeLifecycle::LIFECYCLE_ID_OVERRIDE =
         sub { return 'test-' . join('-', @_); };
     return $code->();
+}
+
+my @timeout_cases = (
+    {
+        name => 'start',
+        payload => { nics => [map { +{} } 1 .. 32] },
+        expected => 970,
+    },
+    {
+        name => 'clone_prepare',
+        payload => { nics => [{}] },
+        expected => 120,
+    },
+    {
+        name => 'snapshot_cleanup',
+        payload => {},
+        expected => 90,
+    },
+    {
+        name => 'destroy_capture',
+        payload => {
+            nics => [{}, {}],
+            snapshots => [{}, {}, {}],
+        },
+        expected => 240,
+    },
+    {
+        name => 'migration_finalize',
+        payload => { transaction => { ports => [{}, {}, {}, {}] } },
+        expected => 210,
+    },
+    {
+        name => 'clone_commit',
+        payload => { ports => [map { +{} } 1 .. 100] },
+        expected => 1800,
+    },
+);
+my @effective_timeouts;
+with_defaults(sub {
+    local $PVN::ComputeLifecycle::REQUEST_OVERRIDE = sub {
+        my ($path, $payload, $request_timeout) = @_;
+        push @effective_timeouts, $request_timeout;
+        return {};
+    };
+    for my $case (@timeout_cases) {
+        PVN::ComputeLifecycle::_request($case->{name}, $case->{payload});
+    }
+});
+is_deeply(
+    \@effective_timeouts,
+    [map { $_->{expected} } @timeout_cases],
+    'request transport receives the per-action and per-item effective timeout',
+);
+my @lifecycle_actions = qw(
+    clone_prepare clone_commit clone_abort
+    migration_begin migration_finalize migration_abort
+    template_prepare template_commit template_abort
+    snapshot_create snapshot_prepare snapshot_commit snapshot_abort snapshot_cleanup
+    destroy_capture destroy_commit destroy_abort
+);
+is_deeply(
+    [map { PVN::ComputeLifecycle::_request_timeout($_, {}) } @lifecycle_actions],
+    [(90) x scalar(@lifecycle_actions)],
+    'every lifecycle mutation has an explicit long-timeout class',
+);
+{
+    my $attempts = 0;
+    local $PVN::ComputeLifecycle::REQUEST_OVERRIDE = sub {
+        $attempts++;
+        die $attempts == 1
+            ? "initial transport response lost\n"
+            : "terminal replay rejected\n";
+    };
+    my $completed = eval {
+        PVN::ComputeLifecycle::_request_bounded_retry('clone_prepare', { nics => [{}] }, 3);
+        1;
+    };
+    ok(!$completed, 'terminal replay failure remains an ambiguous lifecycle error');
+    like($@, qr/initial transport response lost/, 'bounded retry preserves the first response-loss error');
 }
 
 my $unmanaged_checks = 0;
@@ -653,6 +733,38 @@ is($finalize_attempts, 3, 'migration finalize has bounded idempotent retries');
     like($@, qr/request failed/, 'request failure text is preserved');
     my $remaining = alarm(0);
     cmp_ok($remaining, '>=', 19, 'failing nested timeout also preserves the outer alarm');
+}
+{
+    local $SIG{ALRM} = sub { die "outer timeout\n" };
+    alarm(20);
+    is(
+        PVN::ComputeLifecycle::_with_timeout(1800, 'lifecycle timeout', sub { return 'done' }),
+        'done',
+        'a long lifecycle timeout remains bounded by the PVE worker alarm',
+    );
+    my $remaining = alarm(0);
+    cmp_ok($remaining, '>=', 19, 'long lifecycle timeout restores the outer PVE worker alarm');
+}
+{
+    my $attempts = 0;
+    local $SIG{ALRM} = sub { die "outer timeout\n" };
+    local $PVN::ComputeLifecycle::REQUEST_OVERRIDE = sub {
+        $attempts++;
+        return PVN::ComputeLifecycle::_with_timeout(300, 'request timeout', sub {
+            select(undef, undef, undef, 0.2);
+            return {};
+        });
+    };
+    Time::HiRes::alarm(0.03);
+    my $completed = eval {
+        PVN::ComputeLifecycle::_request_bounded_retry('clone_prepare', { nics => [{}] }, 3);
+        1;
+    };
+    my $error = $@;
+    Time::HiRes::alarm(0);
+    ok(!$completed, 'an expired outer PVE alarm terminates a lifecycle request');
+    like($error, qr/outer timeout/, 'outer PVE alarm failure is preserved');
+    is($attempts, 1, 'bounded lifecycle retry does not swallow an outer PVE deadline');
 }
 
 done_testing();

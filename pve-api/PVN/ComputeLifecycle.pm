@@ -28,7 +28,12 @@ our $HA_MANAGED_OVERRIDE;
 our $HA_RUNTIME_OVERRIDE;
 
 my $MAX_RESPONSE = 8 << 20;
-my $REQUEST_TIMEOUT = 10;
+my $CONNECT_TIMEOUT = 10;
+my $READINESS_REQUEST_BASE_TIMEOUT = 10;
+my $LIFECYCLE_REQUEST_BASE_TIMEOUT = 90;
+my $REQUEST_ITEM_TIMEOUT = 30;
+my $REQUEST_MAX_TIMEOUT = 1800;
+my $OUTER_ALARM_EPOCH = 0;
 my $HA_STATE_FRESHNESS = 30;
 my $HA_FUTURE_TOLERANCE = 5;
 my @REQUIRED_UNITS = qw(
@@ -60,6 +65,56 @@ my %PATH = (
     destroy_commit => '/api/v1/runtime/compute/destroy/commit',
     destroy_abort => '/api/v1/runtime/compute/destroy/abort',
 );
+
+my %REQUEST_CLASS = (
+    start => 'readiness',
+    clone_prepare => 'lifecycle',
+    clone_commit => 'lifecycle',
+    clone_abort => 'lifecycle',
+    migration_begin => 'lifecycle',
+    migration_finalize => 'lifecycle',
+    migration_abort => 'lifecycle',
+    template_prepare => 'lifecycle',
+    template_commit => 'lifecycle',
+    template_abort => 'lifecycle',
+    snapshot_create => 'lifecycle',
+    snapshot_prepare => 'lifecycle',
+    snapshot_commit => 'lifecycle',
+    snapshot_abort => 'lifecycle',
+    snapshot_cleanup => 'lifecycle',
+    destroy_capture => 'lifecycle',
+    destroy_commit => 'lifecycle',
+    destroy_abort => 'lifecycle',
+);
+
+sub _lifecycle_item_count {
+    my ($payload) = @_;
+    return 0 if ref($payload) ne 'HASH';
+
+    my $count = 0;
+    for my $field (qw(nics ports snapshots intents blueprints)) {
+        $count += scalar(@{ $payload->{$field} }) if ref($payload->{$field}) eq 'ARRAY';
+    }
+    $count += _lifecycle_item_count($payload->{transaction})
+        if ref($payload->{transaction}) eq 'HASH';
+    return $count;
+}
+
+sub _request_timeout {
+    my ($name, $payload) = @_;
+    die "unknown PVN lifecycle request '$name'\n" if !defined($PATH{$name});
+    die "PVN lifecycle request '$name' has no timeout class\n"
+        if !defined($REQUEST_CLASS{$name});
+    my $base_timeout = $REQUEST_CLASS{$name} eq 'readiness'
+        ? $READINESS_REQUEST_BASE_TIMEOUT
+        : $REQUEST_CLASS{$name} eq 'lifecycle'
+            ? $LIFECYCLE_REQUEST_BASE_TIMEOUT
+            : die "PVN lifecycle request '$name' has an invalid timeout class\n";
+    my $timeout = $base_timeout + $REQUEST_ITEM_TIMEOUT * _lifecycle_item_count($payload);
+    return $timeout < $REQUEST_MAX_TIMEOUT
+        ? $timeout
+        : $REQUEST_MAX_TIMEOUT;
+}
 
 sub _write_all {
     my ($socket, $data) = @_;
@@ -100,6 +155,7 @@ sub _with_timeout {
         local $SIG{ALRM} = sub {
             if ($outer_wins) {
                 $outer_expired = 1;
+                $OUTER_ALARM_EPOCH++;
                 if (ref($outer_handler) eq 'CODE') {
                     return $outer_handler->();
                 }
@@ -128,13 +184,13 @@ sub _with_timeout {
 }
 
 sub _unix_post {
-    my ($path, $payload) = @_;
+    my ($path, $payload, $request_timeout) = @_;
     die "PVN compute lifecycle calls require root\n" if $> != 0;
     my $body = encode_json($payload);
     my $socket = IO::Socket::UNIX->new(
         Type => SOCK_STREAM,
         Peer => $COMPUTE_SOCKET,
-        Timeout => $REQUEST_TIMEOUT,
+        Timeout => $CONNECT_TIMEOUT,
     );
     die "PVN privileged compute manager is unavailable\n" if !$socket;
 
@@ -146,7 +202,7 @@ sub _unix_post {
         . "Connection: close\r\n\r\n$body";
     my ($raw, $error);
     eval {
-        $raw = _with_timeout($REQUEST_TIMEOUT, 'PVN compute request timed out', sub {
+        $raw = _with_timeout($request_timeout, 'PVN compute request timed out', sub {
             _write_all($socket, $request);
             return _read_all($socket);
         });
@@ -179,23 +235,27 @@ sub _request {
     my ($name, $payload) = @_;
     die "unknown PVN lifecycle request '$name'\n" if !defined($PATH{$name});
     die "PVN lifecycle payload must be an object\n" if ref($payload) ne 'HASH';
+    my $request_timeout = _request_timeout($name, $payload);
     my $result = $REQUEST_OVERRIDE
-        ? $REQUEST_OVERRIDE->($PATH{$name}, $payload)
-        : _unix_post($PATH{$name}, $payload);
+        ? $REQUEST_OVERRIDE->($PATH{$name}, $payload, $request_timeout)
+        : _unix_post($PATH{$name}, $payload, $request_timeout);
     die "PVN lifecycle response must be an object\n" if ref($result) ne 'HASH';
     return $result;
 }
 
 sub _request_bounded_retry {
     my ($name, $payload, $attempts) = @_;
-    my $last_error = '';
+    my $first_error;
     for my $attempt (1 .. $attempts) {
+        my $outer_alarm_epoch = $OUTER_ALARM_EPOCH;
         my $result = eval { _request($name, $payload) };
         return $result if !$@;
-        $last_error = $@;
+        my $error = $@;
+        $first_error = $error if !defined($first_error);
+        die $error if $OUTER_ALARM_EPOCH != $outer_alarm_epoch;
         select(undef, undef, undef, 0.1 * $attempt) if $attempt < $attempts;
     }
-    die $last_error;
+    die $first_error;
 }
 
 sub _net_parts {

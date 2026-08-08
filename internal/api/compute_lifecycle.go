@@ -29,7 +29,7 @@ const (
 	computeHAAction          = "compute-ha-rebind"
 	computePayloadVersion    = 1
 	computeIntentLifetime    = 15 * time.Minute
-	computeRecoveryTimeout   = 15 * time.Second
+	computeRecoveryTimeout   = 15 * time.Minute
 	computeHAProofFreshness  = 30 * time.Second
 	computeHAProofFutureSkew = 5 * time.Second
 	haStabilizationDelay     = 30 * time.Second

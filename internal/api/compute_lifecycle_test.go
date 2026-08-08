@@ -26,6 +26,12 @@ type computeTestReconciler struct {
 	failCalls   map[int]bool
 }
 
+func TestComputeRecoveryBudgetCoversLongLifecycleReconciliation(t *testing.T) {
+	if computeRecoveryTimeout < 15*time.Minute {
+		t.Fatalf("compute recovery timeout=%v want at least 15m", computeRecoveryTimeout)
+	}
+}
+
 func (reconciler *computeTestReconciler) Reconcile(ctx context.Context, kind model.Kind, id string) error {
 	return reconciler.mark(ctx, kind, id)
 }

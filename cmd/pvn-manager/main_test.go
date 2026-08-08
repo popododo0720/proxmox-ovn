@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -16,6 +17,16 @@ import (
 	pvnconfig "github.com/popododo0720/proxmox-ovn/internal/config"
 	"github.com/popododo0720/proxmox-ovn/internal/pki"
 )
+
+func TestComputeServerAllowsLongLifecycleResponses(t *testing.T) {
+	server := newComputeHTTPServer(http.NotFoundHandler())
+	if server.WriteTimeout != 31*time.Minute {
+		t.Fatalf("compute write timeout=%v want=%v", server.WriteTimeout, 31*time.Minute)
+	}
+	if server.ReadHeaderTimeout != 5*time.Second || server.ReadTimeout != 30*time.Second || server.IdleTimeout != 30*time.Second {
+		t.Fatalf("compute transport short deadlines changed: %#v", server)
+	}
+}
 
 func TestApplyClusterConfigPinsManagerSockets(t *testing.T) {
 	target := managerConfig{runtimeSocket: "flag-runtime", browserSocket: "old-browser", computeSocket: defaultManagerComputeSocket, clusterName: "old-cluster"}

@@ -45,7 +45,23 @@ type managerConfig struct {
 	shutdownWait    time.Duration
 }
 
-const defaultManagerComputeSocket = "/run/pvn-compute/manager.sock"
+const (
+	defaultManagerComputeSocket = "/run/pvn-compute/manager.sock"
+	// The privileged PVE client caps lifecycle responses at 30 minutes. Keep
+	// the server write deadline just beyond that cap so the client or an outer
+	// PVE worker deadline, rather than net/http, owns cancellation.
+	computeServerWriteTimeout = 31 * time.Minute
+)
+
+func newComputeHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      computeServerWriteTimeout,
+		IdleTimeout:       30 * time.Second,
+	}
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -180,13 +196,7 @@ func run(arguments []string) error {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
-	computeServer := &http.Server{
-		Handler:           handler.ComputeHandler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       30 * time.Second,
-	}
+	computeServer := newComputeHTTPServer(handler.ComputeHandler())
 	runtimeListener, err := listenUnix(defaults.runtimeSocket)
 	if err != nil {
 		return fmt.Errorf("listen for PVN runtime API: %w", err)
