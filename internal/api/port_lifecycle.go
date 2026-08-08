@@ -311,6 +311,9 @@ func (s *Server) reportPort(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if current.BindingStatus == report.Status {
+		if current.State != model.ResourceReady || current.AppliedRevision != current.Revision {
+			current = s.reconcileAndReload(request.Context(), current).(*model.Port)
+		}
 		setETag(writer, current.Revision)
 		writeJSON(writer, http.StatusOK, map[string]any{"data": current})
 		return

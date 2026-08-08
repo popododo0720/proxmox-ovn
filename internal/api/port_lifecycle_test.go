@@ -10,6 +10,7 @@ import (
 
 	"github.com/popododo0720/proxmox-ovn/internal/controlstore"
 	"github.com/popododo0720/proxmox-ovn/internal/model"
+	"github.com/popododo0720/proxmox-ovn/internal/reconcile"
 )
 
 type lifecycleSessionProvider struct {
@@ -216,6 +217,36 @@ func TestRuntimePortReportsUseGenerationCASAndAreUnixOnly(t *testing.T) {
 	unbound := decodeData[model.Port](t, unboundResponse)
 	if unbound.BindingStatus != model.PortUnbound || unbound.NodeID != "" || unbound.VMID != 0 || unbound.NIC != "" || unbound.RequestedChassis != "" || unbound.Generation != detaching.Generation {
 		t.Fatalf("unbound port = %#v", unbound)
+	}
+}
+
+func TestRuntimePortReportReplayRepairsPersistedSameStatusPendingState(t *testing.T) {
+	store, _, node, port := lifecycleTopology(t)
+	port.NodeID, port.VMID, port.NIC, port.RequestedChassis = node.ID, 100, "net0", node.ChassisID
+	port.BindingStatus, port.Generation = model.PortBound, 2
+	persisted, _, err := store.Update(context.Background(), port, port.Revision, "persist-bound-before-response-loss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := persisted.(*model.Port)
+	if pending.State != model.ResourcePending || pending.AppliedRevision == pending.Revision {
+		t.Fatalf("response-loss fixture is not pending: %#v", pending)
+	}
+	provider := &lifecycleSessionProvider{authenticated: true, session: Session{User: "root@pam", Permissions: map[string]any{"/": map[string]bool{"SDN.Audit": true}}}}
+	controller := reconcile.NewController(store, reconcile.NewFakeRenderer())
+	apiServer, err := New(Options{Store: store, Reconciler: controller})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newTestAPIHandler(apiServer, provider)
+	reportPath := "/api/v1/runtime/ports/" + port.ID + "/report"
+	replayed := request(t, server.RuntimeHandler(), http.MethodPost, reportPath, map[string]any{"generation": 2, "status": "bound"}, nil)
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("same-status report replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+	repaired := decodeData[model.Port](t, replayed)
+	if repaired.BindingStatus != model.PortBound || repaired.State != model.ResourceReady || repaired.AppliedRevision != repaired.Revision || repaired.Revision != pending.Revision {
+		t.Fatalf("same-status report replay did not repair exact revision: %#v", repaired)
 	}
 }
 
