@@ -1,3 +1,10 @@
+proxmox-ovn (0.4.3) unstable; urgency=medium
+
+  * Allow a migrated target agent to report the same port generation after
+    the manager advances its binding revision.
+
+ -- PVN Project <root@localhost>  Sat, 08 Aug 2026 03:32:19 +0000
+
 proxmox-ovn (0.4.2) unstable; urgency=medium
 
   * Give privileged VM lifecycle requests per-resource response budgets,
