@@ -25,6 +25,7 @@ def run(
     quorate: bool = True,
     inactive_unit: str = "",
     stale_unit: str = "",
+    partial_unit: str = "",
     fail_unit: str = "",
     check_only: bool = False,
 ):
@@ -42,6 +43,37 @@ def run(
         for unit, values in initial_state.items():
             for field, value in values.items():
                 (state / f"{unit}.{field}").write_text(f"{value}\n", encoding="ascii")
+        proc_root = root / "proc"
+
+        def write_process(pid: int, ppid: int, starttime: int) -> None:
+            process = proc_root / str(pid)
+            process.mkdir(parents=True, exist_ok=True)
+            fields = [
+                str(pid),
+                "(worker)",
+                "S",
+                str(ppid),
+                *(["0"] * 17),
+                str(starttime),
+            ]
+            (process / "stat").write_text(" ".join(fields) + "\n", encoding="ascii")
+
+        worker_sets = {
+            "pvedaemon.service": ([1101, 1102, 1103], [1201, 1202, 1203]),
+            "pveproxy.service": ([2101, 2102, 2103], [2201, 2202, 2203]),
+        }
+        for unit, (old_workers, new_workers) in worker_sets.items():
+            master_pid = initial_state[unit]["pid"]
+            task = proc_root / str(master_pid) / "task" / str(master_pid)
+            task.mkdir(parents=True)
+            (task / "children").write_text(
+                " ".join(str(pid) for pid in old_workers) + "\n", encoding="ascii"
+            )
+            for index, pid in enumerate((*old_workers, *new_workers), start=1):
+                write_process(pid, master_pid, 10_000 + index)
+            (state / f"{unit}.new_workers").write_text(
+                " ".join(str(pid) for pid in new_workers) + "\n", encoding="ascii"
+            )
         events = root / "events"
         executable(
             commands / "systemctl",
@@ -103,8 +135,19 @@ case "$action" in
         if [ "$unit" != "${STALE_UNIT:-}" ]; then
             pid=$(read_state pid)
             generation=$(read_state generation)
-            printf '%s\n' "$((pid + 1))" >"$STATE/$unit.pid"
-            printf '%s\n' "$((generation + 1))" >"$STATE/$unit.generation"
+            if [ "$action" = restart ]; then
+                printf '%s\n' "$((pid + 1))" >"$STATE/$unit.pid"
+                printf '%s\n' "$((generation + 1))" >"$STATE/$unit.generation"
+            else
+                old_workers=$(cat "$PROC_ROOT/$pid/task/$pid/children")
+                new_workers=$(cat "$STATE/$unit.new_workers")
+                if [ "$unit" = "${PARTIAL_UNIT:-}" ]; then
+                    set -- $new_workers
+                    new_workers="$1 $2"
+                fi
+                printf '%s %s\n' "$old_workers" "$new_workers" \
+                    >"$PROC_ROOT/$pid/task/$pid/children"
+            fi
         fi
         ;;
     *) exit 2 ;;
@@ -126,7 +169,10 @@ esac
                 "QUORATE": "Yes" if quorate else "No",
                 "INACTIVE_UNIT": inactive_unit,
                 "STALE_UNIT": stale_unit,
+                "PARTIAL_UNIT": partial_unit,
                 "FAIL_UNIT": fail_unit,
+                "PVN_PVE_REFRESH_PROC_ROOT": str(proc_root),
+                "PROC_ROOT": str(proc_root),
             }
         )
         command = [str(SCRIPT)]
@@ -158,8 +204,8 @@ assert mutations(inactive_lrm_calls) == [
     ["reload", "pvedaemon.service"],
     ["reload", "pveproxy.service"],
 ]
-assert inactive_lrm_state["pvedaemon.service"]["pid"] == 102
-assert inactive_lrm_state["pveproxy.service"]["pid"] == 202
+assert inactive_lrm_state["pvedaemon.service"] == {"pid": 101, "generation": 1001}
+assert inactive_lrm_state["pveproxy.service"] == {"pid": 201, "generation": 2001}
 
 healthy, healthy_calls, healthy_state = run()
 assert healthy.returncode == 0, healthy.stderr
@@ -169,6 +215,8 @@ assert mutations(healthy_calls) == [
     ["reload", "pveproxy.service"],
 ]
 assert healthy_state["pve-ha-lrm.service"]["generation"] == 3002
+assert healthy_state["pvedaemon.service"] == {"pid": 101, "generation": 1001}
+assert healthy_state["pveproxy.service"] == {"pid": 201, "generation": 2001}
 
 for label, options, expected in (
     ("no quorum", {"quorate": False}, "without quorum"),
@@ -200,8 +248,21 @@ for unit, expected_prior_mutations in (
     ),
 ):
     stale, stale_calls, _ = run(stale_unit=unit)
-    assert stale.returncode != 0 and "new active process generation" in stale.stderr
+    expected_error = (
+        "new active process generation"
+        if unit == "pve-ha-lrm.service"
+        else "complete new active worker generation"
+    )
+    assert stale.returncode != 0 and expected_error in stale.stderr
     assert mutations(stale_calls) == expected_prior_mutations
+
+partial, partial_calls, _ = run(partial_unit="pvedaemon.service")
+assert partial.returncode != 0
+assert "complete new active worker generation" in partial.stderr
+assert mutations(partial_calls) == [
+    ["restart", "pve-ha-lrm.service"],
+    ["reload", "pvedaemon.service"],
+]
 
 reload_failure, reload_failure_calls, _ = run(fail_unit="pvedaemon.service")
 assert reload_failure.returncode != 0

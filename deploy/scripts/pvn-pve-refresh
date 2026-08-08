@@ -7,6 +7,8 @@ case "$#:${1:-}" in
     *) echo "usage: pvn-pve-refresh [--check]" >&2; exit 2 ;;
 esac
 
+proc_root=${PVN_PVE_REFRESH_PROC_ROOT:-/proc}
+
 capture_active_generation() {
     unit=$1
     label=$2
@@ -35,6 +37,51 @@ split_generation() {
     IFS=$old_ifs
     [ "$#" -eq 2 ] || return 1
     printf '%s\n%s\n' "$1" "$2"
+}
+
+capture_worker_generations() {
+    master_pid=$1
+    children_file="$proc_root/$master_pid/task/$master_pid/children"
+    [ -r "$children_file" ] || return 1
+    children=$(cat "$children_file") || return 1
+    [ -n "$children" ] || return 1
+
+    generations=
+    for child_pid in $children; do
+        case "$child_pid" in
+            *[!0-9]*|0|'') continue ;;
+        esac
+        stat=$(cat "$proc_root/$child_pid/stat" 2>/dev/null) || continue
+        # The comm field is parenthesized and may contain spaces. Strip it
+        # before selecting ppid (field 4) and starttime (field 22).
+        stat=${stat##*) }
+        set -- $stat
+        [ "$#" -ge 20 ] || continue
+        [ "$2" = "$master_pid" ] || continue
+        shift 19
+        starttime=$1
+        case "$starttime" in
+            *[!0-9]*|0|'') continue ;;
+        esac
+        identity=$child_pid:$starttime
+        if [ -n "$generations" ]; then
+            generations="$generations
+$identity"
+        else
+            generations=$identity
+        fi
+    done
+    [ -n "$generations" ] || return 1
+    printf '%s\n' "$generations"
+}
+
+worker_generation_count() {
+    generations=$1
+    count=0
+    for unused in $generations; do
+        count=$((count + 1))
+    done
+    printf '%s\n' "$count"
 }
 
 verify_new_generation() {
@@ -66,11 +113,61 @@ verify_new_generation() {
     return 1
 }
 
+verify_new_worker_generation() {
+    unit=$1
+    label=$2
+    before_workers=$3
+    before_count=$(worker_generation_count "$before_workers")
+    attempt=1
+    while [ "$attempt" -le 40 ]; do
+        state=$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null || true)
+        if [ "$state" = active ]; then
+            after_pid=$(systemctl show --property=MainPID --value "$unit" 2>/dev/null || true)
+            case "$after_pid" in
+                *[!0-9]*|0|'') ;;
+                *)
+                    after_workers=$(capture_worker_generations "$after_pid" 2>/dev/null || true)
+                    new_count=0
+                    for after_worker in $after_workers; do
+                        existed=false
+                        for before_worker in $before_workers; do
+                            if [ "$after_worker" = "$before_worker" ]; then
+                                existed=true
+                                break
+                            fi
+                        done
+                        [ "$existed" = true ] || new_count=$((new_count + 1))
+                    done
+                    if [ "$new_count" -ge "$before_count" ]; then
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+        attempt=$((attempt + 1))
+        [ "$attempt" -le 40 ] && sleep 0.25
+    done
+    echo "$label did not enter a complete new active worker generation" >&2
+    return 1
+}
+
 # Finish every read-only safety check before changing even one daemon
 # generation. This prevents an inquorate or transitional HA node from ending
 # with only part of the PVE worker set using the new lifecycle hooks.
 pvedaemon_before=$(capture_active_generation pvedaemon.service pvedaemon)
 pveproxy_before=$(capture_active_generation pveproxy.service pveproxy)
+set -- $(split_generation "$pvedaemon_before")
+pvedaemon_pid_before=$1
+pvedaemon_workers_before=$(capture_worker_generations "$pvedaemon_pid_before") || {
+    echo "pvedaemon has no stable active worker generation" >&2
+    exit 1
+}
+set -- $(split_generation "$pveproxy_before")
+pveproxy_pid_before=$1
+pveproxy_workers_before=$(capture_worker_generations "$pveproxy_pid_before") || {
+    echo "pveproxy has no stable active worker generation" >&2
+    exit 1
+}
 
 lrm_state=$(systemctl show --property=ActiveState --value pve-ha-lrm.service 2>/dev/null || true)
 lrm_refresh=false
@@ -108,16 +205,10 @@ if [ "$lrm_refresh" = true ]; then
         "$lrm_pid_before" "$lrm_generation_before"
 fi
 
-set -- $(split_generation "$pvedaemon_before")
-pvedaemon_pid_before=$1
-pvedaemon_generation_before=$2
 systemctl reload pvedaemon.service
-verify_new_generation pvedaemon.service pvedaemon \
-    "$pvedaemon_pid_before" "$pvedaemon_generation_before"
+verify_new_worker_generation pvedaemon.service pvedaemon \
+    "$pvedaemon_workers_before"
 
-set -- $(split_generation "$pveproxy_before")
-pveproxy_pid_before=$1
-pveproxy_generation_before=$2
 systemctl reload pveproxy.service
-verify_new_generation pveproxy.service pveproxy \
-    "$pveproxy_pid_before" "$pveproxy_generation_before"
+verify_new_worker_generation pveproxy.service pveproxy \
+    "$pveproxy_workers_before"
