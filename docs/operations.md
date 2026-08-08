@@ -176,11 +176,32 @@ Repeat on all online nodes before activating any one of them. Confirm that
 `pvn-node.target` and `pvn-central.target` are disabled and inactive, and that
 neither `/etc/pvn/node-enabled` nor `/etc/pvn/central/enabled` exists.
 
-On PVE 9, package configuration fails if the exact tested template signature
-cannot be patched or if the installed loader differs from the packaged copy.
-`pvn-ui-verify` performs the same read-only check. Other PVE major versions are
-left unchanged by the UI installer; they also fail the later PVE 9 doctor check
-and therefore cannot be activated accidentally.
+The package depends on exact `qemu-server (= 9.1.15)`. Before changing any PVE
+source, package configuration checks the signatures of
+`/usr/share/perl5/PVE/QemuServer.pm`,
+`/usr/share/perl5/PVE/QemuMigrate.pm`, and
+`/usr/share/perl5/PVE/API2/Qemu.pm`. The compute injector uses an exclusive
+root-owned lock and replacement journal, verifies every marked block, and Perl
+compiles all three results. An unknown or locally modified signature fails
+configuration before mutation; do not override that failure or upgrade
+`qemu-server` independently of a PVN release that supports it. Debian triggers
+repeat verification when any of those files changes.
+
+The same preflight proves that `pvedaemon` and `pveproxy` have stable active
+generations and that `pve-ha-lrm` is either inactive, or active with quorum and
+a restartable generation. After injection, an active LRM is restarted first;
+`pvedaemon` and `pveproxy` are then reloaded. Every affected process must enter
+a newer active generation. A failed or transitional LRM, missing quorum, or a
+stale worker generation fails package configuration; an inactive LRM is never
+started as a side effect. The packaged LRM drop-in also orders it after
+`pvn-node-ready.service` at boot.
+
+The PVE UI adapter remains separately template-gated. Package configuration
+fails if the exact tested template signature cannot be patched or if the
+installed loader differs from the packaged copy. `pvn-ui-verify` performs the
+same read-only check. Other PVE major versions are left unchanged by the UI
+installer; they also fail the later PVE 9 doctor check and cannot be activated
+accidentally.
 
 ## 3. Apply the inert host topology
 
@@ -419,10 +440,24 @@ the local marker is absent. When the marker exists, a failed readiness check
 fails that `pve-guests.service` start, so all guests on that host—not only PVN
 guests—remain stopped for operator review. The gate is a one-shot and is not
 coupled to later service failures, so it does not automatically stop already
-running guests. It also cannot intercept a later manual VM start through the
-PVE UI/API; until a future PVE start/HA integration exists, enforce operational
-policy that tenant VMs start only while `pvn-node-ready.service` is active on
-their node. A VM started outside that policy can boot with a disconnected TAP.
+running guests.
+
+Independently of that boot gate, every QEMU start whose configuration contains
+a `bridge=br-int` NIC passes through the injected PVN pre-start fence before
+any user hookscript. Manual, API, migration, and HA paths all require the local
+PVN targets and runtime services to be active, `pvn-node-ready.service` to have
+succeeded, and the agent's loopback health response to report one fresh,
+error-free TAP scan. Non-PVN QEMU configurations bypass this network fence.
+
+The manager then proves the complete port set and rejects wrong-chassis state,
+an unproved dual-chassis migration, or any incompatible active compute
+lifecycle. An ordinary start never guesses how to recover an active or expired
+migration. Incoming online migration is admitted only by its exact fresh
+source/target transaction. For a VM present in PVE HA configuration, a manual
+UI/API/CLI start is deliberately rejected: only the root PVE HA worker may
+supply fresh quorate CRM/LRM assignment, service UID, node-state, and agent-lock
+proof for that target. Do not bypass these failures by editing QEMU Perl files,
+port chassis, or lifecycle records.
 
 After changing `/etc/pve/pvn/config.json`, refresh the credential copy and
 local settings one node at a time:
@@ -1163,6 +1198,37 @@ OVN state while attachments remain fail-closed.
 Use [`database-backup.md`](database-backup.md) for the packaged create/verify
 commands and the deliberately manual, one-database-at-a-time restore runbook.
 There is no automatic restore subcommand.
+
+### QEMU lifecycle hook repair
+
+Stop new VM starts, migrations, HA actions, clones, snapshots, template
+conversions, and destroys while investigating a hook failure. These checks are
+read-only:
+
+```sh
+/usr/lib/pvn/pvn-compute-verify
+/usr/lib/pvn/pvn-pve-refresh --check
+systemctl --no-pager --full status \
+  pvn-node-ready pvn-manager pvn-agent pvedaemon pveproxy pve-ha-lrm
+```
+
+If the verifier reports an unknown signature, restore the exact supported
+`qemu-server` 9.1.15 package and reinstall the verified `pvn-node` DEB; never
+copy a patched Perl file from another node. For a known signature that only
+lost marked blocks, the package's compute-only repair sequence is:
+
+```sh
+/usr/lib/pvn/pvn-pve-refresh --check
+/usr/lib/pvn/pvn-compute-inject install
+/usr/lib/pvn/pvn-compute-verify
+/usr/lib/pvn/pvn-pve-refresh
+```
+
+Require the final verifier and node readiness to pass on that node before
+unfreezing guest operations. If a start reports an active lifecycle, keep the
+VM stopped and preserve the returned operation/transaction identity. Retry or
+finish the same PVE operation; there is no generic force-clear or ordinary
+start fallback for an ambiguous transaction.
 
 If an activated node blocks `pve-guests` during boot, inspect
 `pvn-node-ready.service` and fix its reported local or control-plane failure.

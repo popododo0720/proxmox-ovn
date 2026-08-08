@@ -21,6 +21,8 @@ even-sized clusters are rejected before topology changes.
 - flat and VLAN provider networks
 - stateful security groups with a reserved cluster-global default
 - running VM NIC attach and detach
+- fail-closed QEMU start, clone, template, snapshot, and destroy integration
+- coordinated QEMU online migration and HA starts with durable network intent
 - native ExtJS `PVN` tree in the Proxmox web interface
 
 The native **Networks** workspace keeps logical networks and physical provider
@@ -33,8 +35,11 @@ Normal PVN tables, selectors, confirmations, and bounded error messages resolve
 known resource references to human names. Unknown UUIDs are redacted there;
 open **Details** when an operator needs the full, copyable internal UUID.
 
-PVE built-in SDN, BGP, IPv6, LXC, load balancing, metadata service, and live
-migration coordination are intentionally outside the first release.
+PVE built-in SDN, BGP, IPv6, LXC, load balancing, and metadata service are
+intentionally outside the first release. QEMU lifecycle support is deliberately
+narrow: the package requires exact `qemu-server` 9.1.15 sources. An unknown or
+modified PVE signature fails package configuration instead of leaving VM starts
+unfenced; there is no compatibility override.
 
 ## Install
 

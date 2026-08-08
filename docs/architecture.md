@@ -120,6 +120,50 @@ Detach performs the reverse sequence. An unknown TAP remains unbound. Direct
 edits that conflict with PVN ownership are reported as drift and are not
 silently overwritten.
 
+### PVE QEMU lifecycle boundary
+
+The package version-gates and signature-gates three `qemu-server` 9.1.15 files:
+`PVE/QemuServer.pm`, `PVE/QemuMigrate.pm`, and `PVE/API2/Qemu.pm`. It inserts
+marked calls to `PVN::ComputeLifecycle` under one root-owned injector lock and
+an atomic replacement journal, then requires every patched Perl file to
+compile. An unknown or modified signature fails package configuration; a
+recorded interrupted replacement is recovered before another injection
+attempt. PVN does not use per-VM hookscripts; its pre-start fence runs before,
+and preserves the ordering of, an existing user hookscript.
+
+The Perl module sends bounded, idempotent requests over the fixed
+`/run/pvn-compute/manager.sock` Unix socket. The manager accepts only a local
+UID-0 peer, pins the request to that PVE node, and never exposes this API to the
+browser. Only NICs whose exact PVE bridge is `br-int` participate. Before such
+a VM starts, the hook requires the local PVN runtime and node-readiness units,
+a successful agent binding scan, and a manager decision for the complete NIC
+set.
+
+Compute changes use durable per-VM transactions:
+
+- an ordinary start is rejected while any incompatible lifecycle is active;
+  dual-chassis ports require the exact fresh incoming-migration transaction;
+- migration begins on the source, passes `migratedfrom` to target pre-start,
+  and finalizes only after source QEMU/configuration cleanup. Failures before
+  completed source cleanup abort; a finalization failure preserves the durable
+  intent and reports a task error. An expired or ambiguous move remains fenced
+  for explicit completion rather than being inferred from an ordinary start;
+- an HA-managed VM starts only from the root PVE HA worker with fresh quorate
+  CRM assignment, active LRM state, node state, service command UID, and agent
+  lock proof. A manual UI/API start of that HA-managed VM has no such proof and
+  fails closed;
+- clone, template conversion, snapshot rollback/delete, and destroy use
+  prepare/capture followed by exact commit or abort. Snapshot identity includes
+  immutable `snaptime`; clone ports stay disconnected until commit; and
+  response-loss paths preserve their durable intent instead of guessing a
+  rollback.
+
+Snapshot creation is recorded only after PVE creates the snapshot. If that
+recording fails and PVE can definitely remove the new snapshot, an idempotent
+cleanup fences that exact name-and-`snaptime` generation. Destroy captures live
+ports plus PVN-bearing snapshot manifests and commits only after the complete
+PVE cleanup, so templates and snapshot-only identities are not orphaned.
+
 ## North-south networking
 
 The first release follows the centralized OpenStack/Neutron OVN model.
@@ -131,8 +175,9 @@ explicitly selected uplink into it after its destructive topology preflight;
 operators using package-only or manual setup must prepare that bridge instead.
 
 The default assumes a 1500-byte underlay and advertises a 1400-byte tenant MTU
-for Geneve. BGP, IPv6, metadata service, load balancers, LXC, and coordinated
-PVE live migration/HA moves are outside v1.
+for Geneve. BGP, IPv6, metadata service, load balancers, and LXC are outside
+v1. Coordinated QEMU migration and HA starts are limited to the exact packaged
+PVE lifecycle boundary described above.
 
 ## UI and authentication
 
