@@ -339,8 +339,11 @@ func (s *Server) reportPort(writer http.ResponseWriter, request *http.Request) {
 		desired.NIC = ""
 		desired.RequestedChassis = ""
 	}
+	// Online migration can move the same generation back to binding after an
+	// earlier bound report. Scope retries to the exact manager-authored port
+	// revision so that the later Binding -> Bound request has a new identity.
 	updated, _, err := s.store.Update(request.Context(), desired, current.Revision,
-		fmt.Sprintf("runtime-report-%s-%d-%s", current.ID, report.Generation, report.Status))
+		fmt.Sprintf("runtime-report-%s-%d-%s-revision-%d", current.ID, report.Generation, report.Status, current.Revision))
 	if err != nil {
 		s.storeError(writer, err)
 		return

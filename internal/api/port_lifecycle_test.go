@@ -220,6 +220,56 @@ func TestRuntimePortReportsUseGenerationCASAndAreUnixOnly(t *testing.T) {
 	}
 }
 
+func TestRuntimePortReportIdempotencyFollowsManagerRevision(t *testing.T) {
+	store, _, node, port := lifecycleTopology(t)
+	port.NodeID, port.VMID, port.NIC, port.RequestedChassis = node.ID, 100, "net0", node.ChassisID
+	port.BindingStatus, port.Generation = model.PortBinding, 2
+	preparedResource, _, err := store.Update(context.Background(), port, port.Revision, "prepare-runtime-report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := preparedResource.(*model.Port)
+	server := testServer(t, store, nil)
+	reportPath := "/api/v1/runtime/ports/" + port.ID + "/report"
+	reportBody := map[string]any{"generation": prepared.Generation, "status": "bound"}
+
+	first := request(t, server.RuntimeHandler(), http.MethodPost, reportPath, reportBody, nil)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first bound report status=%d body=%s", first.Code, first.Body.String())
+	}
+	firstBound := decodeData[model.Port](t, first)
+
+	managerDesired := clonePort(&firstBound)
+	managerDesired.Metadata = model.Metadata{ID: firstBound.ID}
+	managerDesired.BindingStatus = model.PortBinding
+	managerResource, _, err := store.Update(context.Background(), managerDesired, firstBound.Revision, "simulate-migration-finalize")
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerUpdated := managerResource.(*model.Port)
+	if managerUpdated.Generation != firstBound.Generation || managerUpdated.Revision <= firstBound.Revision {
+		t.Fatalf("manager revision fixture=%#v first=%#v", managerUpdated, firstBound)
+	}
+
+	second := request(t, server.RuntimeHandler(), http.MethodPost, reportPath, reportBody, nil)
+	if second.Code != http.StatusOK {
+		t.Fatalf("same-generation report after manager revision status=%d body=%s", second.Code, second.Body.String())
+	}
+	secondBound := decodeData[model.Port](t, second)
+	if secondBound.BindingStatus != model.PortBound || secondBound.Generation != firstBound.Generation || secondBound.Revision <= managerUpdated.Revision {
+		t.Fatalf("second bound report=%#v manager=%#v", secondBound, managerUpdated)
+	}
+
+	repeated := request(t, server.RuntimeHandler(), http.MethodPost, reportPath, reportBody, nil)
+	if repeated.Code != http.StatusOK {
+		t.Fatalf("stable bound report status=%d body=%s", repeated.Code, repeated.Body.String())
+	}
+	stable := decodeData[model.Port](t, repeated)
+	if stable.Revision != secondBound.Revision || stable.BindingStatus != model.PortBound {
+		t.Fatalf("stable report unexpectedly mutated the port: %#v", stable)
+	}
+}
+
 func TestRuntimePortReportReplayRepairsPersistedSameStatusPendingState(t *testing.T) {
 	store, _, node, port := lifecycleTopology(t)
 	port.NodeID, port.VMID, port.NIC, port.RequestedChassis = node.ID, 100, "net0", node.ChassisID

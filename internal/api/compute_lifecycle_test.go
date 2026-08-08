@@ -1096,6 +1096,54 @@ func TestOfflineMigrationFinalizeAcceptsExactPreparedTargetState(t *testing.T) {
 	}
 }
 
+func TestOnlineMigrationTargetCanRepeatBoundReportAfterFinalize(t *testing.T) {
+	topology := newComputeTestTopology(t)
+	port := topology.port(t, 135, "net0", "02:00:00:00:00:8e")
+	sourceServer := topology.server(t, topology.source.Name, false, nil)
+	targetServer := topology.server(t, topology.target.Name, false, nil)
+	begin := request(t, sourceServer.ComputeHandler(), http.MethodPost, computeMigrationBeginPath,
+		migrationBeginBody("migration-runtime-report-revision-135", topology, true, port), nil)
+	if begin.Code != http.StatusOK {
+		t.Fatalf("online migration begin status=%d body=%s", begin.Code, begin.Body.String())
+	}
+	data := decodeMigrationBegin(t, begin)
+	prepared := loadComputePort(t, topology.store, port.ID)
+	reportPath := "/api/v1/runtime/ports/" + port.ID + "/report"
+	reportBody := map[string]any{"generation": prepared.Generation, "status": "bound"}
+
+	firstReport := request(t, targetServer.RuntimeHandler(), http.MethodPost, reportPath, reportBody, nil)
+	if firstReport.Code != http.StatusOK {
+		t.Fatalf("prepared target bound report status=%d body=%s", firstReport.Code, firstReport.Body.String())
+	}
+	preparedBound := decodeData[model.Port](t, firstReport)
+	targetBody := computeStartBody(135, topology.target.Name, &preparedBound)
+	targetBody["migration_source"] = topology.source.Name
+	started := request(t, targetServer.ComputeHandler(), http.MethodPost, computeStartPath, targetBody, nil)
+	if started.Code != http.StatusOK {
+		t.Fatalf("online migration target start status=%d body=%s", started.Code, started.Body.String())
+	}
+
+	finalizedResponse := request(t, sourceServer.ComputeHandler(), http.MethodPost, computeMigrationFinalPath, migrationFinishBody(data), nil)
+	if finalizedResponse.Code != http.StatusOK {
+		t.Fatalf("online migration finalize status=%d body=%s", finalizedResponse.Code, finalizedResponse.Body.String())
+	}
+	finalized := loadComputePort(t, topology.store, port.ID)
+	if finalized.BindingStatus != model.PortBinding || finalized.Generation != preparedBound.Generation || finalized.Revision <= preparedBound.Revision ||
+		finalized.NodeID != topology.target.ID || finalized.RequestedChassis != topology.target.ChassisID {
+		t.Fatalf("finalized migration did not create a same-generation binding revision: %#v", finalized)
+	}
+
+	secondReport := request(t, targetServer.RuntimeHandler(), http.MethodPost, reportPath, reportBody, nil)
+	if secondReport.Code != http.StatusOK {
+		t.Fatalf("post-finalize repeated bound report status=%d body=%s", secondReport.Code, secondReport.Body.String())
+	}
+	rebound := decodeData[model.Port](t, secondReport)
+	if rebound.BindingStatus != model.PortBound || rebound.Generation != finalized.Generation || rebound.Revision <= finalized.Revision ||
+		rebound.NodeID != topology.target.ID || rebound.RequestedChassis != topology.target.ChassisID {
+		t.Fatalf("post-finalize repeated bound report=%#v finalized=%#v", rebound, finalized)
+	}
+}
+
 func TestMigrationAcceptsOnlyExactRuntimeBoundRevisionAdvances(t *testing.T) {
 	topology := newComputeTestTopology(t)
 	port := topology.port(t, 136, "net0", "02:00:00:00:00:8f")
