@@ -1,3 +1,10 @@
+proxmox-ovn (0.4.1) unstable; urgency=medium
+
+  * Verify graceful pvedaemon and pveproxy reloads by their replacement
+    worker generations while retaining strict HA daemon restart checks.
+
+ -- PVN Project <root@localhost>  Sat, 08 Aug 2026 01:53:25 +0000
+
 proxmox-ovn (0.4.0) unstable; urgency=medium
 
   * Integrate fail-closed Proxmox VM start, clone, template, snapshot, and
